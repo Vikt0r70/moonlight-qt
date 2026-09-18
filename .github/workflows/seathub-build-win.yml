@@ -1,0 +1,87 @@
+name: SeatHub build (Windows)
+
+# Adds SeatHub-specific jobs alongside upstream's existing CI (D-27) — upstream workflows are the
+# baseline and are not removed until SeatHub jobs fully cover them. This job's purpose is the
+# diff gate: it enforces the engine-untouched fork boundary (D-28, amended by ADR-0046).
+#
+# Exception pattern: `overlaymanager|session\.cpp` is the single source of truth for what may be
+# modified under app/streaming/. It is deliberately mirrored (not referenced) in three other
+# places — the verify commands of Plans 03-02, 03-05, and 03-06 — because those verify commands
+# run outside CI, in the executor's own shell, before a PR exists to run this workflow against.
+# Any future amendment to the exception set must update all four locations together.
+
+on:
+  pull_request:
+    branches: [seathub/main]
+  push:
+    branches: [seathub/main]
+
+jobs:
+  diff-gate:
+    name: Engine-untouched diff gate (D-28, ADR-0046)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch upstream tag baseline
+        run: git fetch --tags --force origin v6.1.0
+
+      - name: Fail if any engine file (decoder/renderer/audio/input) changed
+        shell: bash
+        run: |
+          set -euo pipefail
+          CHANGED=$(git diff --name-only origin/v6.1.0..HEAD -- \
+            'app/streaming/video/*' 'app/streaming/audio/*' 'app/streaming/input/*' \
+            'app/streaming/*.cpp' 'app/streaming/*.h')
+          if [ -z "$CHANGED" ]; then
+            echo "No app/streaming/ files changed — gate passes trivially."
+            exit 0
+          fi
+          echo "Changed app/streaming/ files:"
+          echo "$CHANGED"
+          # The only two permitted exceptions (D-28's overlay compositor, ADR-0046's session.cpp
+          # title literal). This regex is the single source; see the header comment above.
+          DISALLOWED=$(echo "$CHANGED" | grep -Ev 'overlaymanager|session\.cpp' || true)
+          if [ -n "$DISALLOWED" ]; then
+            echo "::error::Disallowed engine file(s) modified outside the FORK-CHANGES.md exception list:"
+            echo "$DISALLOWED"
+            exit 1
+          fi
+          echo "Only exception-listed files changed under app/streaming/ — gate passes."
+
+      - name: Fail if a changed exception file has no FORK-CHANGES.md entry
+        shell: bash
+        run: |
+          set -euo pipefail
+          CHANGED=$(git diff --name-only origin/v6.1.0..HEAD -- \
+            'app/streaming/video/*' 'app/streaming/audio/*' 'app/streaming/input/*' \
+            'app/streaming/*.cpp' 'app/streaming/*.h' | grep -E 'overlaymanager|session\.cpp' || true)
+          if [ -z "$CHANGED" ]; then
+            exit 0
+          fi
+          MISSING=""
+          for f in $CHANGED; do
+            grep -qF "$f" FORK-CHANGES.md || MISSING="$MISSING $f"
+          done
+          if [ -n "$MISSING" ]; then
+            echo "::error::These exception-listed files changed but have no FORK-CHANGES.md entry:$MISSING"
+            exit 1
+          fi
+
+  seathub-windows-build:
+    name: SeatHub Windows/Qt build
+    runs-on: windows-latest
+    needs: diff-gate
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # Toolchain provisioning (Qt 6.11 SDK, MSVC 2022 v143) is finalized once Plan 03-01's
+      # Task 3 (human toolchain-install checkpoint) is closed and its exact install method is
+      # confirmed against a real developer machine. Placeholder step kept intentionally minimal
+      # rather than guessing at install-qt-action version pins that have not been verified.
+      - name: Placeholder — Qt/MSVC build step
+        run: echo "Build step pending toolchain provisioning (Plan 03-01 Task 3)."
