@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- SeatHub's AppStream metadata for the Linux packaging path. Deliberately carries no
+     release history: SeatHub's releases are described by the control plane's release feed
+     (D-38), which is the sole source of truth for versions. -->
+<component type="desktop">
+	<id>com.seathub.SeatHub</id>
+	<metadata_license>CC0-1.0</metadata_license>
+	<project_license>GPL-3.0+</project_license>
+	<name>SeatHub</name>
+	<summary>Play on a SeatHub rig</summary>
+
+	<description>
+		<p>SeatHub is the client for the SeatHub rental service. It signs you in, finds a free rig, and streams your session.</p>
+	</description>
+
+	<url type="homepage">https://damra.co</url>
+
+	<developer_name>Seven Hills</developer_name>
+
+	<launchable type="desktop-id">com.seathub.SeatHub.desktop</launchable>
+
+	<provides>
+		<binary>seathub</binary>
+	</provides>
+
+	<categories>
+		<category>Game</category>
+		<category>Qt</category>
+	</categories>
+
+	<content_rating type="oars-1.0" />
+</component>

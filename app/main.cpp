@@ -47,6 +47,8 @@
 #include "streaming/session.h"
 #include "settings/streamingpreferences.h"
 #include "gui/sdlgamepadkeynavigation.h"
+#include "seathub/seathub_client.h"
+#include "seathub/session_lifecycle.h"
 
 #if defined(Q_OS_WIN32)
 #define IS_UNSPECIFIED_HANDLE(x) ((x) == INVALID_HANDLE_VALUE || (x) == NULL)
@@ -249,7 +251,7 @@ LONG WINAPI UnhandledExceptionHandler(struct _EXCEPTION_POINTERS *ExceptionInfo)
     }
 
     WCHAR dmpFileName[MAX_PATH];
-    swprintf_s(dmpFileName, L"%ls\\Moonlight-%I64u.dmp",
+    swprintf_s(dmpFileName, L"%ls\\SeatHub-%I64u.dmp",
                (PWCHAR)QDir::toNativeSeparators(Path::getLogDir()).utf16(), QDateTime::currentSecsSinceEpoch());
     QString qDmpFileName = QString::fromUtf16((const char16_t*)dmpFileName);
     HANDLE dumpHandle = CreateFileW(dmpFileName, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -300,9 +302,9 @@ int main(int argc, char *argv[])
     // Set these here to allow us to use the default QSettings constructor.
     // These also ensure that our cache directory is named correctly. As such,
     // it is critical that these be called before Path::initialize().
-    QCoreApplication::setOrganizationName("Moonlight Game Streaming Project");
-    QCoreApplication::setOrganizationDomain("moonlight-stream.com");
-    QCoreApplication::setApplicationName("Moonlight");
+    QCoreApplication::setOrganizationName("Seven Hills");
+    QCoreApplication::setOrganizationDomain("damra.co");
+    QCoreApplication::setApplicationName("SeatHub");
 
     if (QFile(QDir::currentPath() + "/portable.dat").exists()) {
         QSettings::setDefaultFormat(QSettings::IniFormat);
@@ -336,7 +338,7 @@ int main(int argc, char *argv[])
     if (IS_UNSPECIFIED_HANDLE(oldConErr))
 #endif
     {
-        s_LoggerFile = new QFile(tempDir.filePath(QString("Moonlight-%1.log").arg(QDateTime::currentSecsSinceEpoch())));
+        s_LoggerFile = new QFile(tempDir.filePath(QString("SeatHub-%1.log").arg(QDateTime::currentSecsSinceEpoch())));
         if (s_LoggerFile->open(QIODevice::WriteOnly | QIODevice::Text)) {
             QTextStream(stderr) << "Redirecting log output to " << s_LoggerFile->fileName() << Qt::endl;
             s_LoggerStream.setDevice(s_LoggerFile);
@@ -359,7 +361,7 @@ int main(int argc, char *argv[])
 
 #ifdef LOG_TO_FILE
     // Prune the oldest existing logs if there are more than 10
-    QStringList existingLogNames = tempDir.entryList(QStringList("Moonlight-*.log"), QDir::NoFilter, QDir::SortFlag::Time);
+    QStringList existingLogNames = tempDir.entryList(QStringList("SeatHub-*.log"), QDir::NoFilter, QDir::SortFlag::Time);
     for (int i = 10; i < existingLogNames.size(); i++) {
         qInfo() << "Removing old log file:" << existingLogNames.at(i);
         QFile(tempDir.filePath(existingLogNames.at(i))).remove();
@@ -540,8 +542,8 @@ int main(int argc, char *argv[])
     // Set our app name for SDL to use with PulseAudio and PipeWire. This matches what we
     // provide as our app name to libsoundio too. On SDL 2.0.18+, SDL_APP_NAME is also used
     // for screensaver inhibitor reporting.
-    SDL_SetHint("SDL_AUDIO_DEVICE_APP_NAME", "Moonlight");
-    SDL_SetHint("SDL_APP_NAME", "Moonlight");
+    SDL_SetHint("SDL_AUDIO_DEVICE_APP_NAME", "SeatHub");
+    SDL_SetHint("SDL_APP_NAME", "SeatHub");
 
     // We handle capturing the mouse ourselves when it leaves the window, so we don't need
     // SDL doing it for us behind our backs.
@@ -669,9 +671,9 @@ int main(int argc, char *argv[])
 #endif
 
     // This is necessary to show our icon correctly on Wayland
-    app.setDesktopFileName("com.moonlight_stream.Moonlight.desktop");
-    qputenv("SDL_VIDEO_WAYLAND_WMCLASS", "com.moonlight_stream.Moonlight");
-    qputenv("SDL_VIDEO_X11_WMCLASS", "com.moonlight_stream.Moonlight");
+    app.setDesktopFileName("com.seathub.SeatHub.desktop");
+    qputenv("SDL_VIDEO_WAYLAND_WMCLASS", "com.seathub.SeatHub");
+    qputenv("SDL_VIDEO_X11_WMCLASS", "com.seathub.SeatHub");
 
     // Register our C++ types for QML
     qmlRegisterType<ComputerModel>("ComputerModel", 1, 0, "ComputerModel");
@@ -705,6 +707,21 @@ int main(int argc, char *argv[])
 
     // Create the identity manager on the main thread
     IdentityManager::get();
+
+    // SeatHub's own types. Everything SeatHub adds lives in new files under app/seathub/
+    // (the C++ bridge) and app/gui/ (the QML views) - ADR-0044, D-32. `SeatHubClient` is
+    // the single facade the QML layer talks to (D-35); QML never reaches past it.
+    qmlRegisterType<SeatHubClient>("SeatHub", 1, 0, "SeatHubClient");
+    qmlRegisterUncreatableType<SessionLifecycle>("SeatHub", 1, 0, "SessionLifecycle",
+                                                 "SessionLifecycle is owned by SeatHubClient");
+
+    // The design tokens. Tokens.qml is a byte-for-byte copy of seathub-web's generated
+    // `npm run tokens:build` output (Phase 2.1, D-20/D-54); Metrics.qml is the fork-side
+    // companion that parses its CSS-shaped spacing/type values into the numbers QML wants.
+    qmlRegisterSingletonType(QUrl(QStringLiteral("qrc:/gui/Tokens.qml")),
+                             "SeatHub.Tokens", 1, 0, "Tokens");
+    qmlRegisterSingletonType(QUrl(QStringLiteral("qrc:/gui/Metrics.qml")),
+                             "SeatHub.Tokens", 1, 0, "Metrics");
 
     // We require the Material theme
     QQuickStyle::setStyle("Material");

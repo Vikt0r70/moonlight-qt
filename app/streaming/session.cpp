@@ -1815,7 +1815,8 @@ void Session::execInternal()
 #ifdef Q_OS_DARWIN
     std::string windowName = QString(m_Computer->name).toStdString();
 #else
-    std::string windowName = QString(m_Computer->name + " - Moonlight").toStdString();
+    // SeatHub: D-28 exception, see ADR-0046
+    std::string windowName = QString(m_Computer->name + " - SeatHub").toStdString();
 #endif
 
     m_Window = SDL_CreateWindow(windowName.c_str(),

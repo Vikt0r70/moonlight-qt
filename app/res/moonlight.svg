@@ -1,1 +1,22 @@
-<?xml version="1.0" standalone="no"?><!-- Generator: Gravit.io --><svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" style="isolation:isolate" viewBox="0 0 256 256" width="256" height="256"><g><circle vector-effect="non-scaling-stroke" cx="128" cy="128" r="128" fill="rgb(86,92,100)"/><circle vector-effect="non-scaling-stroke" cx="128.00000000000003" cy="128.00000000000003" r="96" fill="rgb(255,255,255)"/><path d=" M 137.66 132 L 224 132 L 224 124 L 137.66 124 L 198.71 62.95 L 193.05 57.29 L 132 118.34 L 132 32 L 124 32 L 124 118.34 L 62.95 57.29 L 57.29 62.95 L 118.34 124 L 32 124 L 32 132 L 118.34 132 L 57.29 193.05 L 62.95 198.71 L 124 137.66 L 124 224 L 132 224 L 132 137.66 L 193.05 198.71 L 198.71 193.05 L 137.66 132 Z " fill-rule="evenodd" fill="rgb(86,92,100)"/></g></svg>
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  SeatHub client mark.
+
+  This file replaces the content of upstream moonlight-qt's `app/res/moonlight.svg` while
+  keeping its resource path (`:/res/moonlight.svg`). `app/streaming/session.cpp` references
+  that path for the SDL stream window's icon, and the fork boundary (ADR-0044, D-28) permits
+  modifying `session.cpp` only for the ADR-0046 window-title literal - so the icon is changed
+  here, by content, instead of by touching the engine file.
+
+  Palette is the design system's: background #0a0a0a, foreground #fafafa, accent #10b981
+  (`docs/spec/ui.md`; the same values as seathub-web's generated Tokens.qml).
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <rect x="0" y="0" width="256" height="256" rx="56" ry="56" fill="#0a0a0a"/>
+  <circle cx="128" cy="128" r="66" fill="none" stroke="#fafafa" stroke-width="18"/>
+  <circle cx="128" cy="128" r="24" fill="#10b981"/>
+  <rect x="112" y="26" width="32" height="26" rx="8" ry="8" fill="#fafafa"/>
+  <rect x="112" y="204" width="32" height="26" rx="8" ry="8" fill="#fafafa"/>
+  <rect x="26" y="112" width="26" height="32" rx="8" ry="8" fill="#fafafa"/>
+  <rect x="204" y="112" width="26" height="32" rx="8" ry="8" fill="#fafafa"/>
+</svg>

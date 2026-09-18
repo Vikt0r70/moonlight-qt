@@ -2,10 +2,10 @@ QT += core quick network quickcontrols2 svg
 CONFIG += c++11
 
 unix:!macx {
-    TARGET = moonlight
+    TARGET = seathub
 } else {
     # On macOS, this is the name displayed in the global menu bar
-    TARGET = Moonlight
+    TARGET = SeatHub
 }
 
 include(../globaldefs.pri)
@@ -199,6 +199,9 @@ SOURCES += \
     streaming/audio/renderers/sdlaud.cpp \
     gui/computermodel.cpp \
     gui/appmodel.cpp \
+    seathub/seathub_client.cpp \
+    seathub/session_lifecycle.cpp \
+    seathub/error_map.cpp \
     streaming/streamutils.cpp \
     backend/autoupdatechecker.cpp \
     path.cpp \
@@ -234,6 +237,9 @@ HEADERS += \
     streaming/audio/renderers/sdl.h \
     gui/computermodel.h \
     gui/appmodel.h \
+    seathub/seathub_client.h \
+    seathub/session_lifecycle.h \
+    seathub/error_map.h \
     streaming/video/decoder.h \
     streaming/streamutils.h \
     backend/autoupdatechecker.h \
@@ -532,25 +538,24 @@ unix:!macx: {
 
     target.path = $$PREFIX/$$BINDIR/
 
-    desktop.files = deploy/linux/com.moonlight_stream.Moonlight.desktop
+    desktop.files = deploy/linux/com.seathub.SeatHub.desktop
     desktop.path = $$PREFIX/$$DATADIR/applications/
 
     icons.files = res/moonlight.svg
     icons.path = $$PREFIX/$$DATADIR/icons/hicolor/scalable/apps/
 
-    appstream.files = deploy/linux/com.moonlight_stream.Moonlight.appdata.xml
+    appstream.files = deploy/linux/com.seathub.SeatHub.appdata.xml
     appstream.path = $$PREFIX/$$DATADIR/metainfo/
 
     INSTALLS += target desktop icons appstream
 }
 win32 {
-    RC_ICONS = moonlight.ico
-    QMAKE_TARGET_COMPANY = Moonlight Game Streaming Project
-    QMAKE_TARGET_DESCRIPTION = Moonlight Game Streaming Client
-    QMAKE_TARGET_PRODUCT = Moonlight
-
+    RC_ICONS = seathub.ico
+    QMAKE_TARGET_COMPANY = Seven Hills
+    QMAKE_TARGET_DESCRIPTION = SeatHub Streaming Client
+    QMAKE_TARGET_PRODUCT = SeatHub
     CONFIG -= embed_manifest_exe
-    QMAKE_LFLAGS += /MANIFEST:embed /MANIFESTINPUT:$${PWD}/Moonlight.exe.manifest
+    QMAKE_LFLAGS += /MANIFEST:embed /MANIFESTINPUT:$${PWD}/SeatHub.exe.manifest
 }
 macx {
     # Create Info.plist in object dir with the correct version string
@@ -559,7 +564,7 @@ macx {
 
     QMAKE_INFO_PLIST = $$OUT_PWD/Info.plist
 
-    APP_BUNDLE_RESOURCES.files = moonlight.icns
+    APP_BUNDLE_RESOURCES.files = seathub.icns
     APP_BUNDLE_RESOURCES.path = Contents/Resources
 
     APP_BUNDLE_PLIST.files = $$OUT_PWD/Info.plist

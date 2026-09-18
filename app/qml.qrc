@@ -1,6 +1,13 @@
 <RCC>
     <qresource prefix="/">
         <file>gui/main.qml</file>
+        <file>gui/Tokens.qml</file>
+        <file>gui/Metrics.qml</file>
+        <file>gui/SessionSegue.qml</file>
+        <file>gui/SignInScreen.qml</file>
+        <file>gui/HomeScreen.qml</file>
+        <file>gui/ErrorScreen.qml</file>
+        <file>gui/SeatHubOTPField.qml</file>
         <file>gui/PcView.qml</file>
         <file>gui/AppView.qml</file>
         <file>gui/SettingsView.qml</file>
