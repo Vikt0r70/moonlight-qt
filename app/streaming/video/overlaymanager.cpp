@@ -83,6 +83,52 @@ SDL_Surface* OverlayManager::getUpdatedOverlaySurface(OverlayType type)
     return (SDL_Surface*)SDL_AtomicSetPtr((void**)&m_Overlays[type].surface, nullptr);
 }
 
+// SeatHub: D-28 exception, see FORK-CHANGES.md and ADR-0045. Publishes a caller-rendered
+// bitmap through the same swap-and-notify path the text overlays use.
+bool OverlayManager::updateOverlaySurface(OverlayType type, SDL_Surface* surface)
+{
+    if (surface == nullptr) {
+        return false;
+    }
+
+    // Every renderer's upload path asserts both of these before it hands the pixels to the
+    // GPU (see d3d11va.cpp's notifyOverlayUpdated, which rejects anything that is not
+    // SDL_PIXELFORMAT_ARGB8888 and asserts !SDL_MUSTLOCK). Refusing here keeps that contract
+    // instead of tripping an assert inside a render thread.
+    if (surface->format->format != SDL_PIXELFORMAT_ARGB8888 || SDL_MUSTLOCK(surface)) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                    "SeatHub overlay: refused a bitmap for overlay %d (format %s, must lock %d)",
+                    (int)type,
+                    SDL_GetPixelFormatName(surface->format->format),
+                    SDL_MUSTLOCK(surface));
+        SDL_FreeSurface(surface);
+        return false;
+    }
+
+    if (!m_Overlays[type].enabled) {
+        // Nothing would draw it, so publishing would only hand the renderer a surface it
+        // immediately frees (or, worse, leave a bitmap in the slot the text path assumes is
+        // its own). `setOverlayState(type, true)` re-enables and notifies the renderer.
+        SDL_FreeSurface(surface);
+        return false;
+    }
+
+    SDL_Surface* oldSurface = (SDL_Surface*)SDL_AtomicSetPtr((void**)&m_Overlays[type].surface, surface);
+
+    // Free the surface this bitmap replaced, exactly as the text path does.
+    if (oldSurface != nullptr) {
+        SDL_FreeSurface(oldSurface);
+    }
+
+    // Deliberately NOT setOverlayTextUpdated()/notifyOverlayUpdated(): those rasterise the
+    // text field and would publish a text surface over the bitmap set one line above.
+    if (m_Renderer != nullptr) {
+        m_Renderer->notifyOverlayUpdated(type);
+    }
+
+    return true;
+}
+
 void OverlayManager::setOverlayTextUpdated(OverlayType type)
 {
     // Only update the overlay state if it's enabled. If it's not enabled,

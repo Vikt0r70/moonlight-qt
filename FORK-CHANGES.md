@@ -33,13 +33,18 @@ Added by each plan (Plan 03-02 onward) in the same commit that makes the change.
 | `app/qml.qrc` | packaging | Registers the new `app/gui/` QML files (`Tokens.qml`, `Metrics.qml`, `SessionSegue.qml`, `SignInScreen.qml`, `HomeScreen.qml`, `ErrorScreen.qml`, `SeatHubOTPField.qml`) so they are available at `qrc:/gui/`. | 03-02 |
 | `app/qml.qrc` | packaging | Registers the settings page and its control primitives (`SettingsPage.qml`, `SeatHubToggle.qml`, `SeatHubSelect.qml`, `SeatHubNumberField.qml`, `SeatHubReadOnlyRow.qml`) and `ForcedUpdateModal.qml`. Additions only. | 03-04 |
 | `app/res/moonlight.svg` | brand asset (content only) | Content replaced with the SeatHub client mark at the *same* resource path. `app/streaming/session.cpp` references `:/res/moonlight.svg` for the SDL stream window icon, so replacing the content gives SeatHub the stream window's icon **without** editing an engine file and **without** widening ADR-0046's exception set. | 03-02 |
+| `app/streaming/video/overlaymanager.h` | engine (D-28 overlay-compositor exception) | Declares one new public method, `bool updateOverlaySurface(OverlayType type, SDL_Surface* surface)`, with its contract in a comment block. The class could only accept **text** (every surface it published was rasterised by SDL_ttf from a `char[512]`), so the SeatHub HUD had no way in. `ADR-0045` records why the HUD cannot be a QML bitmap instead (the Qt window is hidden for the whole session, so `QQuickItem::grabToImage()` is structurally impossible) and why this path is the one that preserves the single-window requirement (`STREAM-01`) for free: `D3D11VARenderer::renderFrame()` already composites the overlays into the stream's own swapchain before `Present()`. No existing declaration, enum, or behaviour is changed. | 03-05 |
+| `app/streaming/video/overlaymanager.cpp` | engine (D-28 overlay-compositor exception) | Implements `updateOverlaySurface()`: refuses and frees a surface that is not `SDL_PIXELFORMAT_ARGB8888` or that needs locking (every renderer's upload path asserts exactly that, on a render thread), refuses and frees one published while the overlay is disabled, otherwise publishes it through the same `SDL_AtomicSetPtr` swap the text path uses, frees the previous surface, and notifies the renderer **exactly once** by calling `m_Renderer->notifyOverlayUpdated(type)` directly — deliberately not through `setOverlayTextUpdated()`, which would rasterise the text field and overwrite the bitmap just published. Ownership transfers in every case (including refusal) so a caller cannot leak by ignoring the return value. Additive: no existing function's body changes. | 03-05 |
 | `app/Moonlight.exe.manifest` → `app/SeatHub.exe.manifest` | packaging | Renamed, and its `<description>` changed from "Moonlight Game Streaming" to "SeatHub Streaming Client". The file is embedded into the executable by `QMAKE_LFLAGS`, so the old name was a Moonlight string in the shipped binary's manifest. | 03-02 |
 
 Nothing under `app/streaming/audio/`, `app/streaming/input/` or `app/streaming/video/` (other than
-the overlay compositor exception) is modified by any plan, and Plan 03-04 adds none. The settings
-page reads and writes upstream's `StreamingPreferences` through its public members only —
-`app/settings/streamingpreferences.*` is **not** modified, which is why the settings audit can
-claim write-through without a second store (D-12, STREAM-02).
+the overlay compositor exception, which Plan 03-05 is the first and so far only plan to exercise —
+`app/streaming/video/overlaymanager.h` and `.cpp`) is modified by any plan, and Plan 03-04 adds
+none. The settings page reads and writes upstream's `StreamingPreferences` through its public
+members only — `app/settings/streamingpreferences.*` is **not** modified, which is why the
+settings audit can claim write-through without a second store (D-12, STREAM-02). The HUD itself
+adds no further engine edits: it lives in `app/seathub/hud_overlay.*` and reaches the swapchain
+only through the public `OverlayManager` API.
 
 ### Upstream files deliberately left in place but no longer referenced
 
@@ -81,6 +86,8 @@ CI diff gate's exception list (the gate only checks files that exist in the upst
 | `tests/tst_error_map.cpp`, `tests/tst_error_map.pro` | test (new top-level `tests/` tree — upstream ships none) | 03-02 |
 | `tests/tst_settings_bridge.cpp`, `tests/tst_settings_bridge.pro` | test — write-through against upstream's real `StreamingPreferences`, the streaming write guard, the in-memory session overrides, and the settings page loading | 03-04 |
 | `tests/tst_update_feed.cpp`, `tests/tst_update_feed.pro` | test — feed parsing, semantic version comparison, SHA-256 verification against published vectors, the stream-time block, and the modal rendering | 03-04 |
+| `tests/tst_overlay_injection.cpp`, `tests/tst_overlay_injection.pro` | test — the semantics of `OverlayManager::updateOverlaySurface()` against the real `OverlayManager` and a mock `IOverlayRenderer` (`ADR-0045` proof b) | 03-05 |
+| `tests/tst_hud_bitmap.cpp`, `tests/tst_hud_bitmap.pro` | test — the pixel-format contract end to end: `QImage::Format_ARGB32` → `SDL_PIXELFORMAT_ARGB8888` → the exact `CreateTexture2D` code from `d3d11va.cpp` → `CopyResource` + `Map` byte comparison (`ADR-0045` proof a, and proof c for the HUD producer) | 03-05 |
 
 ## Upstream files that must never be modified
 
