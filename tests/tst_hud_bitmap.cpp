@@ -20,6 +20,16 @@
 // is the software rasteriser, so this runs on any Windows machine, including one with no
 // Sunshine host anywhere near it.
 //
+// Proof (c) of Plan 03-05's overlay spike (ADR-0045): the SeatHub HUD producer itself - the
+// bitmap, its layout, its alpha and its lifecycle. It shares this project with proof (a) because
+// both answer the same question from opposite ends: (a) says the engine's upload path consumes
+// exactly what a `QImage::Format_ARGB32` produces, (c) says the bytes put on that path are the
+// HUD the design system asks for.
+//
+// The producer is deliberately linkable with no engine in it (`SeatHubClient` injects the
+// publisher that reaches `OverlayManager`), so nothing here needs an SDL window, a D3D11 device
+// or a streaming session.
+//
 // Build (nothing is on PATH machine-wide - Qt and MSVC are both absolute):
 //   call "<VS BuildTools>\VC\Auxiliary\Build\vcvars64.bat"
 //   set PATH=C:\Qt\6.11.2\msvc2022_64\bin;%PATH%
@@ -27,12 +37,20 @@
 
 #include <QtTest>
 
+#include <QFile>
 #include <QImage>
+#include <QList>
+#include <QMutex>
+#include <QMutexLocker>
+
+#include <atomic>
 
 // Don't let SDL hook the main function Qt Test provides (see `app/main.cpp`), or `QTEST_MAIN`
 // expands to `SDL_main` and the link fails with "unresolved external symbol main".
 #define SDL_MAIN_HANDLED
 #include <SDL.h>
+
+#include "seathub/hud_overlay.h"
 
 #ifdef Q_OS_WIN32
 #include <d3d11.h>
@@ -184,6 +202,84 @@ bool readBackTexture(ID3D11Device* device, ID3D11DeviceContext* context,
 
 #endif // Q_OS_WIN32
 
+// Drives a real `HudOverlay` with a clock the test owns and a publisher that captures what the
+// production publisher would hand to `OverlayManager`.
+//
+// It copies the pixels out immediately rather than keeping the surface: `publishStrip()` wraps a
+// `QImage` that dies as soon as the publisher returns, which is exactly what production relies on
+// (the manager uploads synchronously). A publisher that kept the surface would be reading freed
+// memory - so this one does the copy the manager would have done, and frees the surface, which is
+// the ownership transfer `updateOverlaySurface()` documents.
+class HudHarness
+{
+public:
+    HudHarness()
+    {
+        m_hud.setClock([this]() { return m_nowMs.load(); });
+        m_hud.setPublisher([this](SDL_Surface* surface) {
+            if (surface == nullptr) {
+                QMutexLocker locker(&m_mutex);
+                ++m_hides;
+                return true;
+            }
+
+            QImage copy(surface->w, surface->h, QImage::Format_ARGB32);
+            for (int y = 0; y < surface->h; y++) {
+                memcpy(copy.scanLine(y),
+                       static_cast<const uchar*>(surface->pixels) + y * surface->pitch,
+                       size_t(surface->w) * 4);
+            }
+
+            // Locked, and the clock above is atomic, because `beginSession()` starts a real
+            // SDL_AddTimer heartbeat as soon as SDL's event subsystem is up: on the timer
+            // thread the publisher and the clock are reachable concurrently with the test
+            // thread. The product does not care - it only ever reads the surface inside the
+            // publisher call - but an unlocked harness would be a data race in the test.
+            QMutexLocker locker(&m_mutex);
+            m_formats.append(int(surface->format->format));
+            m_mustLock.append(SDL_MUSTLOCK(surface) != 0);
+            m_frames.append(copy);
+
+            SDL_FreeSurface(surface);
+            return true;
+        });
+    }
+
+    ~HudHarness()
+    {
+        // Stop the heartbeat before the capturing lambdas above go away.
+        m_hud.endSession();
+    }
+
+    HudOverlay& hud() { return m_hud; }
+
+    void advance(qint64 ms) { m_nowMs.store(m_nowMs.load() + ms); }
+
+    int hides() const { QMutexLocker locker(&m_mutex); return m_hides; }
+    const QList<QImage> frames() const { QMutexLocker locker(&m_mutex); return m_frames; }
+    const QList<int> formats() const { QMutexLocker locker(&m_mutex); return m_formats; }
+    const QList<bool> mustLock() const { QMutexLocker locker(&m_mutex); return m_mustLock; }
+
+private:
+    HudOverlay m_hud;
+    std::atomic<qint64> m_nowMs{1000000};
+    mutable QMutex m_mutex;
+    int m_hides = 0;
+    QList<QImage> m_frames;
+    QList<int> m_formats;
+    QList<bool> m_mustLock;
+};
+
+// Reads a file from the fork root (the path comes from the `FORK_ROOT` define in the .pro).
+QString readForkFile(const QString& relativePath)
+{
+    QFile file(QStringLiteral(FORK_ROOT) + QLatin1Char('/') + relativePath);
+    if (!file.open(QIODevice::ReadOnly)) {
+        return QString();
+    }
+    return QString::fromUtf8(file.readAll());
+}
+
 } // namespace
 
 class TestHudBitmap : public QObject
@@ -311,6 +407,303 @@ private slots:
         SDL_FreeSurface(surface);
     }
 #endif // Q_OS_WIN32
+
+    // ---------------------------------------------------------------------------------------
+    // Proof (c): the HUD producer.
+    // ---------------------------------------------------------------------------------------
+
+    // The strip is a full-height HUD band, opaque only where the card is. Everything the renderer
+    // blends with `SRC_ALPHA`/`INV_SRC_ALPHA` depends on that: transparent padding must really be
+    // transparent, or the HUD would paint a bar across the video.
+    void hudStripCoversTheCardAndNothingElse()
+    {
+        HudOverlay hud;
+        const QImage strip = hud.renderStripAt(0, 0);
+
+        QCOMPARE(strip.height(), HudOverlay::stripHeight());
+        QCOMPARE(int(strip.format()), int(QImage::Format_ARGB32));
+        QVERIFY2(strip.width() > 200 && strip.width() < 900,
+                 "the card should be content-sized and fit a 720p stream window");
+
+        // Corners are outside the card: fully transparent, no colour left behind.
+        const QList<QPoint> corners = {QPoint(0, 0), QPoint(strip.width() - 1, 0),
+                                       QPoint(0, strip.height() - 1),
+                                       QPoint(strip.width() - 1, strip.height() - 1)};
+        for (const QPoint& point : corners) {
+            QCOMPARE(qAlpha(strip.pixel(point)), 0);
+        }
+
+        // The middle is the card: opaque.
+        QCOMPARE(qAlpha(strip.pixel(strip.width() / 2, strip.height() / 2)), 255);
+
+        int opaque = 0;
+        for (int y = 0; y < strip.height(); y++) {
+            for (int x = 0; x < strip.width(); x++) {
+                if (qAlpha(strip.pixel(x, y)) == 255) {
+                    opaque++;
+                }
+            }
+        }
+        QVERIFY2(opaque > 500, "the card should be a real surface, not a sliver");
+    }
+
+    // D-56's timer, at the boundaries where a duration display usually breaks.
+    void hudTimerShowsHoursMinutesSeconds()
+    {
+        const QList<QPair<qint64, QString>> cases = {
+            {0, QStringLiteral("00:00:00")},
+            {59, QStringLiteral("00:00:59")},
+            {60, QStringLiteral("00:01:00")},
+            {3600, QStringLiteral("01:00:00")},
+            {3661, QStringLiteral("01:01:01")},
+            {86399, QStringLiteral("23:59:59")},
+        };
+
+        for (const auto& testCase : cases) {
+            HudHarness harness;
+            harness.hud().beginSession();
+            harness.advance(testCase.first * 1000);
+            harness.hud().tick();
+
+            QCOMPARE(harness.hud().elapsedSeconds(), testCase.first);
+            QCOMPARE(harness.hud().timerText(), testCase.second);
+            harness.hud().endSession();
+        }
+
+        // Fixed width, so the card does not reflow when the first hour lands.
+        QCOMPARE(HudOverlay::stripHeight(), 56);
+        QCOMPARE(HudOverlay::autoHideMs(), 4000);
+    }
+
+    // The timer is actually drawn, not just tracked: an unrendered value would pass the test
+    // above while showing a customer a frozen clock.
+    void hudTimerTextChangesTheStripPixels()
+    {
+        HudOverlay hud;
+        const QImage atZero = hud.renderStripAt(0, 0);
+        const QImage atNinetyNine = hud.renderStripAt(99, 0);
+
+        QCOMPARE(atZero.size(), atNinetyNine.size());
+
+        int differing = 0;
+        for (int y = 0; y < atZero.height(); y++) {
+            for (int x = 0; x < atZero.width(); x++) {
+                if (atZero.pixel(x, y) != atNinetyNine.pixel(x, y)) {
+                    differing++;
+                }
+            }
+        }
+        QVERIFY2(differing > 20, "the timer did not reach the bitmap");
+    }
+
+    // ADR-0045's positioning technique: the overlay is drawn 1:1 in swapchain pixels from the
+    // bottom-left anchor, so the card's position comes from the bytes, not from the surface size.
+    // Padding the strip to a display width must therefore leave the card byte-identical - which
+    // is what makes it safe to composite without knowing the stream window's size.
+    void hudStripWidthFollowsTheRequestedDisplayWidth()
+    {
+        HudOverlay hud;
+        const QImage content = hud.renderStripAt(0, 0);
+        const int cardWidth = content.width();
+
+        for (int displayWidth : {1280, 1920, 2560}) {
+            const QImage padded = hud.renderStripAt(0, displayWidth);
+            QCOMPARE(padded.width(), displayWidth);
+            QCOMPARE(padded.height(), content.height());
+
+            for (int y = 0; y < padded.height(); y++) {
+                QCOMPARE(memcmp(padded.constScanLine(y), content.constScanLine(y),
+                                size_t(cardWidth) * 4),
+                         0);
+            }
+
+            // The padding is invisible, not black: it must not darken the video behind it.
+            for (int x = cardWidth; x < padded.width(); x += 37) {
+                QCOMPARE(qAlpha(padded.pixel(x, padded.height() / 2)), 0);
+            }
+        }
+    }
+
+    // The renderers blend with SRC_ALPHA/INV_SRC_ALPHA and a bare texture sample, so the bitmap
+    // has to carry *straight* alpha. A premultiplied edge would double-darken against the video.
+    void hudEdgePixelsCarryStraightAlpha()
+    {
+        HudOverlay hud;
+        const QImage strip = hud.renderStripAt(0, 0);
+
+        // Every colour the producer draws is a solid one, so with straight alpha a partially
+        // covered pixel keeps its colour and only its alpha falls. Two legitimate sets exist and
+        // nothing else may appear:
+        //
+        //  1. a light token - the six-colour palette's lighter entries - which an alpha-scaled
+        //     (premultiplied) buffer would have darkened in proportion to its alpha;
+        //  2. the card's own greys, anywhere between the fill #141414 and the border #404040,
+        //     because the border is stroked over the fill and its antialiased edge is a mix of
+        //     the two.
+        //
+        // The second set exists precisely because it is ambiguous at high alpha: a premultiplied
+        // border pixel at alpha 222 reads #383838, which is inside the fill-to-border range. That
+        // case is not what this test can catch - `hudStripCoversTheCardAndNothingElse` catches the
+        // convention structurally instead, by requiring the image to be `QImage::Format_ARGB32`,
+        // the straight format. What the colour walk below adds is the cases where premultiplication
+        // is unmistakable: a light token at partial alpha. A #fafafa glyph edge at alpha 128 would
+        // arrive as #7d7d7d, and the muted #a3a3a3 the same - neither is in either set.
+        const QList<QColor> lightTokens = {QColor(0xfa, 0xfa, 0xfa),
+                                           QColor(0xa3, 0xa3, 0xa3),
+                                           QColor(0x10, 0xb9, 0x81)};
+        const auto isLightToken = [&lightTokens](const QRgb pixel) {
+            for (const QColor& colour : lightTokens) {
+                if (qAbs(qRed(pixel) - colour.red()) <= 4
+                    && qAbs(qGreen(pixel) - colour.green()) <= 4
+                    && qAbs(qBlue(pixel) - colour.blue()) <= 4) {
+                    return true;
+                }
+            }
+            return false;
+        };
+        const auto isCardGrey = [](const QRgb pixel) {
+            return qRed(pixel) >= 0x14 - 4 && qRed(pixel) <= 0x40 + 4
+                   && qGreen(pixel) >= 0x14 - 4 && qGreen(pixel) <= 0x40 + 4
+                   && qBlue(pixel) >= 0x14 - 4 && qBlue(pixel) <= 0x40 + 4;
+        };
+
+        int edgePixels = 0;
+        int translucentEdges = 0;
+        for (int y = 0; y < strip.height(); y++) {
+            for (int x = 0; x < strip.width(); x++) {
+                const QRgb pixel = strip.pixel(x, y);
+                const int alpha = qAlpha(pixel);
+                if (alpha == 0 || alpha == 255) {
+                    continue;
+                }
+
+                edgePixels++;
+
+                QVERIFY2(isLightToken(pixel) || isCardGrey(pixel),
+                         qPrintable(QStringLiteral("edge pixel (%1,%2) alpha %3 has colour %4 -"
+                                                   " premultiplied, not straight")
+                                        .arg(x).arg(y).arg(alpha)
+                                        .arg(QColor(pixel).name())));
+
+                // The positive evidence, and the reason this walk is not vacuous: below alpha 64
+                // an alpha-scaled card grey falls out of the range above entirely - a border
+                // pixel premultiplied at alpha 27 reads #070707, and the fill at alpha 23 reads
+                // #020202. Both are far below the #10 floor. A pixel this translucent that is
+                // still the card's own colour proves the buffer is straight, because there is no
+                // other way to produce it.
+                if (alpha < 64) {
+                    translucentEdges++;
+                }
+            }
+        }
+
+        QVERIFY2(edgePixels > 0, "the rounded card should be antialiased");
+        QVERIFY2(translucentEdges > 0,
+                 "no pixel was translucent enough for premultiplication to be distinguishable -"
+                 " this walk proved nothing about the alpha convention");
+    }
+
+    // The HUD's colours, metrics and faces are not invented: every one of them is named in a
+    // comment in `hud_overlay.cpp` as the token it mirrors, and this test reads the generated
+    // token files to hold that claim. If a token file changes, this fails and the HUD has to
+    // change with it.
+    void hudUsesTheGeneratedDesignTokens()
+    {
+        const QString tokens = readForkFile(QStringLiteral("app/gui/Tokens.qml"));
+        const QString metrics = readForkFile(QStringLiteral("app/gui/Metrics.qml"));
+        QVERIFY2(!tokens.isEmpty(), "app/gui/Tokens.qml could not be read - is FORK_ROOT right?");
+        QVERIFY2(!metrics.isEmpty(), "app/gui/Metrics.qml could not be read - is FORK_ROOT right?");
+
+        const QList<QPair<QString, QString>> tokenValues = {
+            {QStringLiteral("surface1Default"), QStringLiteral("#141414")},         // card fill
+            {QStringLiteral("borderStrongDefault"), QStringLiteral("#404040")},     // card border
+            {QStringLiteral("foregroundDefault"), QStringLiteral("#fafafa")},       // timer, labels
+            {QStringLiteral("foregroundMutedDefault"), QStringLiteral("#a3a3a3")},  // eyebrow
+            {QStringLiteral("successDefault"), QStringLiteral("#10b981")},          // live dot
+            {QStringLiteral("borderDefault"), QStringLiteral("#262626")},           // hairline
+            {QStringLiteral("fontSansDefault"), QStringLiteral("Inter")},
+            {QStringLiteral("fontMonoDefault"), QStringLiteral("Geist Mono")},
+        };
+
+        for (const auto& token : tokenValues) {
+            const QString expected = token.first + QStringLiteral(": \"") + token.second
+                                     + QLatin1Char('"');
+            QVERIFY2(tokens.contains(expected),
+                     qPrintable(QStringLiteral("Tokens.qml no longer declares %1").arg(expected)));
+        }
+
+        // The numeric companion: the HUD's spacing, radius and type sizes are named after these.
+        for (const QString& metric : {QStringLiteral("s2: 8"), QStringLiteral("s4: 16"),
+                                      QStringLiteral("s5: 20"), QStringLiteral("radiusLg: 20"),
+                                      QStringLiteral("fontLabel: 12"), QStringLiteral("fontSm: 14")}) {
+            QVERIFY2(metrics.contains(metric),
+                     qPrintable(QStringLiteral("Metrics.qml no longer declares %1").arg(metric)));
+        }
+    }
+
+    // The published surface is what `OverlayManager::updateOverlaySurface()` accepts and what
+    // `notifyOverlayUpdated()` uploads without asserting - the same three guards proof (a)
+    // asserts on a synthetic image, now asserted on the HUD's real output.
+    void hudPublishesASurfaceTheRendererAccepts()
+    {
+        HudHarness harness;
+        harness.hud().beginSession();
+
+        QVERIFY(harness.frames().size() >= 1);
+        QCOMPARE(harness.formats().last(), int(SDL_PIXELFORMAT_ARGB8888));
+        QVERIFY2(!harness.mustLock().last(), "the renderer asserts a surface that needs no locking");
+
+        const QImage expected = harness.hud().renderStripAt(0, 0);
+        const QImage published = harness.frames().last();
+        QCOMPARE(published.size(), expected.size());
+        for (int y = 0; y < expected.height(); y++) {
+            QCOMPARE(memcmp(published.constScanLine(y), expected.constScanLine(y),
+                            size_t(expected.width()) * 4),
+                     0);
+        }
+
+        harness.hud().endSession();
+    }
+
+    // D-04/screens.md §25: auto-hide after 4 s, reappear on input. The heartbeat is what makes the
+    // timer advance at all, and hiding must not disable the overlay in a way that blocks the
+    // engine's own use of the same slot (the poor-connection warning).
+    void hudAutoHidesAfterFourSecondsAndReturnsOnInput()
+    {
+        if (SDL_InitSubSystem(SDL_INIT_EVENTS) != 0) {
+            QSKIP("SDL's events subsystem is unavailable, so the input watch cannot be installed");
+        }
+        QVERIFY(SDL_WasInit(SDL_INIT_EVENTS) != 0);
+
+        HudHarness harness;
+        harness.hud().beginSession();
+        QVERIFY2(harness.hud().isVisible(), "the HUD must be up as soon as the session connects");
+
+        // A tick inside the window keeps it up.
+        harness.advance(1000);
+        harness.hud().tick();
+        QVERIFY(harness.hud().isVisible());
+        QCOMPARE(harness.hides(), 0);
+
+        // Past the window with no input, it hides.
+        harness.advance(HudOverlay::autoHideMs());
+        harness.hud().tick();
+        QVERIFY2(!harness.hud().isVisible(), "the HUD should have auto-hidden");
+        QCOMPARE(harness.hides(), 1);
+
+        // Input brings it back.
+        harness.hud().noteActivity();
+        harness.hud().tick();
+        QVERIFY2(harness.hud().isVisible(), "input should have brought the HUD back");
+        QCOMPARE(harness.hides(), 1);
+
+        // Ending the session hides it for good, and does not count as an auto-hide.
+        harness.hud().endSession();
+        QVERIFY(!harness.hud().isVisible());
+        QVERIFY(harness.hides() >= 2);
+
+        SDL_QuitSubSystem(SDL_INIT_EVENTS);
+    }
 };
 
 QTEST_MAIN(TestHudBitmap)

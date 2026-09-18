@@ -19,6 +19,7 @@
 #include <QWindow>
 
 #include "error_map.h"
+#include "hud_overlay.h"
 #include "session_lifecycle.h"
 // Included rather than forward-declared: moc needs complete types for the `SettingsBridge*` and
 // `UpdateFeedClient*` properties below (a bare forward declaration fails the pointer-metatype
@@ -142,5 +143,10 @@ private:
     SessionLifecycle* m_session = nullptr;
     SettingsBridge* m_settings = nullptr;
     UpdateFeedClient* m_updates = nullptr;
+    // The D-56 in-session HUD: a duration timer and the End session affordance, composited into
+    // the stream's own swapchain (ADR-0045). It is deliberately not a Q_PROPERTY - no QML view
+    // reads it, because the HUD is not QML on this tier; the lifecycle drives it and the
+    // publisher composites it.
+    HudOverlay m_hud;
     bool m_inSettings = false;
 };

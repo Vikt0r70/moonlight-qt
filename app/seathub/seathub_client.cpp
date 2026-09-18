@@ -7,6 +7,11 @@
 #include "settings_bridge.h"
 #include "update_feed_client.h"
 
+// Only this translation unit needs the engine type: the HUD's publisher below is the one place
+// that reaches `Session::get()`, which is what keeps `app/seathub/hud_overlay.*` free of the
+// engine and linkable into a test with no engine in it.
+#include "streaming/session.h"
+
 Q_LOGGING_CATEGORY(seathubClient, "seathub.client")
 
 namespace {
@@ -71,6 +76,42 @@ QString stageLineFor(const QString& engineStage)
     return QString::fromLatin1(kStagePreparingStream);
 }
 
+// The HUD's publisher: the one place that composites the SeatHub HUD into the engine's video
+// output, and the one place `Session::get()` is reached for it (ADR-0045).
+//
+// It composites through the overlay path the engine already has - `D3D11VARenderer::renderFrame()`
+// draws the overlays into the stream's own swapchain immediately before `Present()` - so the HUD
+// costs no second window and no second swapchain, and STREAM-01 holds by construction.
+//
+// A null surface means "hide" and disables the overlay, which is what the engine itself does when
+// a connection returns to healthy. A non-null surface is published and the manager's contract is
+// that ownership transfers in every case, so this never leaks one.
+bool publishHudSurface(SDL_Surface* surface)
+{
+    Session* session = Session::get();
+    if (session == nullptr) {
+        // No active session to composite into: the tracer path, or a session already torn down.
+        if (surface != nullptr) {
+            SDL_FreeSurface(surface);
+        }
+        return false;
+    }
+
+    Overlay::OverlayManager& manager = session->getOverlayManager();
+
+    if (surface == nullptr) {
+        manager.setOverlayState(Overlay::OverlayStatusUpdate, false);
+        return true;
+    }
+
+    // Enable before publishing. The manager only notifies on a state change, so this is
+    // idempotent, and it means a HUD published before the renderer has registered is still picked
+    // up on the first frame after it does - the HUD's first publish happens on
+    // `connectionStarted`, which is before the engine creates its stream window (D-01).
+    manager.setOverlayState(Overlay::OverlayStatusUpdate, true);
+    return manager.updateOverlaySurface(Overlay::OverlayStatusUpdate, surface);
+}
+
 } // namespace
 
 SeatHubClient::SeatHubClient(QObject* parent)
@@ -88,6 +129,10 @@ SeatHubClient::SeatHubClient(QObject* parent)
     connect(m_session, &SessionLifecycle::quitStarting, this, &SeatHubClient::handleQuitStarting);
     connect(m_session, &SessionLifecycle::sessionFinished, this, &SeatHubClient::handleSessionFinished);
     connect(m_session, &SessionLifecycle::readyForDeletion, this, &SeatHubClient::handleReadyForDeletion);
+
+    // The HUD composites through the engine's own overlay path; wiring it here rather than in
+    // the HUD keeps the engine reference in one place (and the HUD free of `Session`).
+    m_hud.setPublisher(&publishHudSurface);
 }
 
 QString SeatHubClient::reference() const
@@ -256,6 +301,11 @@ void SeatHubClient::handleConnectionStarted()
     m_settings->noteConnectionStarted();
     setStageText(QString::fromLatin1(kStageReady));
     setAppState(QString::fromLatin1(kStateStreaming));
+
+    // D-56: the duration timer starts here. This fires before the engine creates its SDL window
+    // (D-01), so the first HUD publish may arrive before the renderer has registered; the 1 Hz
+    // heartbeat re-publishes and the stream picks the HUD up on its first frame.
+    m_hud.beginSession();
 }
 
 void SeatHubClient::handleDisplayLaunchError(const QString& text)
@@ -281,6 +331,9 @@ void SeatHubClient::handleQuitStarting()
 
 void SeatHubClient::handleSessionFinished(int portTestResult)
 {
+    // D-56: the duration timer stops here, which is the interval the plan specifies.
+    m_hud.endSession();
+
     if (portTestResult != 0 && portTestResult != -1 && m_failure.isEmpty()) {
         raiseFailure(mapPortTestFailure(portTestResult));
     }

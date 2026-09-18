@@ -5,7 +5,11 @@
 # The upload half is transcribed (it is private to a renderer class the D-28 boundary forbids
 # modifying); the device is WARP, so no GPU, window or swapchain is needed.
 #
-# Task 2 adds the HUD producer's own tests to the same project, so one build covers both.
+# Task 2 adds the HUD producer's own tests to the same project, so one build covers both: the
+# producer is linked in directly (`../app/seathub/hud_overlay.cpp`). It needs no engine, no
+# OverlayManager and no Session - `SeatHubClient` injects the composer, which is why the file can
+# be linked here at all. `FORK_ROOT` is what lets the token test read the generated
+# `Tokens.qml`/`Metrics.qml` and fail if the HUD's colours drift from the design system.
 #
 # Build (nothing is on PATH machine-wide - Qt and MSVC are both absolute):
 #   call "<VS BuildTools>\VC\Auxiliary\Build\vcvars64.bat"
@@ -28,4 +32,9 @@ win32 {
     LIBS += -L$$PWD/../libs/windows/lib/x64 -lSDL2 -ld3d11 -ldxgi
 }
 
-SOURCES += tst_hud_bitmap.cpp
+DEFINES += FORK_ROOT=\\\"$$PWD/..\\\"
+
+SOURCES += tst_hud_bitmap.cpp \
+    ../app/seathub/hud_overlay.cpp
+
+HEADERS += ../app/seathub/hud_overlay.h
