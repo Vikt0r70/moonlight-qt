@@ -12,10 +12,11 @@
 //               support can search by, so an error without one is a defect.
 //   statusCode  the control plane's HTTP status, or 0 when the failure was local
 //   failure     `AllocationRefused.failure`, e.g. NO_HOST_AVAILABLE
-//   diagnostic  diagnostics-only detail (raw engine text). Never rendered.
+//   diagnostic  diagnostics-only detail (raw engine text, or the engine's stage /
+//               error code / failing ports). Never rendered.
 //
-// Plan 03-02 Task 1 ships the tracer's minimal table. Task 2 replaces
-// `stageFailureTable()`/`mapStageFailure()` with the full D-51 mapping.
+// The mapping table lives in `error_map.cpp`: each recognised engine stage collapses onto
+// one of two SeatHub sentences, and anything unnamed takes the D-51 generic fallback.
 
 #include <QString>
 #include <QVariantMap>

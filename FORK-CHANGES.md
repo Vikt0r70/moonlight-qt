@@ -62,3 +62,12 @@ CI diff gate's exception list (the gate only checks files that exist in the upst
 | `app/gui/Metrics.qml` | design tokens — the fork-side number companion `Tokens.qml` needs (it carries spacing/type values as CSS-shaped strings, and QML's `spacing`/`radius`/`font.pixelSize` are numbers). Hand-written. | 03-02 |
 | `app/seathub.ico`, `app/seathub.icns` | brand assets | 03-02 |
 | `app/deploy/linux/com.seathub.SeatHub.desktop`, `app/deploy/linux/com.seathub.SeatHub.appdata.xml` | packaging | 03-02 |
+| `tests/tst_error_map.cpp`, `tests/tst_error_map.pro` | test (new top-level `tests/` tree — upstream ships none) | 03-02 |
+
+## Upstream files that must never be modified
+
+For the avoidance of doubt, the CI diff gate fails the build if any file under
+`app/streaming/`, `app/streaming/video/`, `app/streaming/audio/` or `app/streaming/input/`
+differs from the pinned tag except the two exception categories above. That deliberately
+covers the decoder, renderer, audio and input code, and the one file in that tree this fork
+touches is `session.cpp` — for its window-title literal only.
