@@ -15,7 +15,7 @@
 //
 // The engine's files under `app/streaming/` are never modified to achieve this beyond
 // ADR-0046's window-title literal - the seam used here (`Session::exec(QWindow*)` plus the
-// 7 public signals) is upstream's own, unaltered.
+// engine's public lifecycle signals) is upstream's own, unaltered.
 
 #include <QObject>
 #include <QPointer>
@@ -81,6 +81,11 @@ signals:
     void stageFailed(QString stage, int errorCode, QString failingPorts);
     void connectionStarted();
     void displayLaunchError(QString text);
+    /// The engine's other public reporting seam: a setting it could not honour as saved
+    /// (`Session::emitLaunchWarning`, e.g. "Your host PC doesn't support HDR streaming"). Like
+    /// `displayLaunchError`, the text is engine wording and never reaches a screen; SeatHub's
+    /// settings page turns it into its own sentence beside the saved value (D-14, D-51).
+    void displayLaunchWarning(QString text);
     void quitStarting();
     void sessionFinished(int portTestResult);
     void readyForDeletion();

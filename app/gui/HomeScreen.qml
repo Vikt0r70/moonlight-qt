@@ -70,6 +70,21 @@ Item {
         }
 
         Text {
+            text: qsTr("Settings")
+            color: Tokens.foregroundMutedDefault
+            font.family: Tokens.fontSansDefault
+            font.pixelSize: Metrics.fontCaption
+            horizontalAlignment: Text.AlignHCenter
+            width: parent.width
+
+            MouseArea {
+                anchors.fill: parent
+                cursorShape: Qt.PointingHandCursor
+                onClicked: root.client.openSettings()
+            }
+        }
+
+        Text {
             text: qsTr("Sign out")
             color: Tokens.foregroundSubtleDefault
             font.family: Tokens.fontSansDefault

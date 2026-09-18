@@ -20,6 +20,10 @@
 
 #include "error_map.h"
 #include "session_lifecycle.h"
+// Included rather than forward-declared: moc needs the complete type for the `SettingsBridge*`
+// property below (a bare forward declaration fails the pointer-metatype static_assert in Qt's
+// meta-object code).
+#include "settings_bridge.h"
 
 class SeatHubClient : public QObject
 {
@@ -30,6 +34,15 @@ class SeatHubClient : public QObject
 
     /// The engine lifecycle this client drives.
     Q_PROPERTY(SessionLifecycle* session READ session CONSTANT)
+
+    /// The write-through settings bridge. The Settings page reads and writes through this and
+    /// nothing else (STREAM-02, D-11, D-13).
+    Q_PROPERTY(SettingsBridge* settings READ settings CONSTANT)
+
+    /// True while the Settings page is showing. Settings are a view inside the home state, not
+    /// an appState of their own: a session can end while the page is open and the page must
+    /// still be the right view when it does.
+    Q_PROPERTY(bool inSettings READ inSettings NOTIFY inSettingsChanged)
 
     /// Customer-facing connecting line from `docs/spec/copy.md` §Play flow. Never the
     /// engine's own stage name.
@@ -49,6 +62,8 @@ public:
 
     QString appState() const { return m_appState; }
     SessionLifecycle* session() const { return m_session; }
+    SettingsBridge* settings() const { return m_settings; }
+    bool inSettings() const { return m_inSettings; }
     QString stageText() const { return m_stageText; }
     QVariantMap failure() const { return m_failure; }
     QString reference() const;
@@ -75,11 +90,18 @@ public:
     /// Leaves the error state for the home view.
     Q_INVOKABLE void dismissError();
 
+    /// Shows the Settings page (a view inside the home state).
+    Q_INVOKABLE void openSettings();
+
+    /// Returns to the home view.
+    Q_INVOKABLE void closeSettings();
+
 signals:
     void appStateChanged();
     void stageTextChanged();
     void failureChanged();
     void identityChanged();
+    void inSettingsChanged();
 
     /// Step 1 succeeded - the view should show the code field.
     void otpRequested(const QString& phoneE164);
@@ -95,6 +117,7 @@ private slots:
     void handleStageFailed(const QString& stage, int errorCode, const QString& failingPorts);
     void handleConnectionStarted();
     void handleDisplayLaunchError(const QString& text);
+    void handleDisplayLaunchWarning(const QString& text);
     void handleQuitStarting();
     void handleSessionFinished(int portTestResult);
     void handleReadyForDeletion();
@@ -104,6 +127,7 @@ private:
     void setStageText(const QString& text);
     void raiseFailure(const SeatHubFailure& failure);
     void clearFailure();
+    void setInSettings(bool inSettings);
 
     QString m_appState;
     QString m_stageText;
@@ -111,4 +135,6 @@ private:
     QString m_identity;
     QWindow* m_hostWindow = nullptr;
     SessionLifecycle* m_session = nullptr;
+    SettingsBridge* m_settings = nullptr;
+    bool m_inSettings = false;
 };

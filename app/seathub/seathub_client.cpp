@@ -4,6 +4,7 @@
 #include <QWindow>
 
 #include "session_lifecycle.h"
+#include "settings_bridge.h"
 
 Q_LOGGING_CATEGORY(seathubClient, "seathub.client")
 
@@ -74,12 +75,14 @@ QString stageLineFor(const QString& engineStage)
 SeatHubClient::SeatHubClient(QObject* parent)
     : QObject(parent),
       m_appState(QString::fromLatin1(kStateSignedOut)),
-      m_session(new SessionLifecycle(this))
+      m_session(new SessionLifecycle(this)),
+      m_settings(new SettingsBridge(this))
 {
     connect(m_session, &SessionLifecycle::stageStarting, this, &SeatHubClient::handleStageStarting);
     connect(m_session, &SessionLifecycle::stageFailed, this, &SeatHubClient::handleStageFailed);
     connect(m_session, &SessionLifecycle::connectionStarted, this, &SeatHubClient::handleConnectionStarted);
     connect(m_session, &SessionLifecycle::displayLaunchError, this, &SeatHubClient::handleDisplayLaunchError);
+    connect(m_session, &SessionLifecycle::displayLaunchWarning, this, &SeatHubClient::handleDisplayLaunchWarning);
     connect(m_session, &SessionLifecycle::quitStarting, this, &SeatHubClient::handleQuitStarting);
     connect(m_session, &SessionLifecycle::sessionFinished, this, &SeatHubClient::handleSessionFinished);
     connect(m_session, &SessionLifecycle::readyForDeletion, this, &SeatHubClient::handleReadyForDeletion);
@@ -104,8 +107,25 @@ void SeatHubClient::setAppState(const QString& state)
     // tell how far the tracer reached is a screenshot, and "did the window hide before the
     // stream window existed" (D-01) is not something a screenshot can answer.
     qCInfo(seathubClient) << "app state" << m_appState << "->" << state;
+    const bool wasStreaming = m_appState == QLatin1String(kStateStreaming);
     m_appState = state;
+    const bool isStreaming = m_appState == QLatin1String(kStateStreaming);
+
+    if (wasStreaming != isStreaming) {
+        // Pitfall 6 / T-03-15: the settings page stops accepting writes for the duration.
+        m_settings->setStreamingActive(isStreaming);
+    }
+
     emit appStateChanged();
+}
+
+void SeatHubClient::setInSettings(bool inSettings)
+{
+    if (m_inSettings == inSettings) {
+        return;
+    }
+    m_inSettings = inSettings;
+    emit inSettingsChanged();
 }
 
 void SeatHubClient::setStageText(const QString& text)
@@ -192,12 +212,14 @@ void SeatHubClient::signOut()
     m_identity.clear();
     emit identityChanged();
     clearFailure();
+    setInSettings(false);
     setAppState(QString::fromLatin1(kStateSignedOut));
 }
 
 void SeatHubClient::dismissError()
 {
     clearFailure();
+    setInSettings(false);
     setAppState(m_identity.isEmpty() ? QString::fromLatin1(kStateSignedOut)
                                      : QString::fromLatin1(kStateHome));
 }
@@ -224,6 +246,9 @@ void SeatHubClient::handleStageFailed(const QString& stage, int errorCode, const
 
 void SeatHubClient::handleConnectionStarted()
 {
+    // D-14: from here on the settings page can report what the session actually settled on,
+    // rather than what was asked for.
+    m_settings->noteConnectionStarted();
     setStageText(QString::fromLatin1(kStageReady));
     setAppState(QString::fromLatin1(kStateStreaming));
 }
@@ -232,6 +257,14 @@ void SeatHubClient::handleDisplayLaunchError(const QString& text)
 {
     // Never shown verbatim (T-03-05). `mapLaunchError` keeps `text` as diagnostic only.
     raiseFailure(mapLaunchError(text));
+}
+
+void SeatHubClient::handleDisplayLaunchWarning(const QString& text)
+{
+    // The engine's other public reporting seam: a saved setting it could not honour. The text is
+    // engine wording, so it never reaches a screen; the bridge matches it to the setting and
+    // produces SeatHub's own sentence, leaving the saved preference untouched (D-14, D-51).
+    m_settings->noteLaunchWarning(text);
 }
 
 void SeatHubClient::handleQuitStarting()
@@ -257,4 +290,18 @@ void SeatHubClient::handleReadyForDeletion()
         setAppState(m_identity.isEmpty() ? QString::fromLatin1(kStateSignedOut)
                                          : QString::fromLatin1(kStateHome));
     }
+
+    // D-37 / D-14: the launch's negotiated results and its in-memory overrides are over. The
+    // saved preferences were never touched, so the settings page goes back to showing them.
+    m_settings->noteSessionFinished();
+}
+
+void SeatHubClient::openSettings()
+{
+    setInSettings(true);
+}
+
+void SeatHubClient::closeSettings()
+{
+    setInSettings(false);
 }

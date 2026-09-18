@@ -8,6 +8,11 @@
         <file>gui/HomeScreen.qml</file>
         <file>gui/ErrorScreen.qml</file>
         <file>gui/SeatHubOTPField.qml</file>
+        <file>gui/SettingsPage.qml</file>
+        <file>gui/SeatHubToggle.qml</file>
+        <file>gui/SeatHubSelect.qml</file>
+        <file>gui/SeatHubNumberField.qml</file>
+        <file>gui/SeatHubReadOnlyRow.qml</file>
         <file>gui/PcView.qml</file>
         <file>gui/AppView.qml</file>
         <file>gui/SettingsView.qml</file>

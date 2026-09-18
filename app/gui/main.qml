@@ -39,7 +39,9 @@ ApplicationWindow {
     function componentForState(state) {
         switch (state) {
         case "signed_out": return signInComponent
-        case "home":       return homeComponent
+        // Settings is a view inside the home state, not a state of its own: a session can end
+        // while the page is open, and the page must still be the right view when it does.
+        case "home":       return seatHub.inSettings ? settingsComponent : homeComponent
         case "connecting": return connectingComponent
         case "streaming":  return streamingComponent
         case "error":      return errorComponent
@@ -59,6 +61,10 @@ ApplicationWindow {
         target: seatHub
 
         function onAppStateChanged() {
+            viewLoader.sourceComponent = window.componentForState(seatHub.appState)
+        }
+
+        function onInSettingsChanged() {
             viewLoader.sourceComponent = window.componentForState(seatHub.appState)
         }
     }
@@ -92,6 +98,14 @@ ApplicationWindow {
         id: homeComponent
 
         HomeScreen {
+            client: seatHub
+        }
+    }
+
+    Component {
+        id: settingsComponent
+
+        SettingsPage {
             client: seatHub
         }
     }

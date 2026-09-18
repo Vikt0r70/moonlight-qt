@@ -25,11 +25,21 @@ Added by each plan (Plan 03-02 onward) in the same commit that makes the change.
 |------|----------|--------|------|
 | `app/streaming/session.cpp` | engine (ADR-0046 exception) | SDL stream window title literal changed from `" - Moonlight"` to `" - SeatHub"` in the non-Darwin `#else` branch. The title is passed into `SDL_CreateWindow()` itself, so a runtime `SDL_SetWindowTitle()` could only rename the window after it already existed as "&lt;PC&gt; - Moonlight" — it cannot prevent the initial flash of the brand, and Phase 3 requires Moonlight never be visible. Marker comment `// SeatHub: D-28 exception, see ADR-0046` sits on the changed line for future upstream merges. | 03-02 |
 | `app/main.cpp` | bridge | Register SeatHub types + SeatHub QML entrypoint + brand replacement per brand audit. `SeatHubClient` / `SessionLifecycle` registration, the `Tokens`/`Metrics` QML singletons, and every user-visible brand literal (`SDL_APP_NAME`, `SDL_AUDIO_DEVICE_APP_NAME`, application/organization name, crash-dump and log filenames, desktop file name, Wayland/X11 WMCLASS) changed to SeatHub. | 03-02 |
+| `app/main.cpp` | bridge | `SettingsBridge` and `UpdateFeedClient` registered as uncreatable QML types in the `SeatHub` module, so the QML layer can name the types it reaches through `SeatHubClient.settings` / `.updates` (D-35) and cannot construct them itself. | 03-04 |
 | `app/app.pro` | packaging | Brand replacement: `TARGET` (both branches), `QMAKE_TARGET_COMPANY` / `_DESCRIPTION` / `_PRODUCT`, `RC_ICONS` → `seathub.ico`, the embedded manifest path → `SeatHub.exe.manifest`, `APP_BUNDLE_RESOURCES.files` → `seathub.icns`, and the `unix:!macx` desktop/appstream asset paths → `com.seathub.SeatHub.*`. All `moonlight-common-c` submodule link and include lines are deliberately unchanged — that is the upstream library's name, not our brand. | 03-02 |
+| `app/app.pro` | packaging | Four SeatHub bridge translation units added to `SOURCES`/`HEADERS` (`seathub/settings_bridge.*`, `seathub/update_feed_client.*`, plus the `seathub/seathub_version.h` header). Additions only — no upstream source list entry is removed or reordered. | 03-04 |
 | `app/gui/main.qml` | UI | Replaced the stock moonlight-qt launcher with SeatHub's entry point: `SeatHubClient` facade wiring, a view per app state, the D-01 visibility host window, and the `Ctrl+Alt+Shift+Q` interrupt shortcut (D-02). Removes the PC/app browser route, the `ErrorMessageDialog.qml` route, and consumption of the CLI `initialView` context property, so no Moonlight-worded launcher or dialog window can appear during connect, stream or teardown. | 03-02 |
+| `app/gui/main.qml` | UI | Settings added as a view inside the home state (`SeatHubClient.inSettings`, so a session ending while the page is open leaves the page in place), and the forced-update modal instantiated outside the view `Loader` so no view change can take it away mid-update (D-41). The feed check runs once on launch. | 03-04 |
 | `app/qml.qrc` | packaging | Registers the new `app/gui/` QML files (`Tokens.qml`, `Metrics.qml`, `SessionSegue.qml`, `SignInScreen.qml`, `HomeScreen.qml`, `ErrorScreen.qml`, `SeatHubOTPField.qml`) so they are available at `qrc:/gui/`. | 03-02 |
+| `app/qml.qrc` | packaging | Registers the settings page and its control primitives (`SettingsPage.qml`, `SeatHubToggle.qml`, `SeatHubSelect.qml`, `SeatHubNumberField.qml`, `SeatHubReadOnlyRow.qml`) and `ForcedUpdateModal.qml`. Additions only. | 03-04 |
 | `app/res/moonlight.svg` | brand asset (content only) | Content replaced with the SeatHub client mark at the *same* resource path. `app/streaming/session.cpp` references `:/res/moonlight.svg` for the SDL stream window icon, so replacing the content gives SeatHub the stream window's icon **without** editing an engine file and **without** widening ADR-0046's exception set. | 03-02 |
 | `app/Moonlight.exe.manifest` → `app/SeatHub.exe.manifest` | packaging | Renamed, and its `<description>` changed from "Moonlight Game Streaming" to "SeatHub Streaming Client". The file is embedded into the executable by `QMAKE_LFLAGS`, so the old name was a Moonlight string in the shipped binary's manifest. | 03-02 |
+
+Nothing under `app/streaming/audio/`, `app/streaming/input/` or `app/streaming/video/` (other than
+the overlay compositor exception) is modified by any plan, and Plan 03-04 adds none. The settings
+page reads and writes upstream's `StreamingPreferences` through its public members only —
+`app/settings/streamingpreferences.*` is **not** modified, which is why the settings audit can
+claim write-through without a second store (D-12, STREAM-02).
 
 ### Upstream files deliberately left in place but no longer referenced
 
@@ -40,7 +50,7 @@ reader does not mistake them for live code:
 |------|-------------------------|
 | `app/gui/StreamSegue.qml` | Superseded by `app/gui/SessionSegue.qml`. Nothing loads it after `main.qml` was replaced, but deleting it would grow the merge diff against upstream for no functional gain. |
 | `app/gui/ErrorMessageDialog.qml`, `NavigableMessageDialog.qml`, `NavigableDialog.qml` | Still referenced by the untouched `PcView.qml` / `AppView.qml` / `SettingsView.qml`, which are also unreachable now that `main.qml` no longer routes to them. No code path opens them. |
-| `app/gui/PcView.qml`, `AppView.qml`, `SettingsView.qml`, `Cli*Segue.qml`, `QuitSegue.qml` | Unreachable from SeatHub's `main.qml`. Plan 03-04 (settings) and 03-05 (HUD) decide what is replaced rather than merely unreferenced. |
+| `app/gui/PcView.qml`, `AppView.qml`, `SettingsView.qml`, `Cli*Segue.qml`, `QuitSegue.qml` | Unreachable from SeatHub's `main.qml`. Plan 03-04 answered the settings half of this: `SettingsView.qml` is **replaced by `app/gui/SettingsPage.qml`** and is deliberately left on disk, unmodified, so the diff against upstream stays free of deletions — the upstream file still references `NavigableDialog.qml` and friends, so removing it would grow the diff for no functional gain. Plan 03-05 answers the HUD half. |
 | `app/moonlight.ico`, `app/moonlight.icns`, `app/deploy/linux/com.moonlight_stream.Moonlight.desktop`, `app/deploy/linux/com.moonlight_stream.Moonlight.appdata.xml` | Superseded by `seathub.ico` / `seathub.icns` / `com.seathub.SeatHub.desktop` / `com.seathub.SeatHub.appdata.xml`, which `app.pro` now names. Left on disk to keep the diff free of deletions. |
 
 ## New files (not modifications, informational only)
@@ -54,15 +64,23 @@ CI diff gate's exception list (the gate only checks files that exist in the upst
 | `app/seathub/seathub_client.h`, `app/seathub/seathub_client.cpp` | bridge (D-35 facade) | 03-02 |
 | `app/seathub/session_lifecycle.h`, `app/seathub/session_lifecycle.cpp` | bridge (engine seam) | 03-02 |
 | `app/seathub/error_map.h`, `app/seathub/error_map.cpp` | bridge (D-51 error model) | 03-02 |
+| `app/seathub/settings_bridge.h`, `app/seathub/settings_bridge.cpp` | bridge (setting write-through: `StreamingPreferences` reads/writes, the streaming guard, the launch-only quality-profile overrides, the D-14 fallback reporting) | 03-04 |
+| `app/seathub/update_feed_client.h`, `app/seathub/update_feed_client.cpp` | bridge (`GET /api/releases/{app}` client, version comparison, checksum-verified download) | 03-04 |
+| `app/seathub/seathub_version.h` | bridge — SeatHub's own version constant (D-46); the feed's rows are compared against this, not against upstream's `app/version.txt`, which stays upstream's | 03-04 |
 | `app/gui/SessionSegue.qml` | UI (D-01/D-03 visibility + lifecycle) | 03-02 |
 | `app/gui/SignInScreen.qml` | UI (D-55 sign-in shell) | 03-02 |
 | `app/gui/HomeScreen.qml`, `app/gui/ErrorScreen.qml` | UI | 03-02 |
 | `app/gui/SeatHubOTPField.qml` | UI primitive | 03-02 |
+| `app/gui/SettingsPage.qml` | UI — the flat settings page: five groups (D-48), every audited `[streamsettings]` key a control, `capture-system-keys` as checkbox + dropdown (ADR-0042). Replaces upstream's unreachable `SettingsView.qml`. | 03-04 |
+| `app/gui/SeatHubToggle.qml`, `app/gui/SeatHubSelect.qml`, `app/gui/SeatHubNumberField.qml`, `app/gui/SeatHubReadOnlyRow.qml` | UI primitives — labelled rows for the settings page. Options always come from the bridge's catalogue, never a second copy in QML. | 03-04 |
+| `app/gui/ForcedUpdateModal.qml` | UI — the blocking forced-update modal (D-41); it has no dismissal affordance by design | 03-04 |
 | `app/gui/Tokens.qml` | design tokens — byte-for-byte copy of `seathub-web`'s generated `npm run tokens:build` output (Phase 2.1, D-20/D-54). Never hand-edit; regenerate in `seathub-web` and copy. | 03-02 |
 | `app/gui/Metrics.qml` | design tokens — the fork-side number companion `Tokens.qml` needs (it carries spacing/type values as CSS-shaped strings, and QML's `spacing`/`radius`/`font.pixelSize` are numbers). Hand-written. | 03-02 |
 | `app/seathub.ico`, `app/seathub.icns` | brand assets | 03-02 |
 | `app/deploy/linux/com.seathub.SeatHub.desktop`, `app/deploy/linux/com.seathub.SeatHub.appdata.xml` | packaging | 03-02 |
 | `tests/tst_error_map.cpp`, `tests/tst_error_map.pro` | test (new top-level `tests/` tree — upstream ships none) | 03-02 |
+| `tests/tst_settings_bridge.cpp`, `tests/tst_settings_bridge.pro` | test — write-through against upstream's real `StreamingPreferences`, the streaming write guard, the in-memory session overrides, and the settings page loading | 03-04 |
+| `tests/tst_update_feed.cpp`, `tests/tst_update_feed.pro` | test — feed parsing, semantic version comparison, SHA-256 verification against published vectors, the stream-time block, and the modal rendering | 03-04 |
 
 ## Upstream files that must never be modified
 

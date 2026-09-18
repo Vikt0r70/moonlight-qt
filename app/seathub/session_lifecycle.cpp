@@ -82,6 +82,7 @@ void SessionLifecycle::connectEngineSignals()
     connect(s, &Session::stageFailed, this, &SessionLifecycle::stageFailed);
     connect(s, &Session::connectionStarted, this, &SessionLifecycle::connectionStarted);
     connect(s, &Session::displayLaunchError, this, &SessionLifecycle::displayLaunchError);
+    connect(s, &Session::displayLaunchWarning, this, &SessionLifecycle::displayLaunchWarning);
     connect(s, &Session::quitStarting, this, &SessionLifecycle::quitStarting);
     connect(s, &Session::sessionFinished, this, &SessionLifecycle::sessionFinished);
     connect(s, &Session::readyForDeletion, this, [this]() {
