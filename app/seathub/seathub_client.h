@@ -20,10 +20,11 @@
 
 #include "error_map.h"
 #include "session_lifecycle.h"
-// Included rather than forward-declared: moc needs the complete type for the `SettingsBridge*`
-// property below (a bare forward declaration fails the pointer-metatype static_assert in Qt's
-// meta-object code).
+// Included rather than forward-declared: moc needs complete types for the `SettingsBridge*` and
+// `UpdateFeedClient*` properties below (a bare forward declaration fails the pointer-metatype
+// static_assert in Qt's meta-object code).
 #include "settings_bridge.h"
+#include "update_feed_client.h"
 
 class SeatHubClient : public QObject
 {
@@ -38,6 +39,9 @@ class SeatHubClient : public QObject
     /// The write-through settings bridge. The Settings page reads and writes through this and
     /// nothing else (STREAM-02, D-11, D-13).
     Q_PROPERTY(SettingsBridge* settings READ settings CONSTANT)
+
+    /// The release-feed client behind the forced-update modal (D-38, D-41).
+    Q_PROPERTY(UpdateFeedClient* updates READ updates CONSTANT)
 
     /// True while the Settings page is showing. Settings are a view inside the home state, not
     /// an appState of their own: a session can end while the page is open and the page must
@@ -63,6 +67,7 @@ public:
     QString appState() const { return m_appState; }
     SessionLifecycle* session() const { return m_session; }
     SettingsBridge* settings() const { return m_settings; }
+    UpdateFeedClient* updates() const { return m_updates; }
     bool inSettings() const { return m_inSettings; }
     QString stageText() const { return m_stageText; }
     QVariantMap failure() const { return m_failure; }
@@ -136,5 +141,6 @@ private:
     QWindow* m_hostWindow = nullptr;
     SessionLifecycle* m_session = nullptr;
     SettingsBridge* m_settings = nullptr;
+    UpdateFeedClient* m_updates = nullptr;
     bool m_inSettings = false;
 };

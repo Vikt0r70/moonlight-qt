@@ -50,6 +50,7 @@
 #include "seathub/seathub_client.h"
 #include "seathub/session_lifecycle.h"
 #include "seathub/settings_bridge.h"
+#include "seathub/update_feed_client.h"
 
 #if defined(Q_OS_WIN32)
 #define IS_UNSPECIFIED_HANDLE(x) ((x) == INVALID_HANDLE_VALUE || (x) == NULL)
@@ -717,6 +718,8 @@ int main(int argc, char *argv[])
                                                  "SessionLifecycle is owned by SeatHubClient");
     qmlRegisterUncreatableType<SettingsBridge>("SeatHub", 1, 0, "SettingsBridge",
                                                "SettingsBridge is owned by SeatHubClient");
+    qmlRegisterUncreatableType<UpdateFeedClient>("SeatHub", 1, 0, "UpdateFeedClient",
+                                                 "UpdateFeedClient is owned by SeatHubClient");
 
     // The design tokens. Tokens.qml is a byte-for-byte copy of seathub-web's generated
     // `npm run tokens:build` output (Phase 2.1, D-20/D-54); Metrics.qml is the fork-side

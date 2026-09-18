@@ -34,6 +34,10 @@ ApplicationWindow {
 
     Component.onCompleted: {
         seatHub.setHostWindow(window)
+
+        // D-41: the feed is checked on launch. `SeatHubClient` refuses the check while a stream
+        // is running (Pitfall 8), and re-checks when one ends.
+        seatHub.updates.checkForUpdates()
     }
 
     function componentForState(state) {
@@ -66,6 +70,25 @@ ApplicationWindow {
 
         function onInSettingsChanged() {
             viewLoader.sourceComponent = window.componentForState(seatHub.appState)
+        }
+    }
+
+    // The forced-update modal lives outside the Loader so a view change can never take it away
+    // mid-update (D-41). It renders nothing while a stream is running (Pitfall 8) and swallows
+    // every event aimed at the page behind it while it is up.
+    ForcedUpdateModal {
+        id: forcedUpdate
+        updates: seatHub.updates
+    }
+
+    Connections {
+        target: seatHub.updates
+
+        // D-43/D-42: the installer is unsigned, so Windows raises its own SmartScreen warning
+        // and the per-machine install raises a UAC prompt. SeatHub's part is to stop, so the
+        // installer can replace the binary it is running from.
+        function onInstallRequested() {
+            Qt.quit()
         }
     }
 

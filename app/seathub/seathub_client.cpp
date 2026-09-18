@@ -5,6 +5,7 @@
 
 #include "session_lifecycle.h"
 #include "settings_bridge.h"
+#include "update_feed_client.h"
 
 Q_LOGGING_CATEGORY(seathubClient, "seathub.client")
 
@@ -76,7 +77,8 @@ SeatHubClient::SeatHubClient(QObject* parent)
     : QObject(parent),
       m_appState(QString::fromLatin1(kStateSignedOut)),
       m_session(new SessionLifecycle(this)),
-      m_settings(new SettingsBridge(this))
+      m_settings(new SettingsBridge(this)),
+      m_updates(new UpdateFeedClient(this))
 {
     connect(m_session, &SessionLifecycle::stageStarting, this, &SeatHubClient::handleStageStarting);
     connect(m_session, &SessionLifecycle::stageFailed, this, &SeatHubClient::handleStageFailed);
@@ -113,7 +115,10 @@ void SeatHubClient::setAppState(const QString& state)
 
     if (wasStreaming != isStreaming) {
         // Pitfall 6 / T-03-15: the settings page stops accepting writes for the duration.
+        // Pitfall 8 / T-03-17: so does the updater - replacing the binary a live session is
+        // running from is not something this client does (D-41).
         m_settings->setStreamingActive(isStreaming);
+        m_updates->setStreamingActive(isStreaming);
     }
 
     emit appStateChanged();
@@ -294,6 +299,9 @@ void SeatHubClient::handleReadyForDeletion()
     // D-37 / D-14: the launch's negotiated results and its in-memory overrides are over. The
     // saved preferences were never touched, so the settings page goes back to showing them.
     m_settings->noteSessionFinished();
+
+    // D-41: a release that arrived during the session is offered now, not during it.
+    m_updates->sessionFinished();
 }
 
 void SeatHubClient::openSettings()

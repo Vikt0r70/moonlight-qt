@@ -202,6 +202,7 @@ SOURCES += \
     seathub/seathub_client.cpp \
     seathub/session_lifecycle.cpp \
     seathub/settings_bridge.cpp \
+    seathub/update_feed_client.cpp \
     seathub/error_map.cpp \
     streaming/streamutils.cpp \
     backend/autoupdatechecker.cpp \
@@ -241,6 +242,8 @@ HEADERS += \
     seathub/seathub_client.h \
     seathub/session_lifecycle.h \
     seathub/settings_bridge.h \
+    seathub/update_feed_client.h \
+    seathub/seathub_version.h \
     seathub/error_map.h \
     streaming/video/decoder.h \
     streaming/streamutils.h \

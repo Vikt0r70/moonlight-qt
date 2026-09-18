@@ -13,6 +13,7 @@
         <file>gui/SeatHubSelect.qml</file>
         <file>gui/SeatHubNumberField.qml</file>
         <file>gui/SeatHubReadOnlyRow.qml</file>
+        <file>gui/ForcedUpdateModal.qml</file>
         <file>gui/PcView.qml</file>
         <file>gui/AppView.qml</file>
         <file>gui/SettingsView.qml</file>
