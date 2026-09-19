@@ -31,6 +31,9 @@ const char* kStateError = "error";
 
 // `docs/spec/copy.md` §Sign in, path B.
 const char* kOtpMismatch = "That code didn't match. Try again or resend.";
+// `docs/spec/copy.md`, Sign-in Path B (phone): the string for a number that is not E.164 after
+// normalisation. Documented copy, not invented here.
+const char* kPhoneInvalid = "That doesn't look like a phone number.";
 
 // `docs/spec/copy.md` §Play flow, the four customer-visible stage lines. The engine's own
 // stage names (`LiGetStageName()`, e.g. "RTSP handshake") are internal and are never shown
@@ -140,9 +143,11 @@ SeatHubClient::SeatHubClient(QObject* parent)
       m_session(new SessionLifecycle(this)),
       m_settings(new SettingsBridge(this)),
       m_updates(new UpdateFeedClient(this)),
-      // No parent on these six: `moveToThread()` refuses an object that has one, and they have
+      // No parent on these seven: `moveToThread()` refuses an object that has one, and they have
       // to leave the Qt main thread before a stream starts (see `startNetworkThreads`). The
-      // destructor owns them instead.
+      // destructor owns them instead. `m_teardown` is the one HR-01 added to this group - it was
+      // parented to `this` and therefore never moved, so its verify timer was a main-thread child
+      // while every control-plane callback arrives on the network thread.
       m_controlPlane(new ControlPlaneClient(nullptr)),
       m_tokenStore(new TokenStore(this)),
       m_sessionChannel(new SessionWebSocket(nullptr)),
@@ -150,7 +155,7 @@ SeatHubClient::SeatHubClient(QObject* parent)
       // thread its object lives on, and the main thread is suspended for the whole stream.
       m_pairing(new PairingController(nullptr)),
       m_pairingSeam(new ProductionPairingSeam(nullptr)),
-      m_teardown(new TeardownController(this)),
+      m_teardown(new TeardownController(nullptr)),
       m_liveness(new LivenessTimer(nullptr)),
       m_horizon(new AuthorizedThroughTimer(nullptr))
 {
@@ -209,18 +214,47 @@ SeatHubClient::SeatHubClient(QObject* parent)
 
 SeatHubClient::~SeatHubClient()
 {
-    // Order matters: stop the thread first so nothing can call back in, then destroy what lived
-    // on it. The two pairing objects are moved home before they are deleted because Qt refuses to
-    // stop a live timer from a foreign thread, and both of them own one.
-    if (m_controlPlane != nullptr) {
-        m_controlPlane->stopOwnedThread();
+    // Order matters. Everything that was moved to the control-plane thread is brought home *from
+    // inside that thread* first, the thread is then stopped and joined, and only then is anything
+    // destroyed here. Qt refuses both a cross-thread destruction and a cross-thread
+    // `moveToThread()` - each is a warning, not an error - so the previous version of this
+    // destructor silently left five objects belonging to a thread that had already stopped, one of
+    // them owning a live `QWebSocket` and a running reconnect timer, and then deleted the control
+    // plane a second time (CR-01: it now destroys itself on its own thread, inside
+    // `stopOwnedThread()`).
+    ControlPlaneClient* controlPlane = m_controlPlane;
+    m_controlPlane = nullptr;
+    if (controlPlane != nullptr) {
+        const bool joinable = controlPlane->onOwnThread()
+                              && QThread::currentThread() != controlPlane->thread();
+        if (!joinable) {
+            // Either it was never moved - this thread owns it and deletes it here - or, in the
+            // degenerate case, this destructor is running on the network thread itself, where
+            // joining would deadlock. Deleting it from its own thread is still thread-correct.
+            delete controlPlane;
+        }
+        else {
+            const QList<QObject*> workers = { m_pairingSeam, m_pairing, m_liveness, m_horizon,
+                                              m_sessionChannel, m_teardown };
+            const QThread* home = QThread::currentThread();
+            // Blocking, and issued through an object that lives on the worker thread: a move is
+            // only accepted when it comes from the object's own thread, and this is the last point
+            // in the lifetime where that thread still runs.
+            QMetaObject::invokeMethod(controlPlane, [workers, home]() {
+                QThread* owner = QThread::currentThread();
+                for (QObject* worker : workers) {
+                    if (worker != nullptr && worker->thread() == owner) {
+                        worker->moveToThread(const_cast<QThread*>(home));
+                    }
+                }
+            }, Qt::BlockingQueuedConnection);
+
+            // Stops the thread and destroys `controlPlane` on it, exactly once. No
+            // `ControlPlaneClient*` may be touched after this line.
+            controlPlane->stopOwnedThread();
+        }
     }
-    if (m_pairingSeam != nullptr) {
-        m_pairingSeam->moveToThread(QThread::currentThread());
-    }
-    if (m_pairing != nullptr) {
-        m_pairing->moveToThread(QThread::currentThread());
-    }
+
     // The seam first: it holds the completion callback into the controller, so destroying it
     // first means no handshake result can be delivered to a half-destroyed controller.
     delete m_pairingSeam;
@@ -228,7 +262,7 @@ SeatHubClient::~SeatHubClient()
     delete m_liveness;
     delete m_horizon;
     delete m_sessionChannel;
-    delete m_controlPlane;
+    delete m_teardown;
 }
 
 bool SeatHubClient::inControlPlaneSession() const
@@ -260,6 +294,13 @@ void SeatHubClient::startNetworkThreads()
     // timeout at all - so it runs on a pool thread and only its deadline timer lives here.
     m_pairingSeam->moveToThread(networkThread);
     m_pairing->moveToThread(networkThread);
+
+    // HR-01: teardown's verify timer is the reason this object has to live here, and the reason it
+    // is constructed without a parent (`moveToThread()` refuses a parented object). Every
+    // control-plane callback - `endSession`, `fetchSession` - arrives on this thread, so a
+    // main-thread `m_verifyTimer` would be refused its start and leave teardown stuck before
+    // `Clear`, with the DPAPI blobs still on disk and `teardownCompleted()` never emitted.
+    m_teardown->moveToThread(networkThread);
 }
 
 void SeatHubClient::beginSession(const QString& sessionId)
@@ -390,9 +431,13 @@ void SeatHubClient::interrupt()
 
 void SeatHubClient::requestOtp(const QString& phoneE164)
 {
-    const QString phone = phoneE164.trimmed();
+    // ME-03: one normalisation rule, in `ControlPlaneClient`, applied here and in `verifyOtp`.
+    // Separators a person types are stripped, a leading `00` becomes `+`, and anything that is
+    // not then `^\+[1-9][0-9]{7,14}$` (`docs/spec/openapi.yaml` `phone_e164`) is rejected
+    // locally rather than spent as a round trip that can only come back refused.
+    const QString phone = ControlPlaneClient::normalisePhoneE164(phoneE164);
     if (phone.isEmpty()) {
-        emit otpRejected(QString::fromLatin1(kOtpMismatch), QString());
+        emit otpRejected(QString::fromLatin1(kPhoneInvalid), QString());
         return;
     }
 
@@ -423,10 +468,18 @@ void SeatHubClient::verifyOtp(const QString& phoneE164, const QString& code)
         return;
     }
 
+    // ME-03: the same normalisation `requestOtp` applies, so the two calls cannot send two
+    // spellings of one number - the control plane keys the pending code on what it was sent.
+    const QString phone = ControlPlaneClient::normalisePhoneE164(phoneE164);
+    if (phone.isEmpty()) {
+        emit otpRejected(QString::fromLatin1(kPhoneInvalid), QString());
+        return;
+    }
+
     startNetworkThreads();
 
-    m_controlPlane->verifyOtp(phoneE164, code, [this, phoneE164](const ControlPlaneResult& result) {
-        onClientThread(this, [this, phoneE164, result]() {
+    m_controlPlane->verifyOtp(phone, code, [this, phone](const ControlPlaneResult& result) {
+        onClientThread(this, [this, phone, result]() {
             if (!result.ok) {
                 const SeatHubFailure failure = result.toFailure();
                 emit otpRejected(failure.error, failure.reference);
@@ -454,7 +507,7 @@ void SeatHubClient::verifyOtp(const QString& phoneE164, const QString& code)
 
             m_controlPlane->setAccessToken(pair.accessToken);
 
-            m_identity = phoneE164;
+            m_identity = phone;
             emit identityChanged();
             emit otpAccepted();
             setAppState(QString::fromLatin1(kStateHome));

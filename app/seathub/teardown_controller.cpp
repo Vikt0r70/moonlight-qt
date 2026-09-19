@@ -1,6 +1,7 @@
 #include "teardown_controller.h"
 
 #include <QLoggingCategory>
+#include <QThread>
 
 Q_LOGGING_CATEGORY(seathubTeardown, "seathub.teardown")
 
@@ -71,6 +72,14 @@ void TeardownController::setControlPlane(ControlPlaneClient* client)
     m_client = client;
 }
 
+bool TeardownController::onOwnThread() const
+{
+    // `thread()` goes null only when the QThread that owned this object has been destroyed, in
+    // which case there is no queue left to hand work to and running here is the only option.
+    QThread* owner = thread();
+    return owner == nullptr || owner == QThread::currentThread();
+}
+
 void TeardownController::setTokenStore(TokenStore* store)
 {
     m_store = store;
@@ -121,6 +130,18 @@ bool TeardownController::advanceTo(TeardownStage stage)
 
 void TeardownController::teardown(const QString& sessionId, const QString& clientUuid)
 {
+    if (!onOwnThread()) {
+        // HR-01: `m_verifyTimer` is a child of this object, and this object is moved to the
+        // network thread so its work runs while the stream has the main thread suspended. A call
+        // from the main thread has to be handed over: `QTimer::start()` from a foreign thread is
+        // refused by Qt with a warning, which used to strand teardown before `Clear` - the store
+        // was never cleared and `teardownCompleted()` never fired.
+        QMetaObject::invokeMethod(this, [this, sessionId, clientUuid]() {
+            teardown(sessionId, clientUuid);
+        }, Qt::QueuedConnection);
+        return;
+    }
+
     if (sessionId.isEmpty()) {
         fail(SeatHubFailure::local(QString::fromLatin1(kTeardownFailedSentence)));
         return;
@@ -153,6 +174,11 @@ void TeardownController::teardown(const QString& sessionId, const QString& clien
 
 void TeardownController::cancel()
 {
+    if (!onOwnThread()) {
+        QMetaObject::invokeMethod(this, [this]() { cancel(); }, Qt::QueuedConnection);
+        return;
+    }
+
     m_verifyTimer->stop();
     m_finished = true;
     m_clock.invalidate();
@@ -192,6 +218,11 @@ void TeardownController::scheduleVerify()
 
 void TeardownController::verifySession()
 {
+    if (!onOwnThread()) {
+        QMetaObject::invokeMethod(this, [this]() { verifySession(); }, Qt::QueuedConnection);
+        return;
+    }
+
     if (m_finished || m_sessionId.isEmpty()) {
         return;
     }

@@ -149,9 +149,18 @@ ControlPlaneClient::ControlPlaneClient(QObject* parent)
 
 ControlPlaneClient::~ControlPlaneClient()
 {
+    // Safety net only: the documented route is `stopOwnedThread()`, which has already joined the
+    // thread and cleared `m_thread` by the time this runs. A direct `delete` of an object that
+    // still owns its thread would otherwise leave the thread running with a destroyed owner.
     if (m_thread) {
-        m_thread->quit();
-        m_thread->wait();
+        QThread* thread = m_thread;
+        m_thread = nullptr;
+        // `finished -> deleteLater` would otherwise re-enter this destructor when the join below
+        // flushes the worker's deferred-delete queue.
+        disconnect(thread, nullptr, this, nullptr);
+        thread->quit();
+        thread->wait();
+        delete thread;
     }
 }
 
@@ -171,6 +180,43 @@ bool ControlPlaneClient::isReferenceCode(const QString& reference)
     return re.match(reference).hasMatch();
 }
 
+bool ControlPlaneClient::isPhoneE164(const QString& phoneE164)
+{
+    static const QRegularExpression re(QStringLiteral("^\\+[1-9][0-9]{7,14}$"));
+    return re.match(phoneE164).hasMatch();
+}
+
+QString ControlPlaneClient::normalisePhoneE164(const QString& raw)
+{
+    // The normalisation rule (ME-03), stated once, in one place, and tested:
+    //   1. drop the separators a person types between digits: space, '(', ')', '-' and '.';
+    //   2. a leading `00` is how the international prefix is often written - map it to '+';
+    //   3. whatever remains must match `^\+[1-9][0-9]{7,14}$` exactly, the pattern
+    //      `docs/spec/openapi.yaml` puts on `phone_e164`. Anything else returns an empty string
+    //      and the caller rejects locally instead of spending a round trip.
+    // Nothing is guessed: no country code is supplied, because the spec defines no default for
+    // this field.
+    static const QRegularExpression separators(QStringLiteral("[\\s()\\-.]+"));
+
+    QString digits = raw;
+    digits.remove(separators);
+
+    if (digits.startsWith(QLatin1String("00"))) {
+        digits = QStringLiteral("+") + digits.mid(2);
+    }
+
+    return isPhoneE164(digits) ? digits : QString();
+}
+
+QString ControlPlaneClient::encodedPathSegment(const QString& segment)
+{
+    // ME-04: session ids are interpolated into request paths, and `/`, `?`, `#` and `%` are
+    // *structure* inside a URL path - a corrupt or hostile id could retarget or truncate the route
+    // it was pasted into. `toPercentEncoding` escapes exactly those (and everything else outside
+    // the unreserved set) while leaving the contract's UUIDs, and the `-_.~` set, untouched.
+    return QString::fromLatin1(QUrl::toPercentEncoding(segment));
+}
+
 // ---------------------------------------------------------------- response classification
 
 ControlPlaneResult ControlPlaneClient::classify(int httpStatus, const QByteArray& body)
@@ -183,12 +229,24 @@ ControlPlaneResult ControlPlaneClient::classify(int httpStatus, const QByteArray
     const QJsonObject object = doc.isObject() ? doc.object() : QJsonObject();
 
     if (httpStatus >= 200 && httpStatus < 300) {
-        // Pitfall 4, and the single most important line in this file. The control plane's
+        // Pitfall 4, and the single most important rule in this file. The control plane's
         // `Error` and `AllocationRefused` schemas both ship `status: false` underneath an
         // HTTP 200. A success schema (`Session`, `TokenPair`, `SessionAuthorization`) has no
         // `status` field at all, so absence is success and an explicit false is failure.
-        if (object.contains(QStringLiteral("status"))
-            && !object.value(QStringLiteral("status")).toBool(true)) {
+        //
+        // HR-02: absence is the *only* shape that means success. A 2xx whose body is not a JSON
+        // object carries no evidence of success at all - a captive portal or a proxy interstitial
+        // answering 200 with a sign-in page is exactly that, and reporting "code sent" for it is a
+        // lie. A `status` that is present but is not the boolean `true` (`"false"`, `0`, `null`)
+        // is not a success either; `toBool(true)` used to read every one of those as true.
+        if (!doc.isObject()) {
+            result.ok = false;
+            result.error = SeatHubFailure::generic().error;
+            return result;
+        }
+
+        const QJsonValue status = object.value(QStringLiteral("status"));
+        if (!status.isUndefined() && (!status.isBool() || !status.toBool())) {
             result.ok = false;
             result.error = object.value(QStringLiteral("error")).toString();
             result.reference = object.value(QStringLiteral("reference")).toString();
@@ -320,7 +378,12 @@ void ControlPlaneClient::moveToOwnThread()
     // so it is given a thread with its own running event loop for the duration of the
     // stream. `this` moves with it, so its access manager and every QTimer its orchestrators
     // own live on the same thread and can fire.
-    m_thread = new QThread(this);
+    //
+    // Deliberately *not* parented to `this`: `this` is destroyed during `stopOwnedThread()`'s
+    // join, and a parented thread would be destroyed by that deletion and then deleted again by
+    // the join. The thread is deleted by `stopOwnedThread()`, or by the destructor when nothing
+    // called it.
+    m_thread = new QThread;
     m_thread->setObjectName(QStringLiteral("seathub-control-plane"));
     moveToThread(m_thread);
     connect(m_thread, &QThread::finished, this, &QObject::deleteLater);
@@ -329,22 +392,26 @@ void ControlPlaneClient::moveToOwnThread()
 
 void ControlPlaneClient::stopOwnedThread()
 {
-    if (m_thread == nullptr) {
+    // Callers check `onOwnThread()` first: false means this object was never moved and still
+    // belongs to the calling thread, which is then the thread that has to delete it.
+    QThread* thread = m_thread;
+    if (thread == nullptr) {
         return;
     }
 
-    // Join first. After this returns no reply signal can still be delivered, which is what makes
-    // it safe for the owner to destroy this object and the facade it calls back into.
-    m_thread->quit();
-    m_thread->wait();
-
-    // This object still lives on the thread that has just stopped, and Qt does not allow it to
-    // be destroyed from a different one. Bring it home. The `finished -> deleteLater` above
-    // cannot have run - its event loop is already gone - so this is the only destruction.
-    moveToThread(QThread::currentThread());
-
-    QThread* thread = m_thread;
+    // Cleared *before* the thread is stopped: `this` is destroyed during `wait()` below (see the
+    // header), so no member may be read or written after the join, and the destructor must not
+    // try to join a thread it no longer owns.
     m_thread = nullptr;
+
+    // `moveToOwnThread()` installed `finished -> deleteLater`. `this` lives on that thread, so the
+    // connection is direct and the deferred delete is posted to the worker's own queue; Qt then
+    // flushes that queue as the thread unwinds (`QThreadPrivate::finish()`), on the worker thread
+    // and inside the call below. That is the one and only destruction of this object, and it is
+    // what makes lines that used to follow this join (a `moveToThread()`, a `delete`) illegal:
+    // after `wait()` returns, `this` is gone. Nothing below touches it.
+    thread->quit();
+    thread->wait();
     delete thread;
 }
 
@@ -452,7 +519,7 @@ void ControlPlaneClient::requestSession(const QString& qualityProfile, Callback 
 
 void ControlPlaneClient::fetchSession(const QString& sessionId, Callback callback)
 {
-    send(QStringLiteral("GET"), QStringLiteral("/api/sessions/") + sessionId,
+    send(QStringLiteral("GET"), QStringLiteral("/api/sessions/") + encodedPathSegment(sessionId),
          QByteArray(), true, callback);
 }
 
@@ -461,7 +528,7 @@ void ControlPlaneClient::fetchSessionAuthorization(const QString& sessionId, Cal
     // The session authorization: where to connect, what the CONNECT lease permits, and the
     // control-plane-issued pairing PIN (ADR-0034). Short-lived and scoped to this one
     // session; it never carries a Sunshine admin credential.
-    send(QStringLiteral("GET"), QStringLiteral("/api/sessions/") + sessionId
+    send(QStringLiteral("GET"), QStringLiteral("/api/sessions/") + encodedPathSegment(sessionId)
              + QStringLiteral("/pairing"),
          QByteArray(), true, callback);
 }
@@ -469,14 +536,14 @@ void ControlPlaneClient::fetchSessionAuthorization(const QString& sessionId, Cal
 void ControlPlaneClient::postLiveness(const QString& sessionId, const QString& state,
                                      const QString& errorCode, Callback callback)
 {
-    send(QStringLiteral("POST"), QStringLiteral("/api/sessions/") + sessionId
+    send(QStringLiteral("POST"), QStringLiteral("/api/sessions/") + encodedPathSegment(sessionId)
              + QStringLiteral("/liveness"),
          buildLiveness(state, errorCode), true, callback);
 }
 
 void ControlPlaneClient::endSession(const QString& sessionId, Callback callback)
 {
-    send(QStringLiteral("POST"), QStringLiteral("/api/sessions/") + sessionId
+    send(QStringLiteral("POST"), QStringLiteral("/api/sessions/") + encodedPathSegment(sessionId)
              + QStringLiteral("/end"),
          QByteArray(), true, callback);
 }

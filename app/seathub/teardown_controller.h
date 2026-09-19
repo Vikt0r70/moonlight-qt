@@ -48,6 +48,18 @@ Q_DECLARE_METATYPE(TeardownStage)
 // for the control plane to report the result, because a session reaches a terminal state only
 // after the rig side has finished - a teardown still `ENDING` past `TEARDOWN_GRACE_SECONDS`
 // (30 s, `docs/spec/timing.md`) is `TEARDOWN_TIMEOUT` rather than a normal end.
+//
+// Threading (HR-01): `m_verifyTimer` is a child of this object, so this object must live on the
+// thread that runs the polling - the network thread `ControlPlaneClient` owns, because every
+// control-plane callback arrives there and because upstream suspends Qt processing on the main
+// thread for the whole stream (`app/streaming/session.cpp:1965-1966`). The facade therefore moves
+// it there before any session starts, and `teardown()`, `cancel()` and `verifySession()` hand
+// themselves over queued when they are called from anywhere else - a `QTimer` started from a
+// foreign thread is refused by Qt with a warning and nothing else, which is what used to stop
+// teardown before `Clear` so the token store was never cleared.
+//
+// `m_store->clearAll()` runs from that thread and touches only the filesystem and DPAPI; it owns
+// no timer, socket or event-loop object, so it is deliberately not moved with this controller.
 class TeardownController : public QObject
 {
     Q_OBJECT
@@ -110,6 +122,9 @@ private:
     bool advanceTo(TeardownStage stage);
     void fail(const SeatHubFailure& failure, const QString& failureCode = QString());
     void scheduleVerify();
+    /// True when the calling thread is the one this object lives on (or when it lives on no
+    /// thread at all, which only happens after its thread has been destroyed).
+    bool onOwnThread() const;
 
     ControlPlaneClient* m_client = nullptr;
     TokenStore* m_store = nullptr;

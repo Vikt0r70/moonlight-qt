@@ -89,7 +89,7 @@ protected:
                                  QIODevice* outgoingData = nullptr) override
     {
         Q_UNUSED(op);
-        lastPath = request.url().path();
+        lastPath = request.url().path(QUrl::FullyEncoded);
         lastRequest = request;
         lastMethod = outgoingData ? QByteArrayLiteral("POST") : QByteArrayLiteral("GET");
         if (outgoingData) {
@@ -191,6 +191,167 @@ private slots:
         const ControlPlaneResult result = ControlPlaneClient::classify(
             401, refusedBody(QStringLiteral("Sign in again."), QStringLiteral("SH-3K2XQ1")));
         QCOMPARE(result.toFailure().kind, FailureKind::Auth);
+    }
+
+    // --- HR-02: an unexpected 200 fails closed, it is never read as success ------------------
+
+    void classify_http200WithAnHtmlBody_isFailure()
+    {
+        // The captive portal / proxy interstitial: HTTP 200 and a sign-in page instead of JSON.
+        const QByteArray html =
+            QByteArrayLiteral("<!DOCTYPE html><html><head><title>Sign in to the network</title>"
+                              "</head><body>Wi-Fi authentication required</body></html>");
+        const ControlPlaneResult result = ControlPlaneClient::classify(200, html);
+
+        QVERIFY2(!result.ok, "a 2xx that is not a JSON object carries no evidence of success");
+        QCOMPARE(result.statusCode, 200);
+        QVERIFY(!result.error.isEmpty());
+        QVERIFY(!result.body.contains(QStringLiteral("state")));
+    }
+
+    void classify_http200WithAnEmptyBody_isFailure()
+    {
+        const ControlPlaneResult result = ControlPlaneClient::classify(200, QByteArray());
+        QVERIFY2(!result.ok, "an empty 200 body is not a success either");
+        QVERIFY(!result.error.isEmpty());
+    }
+
+    void classify_http200WithANonBooleanStatus_data()
+    {
+        QTest::addColumn<QByteArray>("body");
+        QTest::addColumn<bool>("expectedOk");
+
+        // A present `status` that is not the boolean `true` is not success. `toBool(true)` used to
+        // read every one of these as true (the default applies when the value has the wrong type).
+        QTest::newRow("string-false") << QByteArrayLiteral("{\"status\":\"false\"}") << false;
+        QTest::newRow("numeric-zero") << QByteArrayLiteral("{\"status\":0}") << false;
+        QTest::newRow("null") << QByteArrayLiteral("{\"status\":null}") << false;
+        QTest::newRow("string-true") << QByteArrayLiteral("{\"status\":\"true\"}") << false;
+        QTest::newRow("array") << QByteArrayLiteral("{\"status\":[]}") << false;
+        QTest::newRow("boolean-false") << QByteArrayLiteral("{\"status\":false}") << false;
+        QTest::newRow("boolean-true") << QByteArrayLiteral("{\"status\":true}") << true;
+    }
+
+    void classify_http200WithANonBooleanStatus()
+    {
+        QFETCH(QByteArray, body);
+        QFETCH(bool, expectedOk);
+
+        const ControlPlaneResult result = ControlPlaneClient::classify(200, body);
+        QCOMPARE(result.ok, expectedOk);
+        if (!expectedOk) {
+            QVERIFY(!result.error.isEmpty());
+        }
+    }
+
+    void requestOtp_aCaptivePortalAnswering200_doesNotReportSuccess()
+    {
+        // The scenario the review named: a proxy answers the OTP request with a login page and
+        // HTTP 200. Nothing was sent, so nothing may be reported as sent.
+        ControlPlaneClient client;
+        auto* fake = new FakeNetworkAccessManager;
+        client.setNetworkAccessManager(fake);
+        fake->status = 200;
+        fake->body = QByteArrayLiteral("<html><body>Sign in to continue</body></html>");
+
+        ControlPlaneResult captured;
+        bool called = false;
+        client.requestOtp(QStringLiteral("+962790000000"), [&](const ControlPlaneResult& result) {
+            captured = result;
+            called = true;
+        });
+
+        QTRY_VERIFY(called);
+        QVERIFY2(!captured.ok, "an HTML 200 must not be read as 'code sent'");
+        QCOMPARE(captured.statusCode, 200);
+        QVERIFY(!captured.error.isEmpty());
+        QCOMPARE(fake->lastPath, QStringLiteral("/api/auth/otp/request"));
+    }
+
+    // --- ME-03: one phone normalisation rule ------------------------------------------------
+
+    void phoneNormalisation_data()
+    {
+        QTest::addColumn<QString>("raw");
+        QTest::addColumn<QString>("expected");
+
+        // Already E.164: unchanged.
+        QTest::newRow("e164") << QStringLiteral("+962790000000")
+                              << QStringLiteral("+962790000000");
+        // The separators people actually type: spaces, parentheses, dashes and dots. `+962 7 0000
+        // 0000` is the placeholder the sign-in screen shows, and it has to normalise to the same
+        // number as `+962700000000`.
+        QTest::newRow("spaces") << QStringLiteral("+962 7 0000 0000")
+                                << QStringLiteral("+962700000000");
+        QTest::newRow("parentheses-and-dashes") << QStringLiteral("+962 (79) 000-0000")
+                                                << QStringLiteral("+962790000000");
+        QTest::newRow("dots") << QStringLiteral("+962.79.000.0000")
+                              << QStringLiteral("+962790000000");
+        QTest::newRow("surrounding-space") << QStringLiteral("  +962790000000  ")
+                                           << QStringLiteral("+962790000000");
+        // The international prefix as people write it.
+        QTest::newRow("double-zero") << QStringLiteral("00962790000000")
+                                     << QStringLiteral("+962790000000");
+        QTest::newRow("double-zero-with-spaces") << QStringLiteral("00 962 79 000 0000")
+                                                 << QStringLiteral("+962790000000");
+        // Rejected: no country code is invented for these, because the spec defines none.
+        QTest::newRow("no-plus") << QStringLiteral("0962790000000") << QString();
+        QTest::newRow("national") << QStringLiteral("0790000000") << QString();
+        QTest::newRow("leading-zero-after-plus") << QStringLiteral("+0962790000000") << QString();
+        QTest::newRow("too-short") << QStringLiteral("+962790") << QString();
+        QTest::newRow("too-long") << QStringLiteral("+9627900000000000") << QString();
+        QTest::newRow("letters") << QStringLiteral("+96279ABC000") << QString();
+        QTest::newRow("empty") << QString() << QString();
+    }
+
+    void phoneNormalisation()
+    {
+        QFETCH(QString, raw);
+        QFETCH(QString, expected);
+
+        QCOMPARE(ControlPlaneClient::normalisePhoneE164(raw), expected);
+    }
+
+    // --- ME-04: ids cannot add structure to the route they are pasted into -------------------
+
+    void encodedPathSegment_data()
+    {
+        QTest::addColumn<QString>("segment");
+        QTest::addColumn<QString>("expected");
+
+        QTest::newRow("uuid") << QStringLiteral("aaaabbbb-cccc-dddd-eeee-ffff00001111")
+                              << QStringLiteral("aaaabbbb-cccc-dddd-eeee-ffff00001111");
+        QTest::newRow("slash") << QStringLiteral("aa/bb") << QStringLiteral("aa%2Fbb");
+        QTest::newRow("query") << QStringLiteral("aa?bb") << QStringLiteral("aa%3Fbb");
+        QTest::newRow("fragment") << QStringLiteral("aa#bb") << QStringLiteral("aa%23bb");
+        QTest::newRow("percent") << QStringLiteral("aa%2Fbb") << QStringLiteral("aa%252Fbb");
+        QTest::newRow("spaces") << QStringLiteral("aa bb") << QStringLiteral("aa%20bb");
+    }
+
+    void encodedPathSegment()
+    {
+        QFETCH(QString, segment);
+        QFETCH(QString, expected);
+
+        QCOMPARE(ControlPlaneClient::encodedPathSegment(segment), expected);
+    }
+
+    void fetchSession_anIdWithASlash_cannotRetargetTheRoute()
+    {
+        ControlPlaneClient client;
+        auto* fake = new FakeNetworkAccessManager;
+        client.setNetworkAccessManager(fake);
+        fake->status = 200;
+        fake->body = okBody();
+
+        bool called = false;
+        client.fetchSession(QStringLiteral("aa/../../admin"), [&](const ControlPlaneResult&) {
+            called = true;
+        });
+
+        QTRY_VERIFY(called);
+        // One segment, still under `/api/sessions/`, and no `/../` left to walk.
+        QCOMPARE(fake->lastPath, QStringLiteral("/api/sessions/aa%2F..%2F..%2Fadmin"));
     }
 
     // --- the routes themselves -------------------------------------------------------------

@@ -152,10 +152,25 @@ public:
     /// `^SH-[0-9A-HJ-KM-NP-TV-Z]{6}$`.
     static bool isReferenceCode(const QString& reference);
 
+    /// The E.164 shape `docs/spec/openapi.yaml` puts on `phone_e164`
+    /// (`^\+[1-9][0-9]{7,14}$`).
+    static bool isPhoneE164(const QString& phoneE164);
+
+    /// Normalises a phone number the way the sign-in field is allowed to be typed: strips the
+    /// separators people actually type (`space ( ) - .`), turns a leading `00` into `+`, and
+    /// returns an empty string when what is left is not E.164. Deciding here keeps `requestOtp`
+    /// and `verifyOtp` from sending two spellings of the same number.
+    static QString normalisePhoneE164(const QString& raw);
+
+    /// Percent-encodes one path segment (a session id) so it cannot add structure to the route it
+    /// is interpolated into.
+    static QString encodedPathSegment(const QString& segment);
+
     // --- response classification (Pitfall 4). Static so the rule is testable without a server.
 
     /// Classifies one response. THE rule this class exists to hold: an HTTP 200 body whose
-    /// `status` field is `false` is a FAILURE, not a success.
+    /// `status` field is `false` is a FAILURE, not a success - and, since HR-02, so is any 2xx
+    /// that carries no evidence of success (a non-JSON body, or a `status` that is not `true`).
     static ControlPlaneResult classify(int httpStatus, const QByteArray& body);
 
     // --- request builders. Static for the same reason: the documented payload shape is
@@ -198,10 +213,25 @@ public:
     /// owning thread's event loop is running - which, during a stream, it is not.
     bool onOwnThread() const { return m_thread != nullptr; }
 
-    /// Stop the thread `moveToOwnThread()` created and join it. Idempotent.
+    /// Stop the thread `moveToOwnThread()` created, join it, and destroy this object **on that
+    /// thread**. Callers must therefore check `onOwnThread()` first:
     ///
-    /// Every caller that owns an instance of this class must run this before destroying it: a
-    /// reply still in flight would otherwise call back into an object that is already gone.
+    ///   * `onOwnThread()` true  -> `stopOwnedThread()` destroys the object; the caller must not
+    ///     touch it again, and must not delete it (that would be the double free this method's
+    ///     shape exists to prevent).
+    ///   * `onOwnThread()` false -> nothing happened and nothing was destroyed; the object still
+    ///     lives on the calling thread and the caller still owns it.
+    ///
+    /// Why it has to be this way: once moved, `this` and its `QNetworkAccessManager` live on the
+    /// worker thread, and Qt refuses both a cross-thread `delete` and a cross-thread
+    /// `moveToThread()` (each is a warning, not an error - the object is simply left behind).
+    /// The one deletion that is both thread-correct and observable is the deferred delete
+    /// `moveToOwnThread()` arms on `QThread::finished`: Qt flushes that thread's deferred-delete
+    /// queue as the thread unwinds, i.e. *inside* `wait()` below, on the thread that owns the
+    /// object. So the join is also the destruction, and no line after it may read `this`.
+    ///
+    /// Idempotent in the only sense that is meaningful: a second call on a destroyed object is
+    /// not a call anyone can make.
     void stopOwnedThread();
 
     // --- calls. Each reports exactly once, on the caller's thread.
