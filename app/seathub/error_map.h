@@ -8,15 +8,18 @@
 //
 //   kind        which layer failed - the UI picks its copy from this
 //   error       customer-facing text. NEVER raw upstream/engine text.
-//   reference   `SH-XXXXXX` (ADR-0008). Always present; it is the only thing
-//               support can search by, so an error without one is a defect.
+//   reference   `SH-XXXXXX` (ADR-0008). Present only when the control plane supplied
+//               one: the client may never generate a code, because a reference the
+//               server never saw resolves to nothing (ADR-0008's rejected
+//               alternatives). Empty means "no code to show", never "invent one".
 //   statusCode  the control plane's HTTP status, or 0 when the failure was local
 //   failure     `AllocationRefused.failure`, e.g. NO_HOST_AVAILABLE
 //   diagnostic  diagnostics-only detail (raw engine text, or the engine's stage /
 //               error code / failing ports). Never rendered.
 //
-// The mapping table lives in `error_map.cpp`: each recognised engine stage collapses onto
-// one of two SeatHub sentences, and anything unnamed takes the D-51 generic fallback.
+// A stage failure the deck has no sentence for gets the generic fallback rather than a
+// per-stage string written in C++ (audit F9): `docs/spec/copy.md` is the only source of
+// customer-facing copy, and a missing sentence is a spec gap, not a licence to invent one.
 
 #include <QMetaType>
 #include <QString>
@@ -41,7 +44,8 @@ struct SeatHubFailure
     FailureKind kind = FailureKind::Engine;
     /// Customer-facing. Sourced from `docs/spec/copy.md`, never from the engine.
     QString error;
-    /// `SH-XXXXXX` (ADR-0008). Always non-empty.
+    /// `SH-XXXXXX` (ADR-0008) when the control plane supplied one; empty when it did not.
+    /// The client never generates one.
     QString reference;
     /// Control-plane HTTP status, or 0 when the failure was local to the client.
     int statusCode = 0;
@@ -62,7 +66,9 @@ struct SeatHubFailure
     static SeatHubFailure api(int statusCode, const QString& error, const QString& reference,
                               const QString& failure = QString());
 
-    /// The D-51 fallback: `Something went wrong on our side. Reference SH-9K2XQ1.`
+    /// The D-51 fallback: the `docs/spec/copy.md` §Support & errors sentence on its own.
+    /// No reference - the deck's `SH-9K2XQ1` is an illustration and printing it would hand
+    /// the customer a code support cannot resolve.
     static SeatHubFailure generic();
 
     /// Keys the customer-facing fields for QML. The `diagnostic` field is deliberately

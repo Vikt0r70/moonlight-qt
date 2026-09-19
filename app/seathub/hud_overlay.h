@@ -76,6 +76,12 @@ public:
     // SDL's event watch, so it only records a timestamp - `tick()` decides what is visible.
     void noteActivity();
 
+    // True while the session's channel is down, so the strip can say so instead of counting
+    // elapsed time the customer is not getting (audit F12; `copy.md` §In session, "Connection
+    // lost. Reconnecting..."). The attempt counter the deck shows in parentheses is D-56-deferred
+    // and is deliberately not rendered. Writes one atomic, so any thread may call it.
+    void setReconnecting(bool reconnecting);
+
     // The heartbeat. Public so a caller - or a test without SDL's timer subsystem - can pump the
     // HUD deterministically instead of waiting for the timer thread.
     void tick();
@@ -113,6 +119,7 @@ private:
     std::atomic<bool> m_sessionActive{false};
     std::atomic<bool> m_visible{false};
     std::atomic<bool> m_publishedVisible{false};
+    std::atomic<bool> m_reconnecting{false};
     std::atomic<qint64> m_sessionStartedMs{0};
     std::atomic<qint64> m_lastActivityMs{0};
     std::atomic<qint64> m_elapsedSeconds{0};

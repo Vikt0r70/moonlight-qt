@@ -93,6 +93,20 @@ class SeatHubClient : public QObject
     /// `SH-XXXXXX` for the current failure, or empty (ADR-0008).
     Q_PROPERTY(QString reference READ reference NOTIFY failureChanged)
 
+    /// The home screen's own state: "ready" | "checking" | "busy" | "offline" (audit F1).
+    /// Separate from `appState` because all four are the home view: "checking" while Play's
+    /// allocation request is in flight, "busy" when the control plane refused it with
+    /// `NO_HOST_AVAILABLE` (`copy.md` §Play flow, "No rig"), "offline" when the control plane
+    /// could not be reached at all (`copy.md` §Support & errors, "Offline"), and "ready" for the
+    /// populated state `screens.md` §23 draws. QML turns each into a sentence; none of them is a
+    /// failure, so none of them raises the error screen.
+    Q_PROPERTY(QString homeStatus READ homeStatus NOTIFY homeStatusChanged)
+
+    /// The last session's end reason as the sentence `docs/spec/copy.md` §Session end reasons
+    /// gives it, or empty. Styled text: the minute count in it is wrapped in the mono family,
+    /// because every number with a unit is mono (copy.md §5). The bare enum never reaches QML.
+    Q_PROPERTY(QString endReasonText READ endReasonText NOTIFY endReasonTextChanged)
+
     /// The signed-in identity (the phone number). Never a credential.
     Q_PROPERTY(QString identity READ identity NOTIFY identityChanged)
 
@@ -118,11 +132,15 @@ public:
     QVariantMap failure() const { return m_failure; }
     QString reference() const;
     QString identity() const { return m_identity; }
+    QString homeStatus() const { return m_homeStatus; }
+    QString endReasonText() const { return m_endReasonText; }
 
     /// The Qt window the visibility sequence hides and restores. Called once by main.qml.
     Q_INVOKABLE void setHostWindow(QWindow* window);
 
-    /// Play (D-35). Moves appState home -> connecting and drives the engine lifecycle.
+    /// Play (D-35). Asks the control plane for a session (`POST /api/sessions`) when there is an
+    /// access token to ask with, then drives the engine lifecycle from the allocation. Without a
+    /// token - the documented Plan 03-02 tracer path - it drives the engine lifecycle directly.
     Q_INVOKABLE void start();
 
     /// D-02: end the active stream immediately.
@@ -139,6 +157,10 @@ public:
 
     /// Leaves the error state for the home view.
     Q_INVOKABLE void dismissError();
+
+    /// ErrorScreen's retry (audit F21). Clears the failure and re-runs the step that failed:
+    /// Play when there is an identity to play with, the sign-in screen when there is not.
+    Q_INVOKABLE void retry();
 
     /// Shows the Settings page (a view inside the home state).
     Q_INVOKABLE void openSettings();
@@ -167,6 +189,8 @@ signals:
     void inSettingsChanged();
     void billingChanged();
     void sessionWarningChanged();
+    void homeStatusChanged();
+    void endReasonTextChanged();
 
     /// Step 1 succeeded - the view should show the code field.
     void otpRequested(const QString& phoneE164);
@@ -205,11 +229,21 @@ private slots:
 private:
     void setAppState(const QString& state);
     void setStageText(const QString& text);
+    void setHomeStatus(const QString& status);
+    void setEndReasonText(const QString& text);
     void raiseFailure(const SeatHubFailure& failure);
     void clearFailure();
     void setInSettings(bool inSettings);
     /// True once `beginSession()` has attached a real control-plane session.
     bool inControlPlaneSession() const;
+    /// The tracer path: no control-plane session, so the engine lifecycle runs on its own
+    /// (Plan 03-02's documented interim, kept for the no-token case).
+    void beginLocalAttempt();
+    /// Play against the control plane: `POST /api/sessions`, then `beginSession()`.
+    void beginPlayRequest();
+    /// Turns an allocation result into a home state: a refusal is the empty state, an
+    /// unreachable control plane is the offline state, and anything else is a real failure.
+    void applyPlayFailure(const ControlPlaneResult& result);
     /// Move the network objects onto a thread with a running event loop. Upstream suspends Qt
     /// processing for the whole stream (`session.cpp:1965-1966`), so a timer or socket left on
     /// the main thread would be silent for exactly the interval it exists to cover.
@@ -217,6 +251,8 @@ private:
 
     QString m_appState;
     QString m_stageText;
+    QString m_homeStatus;
+    QString m_endReasonText;
     QVariantMap m_failure;
     QString m_identity;
     QWindow* m_hostWindow = nullptr;

@@ -1,6 +1,7 @@
 #include "hud_overlay.h"
 
 #include <QColor>
+#include <QCoreApplication>
 #include <QDateTime>
 #include <QFont>
 #include <QFontMetricsF>
@@ -49,12 +50,31 @@ constexpr qint64 kAutoHideMs = 4000;
 // The End session affordance. `End session` is copy.md's own label (its glossary forbids "Quit"
 // and "Stop"); the key combination is the D-02 binding stated as a binding, not as prose. The
 // affordance is not a clickable control in Phase 3 - ADR-0045 records why (a click target inside
-// the stream window would need either a wider D-28 exception or a second window). Neither string
-// is final copy: D-55 gives Phase 5 the copy pass.
+// the stream window would need either a wider D-28 exception or a second window).
 constexpr const char* kLiveLabel = "LIVE";
 constexpr const char* kElapsedLabel = "Elapsed";
 constexpr const char* kEndSessionLabel = "End session";
 constexpr const char* kEndSessionKeys = "Ctrl+Alt+Shift+Q";
+
+// copy.md §In session, "Disconnect": `Connection lost. Reconnecting… (2 of 5)`. The attempt
+// counter in the parentheses is D-56-deferred, so the strip renders the sentence without it.
+// The ellipsis is UTF-8, spelled as escapes so it survives any source charset.
+constexpr const char* kReconnectingLabel = "Connection lost. Reconnecting\xE2\x80\xA6";
+
+// Every customer-facing string in this file goes through here, which is the C++ counterpart of
+// QML's `qsTr()` - the audit found the HUD's labels were the only user-facing strings in the
+// client with no translation wrapper at all. The context names the owner, so a future `.ts` has
+// one place to look. No translation ships today (ADR-0043 retires the language toggle), which is
+// exactly why the wrapper matters: it costs nothing now and is the difference between "untranslated
+// yet" and "never translatable".
+QString hudTr(const char* text)
+{
+    return QCoreApplication::translate("SeatHubHud", text);
+}
+
+// The disconnected sentence in `ui.md` §3.2's destructive treatment, and the healthy one in the
+// published tokens. `kTextPrimary`/`kTextMuted` are above.
+constexpr QRgb kTextDestructive = 0xFFEF4444; // Tokens.destructiveDefault
 
 QFont labelFont(int weight)
 {
@@ -207,10 +227,12 @@ QString HudOverlay::timerText() const
 QImage HudOverlay::renderStripAt(qint64 elapsedSeconds, int displayWidth) const
 {
     const QString timer = formatDuration(elapsedSeconds);
-    const QString live = QString::fromLatin1(kLiveLabel);
-    const QString elapsedLabel = QString::fromLatin1(kElapsedLabel);
-    const QString endSession = QString::fromLatin1(kEndSessionLabel);
-    const QString keys = QString::fromLatin1(kEndSessionKeys);
+    const QString live = hudTr(kLiveLabel);
+    const QString elapsedLabel = hudTr(kElapsedLabel);
+    const QString endSession = hudTr(kEndSessionLabel);
+    const QString keys = hudTr(kEndSessionKeys);
+    const QString reconnectLine = hudTr(kReconnectingLabel);
+    const bool reconnecting = m_reconnecting.load();
 
     const QFont liveFont = labelFont(QFont::Medium);
     const QFont mutedFont = labelFont(QFont::Normal);
@@ -225,9 +247,15 @@ QImage HudOverlay::renderStripAt(qint64 elapsedSeconds, int displayWidth) const
     const QFontMetricsF keysMetrics(keysFont);
 
     const qreal endSessionW = mutedMetrics.horizontalAdvance(endSession);
+    // The status group is either "Elapsed 00:00:12" or the reconnect sentence. The card is sized
+    // to the wider of the two so the strip does not change width when the connection state does
+    // (ui.md §12: no layout shift; §6: only opacity/transform may animate).
+    const qreal elapsedGroupW = mutedMetrics.horizontalAdvance(elapsedLabel) + kGap
+                                + timerMetrics.horizontalAdvance(timer);
+    const qreal statusGroupW = std::max(elapsedGroupW,
+                                        mutedMetrics.horizontalAdvance(reconnectLine));
     const qreal contentWidth = kPadX + kDotDiameter + kGap + liveMetrics.horizontalAdvance(live)
-                               + kGroupGap + mutedMetrics.horizontalAdvance(elapsedLabel) + kGap
-                               + timerMetrics.horizontalAdvance(timer) + kGroupGap + kGlyphSize
+                               + kGroupGap + statusGroupW + kGroupGap + kGlyphSize
                                + (kGap * 0.75) + endSessionW + kGap
                                + keysMetrics.horizontalAdvance(keys) + kPadX;
 
@@ -254,7 +282,17 @@ QImage HudOverlay::renderStripAt(qint64 elapsedSeconds, int displayWidth) const
 
         qreal x = kPadX;
 
+        // ui.md §6: `live pulse 2s ease-in-out loop on live dot + glow-live`, and exactly one
+        // glowing element per page (ui.md §12). The overlay repaints once a second (kTickMs), so
+        // the breath is two steps across a two-second loop keyed to the elapsed second: a
+        // continuous curve would need a faster heartbeat than the overlay can be published at.
+        // The halo's alpha is `--glow-live`'s own 0.18 (46/255) in `successDefault`.
         painter.setPen(Qt::NoPen);
+        if ((elapsedSeconds % 2) == 0) {
+            const qreal halo = kDotDiameter + 8.0;
+            painter.setBrush(QColor(16, 185, 129, 46));
+            painter.drawEllipse(QRectF(x - 4.0, centreY - (halo / 2.0), halo, halo));
+        }
         painter.setBrush(QColor::fromRgba(kLiveDot));
         painter.drawEllipse(QRectF(x, centreY - (kDotDiameter / 2.0), kDotDiameter, kDotDiameter));
         x += kDotDiameter + kGap;
@@ -262,10 +300,16 @@ QImage HudOverlay::renderStripAt(qint64 elapsedSeconds, int displayWidth) const
         x = drawLabel(painter, liveFont, kTextPrimary, live, x, centreY);
         x += kGroupGap;
 
-        x = drawLabel(painter, mutedFont, kTextMuted, elapsedLabel, x, centreY);
-        x += kGap;
-
-        x = drawLabel(painter, timerFont, kTextPrimary, timer, x, centreY);
+        if (reconnecting) {
+            // The media path is what the dot reports and it is still live - this window is
+            // composited over the stream - so the dot stays green while the sentence says which
+            // channel is down (audit F12, copy.md §In session "Disconnect").
+            x = drawLabel(painter, mutedFont, kTextDestructive, reconnectLine, x, centreY);
+        } else {
+            x = drawLabel(painter, mutedFont, kTextMuted, elapsedLabel, x, centreY);
+            x += kGap;
+            x = drawLabel(painter, timerFont, kTextPrimary, timer, x, centreY);
+        }
         x += kGroupGap;
 
         drawPowerGlyph(painter, x, centreY, kTextMuted);
@@ -412,6 +456,21 @@ void HudOverlay::endSession()
     }
 
     m_visible.store(false);
+}
+
+void HudOverlay::setReconnecting(bool reconnecting)
+{
+    if (m_reconnecting.exchange(reconnecting) == reconnecting) {
+        return;
+    }
+
+    // Republish immediately rather than waiting for the next heartbeat, so the sentence appears
+    // within the second the channel dropped. Safe from any thread: rendering and the publisher
+    // are both documented as callable off the main thread (see the class comment), and the flag
+    // itself is an atomic.
+    if (m_sessionActive.load()) {
+        publishStrip();
+    }
 }
 
 void HudOverlay::noteActivity()

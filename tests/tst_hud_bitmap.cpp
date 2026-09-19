@@ -635,12 +635,19 @@ private slots:
                      qPrintable(QStringLiteral("Tokens.qml no longer declares %1").arg(expected)));
         }
 
-        // The numeric companion: the HUD's spacing, radius and type sizes are named after these.
-        for (const QString& metric : {QStringLiteral("s2: 8"), QStringLiteral("s4: 16"),
-                                      QStringLiteral("s5: 20"), QStringLiteral("radiusLg: 20"),
-                                      QStringLiteral("fontLabel: 12"), QStringLiteral("fontSm: 14")}) {
-            QVERIFY2(metrics.contains(metric),
-                     qPrintable(QStringLiteral("Metrics.qml no longer declares %1").arg(metric)));
+        // The numeric companion: Metrics.qml derives its numbers from the generated tokens
+        // rather than keeping a second copy of them (audit F15). This replaces the older
+        // "the literals are still declared" check with the stronger one - a value that stops
+        // being derived is exactly the drift this test exists to catch. `tst_ui_screens`
+        // additionally loads the singleton and asserts the parsed numbers.
+        for (const QString& derived : {QStringLiteral("s2: tokenPx(Tokens.step2)"),
+                                       QStringLiteral("s4: tokenPx(Tokens.step4)"),
+                                       QStringLiteral("s5: tokenPx(Tokens.step5)"),
+                                       QStringLiteral("radiusLg: tokenPx(Tokens.lgDefault)"),
+                                       QStringLiteral("fontLabel: tokenRem(Tokens.scaleLabelSize)"),
+                                       QStringLiteral("fontSm: tokenRem(Tokens.scaleSmSize)")}) {
+            QVERIFY2(metrics.contains(derived),
+                     qPrintable(QStringLiteral("Metrics.qml no longer derives %1").arg(derived)));
         }
     }
 

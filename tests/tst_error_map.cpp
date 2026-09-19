@@ -7,14 +7,21 @@
  * application, so a mapping regression fails here in seconds instead of requiring a
  * full streaming build.
  *
- * Behaviour covered (Plan 03-02 Task 2):
- *   1. connection-refused stage  -> SeatHub copy + reference, kind Engine
- *   2. decoder stage            -> SeatHub copy + reference, kind Engine
- *   3. displayLaunchError       -> generic copy; the engine's own words never reach
- *                                  the customer-facing field, only `diagnostic`
- *   4. unmapped stage           -> the D-51 generic fallback
- *   5. ErrorScreen.qml renders the reason and the reference code in mono type
- *   6. `diagnostic` never crosses into the view model handed to QML
+ * Behaviour covered (Plan 03-02 Task 2, revised for audit F9):
+ *   1. connection-refused stage    -> the copy.md generic sentence, NO reference
+ *   2. decoder stage               -> the same, and no invented decoder copy either
+ *   3. displayLaunchError          -> generic copy; the engine's own words never reach
+ *                                     the customer-facing field, only `diagnostic`
+ *   4. unmapped stage              -> the D-51 generic fallback
+ *   5. the client never invents an ADR-0008 reference code
+ *   6. ErrorScreen.qml renders the reason and the reference code in mono type
+ *   7. `diagnostic` never crosses into the view model handed to QML
+ *
+ * The audit (F9) found five invented strings and two invented codes here - including
+ * `SH-DECUNAV`, seven characters where ADR-0008 allows `SH-` + six. copy.md is the only place
+ * user-facing copy may come from, and ADR-0008 is explicit that a reference the client makes up
+ * "resolves to nothing", which is worse than showing none. So a stage failure now carries the
+ * generic deck sentence and an empty reference, and these tests assert exactly that.
  *****************************************************************************/
 
 #include <QtTest>
@@ -77,11 +84,12 @@ class TstErrorMap : public QObject
 private slots:
     void initTestCase();
 
-    void stageFailure_connectionRefused();
-    void stageFailure_decoderUnavailable();
+    void stageFailure_neverInventsCopyOrReference();
+    void stageFailure_decoderStageIsNoException();
     void launchError_neverExposesEngineText();
     void stageFailure_unmappedFallsBackToGeneric();
     void diagnostic_neverReachesTheViewModel();
+    void apiFailure_passesTheServerReferenceThrough();
     void errorScreen_rendersReasonAndMonoReference();
 };
 
@@ -92,26 +100,34 @@ void TstErrorMap::initTestCase()
     QVERIFY(!guiDir().isEmpty());
 }
 
-void TstErrorMap::stageFailure_connectionRefused()
+void TstErrorMap::stageFailure_neverInventsCopyOrReference()
 {
     const SeatHubFailure failure = mapStageFailure(QStringLiteral("connection_refused"), 0, QString());
 
     QCOMPARE(static_cast<int>(failure.kind), static_cast<int>(FailureKind::Engine));
-    QCOMPARE(failure.error, QStringLiteral("Can't reach the rig right now."));
-    QCOMPARE(failure.reference, QStringLiteral("SH-CONREF"));
+    QCOMPARE(failure.error, QStringLiteral("Something went wrong on our side."));
+    QVERIFY2(failure.reference.isEmpty(),
+             "ADR-0008: a reference the client invents resolves to nothing, which is worse than none");
     QCOMPARE(failure.statusCode, 0);
     QVERIFY2(!failure.error.contains(QStringLiteral("SH-"), Qt::CaseInsensitive),
              "the reference is rendered separately; embedding it in the reason double-prints it");
+    QVERIFY2(failure.diagnostic.contains(QStringLiteral("connection_refused")),
+             "the stage detail is kept for support even though it never reaches the customer");
 }
 
-void TstErrorMap::stageFailure_decoderUnavailable()
+void TstErrorMap::stageFailure_decoderStageIsNoException()
 {
+    // A decoder failure used to get its own invented sentence and a seven-character code. It is
+    // a stage failure like any other: generic copy, no reference, engine detail only in the
+    // diagnostic. Anything more needs a copy.md entry and a control-plane reference first.
     const SeatHubFailure failure = mapStageFailure(QStringLiteral("decoder_unavailable"), 0, QString());
 
     QCOMPARE(static_cast<int>(failure.kind), static_cast<int>(FailureKind::Engine));
-    QCOMPARE(failure.error,
-             QStringLiteral("This rig can't decode the stream. Try a different quality setting."));
-    QCOMPARE(failure.reference, QStringLiteral("SH-DECUNAV"));
+    QCOMPARE(failure.error, QStringLiteral("Something went wrong on our side."));
+    QVERIFY(failure.reference.isEmpty());
+    QVERIFY2(!failure.error.contains(QStringLiteral("decoder"), Qt::CaseInsensitive),
+             "no engine vocabulary reaches the customer-facing sentence");
+    QVERIFY(failure.diagnostic.contains(QStringLiteral("decoder_unavailable")));
 }
 
 void TstErrorMap::launchError_neverExposesEngineText()
@@ -121,7 +137,7 @@ void TstErrorMap::launchError_neverExposesEngineText()
 
     QCOMPARE(static_cast<int>(failure.kind), static_cast<int>(FailureKind::Engine));
     QCOMPARE(failure.error, QStringLiteral("Something went wrong on our side."));
-    QCOMPARE(failure.reference, QStringLiteral("SH-GENERR"));
+    QVERIFY(failure.reference.isEmpty());
 
     // The whole point of the interception (T-03-05): nothing of the engine's reaches
     // the customer-facing field, but the diagnostic is preserved for support
@@ -141,8 +157,7 @@ void TstErrorMap::stageFailure_unmappedFallsBackToGeneric()
 
     QCOMPARE(static_cast<int>(failure.kind), static_cast<int>(FailureKind::Engine));
     QCOMPARE(failure.error, QStringLiteral("Something went wrong on our side."));
-    QCOMPARE(failure.reference, QStringLiteral("SH-GENERR"));
-    QVERIFY(!failure.error.contains(QStringLiteral("STAGE_SOMETHING")));
+    QVERIFY(failure.reference.isEmpty());
     QVERIFY2(!failure.error.contains(QStringLiteral("47989")),
              "failing ports are engine detail and are never shown to a customer");
     // copy.md §Support & errors illustrates the sentence with the *sample* code SH-9K2XQ1.
@@ -165,9 +180,30 @@ void TstErrorMap::diagnostic_neverReachesTheViewModel()
     QCOMPARE(viewModel.value(QStringLiteral("kind")).toString(), QStringLiteral("engine"));
     QCOMPARE(viewModel.value(QStringLiteral("error")).toString(),
              QStringLiteral("Something went wrong on our side."));
-    QCOMPARE(viewModel.value(QStringLiteral("reference")).toString(), QStringLiteral("SH-GENERR"));
+    QVERIFY(viewModel.value(QStringLiteral("reference")).toString().isEmpty());
     QCOMPARE(viewModel.value(QStringLiteral("statusCode")).toInt(), 500);
     QCOMPARE(viewModel.value(QStringLiteral("failure")).toString(), QStringLiteral("NO_HOST_AVAILABLE"));
+}
+
+void TstErrorMap::apiFailure_passesTheServerReferenceThrough()
+{
+    // The only reference codes that exist are the control plane's (ADR-0008). When the
+    // control plane supplies one it is carried through untouched - ErrorScreen renders it in
+    // mono - and when it supplies none the field stays empty rather than being filled in here.
+    const SeatHubFailure failure = SeatHubFailure::api(
+        409, QStringLiteral("An account already exists for this phone number."),
+        QStringLiteral("SH-4F7KQ2"), QStringLiteral("PHONE_ALREADY_REGISTERED"));
+
+    QCOMPARE(static_cast<int>(failure.kind), static_cast<int>(FailureKind::Api));
+    QCOMPARE(failure.statusCode, 409);
+    QCOMPARE(failure.reference, QStringLiteral("SH-4F7KQ2"));
+    QCOMPARE(failure.failure, QStringLiteral("PHONE_ALREADY_REGISTERED"));
+    QCOMPARE(failure.error, QStringLiteral("An account already exists for this phone number."));
+
+    const SeatHubFailure noCode =
+        SeatHubFailure::api(500, QStringLiteral("Something went wrong on our side."), QString());
+    QVERIFY2(noCode.reference.isEmpty(),
+             "the client must not manufacture a reference the control plane never issued");
 }
 
 void TstErrorMap::errorScreen_rendersReasonAndMonoReference()
@@ -190,9 +226,11 @@ void TstErrorMap::errorScreen_rendersReasonAndMonoReference()
     }
 
     // The facade is a QVariantMap-shaped stand-in here; the real one is SeatHubClient,
-    // but ErrorScreen only ever reads `failure.error` and `reference` (D-35).
-    const QString reason = QStringLiteral("Can't reach the rig right now.");
-    const QString reference = QStringLiteral("SH-CONREF");
+    // but ErrorScreen only ever reads `failure.error` and `reference` (D-35). The code is
+    // copy.md's own example, which is shape-valid under ADR-0008 (`SH-` + six characters,
+    // no I/L/O/U) - test data, never shipped copy.
+    const QString reason = QStringLiteral("Something went wrong on our side.");
+    const QString reference = QStringLiteral("SH-4F7KQ2");
     QVariantMap failureMap;
     failureMap.insert(QStringLiteral("kind"), QStringLiteral("engine"));
     failureMap.insert(QStringLiteral("error"), reason);

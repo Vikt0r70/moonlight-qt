@@ -35,6 +35,18 @@ const char* kOtpMismatch = "That code didn't match. Try again or resend.";
 // normalisation. Documented copy, not invented here.
 const char* kPhoneInvalid = "That doesn't look like a phone number.";
 
+// homeStatus values (audit F1). Four states of the one home view, from `screens.md` §23 and the
+// copy deck: the populated state, the named loading state, the "no rig" empty state and the
+// offline state.
+const char* kHomeReady = "ready";
+const char* kHomeChecking = "checking";
+const char* kHomeBusy = "busy";
+const char* kHomeOffline = "offline";
+
+// The quality profile Play asks for. `ADR-0011` fixes the vocabulary; `1080p60` is its base
+// value and the one the control plane uses in its own examples.
+const char* kDefaultQualityProfile = "1080p60";
+
 // `docs/spec/copy.md` §Play flow, the four customer-visible stage lines. The engine's own
 // stage names (`LiGetStageName()`, e.g. "RTSP handshake") are internal and are never shown
 // - each one is mapped onto one of these four sentences.
@@ -82,6 +94,76 @@ QString stageLineFor(const QString& engineStage)
         return QString::fromLatin1(kStageReady);
     }
     return QString::fromLatin1(kStagePreparingStream);
+}
+
+// `docs/spec/copy.md` §Session end reasons, verbatim. The left column of the table is the
+// internal key and never reaches a customer; these are the right column, which is what the home
+// screen renders after a session ends (audit E10). `%1` is the session's real `minutes_billed` -
+// copy.md: "the client substitutes the session's real `minutes_billed`".
+const char* kEndCustomerEnded = "You ended the session. Unused minutes stay in your account.";
+const char* kEndHostLost =
+    "We lost contact with this rig, so the session ended. You were charged for %1 minutes.";
+const char* kEndClientSilent =
+    "We lost contact with your device, so the session ended. You were charged for %1 minutes.";
+const char* kEndConnectTimeout =
+    "You didn't start streaming in time, so the session was released. You were not charged.";
+const char* kEndReadinessTimeout = "This rig didn't come back in time. You were not charged.";
+const char* kEndGraceExpired =
+    "We couldn't reconnect, so the session ended. You were charged for %1 minutes.";
+const char* kEndOwnerReservation =
+    "The rig's owner reserved it, so the session ended. You were charged for %1 minutes.";
+const char* kEndBalanceExhausted = "Your balance ran out, so the session ended.";
+const char* kEndTeardownTimeout =
+    "Something went wrong ending this session, so we closed it. You were charged for the minutes "
+    "you used.";
+const char* kEndOperatorForced = "Support ended this session. You were charged for %1 minutes.";
+
+// Every number with a unit is mono (copy.md §5), and the end-reason sentences are rendered as
+// `Text.StyledText`, so the minute count is wrapped in the mono family. The family name is the
+// `fontMonoDefault` token; C++ cannot read `Tokens.qml`, and `hud_overlay.cpp` requests the same
+// family by name for the same reason.
+QString monoMinutes(int minutesBilled)
+{
+    return QStringLiteral("<font face=\"Geist Mono\">%1</font>").arg(minutesBilled);
+}
+
+// `docs/spec/copy.md` §Session end reasons -> the sentence the customer reads. Returns an empty
+// string for a reason the deck has no line for: `SESSION_LOST`, `LEASE_GUARD_LOST` and
+// `RECONNECT_LIMIT` are documented to "fall back to the client's generic ended-session string",
+// which copy.md never spells out - showing nothing is honest, inventing the sentence is not.
+QString endReasonSentence(const QString& endReason, int minutesBilled)
+{
+    struct ReasonLine {
+        const char* reason;
+        const char* sentence;
+    };
+    static const ReasonLine kLines[] = {
+        { "CUSTOMER_ENDED", kEndCustomerEnded },
+        { "HOST_LOST", kEndHostLost },
+        { "CLIENT_SILENT", kEndClientSilent },
+        { "CONNECT_TIMEOUT", kEndConnectTimeout },
+        { "READINESS_TIMEOUT", kEndReadinessTimeout },
+        // copy.md: MODE_BOOT_TIMEOUT is "the same line as READINESS_TIMEOUT above".
+        { "MODE_BOOT_TIMEOUT", kEndReadinessTimeout },
+        { "GRACE_EXPIRED", kEndGraceExpired },
+        { "OWNER_RESERVATION", kEndOwnerReservation },
+        { "BALANCE_EXHAUSTED", kEndBalanceExhausted },
+        { "TEARDOWN_TIMEOUT", kEndTeardownTimeout },
+        { "OPERATOR_FORCED", kEndOperatorForced },
+    };
+
+    for (const ReasonLine& line : kLines) {
+        if (endReason == QLatin1String(line.reason)) {
+            QString sentence = QString::fromUtf8(line.sentence);
+            if (sentence.contains(QLatin1String("%1"))) {
+                sentence = sentence.arg(monoMinutes(minutesBilled));
+            }
+            return sentence;
+        }
+    }
+
+    qCWarning(seathubClient) << "no copy.md sentence for end reason" << endReason;
+    return QString();
 }
 
 // The HUD's publisher: the one place that composites the SeatHub HUD into the engine's video
@@ -140,6 +222,7 @@ void onClientThread(QObject* owner, Fn fn)
 SeatHubClient::SeatHubClient(QObject* parent)
     : QObject(parent),
       m_appState(QString::fromLatin1(kStateSignedOut)),
+      m_homeStatus(QString::fromLatin1(kHomeReady)),
       m_session(new SessionLifecycle(this)),
       m_settings(new SettingsBridge(this)),
       m_updates(new UpdateFeedClient(this)),
@@ -188,6 +271,18 @@ SeatHubClient::SeatHubClient(QObject* parent)
             this, &SeatHubClient::handleSessionBilling);
     connect(m_sessionChannel, &SessionWebSocket::sessionWarningReceived,
             this, &SeatHubClient::handleSessionWarning);
+
+    // Audit F12: the HUD's reconnect line. The control plane's `DISCONNECTED` warning is one
+    // trigger (see `handleSessionWarning`); the channel dropping is the other, and it is the one
+    // that fires when the customer's own connection goes away and no frame can arrive at all.
+    // `setReconnecting` only stores an atomic the HUD's timer thread reads, so the socket's
+    // thread may call it; this connection is queued to the facade's thread anyway.
+    connect(m_sessionChannel, &SessionWebSocket::opened, this, [this]() {
+        m_hud.setReconnecting(false);
+    });
+    connect(m_sessionChannel, &SessionWebSocket::dropped, this, [this](int, int) {
+        m_hud.setReconnecting(true);
+    });
 
     connect(m_pairing, &PairingController::pairingCompleted,
             this, &SeatHubClient::handlePairingCompleted);
@@ -313,6 +408,11 @@ void SeatHubClient::beginSession(const QString& sessionId)
     m_sessionId = sessionId;
     m_clientUuid.clear();
 
+    // A new session clears the previous one's end reason: the home screen shows the outcome of
+    // the session that just ended, never a stale one (audit E10).
+    setEndReasonText(QString());
+    setHomeStatus(QString::fromLatin1(kHomeReady));
+
     clearFailure();
     setStageText(QString::fromLatin1(kStageWaitingForRig));
     setAppState(QString::fromLatin1(kStateConnecting));
@@ -383,6 +483,27 @@ void SeatHubClient::setStageText(const QString& text)
     emit stageTextChanged();
 }
 
+void SeatHubClient::setHomeStatus(const QString& status)
+{
+    if (m_homeStatus == status) {
+        return;
+    }
+    // Logged for the same reason the stage line is: "was the customer on the empty state or the
+    // offline state" is not a question a screenshot of a machine nobody can see can answer.
+    qCInfo(seathubClient) << "home status" << m_homeStatus << "->" << status;
+    m_homeStatus = status;
+    emit homeStatusChanged();
+}
+
+void SeatHubClient::setEndReasonText(const QString& text)
+{
+    if (m_endReasonText == text) {
+        return;
+    }
+    m_endReasonText = text;
+    emit endReasonTextChanged();
+}
+
 void SeatHubClient::raiseFailure(const SeatHubFailure& failure)
 {
     m_failure = failure.toVariantMap();
@@ -412,13 +533,103 @@ void SeatHubClient::start()
         return;
     }
 
+    // Play is the control plane's allocation (`POST /api/sessions`, D-35). Without an access
+    // token there is nothing to allocate with, so the Plan 03-02 tracer path runs instead -
+    // unchanged, and still the path a build with no control plane exercises.
+    if (!m_controlPlane->hasAccessToken()) {
+        beginLocalAttempt();
+        return;
+    }
+
+    beginPlayRequest();
+}
+
+void SeatHubClient::beginLocalAttempt()
+{
     clearFailure();
+    setEndReasonText(QString());
+    setHomeStatus(QString::fromLatin1(kHomeReady));
     setStageText(QString::fromLatin1(kStageWaitingForRig));
     setAppState(QString::fromLatin1(kStateConnecting));
 
     if (!m_session->start(m_hostWindow)) {
         raiseFailure(SeatHubFailure::generic());
     }
+}
+
+void SeatHubClient::beginPlayRequest()
+{
+    clearFailure();
+    setEndReasonText(QString());
+    // The loading state belongs to the home view, so appState stays `home` until the control
+    // plane answers: the customer sees the named loading line, not a connection screen for a
+    // session that may never exist (`screens.md` §23, audit F1).
+    setHomeStatus(QString::fromLatin1(kHomeChecking));
+    setStageText(QString::fromLatin1(kStageWaitingForRig));
+
+    startNetworkThreads();
+
+    const QString profile = QString::fromLatin1(kDefaultQualityProfile);
+
+    m_controlPlane->requestSession(profile, [this](const ControlPlaneResult& result) {
+        onClientThread(this, [this, result]() {
+            if (!result.ok) {
+                applyPlayFailure(result);
+                return;
+            }
+
+            const QString sessionId = result.body.value(QStringLiteral("id")).toString();
+            if (sessionId.isEmpty()) {
+                // A 2xx that carries no session is a contract violation, not a home state.
+                setHomeStatus(QString::fromLatin1(kHomeReady));
+                raiseFailure(SeatHubFailure::generic());
+                return;
+            }
+
+            setHomeStatus(QString::fromLatin1(kHomeReady));
+            beginSession(sessionId);
+        });
+    });
+}
+
+void SeatHubClient::applyPlayFailure(const ControlPlaneResult& result)
+{
+    // `NO_HOST_AVAILABLE` is the empty state, not an incident (copy.md §Play flow, "No rig"):
+    // the right answer is the sentence and the next thing to do, not the error screen.
+    if (result.failure == QLatin1String("NO_HOST_AVAILABLE")) {
+        setHomeStatus(QString::fromLatin1(kHomeBusy));
+        return;
+    }
+
+    // No HTTP status at all means the request never reached the control plane - `statusCode` is
+    // 0 on that path (`ControlPlaneClient`). That is the offline state the copy deck's offline
+    // sentence covers, and it keeps the customer on the home view instead of a failure screen
+    // for what is very often a dropped Wi-Fi connection.
+    if (result.statusCode == 0 && result.reference.isEmpty()) {
+        setHomeStatus(QString::fromLatin1(kHomeOffline));
+        return;
+    }
+
+    setHomeStatus(QString::fromLatin1(kHomeReady));
+    raiseFailure(result.toFailure());
+}
+
+void SeatHubClient::retry()
+{
+    // Audit F21: retry re-runs the step, it does not just dismiss. With an identity the step
+    // that failed was Play; without one there is nothing to retry but sign-in, so the sign-in
+    // screen comes back.
+    clearFailure();
+    setInSettings(false);
+
+    if (m_identity.isEmpty()) {
+        setHomeStatus(QString::fromLatin1(kHomeReady));
+        setAppState(QString::fromLatin1(kStateSignedOut));
+        return;
+    }
+
+    setAppState(QString::fromLatin1(kStateHome));
+    start();
 }
 
 void SeatHubClient::interrupt()
@@ -534,6 +745,8 @@ void SeatHubClient::signOut()
     emit identityChanged();
     clearFailure();
     setInSettings(false);
+    setHomeStatus(QString::fromLatin1(kHomeReady));
+    setEndReasonText(QString());
     setAppState(QString::fromLatin1(kStateSignedOut));
 }
 
@@ -541,6 +754,7 @@ void SeatHubClient::dismissError()
 {
     clearFailure();
     setInSettings(false);
+    setHomeStatus(QString::fromLatin1(kHomeReady));
     setAppState(m_identity.isEmpty() ? QString::fromLatin1(kStateSignedOut)
                                      : QString::fromLatin1(kStateHome));
 }
@@ -584,6 +798,10 @@ void SeatHubClient::handleConnectionStarted()
     // (D-01), so the first HUD publish may arrive before the renderer has registered; the 1 Hz
     // heartbeat re-publishes and the stream picks the HUD up on its first frame.
     m_hud.beginSession();
+
+    // A stream that just started is by definition connected (audit F12): whatever the last
+    // session's channel did, this one is live now.
+    m_hud.setReconnecting(false);
 }
 
 void SeatHubClient::handleDisplayLaunchError(const QString& text)
@@ -680,6 +898,15 @@ void SeatHubClient::handleSessionState(const SessionInfo& session)
             m_session->interrupt();
         }
     }
+
+    if (!session.endReason.isEmpty()) {
+        // The session's own outcome, in the deck's words, ready for the home screen the customer
+        // lands on once teardown finishes (audit E10). The minute count is the server's own
+        // `minutes_billed`, never arithmetic done here.
+        setEndReasonText(endReasonSentence(
+            session.endReason,
+            m_billing.value(QStringLiteral("minutes_billed")).toInt()));
+    }
 }
 
 void SeatHubClient::handleSessionBilling(const QString& sessionId, int minutesBilled,
@@ -701,6 +928,11 @@ void SeatHubClient::handleSessionWarning(const QString& sessionId, const QString
     m_sessionWarning = warning;
     m_billing.insert(QStringLiteral("warning_deadline_at"), deadlineAt);
     emit sessionWarningChanged();
+
+    // Audit F12: `DISCONNECTED` is the server saying this client stopped reporting, which is
+    // exactly the moment the HUD's strip leaves "Elapsed" and says what is happening. The
+    // strip never shows the "(2 of 5)" attempt counter D-56 defers.
+    m_hud.setReconnecting(warning == QLatin1String("DISCONNECTED"));
 }
 
 // ---------------------------------------------------------------------------
