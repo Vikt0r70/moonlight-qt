@@ -26,7 +26,8 @@
 // The handshake itself is injected rather than called directly, for the same reason the seam is an
 // interface in the first place: the deadline, the fail-closed branches and the exactly-once
 // contract are assertable with no host, no Sunshine and no engine. `pairing_handshake.cpp` is the
-// production handshake and the only file that includes `app/backend/`.
+// production handshake and, with `moonlight_engine_session.cpp`, one of the only two files that
+// include `app/backend/`.
 
 #include <QByteArray>
 #include <QMetaType>
@@ -36,6 +37,7 @@
 
 #include <functional>
 
+#include "engine_session.h"
 #include "pairing_controller.h"
 
 /// One production pairing handshake's outcome.
@@ -46,6 +48,14 @@ struct PairingHandshakeResult
     /// The client identity reported on success - `clientCertificateFingerprint()` of this
     /// client's own certificate. Empty on every failure path (fail closed).
     QString clientIdentity;
+    /// The host this handshake paired with, or null on every failure path.
+    ///
+    /// This exists because the engine has to stream from *the same host the handshake paired with*:
+    /// upstream's `NvComputer` carries the pinned certificate the handshake produced, plus the
+    /// HTTPS port and app version the host reported. A `NvComputer` local to the handshake is
+    /// destroyed when the handshake returns, and a second one built afterwards pins nothing - which
+    /// is what left the engine with no host to stream from before Plan 03-06's gap closure.
+    PairedHostPtr host;
     /// Diagnostics only: raw upstream text for the log and for support. Never rendered (D-51),
     /// and never contains the PIN.
     QString engineError;
@@ -99,6 +109,17 @@ public:
     void pair(const PairingTarget& target,
               std::function<void(bool ok, const QString& clientUuid,
                                  const QString& engineError)> done) override;
+
+signals:
+    /// The host the handshake resolved, emitted immediately before `done(true, ...)` on the one
+    /// success path and never on a failure.
+    ///
+    /// A signal rather than a getter because the two ends live on different threads: this object is
+    /// moved to the network thread (`SeatHubClient::startNetworkThreads()`) while the object that
+    /// builds the engine session belongs to the Qt main thread. `PairedHostPtr` is a
+    /// `shared_ptr`, so the queued connection that carries it keeps the record alive on both sides
+    /// until both are done with it.
+    void hostResolved(const PairedHostPtr& host);
 
 private slots:
     void handleHandshakeResult(const PairingHandshakeResult& result);

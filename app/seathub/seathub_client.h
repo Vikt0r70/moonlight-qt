@@ -9,9 +9,10 @@
 //   * States are typed properties, not JSON. QML never parses a payload (D-35).
 //   * No credential ever crosses into the view layer - not a token, not a header.
 //
-// Plan 03-02 is the tracer: the control-plane calls are stubbed, so this class proves the
-// UI lifecycle and the branding, not network auth. Plan 03-03 replaces the stubbed
-// `requestOtp`/`verifyOtp` bodies with the real `ControlPlaneClient`.
+// Plan 03-02 shipped this against a stubbed control plane and a tracer in place of a stream.
+// Both are gone: `requestOtp`/`verifyOtp` run the real `ControlPlaneClient`, and the stream is a
+// real engine session the pairing handshake's resolved host is attached to. The tracer survives as
+// an explicitly injected fake (`stub_engine_session.h`), never as a fallback.
 
 #include <QObject>
 #include <QString>
@@ -21,9 +22,11 @@
 
 #include "authorized_through_timer.h"
 #include "control_plane_client.h"
+#include "engine_session.h"
 #include "error_map.h"
 #include "hud_overlay.h"
 #include "liveness_timer.h"
+#include "moonlight_engine_session.h"
 #include "pairing_controller.h"
 #include "pairing_seam.h"
 #include "session_lifecycle.h"
@@ -33,6 +36,7 @@
 // static_assert in Qt's meta-object code).
 #include "settings_bridge.h"
 #include "teardown_controller.h"
+#include "teardown_guard.h"
 #include "token_store.h"
 #include "update_feed_client.h"
 
@@ -237,6 +241,18 @@ private slots:
     void handlePairingCompleted(const QString& clientUuid);
     void handlePairingFailed(const SeatHubFailure& failure);
 
+    /// The control plane authorized the session, and with which quality profile. Applies the
+    /// profile to the settings bridge as an in-memory override for this launch only (D-37, WR-05).
+    void handleAuthorizationGranted(const QString& qualityProfile);
+
+    /// The host the handshake paired with, emitted by `ProductionPairingSeam` on its success path
+    /// only. Builds the engine session from it and attaches it, so that by the time
+    /// `handlePairingCompleted` runs there is something for `start()` to drive.
+    ///
+    /// Queued, not direct: the seam lives on the network thread and this slot builds a Qt object
+    /// tree that belongs to the facade's thread.
+    void handleHostResolved(const PairedHostPtr& host);
+
 private:
     void setAppState(const QString& state);
     void setStageText(const QString& text);
@@ -247,9 +263,13 @@ private:
     void setInSettings(bool inSettings);
     /// True once `beginSession()` has attached a real control-plane session.
     bool inControlPlaneSession() const;
-    /// The tracer path: no control-plane session, so the engine lifecycle runs on its own
-    /// (Plan 03-02's documented interim, kept for the no-token case).
+    /// Play with no access token: there is nothing to allocate a session with, so the engine
+    /// lifecycle is asked to run and - with no host attached to stream from - fails closed.
     void beginLocalAttempt();
+    /// Drop the engine session the previous launch attached, if any. Refuses while one is
+    /// running: `run()` hijacks the calling thread for the whole stream, and the object cannot be
+    /// destroyed under it.
+    void releaseEngineSession();
     /// Play against the control plane: `POST /api/sessions`, then `beginSession()`.
     void beginPlayRequest();
     /// Turns an allocation result into a home state: a refusal is the empty state, an
@@ -289,7 +309,16 @@ private:
     LivenessTimer* m_liveness = nullptr;
     AuthorizedThroughTimer* m_horizon = nullptr;
 
-    /// The session the real control-plane path is running, or empty on the tracer path.
+    /// The engine session this launch attached, or null. Owned here: the lifecycle drives it and
+    /// deliberately does not destroy it (it cannot know whether the attacher has other uses for
+    /// it). Released in `handleReadyForDeletion()`.
+    MoonlightEngineSession* m_engineSession = nullptr;
+    /// Per-session teardown claim. Reset by `beginSession()` and released once a teardown has run
+    /// for that session, so the second and every later session tears down exactly like the first
+    /// (defect F-9; `teardown_guard.h` has the whole story).
+    SessionTeardownGuard m_teardownGuard;
+
+    /// The session the real control-plane path is running, or empty when no session is attached.
     QString m_sessionId;
     /// What pairing returned about this client: the SHA-256 fingerprint of its own certificate,
     /// which is the identity a host-side reader of Sunshine's client list can match to this

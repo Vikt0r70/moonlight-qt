@@ -71,8 +71,9 @@ ProductionPairingSeam::ProductionPairingSeam(QObject* parent)
     : QObject(parent),
       m_deadline(new QTimer(this))
 {
-    // The result arrives from the handshake's thread as a queued connection.
+    // Both arrive from the handshake's thread as queued connections.
     qRegisterMetaType<PairingHandshakeResult>("PairingHandshakeResult");
+    qRegisterMetaType<PairedHostPtr>("PairedHostPtr");
 
     m_deadline->setSingleShot(true);
     connect(m_deadline, &QTimer::timeout, this, [this]() {
@@ -172,6 +173,11 @@ void ProductionPairingSeam::finish(const PairingHandshakeResult& result)
     }
 
     qCInfo(seathubPairingSeam) << "upstream pairing handshake completed";
+
+    // The host travels first: the engine session is built from it, and a listener that acted on
+    // `done` before this arrived would be building a session from nothing.
+    emit hostResolved(result.host);
+
     done(true, result.clientIdentity, QString());
 }
 

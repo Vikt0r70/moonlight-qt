@@ -218,6 +218,9 @@ SOURCES += \
     seathub/teardown_controller.cpp \
     seathub/liveness_timer.cpp \
     seathub/authorized_through_timer.cpp \
+    seathub/engine_session.cpp \
+    seathub/moonlight_engine_session.cpp \
+    seathub/stub_engine_session.cpp \
     streaming/streamutils.cpp \
     backend/autoupdatechecker.cpp \
     path.cpp \
@@ -270,6 +273,10 @@ HEADERS += \
     seathub/teardown_controller.h \
     seathub/liveness_timer.h \
     seathub/authorized_through_timer.h \
+    seathub/engine_session.h \
+    seathub/teardown_guard.h \
+    seathub/moonlight_engine_session.h \
+    seathub/stub_engine_session.h \
     streaming/video/decoder.h \
     streaming/streamutils.h \
     backend/autoupdatechecker.h \

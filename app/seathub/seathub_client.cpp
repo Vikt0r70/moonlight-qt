@@ -3,20 +3,23 @@
 #include <QLoggingCategory>
 #include <QWindow>
 
+#include <SDL.h>
+
 #include "agent_config.h"
 #include "session_lifecycle.h"
 #include "settings_bridge.h"
 #include "update_feed_client.h"
 
-// The production pairing handshake. Included here and nowhere else: it is the only translation
-// unit that reaches into `app/backend/`, which is how `app/seathub/` stays free of upstream
-// includes (and how the seam stays testable with no engine in the test binary).
+// The production pairing handshake and the host record it resolves. Included here and nowhere
+// else: these are the translation units that reach into `app/backend/`, which is how the rest of
+// `app/seathub/` stays free of upstream includes (and how the seam stays testable with no engine
+// in the test binary).
 #include "pairing_handshake.h"
 
-// Only this translation unit needs the engine type: the HUD's publisher below is the one place
-// that reaches `Session::get()`, which is what keeps `app/seathub/hud_overlay.*` free of the
-// engine and linkable into a test with no engine in it.
-#include "streaming/session.h"
+// `<SDL.h>` above is here for `SDL_Surface` and `SDL_FreeSurface` alone. The engine type itself is
+// no longer named in this file: the HUD's publisher reaches the engine through the session object
+// the lifecycle is driving, so `Session` appears exactly once in the fork - in
+// `moonlight_engine_session.cpp` - and the publish path is assertable with a fake in its place.
 
 Q_LOGGING_CATEGORY(seathubClient, "seathub.client")
 
@@ -167,40 +170,36 @@ QString endReasonSentence(const QString& endReason, int minutesBilled)
     return QString();
 }
 
-// The HUD's publisher: the one place that composites the SeatHub HUD into the engine's video
-// output, and the one place `Session::get()` is reached for it (ADR-0045).
+// The HUD's publisher: the one place the SeatHub HUD reaches the engine's video output (ADR-0045).
 //
 // It composites through the overlay path the engine already has - `D3D11VARenderer::renderFrame()`
 // draws the overlays into the stream's own swapchain immediately before `Present()` - so the HUD
 // costs no second window and no second swapchain, and STREAM-01 holds by construction.
 //
-// A null surface means "hide" and disables the overlay, which is what the engine itself does when
-// a connection returns to healthy. A non-null surface is published and the manager's contract is
-// that ownership transfers in every case, so this never leaks one.
-bool publishHudSurface(SDL_Surface* surface)
+// It reaches the engine through the session object the lifecycle is driving, not through the
+// engine's `Session::get()` global. That global is null on every path that is not a running engine
+// session, so a publisher built on it silently did nothing whenever the session was a fake or had
+// already been torn down - which, before the Plan 03-06 fix, was always, because no engine session
+// was ever attached.
+//
+// Ownership (ADR-0045): a non-null surface is never the caller's afterwards. With a session
+// attached the engine takes it in every case - it keeps an accepted one and frees a refused one -
+// so nothing here releases anything. With no session there is no swapchain to composite into and no
+// engine to take it, so it is released here and the HUD is told the publish did not land. That
+// second branch is why this asks whether a session is attached at all rather than relying on the
+// lifecycle's `false`: the two answers differ in what happens to the surface.
+bool publishHudSurface(SessionLifecycle* lifecycle, SDL_Surface* surface)
 {
-    Session* session = Session::get();
-    if (session == nullptr) {
-        // No active session to composite into: the tracer path, or a session already torn down.
+    if (lifecycle == nullptr || lifecycle->upstreamSession() == nullptr) {
+        // No active session to composite into: nothing is streaming, or the session already tore
+        // down.
         if (surface != nullptr) {
             SDL_FreeSurface(surface);
         }
         return false;
     }
 
-    Overlay::OverlayManager& manager = session->getOverlayManager();
-
-    if (surface == nullptr) {
-        manager.setOverlayState(Overlay::OverlayStatusUpdate, false);
-        return true;
-    }
-
-    // Enable before publishing. The manager only notifies on a state change, so this is
-    // idempotent, and it means a HUD published before the renderer has registered is still picked
-    // up on the first frame after it does - the HUD's first publish happens on
-    // `connectionStarted`, which is before the engine creates its stream window (D-01).
-    manager.setOverlayState(Overlay::OverlayStatusUpdate, true);
-    return manager.updateOverlaySurface(Overlay::OverlayStatusUpdate, surface);
+    return lifecycle->publishOverlaySurface(surface);
 }
 
 } // namespace
@@ -290,6 +289,17 @@ SeatHubClient::SeatHubClient(QObject* parent)
     connect(m_pairing, &PairingController::pairingFailed,
             this, &SeatHubClient::handlePairingFailed);
 
+    // D-37 / WR-05: the authorization's quality profile. Emitted before pairing starts, which is
+    // what puts the override in place before the engine negotiates the stream.
+    connect(m_pairing, &PairingController::authorizationGranted,
+            this, &SeatHubClient::handleAuthorizationGranted);
+
+    // The host the handshake resolved, in the same emission as the completion above and always
+    // ahead of it (see `ProductionPairingSeam::finish()`), so `handlePairingCompleted()` finds an
+    // engine session already attached. Queued: the seam lives on the network thread.
+    connect(m_pairingSeam, &ProductionPairingSeam::hostResolved,
+            this, &SeatHubClient::handleHostResolved);
+
     connect(m_teardown, &TeardownController::teardownCompleted,
             this, &SeatHubClient::handleTeardownCompleted);
     connect(m_teardown, &TeardownController::teardownFailed,
@@ -304,8 +314,11 @@ SeatHubClient::SeatHubClient(QObject* parent)
     connect(m_liveness, &LivenessTimer::livenessWarning, this, &SeatHubClient::onLivenessWarning);
 
     // The HUD composites through the engine's own overlay path; wiring it here rather than in
-    // the HUD keeps the engine reference in one place (and the HUD free of `Session`).
-    m_hud.setPublisher(&publishHudSurface);
+    // the HUD keeps the engine reference in one place (and the HUD free of `Session`). The session
+    // is read per call rather than captured: which engine session is attached changes per launch.
+    m_hud.setPublisher([this](SDL_Surface* surface) {
+        return publishHudSurface(m_session, surface);
+    });
 }
 
 SeatHubClient::~SeatHubClient()
@@ -359,6 +372,15 @@ SeatHubClient::~SeatHubClient()
     delete m_horizon;
     delete m_sessionChannel;
     delete m_teardown;
+
+    // Last, and only when no stream is running. `run()` blocks inside this thread's event loop, so
+    // a live session means this destructor is running *underneath* the engine's own frames - the
+    // object cannot be destroyed there. An engine still streaming at shutdown is released by the
+    // process, which is the only correct answer available at that point.
+    if (m_engineSession != nullptr && !m_session->active()) {
+        delete m_engineSession;
+        m_engineSession = nullptr;
+    }
 }
 
 bool SeatHubClient::inControlPlaneSession() const
@@ -408,6 +430,9 @@ void SeatHubClient::beginSession(const QString& sessionId)
 
     m_sessionId = sessionId;
     m_clientUuid.clear();
+    // A new session's teardown has not been asked for yet. Without this the second and later
+    // sessions in one run never tear down (defect F-9; `teardown_guard.h`).
+    m_teardownGuard.reset();
 
     // A new session clears the previous one's end reason: the home screen shows the outcome of
     // the session that just ended, never a stale one (audit E10).
@@ -535,8 +560,10 @@ void SeatHubClient::start()
     }
 
     // Play is the control plane's allocation (`POST /api/sessions`, D-35). Without an access
-    // token there is nothing to allocate with, so the Plan 03-02 tracer path runs instead -
-    // unchanged, and still the path a build with no control plane exercises.
+    // token there is nothing to allocate with, so there is nothing to stream: a stream is always
+    // the object of an allocated session. This used to run the Plan 03-02 tracer instead, which is
+    // how a build with no control plane produced a window and no stream; the lifecycle now refuses
+    // to start with no engine session attached and this reports the failure.
     if (!m_controlPlane->hasAccessToken()) {
         beginLocalAttempt();
         return;
@@ -867,9 +894,23 @@ void SeatHubClient::handleReadyForDeletion()
     // D-10/STREAM-10: disable -> remove -> verify, then leave no local state. This is the point
     // in the documented sequence where the server-side teardown runs: the SDL window has been
     // destroyed, so the stream that the rig is about to revoke no longer exists on this PC.
-    if (inControlPlaneSession() && m_teardown->stage() != TeardownStage::Done) {
+    //
+    // The guard is this facade's own per-session flag, reset in `beginSession()`, and not
+    // `TeardownController::stage()`. That stage is sticky - it reaches `Done` on the first
+    // teardown and is cleared only by `cancel()`, which only `signOut()` calls - so guarding on it
+    // ran teardown for the first session and silently skipped every session after it: no
+    // `POST /api/sessions/{id}/end`, no rig-side disable or unpair, no local clear, and no
+    // `teardownCompleted()`. The flag is also atomic, which removes the unsynchronised
+    // cross-thread read the security re-audit flagged on the same line (defect F-9).
+    if (inControlPlaneSession() && m_teardownGuard.markStarted()) {
         m_teardown->teardown(m_sessionId, m_clientUuid);
     }
+
+    // The engine session is finished with - the signal that arrived here was its own. Released
+    // now rather than after the teardown completes: teardown talks to the control plane and needs
+    // nothing from the engine object, and holding it until then would keep an engine `Session`
+    // alive across the whole teardown for no reason.
+    releaseEngineSession();
 
     // D-37 / D-14: the launch's negotiated results and its in-memory overrides are over. The
     // saved preferences were never touched, so the settings page goes back to showing them.
@@ -991,11 +1032,56 @@ void SeatHubClient::handlePairingCompleted(const QString& clientUuid)
     // needs it to verify the removal.
     m_clientUuid = clientUuid;
 
-    // Pairing is done, so the stream may start. This is the same lifecycle entry the tracer uses,
-    // which is what keeps the D-01/D-03 window sequence proven on the real path too.
+    // Pairing is done, so the stream may start. The engine session was attached by
+    // `handleHostResolved()`, which the seam emitted ahead of this; when it could not be built -
+    // a host that is not a paired record, or an application list that names no single application
+    // to launch - nothing is attached and `start()` fails closed here rather than starting a
+    // session against nothing. Before the Plan 03-06 fix this `start()` fell through to the 03-02
+    // tracer, which is how the client paired for real and then streamed a fake.
     if (!m_session->start(m_hostWindow)) {
         raiseFailure(SeatHubFailure::generic());
     }
+}
+
+void SeatHubClient::handleHostResolved(const PairedHostPtr& host)
+{
+    releaseEngineSession();
+    if (m_engineSession != nullptr) {
+        // A previous launch is still running. One lifecycle drives one session, so a second engine
+        // cannot be attached to it; the host is dropped and `handlePairingCompleted()` reports the
+        // failure rather than quietly streaming the old session under the new one's billing.
+        qCWarning(seathubClient) << "a session is still active; ignoring the paired host";
+        return;
+    }
+
+    MoonlightEngineSession* engine = MoonlightEngineSession::create(host);
+    if (engine == nullptr) {
+        // Fail closed. `MoonlightEngineSession::create()` logs which of the two reasons it was.
+        return;
+    }
+
+    m_engineSession = engine;
+    m_session->attachSession(engine);
+}
+
+void SeatHubClient::releaseEngineSession()
+{
+    if (m_engineSession == nullptr) {
+        return;
+    }
+
+    if (m_session->active()) {
+        // The engine is inside `run()` on this thread's event loop. Deleting the object under it
+        // would leave the next touch a use-after-free, so this refuses and the object is released
+        // by `handleReadyForDeletion()` instead.
+        qCWarning(seathubClient) << "engine session is still active; not releasing it";
+        return;
+    }
+
+    // Detach before destroying: the lifecycle must not be holding an object that is going away.
+    m_session->attachSession(nullptr);
+    m_engineSession->deleteLater();
+    m_engineSession = nullptr;
 }
 
 void SeatHubClient::handlePairingFailed(const SeatHubFailure& failure)
@@ -1006,6 +1092,20 @@ void SeatHubClient::handlePairingFailed(const SeatHubFailure& failure)
     raiseFailure(failure);
 }
 
+void SeatHubClient::handleAuthorizationGranted(const QString& qualityProfile)
+{
+    // D-37 / WR-05: the control plane's `quality_profile` becomes this launch's resolution and
+    // frame rate, in memory, leaving every saved preference untouched (D-12, STREAM-02). It is
+    // applied here - on authorization, ahead of pairing - so the override is in place before
+    // `handleConnectionStarted()` reports what the session actually settled on (D-14), and it is
+    // handed over here rather than in the controller so that the bridge keeps exactly one writer
+    // from the session path.
+    //
+    // The controller is the only object that sees the authorization; it puts this one field on the
+    // signal and keeps the rest, including `pairing_pin` (STREAM-03).
+    m_settings->applySessionOverride(qualityProfile);
+}
+
 void SeatHubClient::handleTeardownCompleted()
 {
     m_liveness->stop();
@@ -1014,6 +1114,10 @@ void SeatHubClient::handleTeardownCompleted()
 
     m_sessionId.clear();
     m_clientUuid.clear();
+    // The session's teardown claim goes with its id. The next `beginSession()` resets it anyway;
+    // clearing it here keeps "no session" and "no claim" the same state, which is what the guard
+    // documents.
+    m_teardownGuard.reset();
     m_billing.clear();
     m_sessionWarning.clear();
     emit billingChanged();

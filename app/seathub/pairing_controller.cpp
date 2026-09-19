@@ -161,7 +161,7 @@ void PairingController::handleAuthorization(const ControlPlaneResult& result)
         return;
     }
 
-    emit authorizationGranted();
+    emit authorizationGranted(authorization.qualityProfile);
 
     if (authorization.pairingPin.isEmpty()) {
         // `pairing_pin` is null until the host is ready to pair. Poll again rather than seating

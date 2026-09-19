@@ -1,47 +1,44 @@
 #pragma once
 
-// Owns the upstream streaming-engine seam (`app/streaming/session.h`) for SeatHub.
+// The one place a streaming engine's lifecycle becomes the client's view state.
 //
-// D-01/D-03/D-32: this is the single place that constructs, drives and destroys the
-// engine's `Session`, and the single place the engine's lifecycle signals are observed.
-// SeatHub's own signals carry the same names as the engine's, so `SessionSegue.qml`
-// has exactly one set of handlers no matter which path is live:
+// Plan 03-02 shipped this class with two paths: an "attached" one that drove a real engine
+// `Session` and a "tracer" one that ran a timed sequence when no engine session was attached. No
+// plan ever attached one, so the tracer - an expedient for proving the D-01/D-03 window sequence
+// with no Sunshine host - was in practice the only path a customer would have got. Plan 03-06's gap
+// closure removed the fallback: nothing attached means `start()` fails closed, and the tracer is
+// now an explicitly injected `EngineSession` (`stub_engine_session.h`) rather than a default.
 //
-//   attached path (Plan 03-03 and later)  engine Session -> connect -> re-emit below
-//   tracer path  (Plan 03-02 Task 1)     no engine Session -> emit below directly
+// What the class owns, and what it does not:
 //
-// Only one path is live at a time: `m_session != nullptr` selects the attached path, and
-// the tracer sequence refuses to start while a Session is attached.
+//   * It does NOT own the session. Whoever attaches one owns it and keeps it alive for at least as
+//     long as the lifecycle holds it - the same contract `Session::exec()` comes with upstream,
+//     where the allocating QML object is what releases it.
+//   * It does NOT know the engine type. `EngineSession` (`engine_session.h`) is the whole surface,
+//     which is what makes the signal wiring and the fail-closed start assertable in a test binary
+//     with no engine, no SDL and no host in it.
 //
-// The engine's files under `app/streaming/` are never modified to achieve this beyond
-// ADR-0046's window-title literal - the seam used here (`Session::exec(QWindow*)` plus the
-// engine's public lifecycle signals) is upstream's own, unaltered.
+// The D-01/D-03 window sequence is not implemented here - it is applied by `SessionSegue.qml`, on
+// the signals this class re-emits, exactly as upstream's QML applies it on the engine's own.
 
 #include <QObject>
 #include <QPointer>
 #include <QString>
-#include <QWindow>
 
-class QTimer;
-class Session;
+#include "engine_session.h"
+
+class QWindow;
+struct SDL_Surface;
 
 class SessionLifecycle : public QObject
 {
     Q_OBJECT
 
-    /// The engine Session currently attached, or null in the tracer's stubbed path.
+    /// The attached session, or null. `QObject*` rather than `EngineSession*` so QML can name it
+    /// without the seam type; `SessionSegue.qml` only ever connects to this object's signals.
     Q_PROPERTY(QObject* upstreamSession READ upstreamSession NOTIFY upstreamSessionChanged)
-
-    /// True from the moment a stream is driven until SDL destruction is complete.
+    /// True from `start()` until the session reports `readyForDeletion()`.
     Q_PROPERTY(bool active READ active NOTIFY activeChanged)
-
-    /// Display name used for the stream window title. In the attached path the engine
-    /// uses the real computer name; this is the tracer's stand-in.
-    Q_PROPERTY(QString rigName READ rigName WRITE setRigName NOTIFY rigNameChanged)
-
-    /// True while the tracer's stubbed sequence is driving the lifecycle instead of a
-    /// real engine Session. Plan 03-03 attaches a real Session and this becomes false.
-    Q_PROPERTY(bool stubbed READ stubbed NOTIFY stubbedChanged)
 
 public:
     explicit SessionLifecycle(QObject* parent = nullptr);
@@ -49,75 +46,56 @@ public:
 
     QObject* upstreamSession() const;
     bool active() const { return m_active; }
-    bool stubbed() const { return m_stubbed; }
-    QString rigName() const { return m_rigName; }
-    void setRigName(const QString& name);
 
-    /// Hands this lifecycle an engine Session created elsewhere (the C++ owner keeps
-    /// lifetime, exactly as upstream's AppModel/ComputerModel do). Connects the 7
-    /// engine signals and re-emits them under this object.
-    Q_INVOKABLE void attachSession(QObject* session);
+    /// Attach the session `start()` will drive. Pass null to detach.
+    ///
+    /// Deliberately not `Q_INVOKABLE`: the only caller is `SeatHubClient`, and a QML-reachable
+    /// setter for "the object that gets driven for the whole stream" is view-layer surface this
+    /// client has no reason to expose.
+    ///
+    /// The caller keeps ownership. Attaching while a session is active is refused: replacing the
+    /// object under a running `run()` would leave the old one driven by nothing.
+    void attachSession(EngineSession* session);
 
-    /// Owns the engine seam: drives the attached Session to completion, or runs the
-    /// tracer's stubbed sequence when none is attached (Plan 03-02 Task 1).
+    /// Hand the engine the Qt window and run the session.
+    ///
+    /// False when a session is already active, or when none is attached. The second case is the
+    /// point of the Plan 03-06 fix: this used to start the tracer instead, which meant every
+    /// customer got a fake stream. The caller reports a failure (which carries a reason, a retry
+    /// and a support reference, D-51) rather than substituting one.
     Q_INVOKABLE bool start(QWindow* window);
 
-    /// D-02: ends the active stream immediately, without touching any engine file.
-    /// Attached path: pushes the exact keystroke the engine already treats as "quit"
-    /// (Ctrl+Alt+Shift+Q -> SdlInputHandler::KeyComboQuit -> SDL_QUIT), which the
-    /// engine's own event loop then handles as a normal session end.
-    /// Tracer path: jumps the stubbed sequence straight to its teardown leg.
+    /// D-02: end the active stream now.
     Q_INVOKABLE void interrupt();
 
-signals:
-    void upstreamSessionChanged();
-    void activeChanged();
-    void rigNameChanged();
-    void stubbedChanged();
+    /// ADR-0045: composite the HUD bitmap into the running stream's own swapchain. False when
+    /// there is no session to composite into; see `EngineSession::publishOverlaySurface` for the
+    /// ownership contract, which holds in every case.
+    bool publishOverlaySurface(SDL_Surface* surface);
 
-    // --- SeatHub's lifecycle signals. Same names as the engine's, so one QML wiring
-    // --- serves both paths. See SessionSegue.qml for the visibility contract.
+signals:
+    // SeatHub's own copies of the engine's lifecycle signals, re-emitted so `SessionSegue.qml` has
+    // one wiring whether the session is the engine's or a test's.
     void stageStarting(QString stage);
     void stageFailed(QString stage, int errorCode, QString failingPorts);
     void connectionStarted();
     void displayLaunchError(QString text);
-    /// The engine's other public reporting seam: a setting it could not honour as saved
-    /// (`Session::emitLaunchWarning`, e.g. "Your host PC doesn't support HDR streaming"). Like
-    /// `displayLaunchError`, the text is engine wording and never reaches a screen; SeatHub's
-    /// settings page turns it into its own sentence beside the saved value (D-14, D-51).
     void displayLaunchWarning(QString text);
     void quitStarting();
     void sessionFinished(int portTestResult);
     void readyForDeletion();
 
-private slots:
-    void runStubStage(int step);
+    void activeChanged();
+    void upstreamSessionChanged();
 
 private:
     void connectEngineSignals();
     void disconnectEngineSignals();
 
-    /// True when the Qt window the engine (or the tracer) is streaming over is on screen.
-    /// Used by the lifecycle's own diagnostics, which is how the D-01/D-03 visibility
-    /// sequence is provable from a run's log rather than only from its source.
-    bool qtWindowVisible() const;
-    void beginStubSequence();
-    void createStubStreamWindow();
-    void destroyStubStreamWindow();
-    void finishStubSequence();
-    void stopStubSequence();
-
-    Session* m_session = nullptr;
+    EngineSession* m_session = nullptr;
+    /// `deleteLater()`d only to keep a queued connection from delivering into a destroyed object;
+    /// it never deletes the session itself.
     QPointer<QObject> m_sessionGuard;
-
     QWindow* m_qtWindow = nullptr;
     bool m_active = false;
-    bool m_stubbed = false;
-    QString m_rigName;
-
-    // Tracer-only state (Plan 03-02 Task 1; removed when Plan 03-03 attaches the engine).
-    QTimer* m_stubTimer = nullptr;
-    int m_stubStep = 0;
-    bool m_stubOwnsVideoSubsystem = false;
-    void* m_stubWindow = nullptr;   // SDL_Window*, kept void* so SDL.h stays out of the header
 };

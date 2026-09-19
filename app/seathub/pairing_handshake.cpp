@@ -3,10 +3,13 @@
 #include <QHostAddress>
 #include <QLoggingCategory>
 
+#include <memory>
+
 #include "backend/nvcomputer.h"
 #include "backend/nvhttp.h"
 #include "backend/nvpairingmanager.h"
 #include "backend/identitymanager.h"
+#include "moonlight_engine_session.h"
 
 Q_LOGGING_CATEGORY(seathubPairingHandshake, "seathub.pairing.handshake")
 
@@ -68,25 +71,39 @@ PairingHandshakeResult runUpstreamPairingHandshake(const PairingTarget& target)
         // (`app/backend/computermanager.cpp:821`). It reads `<HttpsPort>`, `<appversion>`, the
         // host `uniqueid`, the MAC and the pair state out of `serverInfo`, and pins
         // `activeAddress` to the address we handed it.
-        NvComputer computer(http, serverInfo);
+        //
+        // Heap-allocated and handed back in `result.host`, not a local: the engine streams from
+        // *this* record, so the pinned certificate and the host's own reported ports have to
+        // survive this function. Plan 03-03's version let it die at the closing brace, which left
+        // the engine with no host to build a session from - the gap Plan 03-06 closed.
+        std::shared_ptr<MoonlightPairedHost> host =
+            std::make_shared<MoonlightPairedHost>(http, serverInfo);
+        NvComputer& computer = *host->computer();
 
         // Step 4: upstream's five-phase handshake with the control-plane PIN (ADR-0034). The
-        // pinned server certificate it produces - upstream's own MITM protection, originally
-        // written to `QSettings` by `ComputerManager::saveHost()` - stays in this scope. STREAM-10:
-        // this client stores no pairing of its own, and the engine builds its own host record when
-        // the stream starts.
+        // pinned server certificate it produces is upstream's own MITM protection, which
+        // `ComputerManager::saveHost()` writes to `QSettings`. Nothing is written here: STREAM-10
+        // keeps this client storing no pairing of its own, so the pin lives on `host` - in memory,
+        // for the life of the session - and never on disk.
         NvPairingManager pairingManager(&computer);
         QSslCertificate pinnedCertificate;
         const NvPairingManager::PairState state =
             pairingManager.pair(computer.appVersion, target.pairingPin, pinnedCertificate);
 
         if (state == NvPairingManager::PAIRED) {
-            computer.serverCert = pinnedCertificate; // in memory, for this handshake only
+            host->pinCertificate(pinnedCertificate.toPem());
+
+            // The rig's own application list, read here on the pool thread so no frame of the Qt
+            // main thread's work waits on it. A failure is recorded rather than raised: pairing
+            // succeeded, and the caller fails closed at `launchApp()` instead of streaming an
+            // application it cannot name.
+            host->fetchAppList();
 
             // The identity the host side can match to this client: Sunshine stores the client
             // certificate and compares it at TLS time, so its SHA-256 is the pairable handle.
             result.clientIdentity =
                 clientCertificateFingerprint(IdentityManager::get()->getCertificate());
+            result.host = host;
             result.engineError.clear();
             result.ok = true;
             return result;
