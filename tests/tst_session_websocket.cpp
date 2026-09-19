@@ -99,9 +99,26 @@ private slots:
     void reconnectDelay_neverExceedsTheCap()
     {
         for (int attempt = 0; attempt < 64; ++attempt) {
-            QVERIFY(SessionWebSocket::reconnectDelayMs(attempt)
-                    <= SessionWebSocket::kMaxReconnectDelayMs);
+            const int delay = SessionWebSocket::reconnectDelayMs(attempt);
+            // Positive, not merely "not greater than the cap". ME-05 was a *negative* delay:
+            // `1000 * (1 << attempt)` overflowed `int` from attempt 22, wrapped, and a negative
+            // interval is refused by QTimer - so the channel was permanently dead after roughly
+            // nine minutes offline while the state still said "reconnecting".
+            QVERIFY2(delay > 0,
+                     qPrintable(QStringLiteral("attempt %1 produced %2").arg(attempt).arg(delay)));
+            QVERIFY(delay <= SessionWebSocket::kMaxReconnectDelayMs);
         }
+    }
+
+    void reconnectDelay_isCappedBeforeTheShiftCanOverflow()
+    {
+        // The attempts the old guard at 30 let through: 1000 * (1 << 22) is already past INT_MAX.
+        QCOMPARE(SessionWebSocket::reconnectDelayMs(21), 30000);
+        QCOMPARE(SessionWebSocket::reconnectDelayMs(22), 30000);
+        QCOMPARE(SessionWebSocket::reconnectDelayMs(23), 30000);
+        QCOMPARE(SessionWebSocket::reconnectDelayMs(30), 30000);
+        QCOMPARE(SessionWebSocket::reconnectDelayMs(31), 30000);
+        QCOMPARE(SessionWebSocket::reconnectDelayMs(63), 30000);
     }
 
     // --- routing ----------------------------------------------------------------------------

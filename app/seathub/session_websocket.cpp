@@ -111,10 +111,17 @@ int SessionWebSocket::reconnectDelayMs(int attempt)
     if (attempt < 0) {
         attempt = 0;
     }
-    if (attempt >= 30) {
-        // 1 << 30 already overflows int; the cap is reached long before this.
+
+    // ME-05: clamp the *shift*, not just the product. `1000 * (1 << attempt)` is already past
+    // `INT_MAX` at attempt 22 and shifts into the sign bit from attempt 31, so the old guard at
+    // 30 was eight attempts too late: from attempt 22 the delay wrapped negative, `QTimer`
+    // refused a negative interval, and the channel was permanently dead after roughly nine
+    // minutes offline (`scheduleReconnect()` had already set the state to "reconnecting").
+    // The cap is reached at attempt 5, so no higher shift can change the answer.
+    if (attempt >= 5) {
         return kMaxReconnectDelayMs;
     }
+
     const int delay = 1000 * (1 << attempt);
     return delay > kMaxReconnectDelayMs ? kMaxReconnectDelayMs : delay;
 }
