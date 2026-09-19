@@ -207,6 +207,7 @@ SOURCES += \
     seathub/settings_bridge.cpp \
     seathub/update_feed_client.cpp \
     seathub/error_map.cpp \
+    seathub/agent_config.cpp \
     seathub/hud_overlay.cpp \
     seathub/control_plane_client.cpp \
     seathub/token_store.cpp \
@@ -258,6 +259,7 @@ HEADERS += \
     seathub/update_feed_client.h \
     seathub/seathub_version.h \
     seathub/error_map.h \
+    seathub/agent_config.h \
     seathub/hud_overlay.h \
     seathub/control_plane_client.h \
     seathub/token_store.h \

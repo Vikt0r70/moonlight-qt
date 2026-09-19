@@ -10,6 +10,7 @@
         <file>gui/SeatHubOTPField.qml</file>
         <file>gui/SeatHubButton.qml</file>
         <file>gui/SeatHubStepper.qml</file>
+        <file>gui/AgentConfigPanel.qml</file>
         <file>gui/SettingsPage.qml</file>
         <file>gui/SeatHubToggle.qml</file>
         <file>gui/SeatHubSelect.qml</file>

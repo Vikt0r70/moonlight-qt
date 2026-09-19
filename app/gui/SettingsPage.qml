@@ -627,6 +627,15 @@ Item {
                         description: qsTr("No language toggle in this build (ADR-0043). Arabic wording renders in the same layout.")
                     }
 
+                    // ------------------------------------------------- host agent config file
+                    // The file the Node Agent writes on the rental PC. Read-only on our side:
+                    // the path and the masked token are shown so support can confirm which
+                    // installation the customer is pointing at.
+                    AgentConfigPanel {
+                        width: parent.width
+                        client: page.client
+                    }
+
                     // ------------------------------------------------- settings SeatHub owns
                     // D-47: keys SeatHub manages itself are disclosed here with the reason
                     // rather than hidden, so the settings audit stays checkable on screen.
