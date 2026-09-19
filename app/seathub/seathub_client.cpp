@@ -7,6 +7,11 @@
 #include "settings_bridge.h"
 #include "update_feed_client.h"
 
+// The production pairing handshake. Included here and nowhere else: it is the only translation
+// unit that reaches into `app/backend/`, which is how `app/seathub/` stays free of upstream
+// includes (and how the seam stays testable with no engine in the test binary).
+#include "pairing_handshake.h"
+
 // Only this translation unit needs the engine type: the HUD's publisher below is the one place
 // that reaches `Session::get()`, which is what keeps `app/seathub/hud_overlay.*` free of the
 // engine and linkable into a test with no engine in it.
@@ -135,13 +140,16 @@ SeatHubClient::SeatHubClient(QObject* parent)
       m_session(new SessionLifecycle(this)),
       m_settings(new SettingsBridge(this)),
       m_updates(new UpdateFeedClient(this)),
-      // No parent on these four: `moveToThread()` refuses an object that has one, and they have
+      // No parent on these six: `moveToThread()` refuses an object that has one, and they have
       // to leave the Qt main thread before a stream starts (see `startNetworkThreads`). The
       // destructor owns them instead.
       m_controlPlane(new ControlPlaneClient(nullptr)),
       m_tokenStore(new TokenStore(this)),
       m_sessionChannel(new SessionWebSocket(nullptr)),
-      m_pairing(new PairingController(this)),
+      // `m_pairing` has to travel with the seam and its poll timer: a `QTimer` fires only on the
+      // thread its object lives on, and the main thread is suspended for the whole stream.
+      m_pairing(new PairingController(nullptr)),
+      m_pairingSeam(new ProductionPairingSeam(nullptr)),
       m_teardown(new TeardownController(this)),
       m_liveness(new LivenessTimer(nullptr)),
       m_horizon(new AuthorizedThroughTimer(nullptr))
@@ -160,6 +168,10 @@ SeatHubClient::SeatHubClient(QObject* parent)
     // One object owns each safety-critical sequence, and the facade owns the objects. The
     // connection topology is deliberately a fan-in to the facade: QML sees typed state
     // (`appState`, `stageText`, `failure`) and never a frame, a header or a token (D-35).
+    // The seam gets upstream's real handshake; without it `PairingController` fails closed, which
+    // is the state 03-03 shipped and the gap this wiring closes.
+    m_pairingSeam->setHandshake(&runUpstreamPairingHandshake);
+    m_pairing->setSeam(m_pairingSeam);
     m_pairing->setControlPlane(m_controlPlane);
     m_teardown->setControlPlane(m_controlPlane);
     m_teardown->setTokenStore(m_tokenStore);
@@ -198,10 +210,21 @@ SeatHubClient::SeatHubClient(QObject* parent)
 SeatHubClient::~SeatHubClient()
 {
     // Order matters: stop the thread first so nothing can call back in, then destroy what lived
-    // on it.
+    // on it. The two pairing objects are moved home before they are deleted because Qt refuses to
+    // stop a live timer from a foreign thread, and both of them own one.
     if (m_controlPlane != nullptr) {
         m_controlPlane->stopOwnedThread();
     }
+    if (m_pairingSeam != nullptr) {
+        m_pairingSeam->moveToThread(QThread::currentThread());
+    }
+    if (m_pairing != nullptr) {
+        m_pairing->moveToThread(QThread::currentThread());
+    }
+    // The seam first: it holds the completion callback into the controller, so destroying it
+    // first means no handshake result can be delivered to a half-destroyed controller.
+    delete m_pairingSeam;
+    delete m_pairing;
     delete m_liveness;
     delete m_horizon;
     delete m_sessionChannel;
@@ -232,6 +255,11 @@ void SeatHubClient::startNetworkThreads()
     m_liveness->moveToThread(networkThread);
     m_horizon->moveToThread(networkThread);
     m_sessionChannel->moveToThread(networkThread);
+
+    // The seam's handshake blocks - upstream's first pairing request is issued with no client-side
+    // timeout at all - so it runs on a pool thread and only its deadline timer lives here.
+    m_pairingSeam->moveToThread(networkThread);
+    m_pairing->moveToThread(networkThread);
 }
 
 void SeatHubClient::beginSession(const QString& sessionId)
@@ -256,7 +284,9 @@ void SeatHubClient::beginSession(const QString& sessionId)
     // protocol requires.
     m_sessionChannel->setBaseUrl(m_controlPlane->baseUrl());
     m_sessionChannel->open(sessionId);
-    m_pairing->start(sessionId);
+    // Marshalled, not called: the controller and its poll timer now live on the network thread,
+    // and its authorization callbacks come back there too.
+    onClientThread(m_pairing, [this, sessionId]() { m_pairing->start(sessionId); });
 }
 
 QString SeatHubClient::reference() const
@@ -439,7 +469,7 @@ void SeatHubClient::signOut()
     m_sessionChannel->close();
     m_liveness->stop();
     m_horizon->disarm();
-    m_pairing->cancel();
+    onClientThread(m_pairing, [this]() { m_pairing->cancel(); });
     m_teardown->cancel();
     m_tokenStore->clearAll();
 

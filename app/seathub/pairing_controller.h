@@ -29,15 +29,21 @@ struct PairingTarget {
 
 // The engine's pairing entry point, as this controller needs it.
 //
-// It is an interface rather than a call into `app/backend/computermanager.h` so the controller
-// can be tested with no engine, no host and no Sunshine: the protocol, the deadline and the
-// fail-closed rules are what this plan delivers, and all three are assertable against a fake.
+// It is an interface rather than a call into `app/backend/` so the controller can be tested with
+// no engine, no host and no Sunshine: the protocol, the deadline and the fail-closed rules are
+// what this plan delivers, and all three are assertable against a fake.
 //
 // Upstream owns the cryptography. `03-RESEARCH.md` §Pairing sequence step 3: "reuse upstream
 // Moonlight pairing crypto; do not reimplement salt/certificate/AES handshake logic in SeatHub".
-// A real implementation calls `ComputerManager::pairHost(NvComputer*, QString)` - a public
-// method on an existing upstream class, so reaching it edits no upstream file and the D-28 diff
-// gate is untouched.
+//
+// The production implementation is `ProductionPairingSeam` (`app/seathub/pairing_seam.h`), which
+// drives upstream's `NvPairingManager` against the address the control plane supplied
+// (`app/seathub/pairing_handshake.cpp`). 03-03 expected this interface to be filled by
+// `ComputerManager::pairHost()`, and it cannot be: that path reports its result as
+// `pairingCompleted(NvComputer*, QString error)` (`app/backend/computermanager.h:251`) with no
+// client identity anywhere in the signal, so it cannot satisfy the fail-closed rule the
+// contract below is built on. Both `pairHost` and `NvPairingManager` are public upstream API -
+// no upstream file is edited either way.
 class PairingSeam
 {
 public:
@@ -45,8 +51,10 @@ public:
 
     /// Start upstream's pairing handshake against `target.hostAddress` using `target.pairingPin`.
     ///
-    /// Calls `done` exactly once: `ok` true with the paired client UUID, or `ok` false with the
-    /// engine's own failure text, which is diagnostic only and is never rendered (D-51).
+    /// Calls `done` exactly once: `ok` true with the identity the client reports about itself -
+    /// see `pairing_seam.h` for why that is this client's certificate fingerprint and not the
+    /// Sunshine-assigned UUID, which no route available to this process returns - or `ok` false
+    /// with the engine's own failure text, which is diagnostic only and is never rendered (D-51).
     virtual void pair(const PairingTarget& target,
                       std::function<void(bool ok, const QString& clientUuid,
                                          const QString& engineError)> done) = 0;
@@ -106,8 +114,10 @@ signals:
     /// The control plane granted the session. Carries no PIN and no token: the view has no use
     /// for either.
     void authorizationGranted();
-    /// Pairing finished; `clientUuid` is the exact Sunshine client UUID, which teardown needs
-    /// and which is the only thing that ever identifies this client (Pitfall 3, D-07).
+    /// Pairing finished; `clientUuid` is the identity this client reports about itself - the
+    /// SHA-256 of its own certificate, the value a host-side reader of Sunshine's client list can
+    /// match to this client's pairing record. It is the only thing that ever identifies this
+    /// client (Pitfall 3, D-07); see `pairing_seam.h` for the full statement.
     void pairingCompleted(const QString& clientUuid);
     /// Pairing failed closed. Always a SeatHub failure, never engine text in `error`.
     void pairingFailed(const SeatHubFailure& failure);

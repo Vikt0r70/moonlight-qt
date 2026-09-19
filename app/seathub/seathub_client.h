@@ -24,6 +24,7 @@
 #include "hud_overlay.h"
 #include "liveness_timer.h"
 #include "pairing_controller.h"
+#include "pairing_seam.h"
 #include "session_lifecycle.h"
 #include "session_websocket.h"
 // Included rather than forward-declared: moc needs complete types for the `SettingsBridge*` and
@@ -230,6 +231,10 @@ private:
     TokenStore* m_tokenStore = nullptr;
     SessionWebSocket* m_sessionChannel = nullptr;
     PairingController* m_pairing = nullptr;
+    /// The production pairing seam (the gap 03-03 left open). Owned here, moved to the network
+    /// thread with the controller it serves, and never exposed: it is the only object in the
+    /// process that ever holds the PIN, and it holds it only for the length of one handshake.
+    ProductionPairingSeam* m_pairingSeam = nullptr;
     TeardownController* m_teardown = nullptr;
 
     // D-31/D-34 and D-33. Both must outlive the stream and neither is a Q_PROPERTY: the UI has
@@ -239,8 +244,11 @@ private:
 
     /// The session the real control-plane path is running, or empty on the tracer path.
     QString m_sessionId;
-    /// The Sunshine client UUID pairing returned. The only thing that identifies this client;
-    /// never the rig's name, address or index (Pitfall 3, D-07).
+    /// What pairing returned about this client: the SHA-256 fingerprint of its own certificate,
+    /// which is the identity a host-side reader of Sunshine's client list can match to this
+    /// client's record. It is the only thing that identifies this client - never the rig's name,
+    /// address or index (Pitfall 3, D-07). The Sunshine-assigned UUID is a different value and
+    /// this process cannot read it (see `pairing_seam.h`).
     QString m_clientUuid;
     QVariantMap m_billing;
     QString m_sessionWarning;

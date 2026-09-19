@@ -212,6 +212,8 @@ SOURCES += \
     seathub/token_store.cpp \
     seathub/session_websocket.cpp \
     seathub/pairing_controller.cpp \
+    seathub/pairing_seam.cpp \
+    seathub/pairing_handshake.cpp \
     seathub/teardown_controller.cpp \
     seathub/liveness_timer.cpp \
     seathub/authorized_through_timer.cpp \
@@ -261,6 +263,8 @@ HEADERS += \
     seathub/token_store.h \
     seathub/session_websocket.h \
     seathub/pairing_controller.h \
+    seathub/pairing_seam.h \
+    seathub/pairing_handshake.h \
     seathub/teardown_controller.h \
     seathub/liveness_timer.h \
     seathub/authorized_through_timer.h \

@@ -15,15 +15,18 @@
 #include <QtTest>
 #include <QBuffer>
 #include <QElapsedTimer>
+#include <QFile>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QNetworkAccessManager>
 #include <QNetworkReply>
 #include <QNetworkRequest>
+#include <QSemaphore>
 #include <QSignalSpy>
 #include <QTimer>
 
 #include "seathub/pairing_controller.h"
+#include "seathub/pairing_seam.h"
 
 namespace {
 
@@ -148,6 +151,51 @@ ControlPlaneClient* wire(PairingController& controller, FakeNetworkAccessManager
     client->setNetworkAccessManager(fake);
     controller.setControlPlane(client);
     return client;
+}
+
+// ---------------------------------------------------------------------------------------------
+// The production seam. Its handshake is the one part of silent pairing that cannot run here - it
+// needs a Sunshine host - so these tests fake the handshake and hold the seam's own contract: the
+// deadline, the exactly-once rule, the fail-closed branches, and the PIN's confinement.
+// ---------------------------------------------------------------------------------------------
+
+PairingTarget pairingTarget()
+{
+    PairingTarget target;
+    target.sessionId = QString::fromLatin1(kSessionId);
+    target.hostAddress = QStringLiteral("203.0.113.7");
+    target.httpsPort = 47984;
+    target.pairingPin = QString::fromLatin1(kPin);
+    return target;
+}
+
+PairingHandshakeResult handshakeResult(bool ok, const QString& identity,
+                                       const QString& diagnostic = QString())
+{
+    PairingHandshakeResult result;
+    result.ok = ok;
+    result.clientIdentity = identity;
+    result.engineError = diagnostic;
+    return result;
+}
+
+/// Everything the seam said, in the order it said it.
+struct SeamReport
+{
+    QVector<bool> outcomes;
+    QVector<QString> identities;
+    QVector<QString> diagnostics;
+
+    int count() const { return outcomes.size(); }
+};
+
+std::function<void(bool, const QString&, const QString&)> recordInto(SeamReport* report)
+{
+    return [report](bool ok, const QString& identity, const QString& diagnostic) {
+        report->outcomes.append(ok);
+        report->identities.append(identity);
+        report->diagnostics.append(diagnostic);
+    };
 }
 
 } // namespace
@@ -441,6 +489,189 @@ private slots:
         QSignalSpy failed(&controller, &PairingController::pairingFailed);
         controller.start(QString());
         QCOMPARE(failed.count(), 1);
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // The production seam (`app/seathub/pairing_seam.{h,cpp}`, Plan 03-03 gap closure).
+    // -----------------------------------------------------------------------------------------
+
+    void seam_reportsThePairedIdentityToItsCaller()
+    {
+        ProductionPairingSeam seam;
+        seam.setHandshake([](const PairingTarget&) {
+            return handshakeResult(true, QStringLiteral("ca13d3dd610947684e95760011340f214bc8fdb1cc6b93c31d7f3f13d8caf9b0"));
+        });
+
+        SeamReport report;
+        seam.pair(pairingTarget(), recordInto(&report));
+        QTRY_COMPARE(report.count(), 1);
+
+        QCOMPARE(report.outcomes.first(), true);
+        QCOMPARE(report.identities.first(),
+                 QStringLiteral("ca13d3dd610947684e95760011340f214bc8fdb1cc6b93c31d7f3f13d8caf9b0"));
+        QVERIFY(report.diagnostics.first().isEmpty());
+    }
+
+    void seam_thePinReachesTheHandshakeAndNothingElseReportsIt()
+    {
+        ProductionPairingSeam seam;
+        QString pinSeenByTheHandshake;
+        seam.setHandshake([&pinSeenByTheHandshake](const PairingTarget& target) {
+            pinSeenByTheHandshake = target.pairingPin;
+            return handshakeResult(true, QStringLiteral("aa"));
+        });
+
+        SeamReport report;
+        seam.pair(pairingTarget(), recordInto(&report));
+        QTRY_COMPARE(report.count(), 1);
+
+        // The handshake is the only holder, and the PIN is not on the way back out - not in the
+        // identity, not in the diagnostic, which is the value the controller keeps for support.
+        QCOMPARE(pinSeenByTheHandshake, QString::fromLatin1(kPin));
+        QVERIFY(!report.identities.first().contains(QLatin1String(kPin)));
+        QVERIFY(!report.diagnostics.first().contains(QLatin1String(kPin)));
+    }
+
+    void seam_deadline_failsClosedAndSpeaksOnce()
+    {
+        ProductionPairingSeam seam;
+        seam.setDeadlineMs(50);
+
+        // A handshake that does not come back inside the deadline. This is not a contrivance: the
+        // first upstream pairing request is issued with no client-side timeout at all
+        // (`app/backend/nvpairingmanager.cpp:237` passes 0), so it blocks until the host side
+        // answers - up to Sunshine's five-minute pending-session lifetime.
+        QSemaphore release;
+        seam.setHandshake([&release](const PairingTarget&) {
+            release.acquire();
+            return handshakeResult(true, QStringLiteral("late"));
+        });
+
+        SeamReport report;
+        seam.pair(pairingTarget(), recordInto(&report));
+        QTRY_VERIFY_WITH_TIMEOUT(report.count() == 1, 5000);
+
+        QCOMPARE(report.outcomes.first(), false);
+        QVERIFY(report.identities.first().isEmpty());
+        QVERIFY(!report.diagnostics.first().isEmpty());
+
+        // The handshake finally returns. It does not get a second word: `done` is called exactly
+        // once per `pair()`.
+        release.release();
+        QTest::qWait(150);
+        QCOMPARE(report.count(), 1);
+    }
+
+    void seam_withoutAHandshake_failsClosed()
+    {
+        ProductionPairingSeam seam;
+        // No handshake installed - the state 03-03 shipped.
+
+        SeamReport report;
+        seam.pair(pairingTarget(), recordInto(&report));
+
+        QCOMPARE(report.count(), 1);
+        QCOMPARE(report.outcomes.first(), false);
+        QVERIFY(report.identities.first().isEmpty());
+    }
+
+    void seam_successWithoutAnIdentity_isNotSuccess()
+    {
+        ProductionPairingSeam seam;
+        seam.setHandshake([](const PairingTarget&) {
+            // `ok` with nothing that identifies the client: there is no way to verify a teardown
+            // against it, so it cannot be reported as a pairing (fail closed, Pitfall 3).
+            return handshakeResult(true, QString());
+        });
+
+        SeamReport report;
+        seam.pair(pairingTarget(), recordInto(&report));
+        QTRY_COMPARE(report.count(), 1);
+
+        QCOMPARE(report.outcomes.first(), false);
+        QVERIFY(report.identities.first().isEmpty());
+    }
+
+    void seam_incompleteTarget_neverStartsAHandshake()
+    {
+        ProductionPairingSeam seam;
+        int handshakes = 0;
+        seam.setHandshake([&handshakes](const PairingTarget&) {
+            ++handshakes;
+            return handshakeResult(true, QStringLiteral("aa"));
+        });
+
+        PairingTarget noAddress = pairingTarget();
+        noAddress.hostAddress.clear();
+        SeamReport addressReport;
+        seam.pair(noAddress, recordInto(&addressReport));
+        QCOMPARE(addressReport.count(), 1);
+        QCOMPARE(addressReport.outcomes.first(), false);
+
+        PairingTarget noPin = pairingTarget();
+        noPin.pairingPin.clear();
+        SeamReport pinReport;
+        seam.pair(noPin, recordInto(&pinReport));
+        QCOMPARE(pinReport.count(), 1);
+        QCOMPARE(pinReport.outcomes.first(), false);
+
+        QCOMPARE(handshakes, 0);
+    }
+
+    void seam_secondCallWhileOneIsInFlight_isRefused()
+    {
+        ProductionPairingSeam seam;
+        QSemaphore release;
+        int handshakes = 0;
+        seam.setHandshake([&release, &handshakes](const PairingTarget&) {
+            ++handshakes;
+            release.acquire();
+            return handshakeResult(true, QStringLiteral("aa"));
+        });
+
+        SeamReport first;
+        SeamReport second;
+        seam.pair(pairingTarget(), recordInto(&first));
+
+        // The handshake starts on a pool thread, so wait until it is actually inside it before
+        // the second call - that is the state the refusal is about.
+        QTRY_COMPARE(handshakes, 1);
+        seam.pair(pairingTarget(), recordInto(&second));
+
+        // One handshake at a time: two against the same rig would collide host-side and leave the
+        // caller holding two results for one session.
+        QCOMPARE(handshakes, 1);
+        QCOMPARE(second.count(), 1);
+        QCOMPARE(second.outcomes.first(), false);
+        QVERIFY(second.identities.first().isEmpty());
+
+        release.release();
+        QTRY_COMPARE(first.count(), 1);
+        QCOMPARE(first.outcomes.first(), true);
+    }
+
+    void fingerprint_ofACertificate_isItsSha256Hex()
+    {
+        // The fixture is a throwaway self-signed certificate generated for this test; only its
+        // public half is stored next to the test source. Expected value: SHA-256 over its DER.
+        const QString path = QFINDTESTDATA("fixtures/seathub-client-cert.pem");
+        QVERIFY2(!path.isEmpty(), "the certificate fixture was not found next to the test source");
+
+        QFile file(path);
+        QVERIFY(file.open(QIODevice::ReadOnly));
+        QCOMPARE(clientCertificateFingerprint(file.readAll()),
+                 QStringLiteral("ca13d3dd610947684e95760011340f214bc8fdb1cc6b93c31d7f3f13d8caf9b0"));
+    }
+
+    void fingerprint_ofAnUnreadablePem_isEmpty()
+    {
+        // No identity is ever invented: an unreadable certificate produces nothing, and the seam
+        // turns that into a failure rather than a success with no handle on it.
+        QVERIFY(clientCertificateFingerprint(QByteArray()).isEmpty());
+        QVERIFY(clientCertificateFingerprint(QByteArray("not a certificate")).isEmpty());
+        QVERIFY(clientCertificateFingerprint(
+                    QByteArray("-----BEGIN CERTIFICATE-----\nnope\n-----END CERTIFICATE-----\n"))
+                    .isEmpty());
     }
 };
 
