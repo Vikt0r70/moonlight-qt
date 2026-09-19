@@ -15,6 +15,7 @@
 
 #include <QObject>
 #include <QString>
+#include <QUrl>
 #include <QVariantMap>
 #include <QWindow>
 
@@ -176,6 +177,16 @@ public:
     /// The access token must already have been set on the control-plane client by a successful
     /// sign-in. Nothing here reads it, returns it, or logs it.
     Q_INVOKABLE void beginSession(const QString& sessionId);
+
+    /// Reads the host agent's config file the customer picked (the file the Node Agent writes,
+    /// `%ProgramData%\SeatHub\node-agent.json`) and reports what may be shown: the file's absolute
+    /// path and the agent token in masked form.
+    ///
+    /// The token itself never crosses this boundary - see `agent_config.h`. A file that is missing,
+    /// unreadable or carries no token is reported as an ordinary value (`ok: false`) and logged for
+    /// support; it is never raised as a session failure, because the customer chose the file and
+    /// nothing about the session depends on it.
+    Q_INVOKABLE QVariantMap readAgentConfigFile(const QUrl& fileUrl);
 
     /// The DPAPI-backed credential store. Exposed for teardown's benefit and for `signOut()`;
     /// its contents are never a property.

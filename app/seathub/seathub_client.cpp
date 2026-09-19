@@ -3,6 +3,7 @@
 #include <QLoggingCategory>
 #include <QWindow>
 
+#include "agent_config.h"
 #include "session_lifecycle.h"
 #include "settings_bridge.h"
 #include "update_feed_client.h"
@@ -724,6 +725,19 @@ void SeatHubClient::verifyOtp(const QString& phoneE164, const QString& code)
             setAppState(QString::fromLatin1(kStateHome));
         });
     });
+}
+
+QVariantMap SeatHubClient::readAgentConfigFile(const QUrl& fileUrl)
+{
+    const QVariantMap described = AgentConfig::describe(fileUrl);
+
+    // The path and whether a token was found are support facts. The token is not - it is not in
+    // `described` and it is not logged here either.
+    qCInfo(seathubClient) << "agent config file" << described.value(QStringLiteral("path")).toString()
+                          << "token found" << described.value(QStringLiteral("ok")).toBool()
+                          << described.value(QStringLiteral("error")).toString();
+
+    return described;
 }
 
 void SeatHubClient::signOut()
