@@ -5,3 +5,9 @@
 build/
 config.tests/*/.qmake.stash
 config.tests/*/Makefile
+
+# Staged installer payload and generated installer inputs. scripts\build-seathub.ps1 writes these
+# from the deploy folder every run; they are build output, not sources.
+installer/packages/*/data/
+installer/packages/*/meta/license.txt
+installer/config/seathub.ico

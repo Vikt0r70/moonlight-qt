@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Release feed entry for auto-update (D-38).
+
+  READ THIS BEFORE USING THIS FILE AS AN UPDATE SOURCE: it is not one. D-38 rejects the IFW
+  Updates.xml repository as SeatHub's update mechanism, deliberately, so that there is exactly one
+  source of truth for what is current. The one source of truth is the control plane's public feed:
+
+      GET https://api-sevenhills.damra.co/api/releases/client   ->  Release (ADR-0026, ADR-0041)
+
+  which UpdateFeedClient (app/seathub/update_feed_client.cpp) reads on launch, verifies the
+  downloaded package against its SHA-256 (D-43), and only then runs.
+
+  This file is the *build-time record* of the feed entry a release publishes. Since the frozen
+  Release schema carries no digest field (its only integrity field, signature, stays null per
+  D-43), the digest below is the value that also lives in seathub-ops/pins.yaml, and pins.yaml is
+  what the client's pinned checksum comes from. The two must agree: a release whose recorded
+  sha256 differs from the published artifact is not a release.
+
+  The <ReleaseFeed> element is local to this record and is not part of any IFW schema; IFW reads
+  package.xml, never meta/Updates.xml, for an offline install.
+-->
+<Updates>
+    <ReleaseFeed>
+        <App>client</App>
+        <Platform>windows-x86_64</Platform>
+        <Version>0.1.0</Version>
+        <Build>1</Build>
+        <!-- The URL is not known until publish. D-39/D-40: the operator uploads the package to
+             POST /api/admin/releases, the control plane writes it to the versioned releases
+             directory and records the app_releases row, and the row's url column is what the feed
+             answers with. Nothing here may guess that host. -->
+        <Url>assigned by the control plane on publish</Url>
+        <Sha256>c00485a9ac77b0d22f07c3d90aab84f28d5ba026d8c3b55a96867cc1a026170c</Sha256>
+        <Notes>Phase 3 client: control-plane sessions, silent pairing, in-session HUD.</Notes>
+    </ReleaseFeed>
+</Updates>
+
+
+

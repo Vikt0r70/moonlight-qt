@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  SeatHub installer configuration (D-15, D-16, D-42).
+
+  Verified against the IFW 4.7 manual installed at
+  C:\Qt\Tools\QtInstallerFramework\4.7\doc\html\ifw-globalconfig.html. Every element below is in
+  that page's "Summary of Configuration File Elements" table; nothing here was guessed.
+
+  TargetDir   @RootDir@ is a documented predefined variable (the drive IFW is installed on). The
+              composed path is C:/Program Files/SeatHub, which is the per-machine location D-42
+              requires: updates therefore elevate through UAC instead of silently writing a
+              per-user copy.
+  Version     SeatHub's own version (D-46), the same string app/seathub/seathub_version.h
+              compiles in as SEATHUB_VERSION and the release feed's rows are compared against.
+              The upstream moonlight-qt pin is recorded separately in seathub-ops/pins.yaml and
+              this number never implies parity with it.
+  No repository is configured: D-38 rejects the IFW Updates.xml repository as the update
+              mechanism, so the Maintenance Tool can only repair or remove what is already
+              installed. Updates arrive through the JSON feed (GET /api/releases/client).
+  No signing: the package is unsigned (D-43). SmartScreen will warn once; that is accepted.
+-->
+<Installer>
+    <Name>SeatHub</Name>
+    <Version>0.1.0</Version>
+    <Title>SeatHub Setup</Title>
+    <Publisher>Seven Hills</Publisher>
+    <StartMenuDir>SeatHub</StartMenuDir>
+    <TargetDir>@RootDir@/Program Files/SeatHub</TargetDir>
+    <MaintenanceToolName>SeatHubMaintenanceTool</MaintenanceToolName>
+    <InstallerApplicationIcon>seathub</InstallerApplicationIcon>
+    <RunProgram>@TargetDir@/SeatHub.exe</RunProgram>
+    <RunProgramDescription>Launch SeatHub</RunProgramDescription>
+</Installer>

@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  The single SeatHub component (D-15: one application containing the streaming engine, shipped and
+  updated as a whole).
+
+  Verified against the IFW 4.7 manual:
+  - ifw-component-description.html: the package *directory* name is the identifier and must not
+    contain ':' or '-', which is why the directory is install/packages/com.seathub.client and not
+    com.seathub.client-0.1.0. Elements below (DisplayName, Description, Version, ReleaseDate,
+    Licenses, Default, Script, RequiresAdminRights) are all listed on that page.
+  - RequiresAdminRights (D-42): the documented way to say the package needs elevated permissions.
+    That is what makes the per-machine Program Files install work and what makes an update raise
+    the UAC prompt the forced-update flow expects.
+  - Licenses/License: the file named here is shown on the installer's license page. The file
+    itself is assembled by scripts/build-seathub.bat from GPL-3.0.txt and installer/WRITTEN-OFFER.txt
+    so the customer reads the licence *and* the corresponding-source offer in the same step
+    (Pitfall 9: the licence file alone is not GPL compliance).
+-->
+<Package>
+    <DisplayName>SeatHub</DisplayName>
+    <Description>SeatHub streaming client. Installs the SeatHub client and everything it needs to run.</Description>
+    <Version>0.1.0-1</Version>
+    <ReleaseDate>2026-09-19</ReleaseDate>
+    <Default>true</Default>
+    <Script>installscript.qs</Script>
+    <RequiresAdminRights>true</RequiresAdminRights>
+    <Licenses>
+        <License name="GNU General Public License v3 - and the source code offer that comes with it" file="license.txt"/>
+    </Licenses>
+</Package>

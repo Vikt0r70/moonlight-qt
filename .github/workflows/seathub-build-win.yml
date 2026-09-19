@@ -79,9 +79,39 @@ jobs:
         with:
           submodules: recursive
 
-      # Toolchain provisioning (Qt 6.11 SDK, MSVC 2022 v143) is finalized once Plan 03-01's
-      # Task 3 (human toolchain-install checkpoint) is closed and its exact install method is
-      # confirmed against a real developer machine. Placeholder step kept intentionally minimal
-      # rather than guessing at install-qt-action version pins that have not been verified.
-      - name: Placeholder — Qt/MSVC build step
-        run: echo "Build step pending toolchain provisioning (Plan 03-01 Task 3)."
+      # Toolchain. Plan 03-01 left this as a placeholder rather than guess at provisioning, and
+      # Plan 03-06 replaces it now that the recipe is proven on a real machine. Qt and the Qt
+      # Installer Framework are installed with aqtinstall, whose layout is the same one the Qt
+      # Online Installer writes, so the paths below match scripts\build-seathub.ps1's defaults and
+      # the install paths pinned in seathub-ops/pins.yaml.
+      #
+      # MSVC is not provisioned: windows-latest already carries Visual Studio 2022 with the
+      # Desktop C++ workload, and the script finds vcvars64.bat for an install that actually has
+      # the VC toolset - via vswhere with -requires, which is the check upstream's build-arch.bat
+      # omits.
+      - name: Install Qt 6.11.2 (MSVC 2022 x64) and Qt Installer Framework 4.7
+        shell: pwsh
+        run: |
+          python -m pip install --disable-pip-version-check aqtinstall
+          python -m aqt install-qt windows desktop 6.11.2 win64_msvc2022_64 -m qtwebsockets qtsvg -O C:\Qt
+          python -m aqt install-tool windows desktop tools_ifw -O C:\Qt
+
+      - name: Build, deploy and package SeatHub
+        shell: pwsh
+        run: ./scripts/build-seathub.ps1
+
+      - name: Record the installer hash
+        shell: pwsh
+        run: |
+          Get-Content build\installer-x64-release\sha256.txt
+          Write-Output "Publish with POST /api/admin/releases (D-40); see docs/runbooks/client-release.md in the monorepo."
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SeatHub-Setup
+          path: build\installer-x64-release\SeatHub-Setup-*.exe
+          if-no-files-found: error
+
+      # NOT YET EXERCISED: this job has not been run. It is the proven local recipe wired into CI,
+      # and the first CI run is what confirms the runner's Qt layout and MSVC discovery. Until then
+      # the local `pwsh -File scripts\build-seathub.ps1` is the recipe of record.

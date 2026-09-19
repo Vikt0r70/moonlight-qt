@@ -1,0 +1,34 @@
+SeatHub - written offer of corresponding source code (GNU GPL v3, section 6)
+
+SeatHub is built on Moonlight (moonlight-qt), which is free software licensed under the GNU
+General Public License, version 3. SeatHub ships the Moonlight streaming engine as part of the
+SeatHub client, so the whole SeatHub client binary is distributed under the GPL v3.
+
+This offer is part of how the source obligation is met. The licence text by itself is not
+compliance: whoever receives the binary must be able to get the corresponding source, and this
+file is the offer that tells them where.
+
+The complete corresponding source code for the SeatHub client as shipped is available at:
+
+    https://github.com/Vikt0r70/moonlight-qt        (branch: seathub/main)
+
+The exact revision shipped in a given SeatHub build is recorded, with its checksum, in
+seathub-ops/pins.yaml under moonlight_qt. The same repository carries:
+
+    FORK-CHANGES.md   every file that differs from the pinned upstream tag, and why
+    SBOM.md           every third-party dependency in the build, with its version and licence
+
+The corresponding source also covers the modifications: SeatHub's own code lives in new files
+under app/seathub/ and app/gui/, and every upstream file the fork changes is enumerated in
+FORK-CHANGES.md. The decoders, renderers, audio and input paths are not modified.
+
+Written requests for the source may also be sent to:
+
+    Viktor.Damra@protonmail.com
+
+There is no charge for the source beyond the cost of the medium, as section 6 requires.
+
+--------------------------------------------------------------------------------
+
+The licence that governs this distribution follows in full.
+
