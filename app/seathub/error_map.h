@@ -18,6 +18,7 @@
 // The mapping table lives in `error_map.cpp`: each recognised engine stage collapses onto
 // one of two SeatHub sentences, and anything unnamed takes the D-51 generic fallback.
 
+#include <QMetaType>
 #include <QString>
 #include <QVariantMap>
 
@@ -54,6 +55,13 @@ struct SeatHubFailure
     static SeatHubFailure local(const QString& message);
     static SeatHubFailure engine(const QString& message, const QString& reference);
 
+    /// The control plane answered and refused: an HTTP 200 carrying `status:false`, or any
+    /// non-2xx `Error` / `AllocationRefused` response. Carries the control plane's own
+    /// ADR-0008 reference when it named one, and its `failure` code when it named one.
+    /// `error` is the control plane's customer-facing sentence, never engine text.
+    static SeatHubFailure api(int statusCode, const QString& error, const QString& reference,
+                              const QString& failure = QString());
+
     /// The D-51 fallback: `Something went wrong on our side. Reference SH-9K2XQ1.`
     static SeatHubFailure generic();
 
@@ -61,6 +69,12 @@ struct SeatHubFailure
     /// omitted - it must never cross into the view layer (D-51).
     QVariantMap toVariantMap() const;
 };
+
+// Declared so a failure can cross a thread boundary. The control-plane callbacks run on the
+// network thread `ControlPlaneClient` owns, so `pairingFailed` and `teardownFailed` are delivered
+// to the facade as queued connections - which needs a registered metatype, not just a copyable
+// struct.
+Q_DECLARE_METATYPE(SeatHubFailure)
 
 /// Maps `Session::stageFailed(stage, errorCode, failingPorts)` to a SeatHub failure.
 SeatHubFailure mapStageFailure(const QString& stage, int errorCode, const QString& failingPorts);

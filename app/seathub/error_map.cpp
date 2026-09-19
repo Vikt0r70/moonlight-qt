@@ -59,6 +59,21 @@ SeatHubFailure SeatHubFailure::engine(const QString& message, const QString& ref
     return f;
 }
 
+SeatHubFailure SeatHubFailure::api(int statusCode, const QString& error, const QString& reference,
+                                   const QString& failure)
+{
+    SeatHubFailure f;
+    f.kind = FailureKind::Api;
+    f.error = error;
+    // Every control-plane error carries a reference (ADR-0008, `Error.required`). One that
+    // arrives without it is a malformed response, and printing nothing would leave support
+    // with no search key at all - the fallback sentence's own code is used instead.
+    f.reference = reference.isEmpty() ? QString::fromLatin1(kGenericReference) : reference;
+    f.statusCode = statusCode;
+    f.failure = failure;
+    return f;
+}
+
 SeatHubFailure SeatHubFailure::generic()
 {
     SeatHubFailure f;

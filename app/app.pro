@@ -1,4 +1,4 @@
-QT += core quick network quickcontrols2 svg
+QT += core quick network quickcontrols2 svg websockets
 CONFIG += c++11
 
 unix:!macx {
@@ -51,6 +51,9 @@ win32 {
 
     INCLUDEPATH += $$PWD/../libs/windows/include
     LIBS += ws2_32.lib winmm.lib dxva2.lib ole32.lib gdi32.lib user32.lib d3d9.lib dwmapi.lib dbghelp.lib
+    # SeatHub: DPAPI (`CryptProtectData` / `CryptUnprotectData`) for the credential store
+    # (D-30, app/seathub/token_store.cpp).
+    LIBS += crypt32.lib
 
     # Work around a conflict with math.h inclusion between SDL and Qt 6
     DEFINES += _USE_MATH_DEFINES
@@ -205,6 +208,9 @@ SOURCES += \
     seathub/update_feed_client.cpp \
     seathub/error_map.cpp \
     seathub/hud_overlay.cpp \
+    seathub/control_plane_client.cpp \
+    seathub/token_store.cpp \
+    seathub/session_websocket.cpp \
     streaming/streamutils.cpp \
     backend/autoupdatechecker.cpp \
     path.cpp \
@@ -247,6 +253,9 @@ HEADERS += \
     seathub/seathub_version.h \
     seathub/error_map.h \
     seathub/hud_overlay.h \
+    seathub/control_plane_client.h \
+    seathub/token_store.h \
+    seathub/session_websocket.h \
     streaming/video/decoder.h \
     streaming/streamutils.h \
     backend/autoupdatechecker.h \
