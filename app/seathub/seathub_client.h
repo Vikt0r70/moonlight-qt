@@ -266,9 +266,12 @@ private:
     /// Play with no access token: there is nothing to allocate a session with, so the engine
     /// lifecycle is asked to run and - with no host attached to stream from - fails closed.
     void beginLocalAttempt();
-    /// Drop the engine session the previous launch attached, if any. Refuses while one is
-    /// running: `run()` hijacks the calling thread for the whole stream, and the object cannot be
-    /// destroyed under it.
+    /// Drop the engine session the previous launch attached, if any. Called at the end of a
+    /// session (`handleReadyForDeletion()`) and at the start of the next one
+    /// (`handleHostResolved()`). Refuses while a session is running: `run()` hijacks the calling
+    /// thread for the whole stream, and the object cannot be destroyed under it. The end-of-session
+    /// call site depends on the lifecycle clearing its own state *above* the emission that reaches
+    /// it - see the ordering comment in `session_lifecycle.cpp`.
     void releaseEngineSession();
     /// Play against the control plane: `POST /api/sessions`, then `beginSession()`.
     void beginPlayRequest();

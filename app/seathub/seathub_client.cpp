@@ -911,6 +911,12 @@ void SeatHubClient::handleReadyForDeletion()
     // now rather than after the teardown completes: teardown talks to the control plane and needs
     // nothing from the engine object, and holding it until then would keep an engine `Session`
     // alive across the whole teardown for no reason.
+    //
+    // This release is permitted because the lifecycle clears its own state *above* the emission
+    // that runs this handler: `releaseEngineSession()` refuses while the lifecycle reports itself
+    // active, and this is a direct connection. Before that ordering was fixed the refusal was
+    // unconditional and the finished engine object survived until the next launch's
+    // `handleHostResolved()` (verifier finding W1; `session_lifecycle.cpp` has the whole story).
     releaseEngineSession();
 
     // D-37 / D-14: the launch's negotiated results and its in-memory overrides are over. The
@@ -1072,9 +1078,11 @@ void SeatHubClient::releaseEngineSession()
     }
 
     if (m_session->active()) {
-        // The engine is inside `run()` on this thread's event loop. Deleting the object under it
-        // would leave the next touch a use-after-free, so this refuses and the object is released
-        // by `handleReadyForDeletion()` instead.
+        // The engine may be inside `run()` on this thread's event loop: deleting the object under
+        // it would leave the next touch a use-after-free. This branch is reached while a session
+        // is starting or running (`handleHostResolved()`); at the end of one the lifecycle has
+        // already cleared `active` by the time `readyForDeletion` arrives, so
+        // `handleReadyForDeletion()` releases the object instead of refusing here (W1).
         qCWarning(seathubClient) << "engine session is still active; not releasing it";
         return;
     }

@@ -64,13 +64,30 @@ void SessionLifecycle::connectEngineSignals()
         // The engine has finished tearing the SDL window down; it is safe to release the
         // Session and to let the QML window come back (D-03). Upstream's QML does the
         // equivalent with `session = null; gc()`.
-        emit readyForDeletion();
-
-        // Detach only. The object stays alive: `SeatHubClient` owns it and destroys it after the
-        // control-plane teardown it starts from this same signal has been asked for.
+        //
+        // The state under this comment is cleared *above* the emission, and that order is
+        // load-bearing rather than stylistic. `SeatHubClient` connects `handleReadyForDeletion()`
+        // to the signal emitted below with a direct same-thread connection, and it releases the
+        // engine session from inside that emission (`releaseEngineSession()`,
+        // `seathub_client.cpp:1068`). A release is permitted only while this lifecycle reports
+        // itself inactive - an active lifecycle is one whose engine may be inside `run()`, which
+        // must not be destroyed under it - so clearing the flag *after* the emission made that
+        // refusal unconditional. The finished session was then never released at the end of a
+        // session: it was retained until the next launch released it in `handleHostResolved()`, or
+        // until shutdown. By the time an engine reports `readyForDeletion` its SDL window is gone,
+        // so there is no running session left to describe.
+        //
+        // Detach, do not destroy. The object stays alive: `SeatHubClient` owns it and destroys it
+        // after the control-plane teardown it starts from this same signal has been asked for.
         disconnectEngineSignals();
         m_session = nullptr;
         m_active = false;
+
+        emit readyForDeletion();
+
+        // The two change notifications follow, in the order they have always been emitted in. They
+        // report the state the emission above already saw, so nothing here has to be re-derived by
+        // a handler that reads `active()` or `upstreamSession()` on them.
         emit activeChanged();
         emit upstreamSessionChanged();
     });

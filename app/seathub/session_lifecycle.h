@@ -38,6 +38,11 @@ class SessionLifecycle : public QObject
     /// without the seam type; `SessionSegue.qml` only ever connects to this object's signals.
     Q_PROPERTY(QObject* upstreamSession READ upstreamSession NOTIFY upstreamSessionChanged)
     /// True from `start()` until the session reports `readyForDeletion()`.
+    ///
+    /// Cleared *above* this class's re-emission of that signal, so a handler connected to
+    /// `readyForDeletion` already sees false. The order is load-bearing:
+    /// `SeatHubClient::releaseEngineSession()` refuses to release the engine object while this
+    /// reports true, and it is called from a direct connection to that same signal.
     Q_PROPERTY(bool active READ active NOTIFY activeChanged)
 
 public:
