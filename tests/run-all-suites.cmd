@@ -10,20 +10,33 @@ rem   * Every suite is a single-config qmake project. The recipe is
 rem     `qmake <suite>.pro && jom` - bare `jom`, because `jom release` fails on
 rem     a project with `CONFIG -= debug_and_release debug`.
 rem   * qmake writes one `Makefile` into tests\, so the suites cannot be built in
-rem     parallel. Two earlier phase audits hand-rolled this loop; one of them
-rem     captured exit codes with `%ERRORLEVEL%` inside a parenthesised block,
-rem     which expands at parse time, so every suite reported exit 0 - including
-rem     two that had not run at all. The `setlocal enabledelayedexpansion` and
-rem     `!ERRORLEVEL!` below are the fix for exactly that trap, and each suite's
-rem     own `Totals:` line is read as well as its exit code.
+rem     parallel.
+rem   * An earlier audit hand-rolled this loop and captured exit codes with the
+rem     ERRORLEVEL percent-variable inside a parenthesised block, which expands
+rem     when the block is parsed rather than when it runs. Every suite reported
+rem     exit 0, including two that had not run at all. This file uses
+rem     `setlocal enabledelayedexpansion` with the exclamation-mark form for the
+rem     exit code, and reads each suite's own `Totals:` line as well, so a suite
+rem     that dies before printing one is reported as failed rather than skipped.
+rem   * A second parse trap, hit while writing this file: echoing a variable whose
+rem     value contains a parenthesis (`%VCVARS%` lives under `Program Files
+rem     (x86)`) inside a parenthesised `if` block makes cmd read that `(` as the
+rem     start of a nested block and abort with "Microsoft was unexpected at this
+rem     time" before a single line of the file runs. No variable that can hold a
+rem     parenthesis is echoed inside a block here.
 rem   * `tst_hud_bitmap` and `tst_overlay_injection` need SDL2 on PATH and Qt's
 rem     platform plugins, or they abort with 0xC0000135 before printing a
 rem     result. Both are set below.
 rem   * The deployed `build\build-x64-release\app\release` directory must NOT be
 rem     on PATH: it shadows the real Qt install.
 rem
-rem Build logs land in <suite>-build-out.txt / <suite>-qmake-out.txt and results
-rem in <suite>-out.txt (all three are gitignored).
+rem There is deliberately no `for` loop over the suite list: a nested
+rem if/else inside a parenthesised block is what cmd mis-parses here, and the
+rem flat `call :suite` list below cannot have that problem. Add a suite by
+rem adding one line.
+rem
+rem Build logs land in `<suite>-build-out.txt` / `<suite>-qmake-out.txt`, results
+rem in `<suite>-out.txt`. All three name patterns are gitignored.
 rem ===========================================================================
 setlocal enabledelayedexpansion
 
@@ -35,7 +48,8 @@ pushd "%~dp0"
 
 call "%VCVARS%" >nul
 if errorlevel 1 (
-    echo VCVARS_FAILED: %VCVARS%
+    echo VCVARS_FAILED - the Visual Studio 2022 BuildTools environment did not load
+    echo See the VCVARS line near the top of this file.
     popd
     exit /b 1
 )
@@ -43,45 +57,70 @@ if errorlevel 1 (
 set "PATH=%QT%\bin;%FORK%\libs\windows\lib\x64;%PATH%"
 set "QT_QPA_PLATFORM_PLUGIN_PATH=%QT%\plugins"
 
-set "SUITES=tst_control_plane tst_engine_seam tst_error_map tst_hud_bitmap tst_liveness tst_overlay_injection tst_pairing tst_session_websocket tst_settings_bridge tst_teardown tst_threading tst_token_store tst_ui_screens tst_update_feed tst_facade_wiring tst_d28_boundary"
-
 set "FAILED="
 
-for %%S in (%SUITES%) do (
-    if exist "%%S-out.txt" del /q "%%S-out.txt"
-    "%QT%\bin\qmake.exe" "%%S.pro" > "%%S-qmake-out.txt" 2>&1
-    if errorlevel 1 (
-        echo [QMAKE FAILED] %%S - see %%S-qmake-out.txt
-        set "FAILED=1"
-    ) else (
-        "%FORK%\scripts\jom.exe" -j8 > "%%S-build-out.txt" 2>&1
-        if errorlevel 1 (
-            echo [BUILD FAILED] %%S - see %%S-build-out.txt
-            set "FAILED=1"
-        ) else (
-            ".\%%S.exe" -o "%%S-out.txt,txt" >nul 2>&1
-            set "RC=!ERRORLEVEL!"
-            findstr /r /c:"^Totals:.*, 0 failed" "%%S-out.txt" >nul 2>&1
-            if errorlevel 1 (
-                echo [SUITE FAILED] %%S ^(exit !RC!^) - no ", 0 failed" in %%S-out.txt
-                set "FAILED=1"
-            ) else (
-                findstr /r /c:"^Totals:" "%%S-out.txt"
-            )
-            if !RC! neq 0 (
-                echo [NONZERO EXIT] %%S exited !RC!
-                set "FAILED=1"
-            )
-        )
-    )
-)
+call :suite tst_control_plane
+call :suite tst_engine_seam
+call :suite tst_error_map
+call :suite tst_hud_bitmap
+call :suite tst_liveness
+call :suite tst_overlay_injection
+call :suite tst_pairing
+call :suite tst_session_websocket
+call :suite tst_settings_bridge
+call :suite tst_teardown
+call :suite tst_threading
+call :suite tst_token_store
+call :suite tst_ui_screens
+call :suite tst_update_feed
+call :suite tst_facade_wiring
+call :suite tst_d28_boundary
 
-if defined FAILED (
-    echo SOME_SUITES_FAILED
-    popd
-    exit /b 1
-)
+if defined FAILED goto :failed
 
 echo ALL_SUITES_PASSED
 popd
 exit /b 0
+
+:failed
+echo SOME_SUITES_FAILED
+popd
+exit /b 1
+
+rem ---------------------------------------------------------------------------
+rem One suite: qmake, jom, run, and read the suite's own Totals line.
+rem ---------------------------------------------------------------------------
+:suite
+if exist "%~1-out.txt" del /q "%~1-out.txt"
+
+"%QT%\bin\qmake.exe" "%~1.pro" > "%~1-qmake-out.txt" 2>&1
+if errorlevel 1 (
+    echo [QMAKE FAILED] %~1 - see %~1-qmake-out.txt
+    set "FAILED=1"
+    goto :eof
+)
+
+"%FORK%\scripts\jom.exe" -j8 > "%~1-build-out.txt" 2>&1
+if errorlevel 1 (
+    echo [BUILD FAILED] %~1 - see %~1-build-out.txt
+    set "FAILED=1"
+    goto :eof
+)
+
+"%~1.exe" -o "%~1-out.txt,txt" >nul 2>&1
+set "RC=!ERRORLEVEL!"
+
+findstr /r /c:"^Totals:.*, 0 failed" "%~1-out.txt" >nul 2>&1
+if errorlevel 1 (
+    echo [SUITE FAILED] %~1 exit=!RC! - no ", 0 failed" line in %~1-out.txt
+    set "FAILED=1"
+    goto :eof
+)
+
+findstr /r /c:"^Totals:" "%~1-out.txt"
+
+if !RC! neq 0 (
+    echo [NONZERO EXIT] %~1 exited !RC!
+    set "FAILED=1"
+)
+goto :eof
