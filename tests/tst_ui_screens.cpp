@@ -709,10 +709,21 @@ void TstUiScreens::disabledActionLabelStaysLegible()
     button->setProperty("text", QStringLiteral("Verify and continue"));
     button->setProperty("enabled", false);
 
-    QObject* label = button->property("contentItem").value<QObject*>();
+    QObject* contentItem = button->property("contentItem").value<QObject*>();
     QObject* background = button->property("background").value<QObject*>();
-    QVERIFY2(label, "the button must draw its label through a contentItem");
+    QVERIFY2(contentItem, "the button must draw its label through a contentItem");
     QVERIFY2(background, "the button must draw its own background");
+
+    // The contentItem is a row (the label, plus the spinner while the button is busy), so the
+    // label is the text item inside it.
+    QObject* label = nullptr;
+    for (QObject* child : contentItem->findChildren<QObject*>()) {
+        if (child->property("text").isValid() && child->property("color").isValid()) {
+            label = child;
+            break;
+        }
+    }
+    QVERIFY2(label, "the button must draw its label through a text item");
 
     const QColor labelColor = label->property("color").value<QColor>();
     // The fill animates in `--dur-fast` (ui.md §6), so the disabled colour arrives one
@@ -730,8 +741,9 @@ void TstUiScreens::disabledActionLabelStaysLegible()
                                           .arg(ratio, 0, 'f', 2)));
 
     // The focus ring is a real 2px `--focus` border on the control, from the tokens.
-    const QString source = QString::fromUtf8(
-        QFile(guiDir() + QStringLiteral("/SeatHubButton.qml")).readAll());
+    QFile buttonFile(guiDir() + QStringLiteral("/SeatHubButton.qml"));
+    QVERIFY2(buttonFile.open(QIODevice::ReadOnly), "SeatHubButton.qml must be readable");
+    const QString source = QString::fromUtf8(buttonFile.readAll());
     QVERIFY2(source.contains(QStringLiteral("border.width: root.activeFocus ? 2 : 0")),
              "the button must draw the spec's 2px focus ring (ui.md §9, audit F14)");
     QVERIFY2(source.contains(QStringLiteral("Tokens.focusDefault")),
