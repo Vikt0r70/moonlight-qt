@@ -18,13 +18,20 @@
 #include <QVariantMap>
 #include <QWindow>
 
+#include "authorized_through_timer.h"
+#include "control_plane_client.h"
 #include "error_map.h"
 #include "hud_overlay.h"
+#include "liveness_timer.h"
+#include "pairing_controller.h"
 #include "session_lifecycle.h"
+#include "session_websocket.h"
 // Included rather than forward-declared: moc needs complete types for the `SettingsBridge*` and
 // `UpdateFeedClient*` properties below (a bare forward declaration fails the pointer-metatype
 // static_assert in Qt's meta-object code).
 #include "settings_bridge.h"
+#include "teardown_controller.h"
+#include "token_store.h"
 #include "update_feed_client.h"
 
 class SeatHubClient : public QObject
@@ -43,6 +50,32 @@ class SeatHubClient : public QObject
 
     /// The release-feed client behind the forced-update modal (D-38, D-41).
     Q_PROPERTY(UpdateFeedClient* updates READ updates CONSTANT)
+
+    /// The control-plane bridge (D-29). Holds the session's opaque access token; the token is
+    /// never a property and never crosses into a view (D-35).
+    Q_PROPERTY(ControlPlaneClient* controlPlane READ controlPlane CONSTANT)
+
+    /// The control plane's live session channel, `/ws/session/{session_id}` (D-29). The UI
+    /// reads billing and warning state from here via the signals below, never by parsing a
+    /// frame itself.
+    Q_PROPERTY(SessionWebSocket* sessionChannel READ sessionChannel CONSTANT)
+
+    /// Silent pairing (D-21, D-22, STREAM-03). Exposed so the connecting view can report
+    /// progress; it carries no PIN and no token.
+    Q_PROPERTY(PairingController* pairing READ pairing CONSTANT)
+
+    /// Disable -> remove -> verify, then leave nothing behind (D-10, STREAM-10).
+    Q_PROPERTY(TeardownController* teardown READ teardown CONSTANT)
+
+    /// The most recent `session.billing` frame: `minutes_billed`, `balance_minutes`,
+    /// `minute_index`. Server-provided facts the client displays; it never computes, adjusts or
+    /// anticipates them (`docs/spec/client.md` §Wallet authority).
+    Q_PROPERTY(QVariantMap billing READ billing NOTIFY billingChanged)
+
+    /// The most recent `session.warning` enum value (`LOW_BALANCE | SAVE_NOW | DISCONNECTED |
+    /// RECONNECT_LIMIT_NEAR | OWNER_RESERVATION_NEAR`), or empty. The sentence the customer
+    /// reads for it comes from `docs/spec/copy.md` and is chosen in QML.
+    Q_PROPERTY(QString sessionWarning READ sessionWarning NOTIFY sessionWarningChanged)
 
     /// True while the Settings page is showing. Settings are a view inside the home state, not
     /// an appState of their own: a session can end while the page is open and the page must
@@ -64,11 +97,21 @@ class SeatHubClient : public QObject
 
 public:
     explicit SeatHubClient(QObject* parent = nullptr);
+    /// Stops the control-plane thread and joins it before anything that could still be running
+    /// on it is destroyed. A reply in flight during shutdown would otherwise call back into a
+    /// half-destroyed facade.
+    ~SeatHubClient() override;
 
     QString appState() const { return m_appState; }
     SessionLifecycle* session() const { return m_session; }
     SettingsBridge* settings() const { return m_settings; }
     UpdateFeedClient* updates() const { return m_updates; }
+    ControlPlaneClient* controlPlane() const { return m_controlPlane; }
+    SessionWebSocket* sessionChannel() const { return m_sessionChannel; }
+    PairingController* pairing() const { return m_pairing; }
+    TeardownController* teardown() const { return m_teardown; }
+    QVariantMap billing() const { return m_billing; }
+    QString sessionWarning() const { return m_sessionWarning; }
     bool inSettings() const { return m_inSettings; }
     QString stageText() const { return m_stageText; }
     QVariantMap failure() const { return m_failure; }
@@ -102,12 +145,27 @@ public:
     /// Returns to the home view.
     Q_INVOKABLE void closeSettings();
 
+    /// Attach a control-plane session to this client: the real path, as opposed to the tracer's
+    /// stubbed stage sequence. Starts the session channel, runs silent pairing, and hands the
+    /// session authorization's `quality_profile` to the settings bridge as an in-memory override
+    /// for this launch only (D-37, WR-05).
+    ///
+    /// The access token must already have been set on the control-plane client by a successful
+    /// sign-in. Nothing here reads it, returns it, or logs it.
+    Q_INVOKABLE void beginSession(const QString& sessionId);
+
+    /// The DPAPI-backed credential store. Exposed for teardown's benefit and for `signOut()`;
+    /// its contents are never a property.
+    TokenStore* credentialStore() const { return m_tokenStore; }
+
 signals:
     void appStateChanged();
     void stageTextChanged();
     void failureChanged();
     void identityChanged();
     void inSettingsChanged();
+    void billingChanged();
+    void sessionWarningChanged();
 
     /// Step 1 succeeded - the view should show the code field.
     void otpRequested(const QString& phoneE164);
@@ -128,12 +186,33 @@ private slots:
     void handleSessionFinished(int portTestResult);
     void handleReadyForDeletion();
 
+    // The control plane's session channel (`/ws/session/{session_id}`).
+    void handleSessionState(const SessionInfo& session);
+    void handleSessionBilling(const QString& sessionId, int minutesBilled, int balanceMinutes,
+                              int minuteIndex);
+    void handleSessionWarning(const QString& sessionId, const QString& warning,
+                              const QString& deadlineAt);
+
+    // D-33: the only locally enforced end. Liveness failure is not one (see `onLivenessWarning`).
+    void handleHorizonReached();
+    void onLivenessWarning();
+    void handleTeardownCompleted();
+    void handleTeardownFailed(const SeatHubFailure& failure);
+    void handlePairingCompleted(const QString& clientUuid);
+    void handlePairingFailed(const SeatHubFailure& failure);
+
 private:
     void setAppState(const QString& state);
     void setStageText(const QString& text);
     void raiseFailure(const SeatHubFailure& failure);
     void clearFailure();
     void setInSettings(bool inSettings);
+    /// True once `beginSession()` has attached a real control-plane session.
+    bool inControlPlaneSession() const;
+    /// Move the network objects onto a thread with a running event loop. Upstream suspends Qt
+    /// processing for the whole stream (`session.cpp:1965-1966`), so a timer or socket left on
+    /// the main thread would be silent for exactly the interval it exists to cover.
+    void startNetworkThreads();
 
     QString m_appState;
     QString m_stageText;
@@ -143,6 +222,29 @@ private:
     SessionLifecycle* m_session = nullptr;
     SettingsBridge* m_settings = nullptr;
     UpdateFeedClient* m_updates = nullptr;
+
+    // The control-plane bridge (Plan 03-03). `m_tokenStore` is the DPAPI store and the only
+    // place a credential is ever at rest (D-30); `m_sessionChannel` is the control plane's
+    // `/ws/session/{id}`; `m_pairing` and `m_teardown` are the two safety-critical sequences.
+    ControlPlaneClient* m_controlPlane = nullptr;
+    TokenStore* m_tokenStore = nullptr;
+    SessionWebSocket* m_sessionChannel = nullptr;
+    PairingController* m_pairing = nullptr;
+    TeardownController* m_teardown = nullptr;
+
+    // D-31/D-34 and D-33. Both must outlive the stream and neither is a Q_PROPERTY: the UI has
+    // no business starting or stopping either one.
+    LivenessTimer* m_liveness = nullptr;
+    AuthorizedThroughTimer* m_horizon = nullptr;
+
+    /// The session the real control-plane path is running, or empty on the tracer path.
+    QString m_sessionId;
+    /// The Sunshine client UUID pairing returned. The only thing that identifies this client;
+    /// never the rig's name, address or index (Pitfall 3, D-07).
+    QString m_clientUuid;
+    QVariantMap m_billing;
+    QString m_sessionWarning;
+
     // The D-56 in-session HUD: a duration timer and the End session affordance, composited into
     // the stream's own swapchain (ADR-0045). It is deliberately not a Q_PROPERTY - no QML view
     // reads it, because the HUD is not QML on this tier; the lifecycle drives it and the

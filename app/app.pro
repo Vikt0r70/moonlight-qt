@@ -211,6 +211,10 @@ SOURCES += \
     seathub/control_plane_client.cpp \
     seathub/token_store.cpp \
     seathub/session_websocket.cpp \
+    seathub/pairing_controller.cpp \
+    seathub/teardown_controller.cpp \
+    seathub/liveness_timer.cpp \
+    seathub/authorized_through_timer.cpp \
     streaming/streamutils.cpp \
     backend/autoupdatechecker.cpp \
     path.cpp \
@@ -256,6 +260,10 @@ HEADERS += \
     seathub/control_plane_client.h \
     seathub/token_store.h \
     seathub/session_websocket.h \
+    seathub/pairing_controller.h \
+    seathub/teardown_controller.h \
+    seathub/liveness_timer.h \
+    seathub/authorized_through_timer.h \
     streaming/video/decoder.h \
     streaming/streamutils.h \
     backend/autoupdatechecker.h \

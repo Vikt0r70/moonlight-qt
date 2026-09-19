@@ -1,0 +1,366 @@
+/*****************************************************************************
+ * SeatHub fork - unit tests for teardown (Plan 03-03 Task 2, STREAM-10).
+ *
+ * Two properties are worth more than a live server here, and both are assertable:
+ *
+ *   1. The order. Disable, then remove, then verify - never removal first, because removing the
+ *      record does not stop a live stream (Pitfall 5). The controller encodes the order as a
+ *      stage enum it advances through, so the property is enforced rather than commented.
+ *   2. Nothing is left behind. STREAM-10 ends with "the client keeps no stored rig, address or
+ *      pairing of its own", and the DPAPI store is where such a thing would survive - so the
+ *      test stores a real token, runs teardown, and checks the file is gone.
+ *****************************************************************************/
+
+#include <QtTest>
+#include <QBuffer>
+#include <QDir>
+#include <QFile>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QNetworkAccessManager>
+#include <QNetworkReply>
+#include <QNetworkRequest>
+#include <QScopedPointer>
+#include <QSignalSpy>
+#include <QTemporaryDir>
+#include <QTimer>
+
+#include "seathub/teardown_controller.h"
+
+namespace {
+
+const char* kSessionId = "aaaabbbb-cccc-dddd-eeee-ffff00001111";
+const char* kClientUuid = "9f1c6f5e-3a1e-4b1e-9f2e-0f1a2b3c4d5e";
+
+class FakeReply : public QNetworkReply
+{
+    Q_OBJECT
+
+public:
+    FakeReply(int httpStatus, const QByteArray& body, QObject* parent)
+        : QNetworkReply(parent)
+    {
+        setAttribute(QNetworkRequest::HttpStatusCodeAttribute, QVariant(httpStatus));
+        m_buffer.setData(body);
+        m_buffer.open(QIODevice::ReadOnly);
+        open(QIODevice::ReadOnly);
+        QTimer::singleShot(0, this, [this]() {
+            setFinished(true);
+            emit finished();
+        });
+    }
+
+    void abort() override {}
+    qint64 readData(char* data, qint64 maxSize) override
+    {
+        return m_buffer.read(data, maxSize);
+    }
+    qint64 bytesAvailable() const override
+    {
+        return m_buffer.size() + QNetworkReply::bytesAvailable();
+    }
+
+private:
+    QBuffer m_buffer;
+};
+
+class FakeNetworkAccessManager : public QNetworkAccessManager
+{
+    Q_OBJECT
+
+public:
+    QList<int> statuses;
+    QList<QByteArray> bodies;
+    QStringList paths;
+    int calls = 0;
+
+protected:
+    QNetworkReply* createRequest(Operation, const QNetworkRequest& request, QIODevice*) override
+    {
+        const int index = qMax(0, qMin(calls, statuses.size() - 1));
+        const int status = statuses.isEmpty() ? 200 : statuses.at(index);
+        const QByteArray body = bodies.isEmpty() ? QByteArray() : bodies.at(index);
+        paths.append(request.url().path());
+        ++calls;
+        return new FakeReply(status, body, this);
+    }
+};
+
+QByteArray sessionBody(const QString& state)
+{
+    QJsonObject object;
+    object.insert(QStringLiteral("id"), QLatin1String(kSessionId));
+    object.insert(QStringLiteral("state"), state);
+    object.insert(QStringLiteral("quality_profile"), QStringLiteral("1080p60"));
+    object.insert(QStringLiteral("minutes_billed"), 7);
+    object.insert(QStringLiteral("reconnect_count"), 0);
+    object.insert(QStringLiteral("requested_at"), QStringLiteral("2026-09-19T00:00:00Z"));
+    return QJsonDocument(object).toJson(QJsonDocument::Compact);
+}
+
+QByteArray refusedBody(const QString& error, const QString& reference)
+{
+    QJsonObject object;
+    object.insert(QStringLiteral("status_code"), 200);
+    object.insert(QStringLiteral("status"), false);
+    object.insert(QStringLiteral("error"), error);
+    object.insert(QStringLiteral("reference"), reference);
+    return QJsonDocument(object).toJson(QJsonDocument::Compact);
+}
+
+} // namespace
+
+class TstTeardown : public QObject
+{
+    Q_OBJECT
+
+private:
+    QScopedPointer<QTemporaryDir> m_dir;
+
+private slots:
+    void initTestCase()
+    {
+        qRegisterMetaType<SeatHubFailure>("SeatHubFailure");
+        qRegisterMetaType<TeardownStage>("TeardownStage");
+    }
+
+    void init()
+    {
+        m_dir.reset(new QTemporaryDir);
+        QVERIFY(m_dir->isValid());
+    }
+
+    void cleanup()
+    {
+        m_dir.reset();
+    }
+
+    // --- the order is the safety property --------------------------------------------------
+
+    void stages_areOrderedDisableThenRemoveThenVerify()
+    {
+        // This is Pitfall 5 as an assertion. If a future edit reorders the enum, removal can be
+        // reached before the disable step and this fails.
+        QVERIFY(static_cast<int>(TeardownStage::Disable)
+                < static_cast<int>(TeardownStage::Unpair));
+        QVERIFY(static_cast<int>(TeardownStage::Unpair)
+                < static_cast<int>(TeardownStage::Verify));
+        QVERIFY(static_cast<int>(TeardownStage::Verify)
+                < static_cast<int>(TeardownStage::Clear));
+        QVERIFY(static_cast<int>(TeardownStage::Clear)
+                < static_cast<int>(TeardownStage::Done));
+    }
+
+    void advanceIsStrictlyForward()
+    {
+        QVERIFY(TeardownController::isOrdered(TeardownStage::Idle, TeardownStage::Disable));
+        QVERIFY(TeardownController::isOrdered(TeardownStage::Disable, TeardownStage::Unpair));
+        QVERIFY(TeardownController::isOrdered(TeardownStage::Unpair, TeardownStage::Verify));
+
+        // Backwards is refused - the whole point.
+        QVERIFY(!TeardownController::isOrdered(TeardownStage::Unpair, TeardownStage::Disable));
+        QVERIFY(!TeardownController::isOrdered(TeardownStage::Verify, TeardownStage::Unpair));
+        QVERIFY(!TeardownController::isOrdered(TeardownStage::Done, TeardownStage::Disable));
+        // And so is standing still.
+        QVERIFY(!TeardownController::isOrdered(TeardownStage::Disable, TeardownStage::Disable));
+    }
+
+    void graceWindow_isTheFrozenThirtySeconds()
+    {
+        // `TEARDOWN_GRACE_SECONDS` (`docs/spec/timing.md`, D-13/D-16).
+        QCOMPARE(TeardownController::kTeardownGraceMs, 30000);
+    }
+
+    // --- the happy path --------------------------------------------------------------------
+
+    void teardown_endsTheSessionVerifiesItAndLeavesNothingBehind()
+    {
+        TeardownController controller;
+        auto* client = new ControlPlaneClient(&controller);
+        auto* fake = new FakeNetworkAccessManager;
+        client->setNetworkAccessManager(fake);
+        controller.setControlPlane(client);
+
+        TokenStore store;
+        store.setDirectory(m_dir->path());
+        controller.setTokenStore(&store);
+
+        // A real stored credential, so "leaves nothing behind" is a statement about the disk.
+        QVERIFY(store.storeToken(TokenStore::refreshTokenName(),
+                                 QStringLiteral("sb_rt_PLAINTEXT-MARKER-4F7K")));
+        const QString tokenPath = store.pathFor(TokenStore::refreshTokenName());
+        QVERIFY(QFile::exists(tokenPath));
+
+        // POST /end, then the verification polls: still ENDING once, then terminal.
+        fake->statuses = { 202, 200, 200 };
+        fake->bodies = { sessionBody(QStringLiteral("ENDING")),
+                         sessionBody(QStringLiteral("ENDING")),
+                         sessionBody(QStringLiteral("COMPLETED")) };
+        controller.setVerifyIntervalMs(1);
+
+        QSignalSpy completed(&controller, &TeardownController::teardownCompleted);
+        QSignalSpy failed(&controller, &TeardownController::teardownFailed);
+        QSignalSpy stages(&controller, &TeardownController::stageEntered);
+
+        controller.teardown(QString::fromLatin1(kSessionId), QString::fromLatin1(kClientUuid));
+        QTRY_COMPARE(completed.count(), 1);
+        QCOMPARE(failed.count(), 0);
+
+        // Step 1 went out on the documented route.
+        QVERIFY(!fake->paths.isEmpty());
+        QCOMPARE(fake->paths.first(),
+                 QString(QStringLiteral("/api/sessions/%1/end").arg(QLatin1String(kSessionId))));
+
+        // The stages arrived in the required order and never went backwards.
+        QList<int> seen;
+        for (const QList<QVariant>& emission : stages) {
+            seen.append(emission.at(0).toInt());
+        }
+        int previous = -1;
+        for (int stage : seen) {
+            QVERIFY2(stage > previous, "teardown stages must advance strictly forward");
+            previous = stage;
+        }
+        QVERIFY(seen.contains(static_cast<int>(TeardownStage::Disable)));
+        QVERIFY(seen.contains(static_cast<int>(TeardownStage::Unpair)));
+        QVERIFY(seen.contains(static_cast<int>(TeardownStage::Verify)));
+        QVERIFY(seen.contains(static_cast<int>(TeardownStage::Clear)));
+        QVERIFY(seen.contains(static_cast<int>(TeardownStage::Done)));
+
+        // STREAM-10, on the disk: nothing of this client survives.
+        QVERIFY2(!QFile::exists(tokenPath), "teardown must remove the stored credential");
+        QCOMPARE(QDir(m_dir->path()).entryList(QDir::Files).size(), 0);
+        QCOMPARE(controller.stage(), TeardownStage::Done);
+    }
+
+    void teardown_isIdempotentOnTheEndRequest()
+    {
+        // `POST /end` is documented idempotent, so a second End press is not an error.
+        TeardownController controller;
+        auto* client = new ControlPlaneClient(&controller);
+        auto* fake = new FakeNetworkAccessManager;
+        client->setNetworkAccessManager(fake);
+        controller.setControlPlane(client);
+        controller.setVerifyIntervalMs(1);
+
+        fake->statuses = { 202, 200 };
+        fake->bodies = { sessionBody(QStringLiteral("ENDING")),
+                         sessionBody(QStringLiteral("CANCELLED")) };
+
+        QSignalSpy completed(&controller, &TeardownController::teardownCompleted);
+        controller.teardown(QString::fromLatin1(kSessionId), QString::fromLatin1(kClientUuid));
+        QTRY_COMPARE(completed.count(), 1);
+    }
+
+    // --- failure modes ---------------------------------------------------------------------
+
+    void sessionStuckEnding_failsWithTeardownTimeout()
+    {
+        TeardownController controller;
+        auto* client = new ControlPlaneClient(&controller);
+        auto* fake = new FakeNetworkAccessManager;
+        client->setNetworkAccessManager(fake);
+        controller.setControlPlane(client);
+        controller.setVerifyIntervalMs(1);
+        controller.setTeardownGraceMs(1);
+
+        // The rig never finishes. `timing.md` makes this `TEARDOWN_TIMEOUT`, not a normal end.
+        fake->statuses = { 202, 200 };
+        fake->bodies = { sessionBody(QStringLiteral("ENDING")),
+                         sessionBody(QStringLiteral("ENDING")) };
+
+        QSignalSpy failed(&controller, &TeardownController::teardownFailed);
+        QSignalSpy completed(&controller, &TeardownController::teardownCompleted);
+        controller.teardown(QString::fromLatin1(kSessionId), QString::fromLatin1(kClientUuid));
+
+        QTRY_COMPARE(failed.count(), 1);
+        QCOMPARE(completed.count(), 0);
+
+        const SeatHubFailure failure = failed.at(0).at(0).value<SeatHubFailure>();
+        QCOMPARE(failure.failure, QStringLiteral("TEARDOWN_TIMEOUT"));
+        QVERIFY(!failure.reference.isEmpty());
+        QVERIFY(!failure.error.isEmpty());
+        QCOMPARE(controller.stage(), TeardownStage::Failed);
+    }
+
+    void controlPlaneRefusalOnHttp200_isAFailure()
+    {
+        TeardownController controller;
+        auto* client = new ControlPlaneClient(&controller);
+        auto* fake = new FakeNetworkAccessManager;
+        client->setNetworkAccessManager(fake);
+        controller.setControlPlane(client);
+
+        // Pitfall 4 again, on the teardown path.
+        fake->statuses = { 200 };
+        fake->bodies = { refusedBody(QStringLiteral("That session has already ended."),
+                                     QStringLiteral("SH-4F7KQ2")) };
+
+        QSignalSpy failed(&controller, &TeardownController::teardownFailed);
+        controller.teardown(QString::fromLatin1(kSessionId), QString::fromLatin1(kClientUuid));
+
+        QTRY_COMPARE(failed.count(), 1);
+        const SeatHubFailure failure = failed.at(0).at(0).value<SeatHubFailure>();
+        QCOMPARE(failure.kind, FailureKind::Api);
+        QCOMPARE(failure.reference, QStringLiteral("SH-4F7KQ2"));
+    }
+
+    void unreachableControlPlane_waitsRatherThanGuessing()
+    {
+        TeardownController controller;
+        auto* client = new ControlPlaneClient(&controller);
+        auto* fake = new FakeNetworkAccessManager;
+        client->setNetworkAccessManager(fake);
+        controller.setControlPlane(client);
+        controller.setVerifyIntervalMs(1);
+        controller.setTeardownGraceMs(10000);
+
+        // Every verification poll fails at the transport. The controller cannot know whether the
+        // rig-side removal happened, so it must not report either outcome.
+        fake->statuses = { 202, 0 };
+        fake->bodies = { sessionBody(QStringLiteral("ENDING")), QByteArray() };
+
+        QSignalSpy failed(&controller, &TeardownController::teardownFailed);
+        QSignalSpy completed(&controller, &TeardownController::teardownCompleted);
+        controller.teardown(QString::fromLatin1(kSessionId), QString::fromLatin1(kClientUuid));
+
+        QTest::qWait(40);
+        QCOMPARE(failed.count(), 0);
+        QCOMPARE(completed.count(), 0);
+        QVERIFY2(fake->calls > 2, "the controller must keep verifying, not give up after one try");
+    }
+
+    void emptySessionId_failsImmediately()
+    {
+        TeardownController controller;
+        QSignalSpy failed(&controller, &TeardownController::teardownFailed);
+        controller.teardown(QString(), QString::fromLatin1(kClientUuid));
+        QCOMPARE(failed.count(), 1);
+    }
+
+    void cancel_stopsTheSequence()
+    {
+        TeardownController controller;
+        auto* client = new ControlPlaneClient(&controller);
+        auto* fake = new FakeNetworkAccessManager;
+        client->setNetworkAccessManager(fake);
+        controller.setControlPlane(client);
+        controller.setVerifyIntervalMs(1);
+
+        fake->statuses = { 202, 200 };
+        fake->bodies = { sessionBody(QStringLiteral("ENDING")),
+                         sessionBody(QStringLiteral("ENDING")) };
+
+        controller.teardown(QString::fromLatin1(kSessionId), QString::fromLatin1(kClientUuid));
+        controller.cancel();
+
+        const int callsAtCancel = fake->calls;
+        QTest::qWait(20);
+        QCOMPARE(fake->calls, callsAtCancel);
+        QCOMPARE(controller.stage(), TeardownStage::Idle);
+    }
+};
+
+QTEST_MAIN(TstTeardown)
+
+#include "tst_teardown.moc"

@@ -1,0 +1,449 @@
+/*****************************************************************************
+ * SeatHub fork - unit tests for silent pairing (Plan 03-03 Task 2, STREAM-03).
+ *
+ * STREAM-03 is "Customer connects to a rig without typing a PIN". The strongest form of that
+ * is not "we did not show a PIN field" - it is that this client has no PIN surface at all, so
+ * there is nothing to show. These tests hold that line directly:
+ *
+ *   * the control-plane-issued PIN reaches the engine seam and nothing else;
+ *   * no signal carries it, so no view can obtain it;
+ *   * every failure is fail-closed, produces a SeatHub error with a reference, and never a
+ *     dialog;
+ *   * the 90-second deadline is real.
+ *****************************************************************************/
+
+#include <QtTest>
+#include <QBuffer>
+#include <QElapsedTimer>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QNetworkAccessManager>
+#include <QNetworkReply>
+#include <QNetworkRequest>
+#include <QSignalSpy>
+#include <QTimer>
+
+#include "seathub/pairing_controller.h"
+
+namespace {
+
+const char* kSessionId = "aaaabbbb-cccc-dddd-eeee-ffff00001111";
+const char* kPin = "4821";
+const char* kClientUuid = "9f1c6f5e-3a1e-4b1e-9f2e-0f1a2b3c4d5e";
+
+class FakeReply : public QNetworkReply
+{
+    Q_OBJECT
+
+public:
+    FakeReply(int httpStatus, const QByteArray& body, QObject* parent)
+        : QNetworkReply(parent)
+    {
+        setAttribute(QNetworkRequest::HttpStatusCodeAttribute, QVariant(httpStatus));
+        m_buffer.setData(body);
+        m_buffer.open(QIODevice::ReadOnly);
+        open(QIODevice::ReadOnly);
+        QTimer::singleShot(0, this, [this]() {
+            setFinished(true);
+            emit finished();
+        });
+    }
+
+    void abort() override {}
+    qint64 readData(char* data, qint64 maxSize) override
+    {
+        return m_buffer.read(data, maxSize);
+    }
+    qint64 bytesAvailable() const override
+    {
+        return m_buffer.size() + QNetworkReply::bytesAvailable();
+    }
+
+private:
+    QBuffer m_buffer;
+};
+
+class FakeNetworkAccessManager : public QNetworkAccessManager
+{
+    Q_OBJECT
+
+public:
+    QList<int> statuses;
+    QList<QByteArray> bodies;
+    int calls = 0;
+
+protected:
+    QNetworkReply* createRequest(Operation, const QNetworkRequest&, QIODevice*) override
+    {
+        const int index = qMin(calls, statuses.size() - 1);
+        const int status = statuses.isEmpty() ? 200 : statuses.at(qMax(0, index));
+        const QByteArray body = bodies.isEmpty() ? QByteArray() : bodies.at(qMax(0, index));
+        ++calls;
+        return new FakeReply(status, body, this);
+    }
+};
+
+// The 409 the contract documents for "this session has no pairing target yet".
+QByteArray conflictBody()
+{
+    QJsonObject object;
+    object.insert(QStringLiteral("status_code"), 409);
+    object.insert(QStringLiteral("status"), false);
+    object.insert(QStringLiteral("error"), QStringLiteral("The session isn't ready yet."));
+    object.insert(QStringLiteral("reference"), QStringLiteral("SH-3K2XQ1"));
+    return QJsonDocument(object).toJson(QJsonDocument::Compact);
+}
+
+QByteArray authorizationBody(const QString& pin)
+{
+    QJsonObject ports;
+    ports.insert(QStringLiteral("https"), 47984);
+    ports.insert(QStringLiteral("control"), 47989);
+    ports.insert(QStringLiteral("rtsp"), 48010);
+
+    QJsonObject lease;
+    lease.insert(QStringLiteral("lease_id"), QStringLiteral("11111111-2222-3333-4444-555555555555"));
+    lease.insert(QStringLiteral("lease_seq"), 1);
+    lease.insert(QStringLiteral("kind"), QStringLiteral("connect"));
+    lease.insert(QStringLiteral("connect_deadline_at"), QStringLiteral("2026-09-19T00:10:00Z"));
+
+    QJsonObject body;
+    body.insert(QStringLiteral("session_id"), QLatin1String(kSessionId));
+    body.insert(QStringLiteral("pairing_pin"), pin.isEmpty() ? QJsonValue(QJsonValue::Null)
+                                                            : QJsonValue(pin));
+    body.insert(QStringLiteral("host_address"), QStringLiteral("203.0.113.7"));
+    body.insert(QStringLiteral("ports"), ports);
+    body.insert(QStringLiteral("quality_profile"), QStringLiteral("1080p60"));
+    body.insert(QStringLiteral("lease"), lease);
+    return QJsonDocument(body).toJson(QJsonDocument::Compact);
+}
+
+// Records exactly what it was asked to pair against. This is the only thing in the process that
+// is allowed to see the PIN.
+class RecordingSeam : public PairingSeam
+{
+public:
+    int calls = 0;
+    PairingTarget lastTarget;
+    bool ok = true;
+    QString uuid = QString::fromLatin1(kClientUuid);
+    QString engineError;
+
+    void pair(const PairingTarget& target,
+              std::function<void(bool, const QString&, const QString&)> done) override
+    {
+        ++calls;
+        lastTarget = target;
+        // Delivered asynchronously, like a real handshake.
+        QTimer::singleShot(0, [done, this]() { done(ok, uuid, engineError); });
+    }
+};
+
+// Instantiates the client the controller drives, points it at the fake transport, and hands it
+// over. `ControlPlaneClient::setNetworkAccessManager` is the production injection seam, so the
+// test exercises the real request path with no server anywhere.
+ControlPlaneClient* wire(PairingController& controller, FakeNetworkAccessManager* fake)
+{
+    auto* client = new ControlPlaneClient(&controller);
+    client->setNetworkAccessManager(fake);
+    controller.setControlPlane(client);
+    return client;
+}
+
+} // namespace
+
+class TstPairing : public QObject
+{
+    Q_OBJECT
+
+private slots:
+    void initTestCase()
+    {
+        qRegisterMetaType<SeatHubFailure>("SeatHubFailure");
+    }
+
+    void constants_areTheLockedValues()
+    {
+        // D-08: 250 ms poll, 90 s deadline. Neither is the client's to choose.
+        QCOMPARE(PairingController::kPollIntervalMs, 250);
+        QCOMPARE(PairingController::kDeadlineMs, 90000);
+    }
+
+    void happyPath_authorizesThenPairsAndNeverInvolvesTheCustomer()
+    {
+        PairingController controller;
+        auto* fake = new FakeNetworkAccessManager;
+        auto* seam = new RecordingSeam;
+        wire(controller, fake);
+        controller.setSeam(seam);
+
+        fake->statuses = { 200 };
+        fake->bodies = { authorizationBody(QString::fromLatin1(kPin)) };
+
+        QSignalSpy granted(&controller, &PairingController::authorizationGranted);
+        QSignalSpy completed(&controller, &PairingController::pairingCompleted);
+        QSignalSpy failed(&controller, &PairingController::pairingFailed);
+
+        controller.start(QString::fromLatin1(kSessionId));
+
+        QTRY_COMPARE(completed.count(), 1);
+        QCOMPARE(granted.count(), 1);
+        QCOMPARE(failed.count(), 0);
+
+        // The seam got the address and the PIN...
+        QCOMPARE(seam->calls, 1);
+        QCOMPARE(seam->lastTarget.hostAddress, QStringLiteral("203.0.113.7"));
+        QCOMPARE(seam->lastTarget.httpsPort, 47984);
+        QCOMPARE(seam->lastTarget.pairingPin, QString::fromLatin1(kPin));
+        QCOMPARE(seam->lastTarget.sessionId, QString::fromLatin1(kSessionId));
+
+        // ...and the result carries the exact Sunshine client UUID, which is the only thing that
+        // ever identifies this client (Pitfall 3, D-07).
+        QCOMPARE(completed.at(0).at(0).toString(), QString::fromLatin1(kClientUuid));
+        QCOMPARE(controller.state(), QStringLiteral("ready"));
+    }
+
+    void thePinIsNotOnAnySignal()
+    {
+        // The PIN's only route out of the control plane is the engine seam. If it ever appeared
+        // in a signal argument a view could show it, which is the thing STREAM-03 forbids.
+        PairingController controller;
+        auto* fake = new FakeNetworkAccessManager;
+        auto* seam = new RecordingSeam;
+        wire(controller, fake);
+        controller.setSeam(seam);
+
+        fake->statuses = { 200 };
+        fake->bodies = { authorizationBody(QString::fromLatin1(kPin)) };
+
+        QSignalSpy granted(&controller, &PairingController::authorizationGranted);
+        QSignalSpy completed(&controller, &PairingController::pairingCompleted);
+
+        controller.start(QString::fromLatin1(kSessionId));
+        QTRY_COMPARE(completed.count(), 1);
+
+        // Every argument of every emission, checked for the PIN. `QSignalSpy` is a QObject and
+        // cannot be copied into a container, so the check is applied to each spy in turn.
+        const auto assertNoPin = [](const QSignalSpy& spy) {
+            for (const QList<QVariant>& emission : spy) {
+                for (const QVariant& argument : emission) {
+                    QVERIFY2(!argument.toString().contains(QLatin1String(kPin)),
+                             "the PIN must never be a signal argument");
+                }
+            }
+        };
+        assertNoPin(granted);
+        assertNoPin(completed);
+
+        // The controller exposes no accessor that returns it either.
+        QVERIFY(!controller.sessionId().contains(QLatin1String(kPin)));
+    }
+
+    void conflict_isAWaitNotAFailure()
+    {
+        // `GET /api/sessions/{id}/pairing` 409s until the host has a pairing target. The early
+        // polls are expected and must not surface as an error.
+        PairingController controller;
+        auto* fake = new FakeNetworkAccessManager;
+        auto* seam = new RecordingSeam;
+        wire(controller, fake);
+        controller.setSeam(seam);
+        controller.setPollIntervalMs(1);
+
+        fake->statuses = { 409, 409, 200 };
+        fake->bodies = { conflictBody(), conflictBody(),
+                         authorizationBody(QString::fromLatin1(kPin)) };
+
+        QSignalSpy failed(&controller, &PairingController::pairingFailed);
+        QSignalSpy completed(&controller, &PairingController::pairingCompleted);
+
+        controller.start(QString::fromLatin1(kSessionId));
+        QTRY_COMPARE(completed.count(), 1);
+        QCOMPARE(failed.count(), 0);
+    }
+
+    void nullPin_pollsAgainRatherThanPairingWithNothing()
+    {
+        // `pairing_pin` is nullable: null means the host has not been told to expect this client
+        // yet. Seating an empty PIN into the engine would be a wasted handshake.
+        PairingController controller;
+        auto* fake = new FakeNetworkAccessManager;
+        auto* seam = new RecordingSeam;
+        wire(controller, fake);
+        controller.setSeam(seam);
+        controller.setPollIntervalMs(1);
+
+        fake->statuses = { 200, 200 };
+        fake->bodies = { authorizationBody(QString()), authorizationBody(QString::fromLatin1(kPin)) };
+
+        QSignalSpy completed(&controller, &PairingController::pairingCompleted);
+        controller.start(QString::fromLatin1(kSessionId));
+
+        QTRY_COMPARE(completed.count(), 1);
+        QCOMPARE(seam->calls, 1);
+        QCOMPARE(seam->lastTarget.pairingPin, QString::fromLatin1(kPin));
+    }
+
+    void deadline_expiresAndFailsClosedWithASeatHubError()
+    {
+        PairingController controller;
+        auto* fake = new FakeNetworkAccessManager;
+        auto* seam = new RecordingSeam;
+        wire(controller, fake);
+        controller.setSeam(seam);
+        controller.setPollIntervalMs(1);
+        controller.setDeadlineMs(1);
+
+        // Never resolves: the host never produces a pairing target.
+        fake->statuses = { 409 };
+        fake->bodies = { conflictBody() };
+
+        QSignalSpy failed(&controller, &PairingController::pairingFailed);
+        controller.start(QString::fromLatin1(kSessionId));
+
+        QTRY_COMPARE(failed.count(), 1);
+
+        // A SeatHub failure with a reference and a readable reason - never a dialog, never a
+        // Moonlight error surface (ADR-0008, D-51).
+        const SeatHubFailure failure = failed.at(0).at(0).value<SeatHubFailure>();
+        QVERIFY(!failure.error.isEmpty());
+        QVERIFY(!failure.reference.isEmpty());
+        QCOMPARE(failure.kind, FailureKind::Local);
+        QCOMPARE(seam->calls, 0);
+        QCOMPARE(controller.state(), QStringLiteral("failed"));
+    }
+
+    void controlPlaneRefusalOnHttp200_isAFailure()
+    {
+        // Pitfall 4: the control plane's `Error` body is valid JSON on an HTTP 200.
+        PairingController controller;
+        auto* fake = new FakeNetworkAccessManager;
+        auto* seam = new RecordingSeam;
+        wire(controller, fake);
+        controller.setSeam(seam);
+
+        QJsonObject body;
+        body.insert(QStringLiteral("status_code"), 200);
+        body.insert(QStringLiteral("status"), false);
+        body.insert(QStringLiteral("error"), QStringLiteral("That session has already ended."));
+        body.insert(QStringLiteral("reference"), QStringLiteral("SH-4F7KQ2"));
+
+        fake->statuses = { 200 };
+        fake->bodies = { QJsonDocument(body).toJson(QJsonDocument::Compact) };
+
+        QSignalSpy failed(&controller, &PairingController::pairingFailed);
+        controller.start(QString::fromLatin1(kSessionId));
+
+        QTRY_COMPARE(failed.count(), 1);
+        const SeatHubFailure failure = failed.at(0).at(0).value<SeatHubFailure>();
+        // The control plane's own sentence and reference, not the client's substitute.
+        QCOMPARE(failure.error, QStringLiteral("That session has already ended."));
+        QCOMPARE(failure.reference, QStringLiteral("SH-4F7KQ2"));
+        QCOMPARE(failure.kind, FailureKind::Api);
+        QCOMPARE(seam->calls, 0);
+    }
+
+    void engineFailure_keepsItsTextOutOfWhatTheCustomerReads()
+    {
+        PairingController controller;
+        auto* fake = new FakeNetworkAccessManager;
+        auto* seam = new RecordingSeam;
+        seam->ok = false;
+        seam->engineError = QStringLiteral("NvPairingManager: salt mismatch at 0x7ffd");
+        wire(controller, fake);
+        controller.setSeam(seam);
+
+        fake->statuses = { 200 };
+        fake->bodies = { authorizationBody(QString::fromLatin1(kPin)) };
+
+        QSignalSpy failed(&controller, &PairingController::pairingFailed);
+        controller.start(QString::fromLatin1(kSessionId));
+
+        QTRY_COMPARE(failed.count(), 1);
+        const SeatHubFailure failure = failed.at(0).at(0).value<SeatHubFailure>();
+
+        // D-51: engine text is diagnostic only.
+        QVERIFY2(!failure.error.contains(QStringLiteral("NvPairingManager")),
+                 qPrintable(failure.error));
+        QVERIFY(!failure.error.contains(QStringLiteral("0x7ffd")));
+        QCOMPARE(failure.diagnostic, QStringLiteral("NvPairingManager: salt mismatch at 0x7ffd"));
+        // And `toVariantMap()` - the map QML actually sees - drops it entirely.
+        QVERIFY(!failure.toVariantMap().contains(QStringLiteral("diagnostic")));
+    }
+
+    void successWithoutAClientUuid_isARefusal()
+    {
+        // The UUID is the only identifier teardown can verify against (Pitfall 3). A handshake
+        // that reports success without one cannot be torn down, so it is not a success.
+        PairingController controller;
+        auto* fake = new FakeNetworkAccessManager;
+        auto* seam = new RecordingSeam;
+        seam->uuid.clear();
+        wire(controller, fake);
+        controller.setSeam(seam);
+
+        fake->statuses = { 200 };
+        fake->bodies = { authorizationBody(QString::fromLatin1(kPin)) };
+
+        QSignalSpy failed(&controller, &PairingController::pairingFailed);
+        QSignalSpy completed(&controller, &PairingController::pairingCompleted);
+        controller.start(QString::fromLatin1(kSessionId));
+
+        QTRY_COMPARE(failed.count(), 1);
+        QCOMPARE(completed.count(), 0);
+    }
+
+    void noSeam_failsClosedRatherThanClaimingSuccess()
+    {
+        PairingController controller;
+        auto* fake = new FakeNetworkAccessManager;
+        wire(controller, fake);
+        // No seam set.
+
+        fake->statuses = { 200 };
+        fake->bodies = { authorizationBody(QString::fromLatin1(kPin)) };
+
+        QSignalSpy failed(&controller, &PairingController::pairingFailed);
+        QSignalSpy completed(&controller, &PairingController::pairingCompleted);
+        controller.start(QString::fromLatin1(kSessionId));
+
+        QTRY_COMPARE(failed.count(), 1);
+        QCOMPARE(completed.count(), 0);
+    }
+
+    void cancel_stopsEverything()
+    {
+        PairingController controller;
+        auto* fake = new FakeNetworkAccessManager;
+        auto* seam = new RecordingSeam;
+        wire(controller, fake);
+        controller.setSeam(seam);
+        controller.setPollIntervalMs(1);
+
+        fake->statuses = { 409 };
+        fake->bodies = { conflictBody() };
+
+        controller.start(QString::fromLatin1(kSessionId));
+        controller.cancel();
+
+        QCOMPARE(controller.state(), QStringLiteral("idle"));
+        QVERIFY(controller.sessionId().isEmpty());
+
+        const int callsAtCancel = fake->calls;
+        QTest::qWait(20);
+        // No further polls: cancel really stopped the loop rather than merely changing a label.
+        QCOMPARE(fake->calls, callsAtCancel);
+    }
+
+    void emptySessionId_failsImmediately()
+    {
+        PairingController controller;
+        QSignalSpy failed(&controller, &PairingController::pairingFailed);
+        controller.start(QString());
+        QCOMPARE(failed.count(), 1);
+    }
+};
+
+QTEST_MAIN(TstPairing)
+
+#include "tst_pairing.moc"
