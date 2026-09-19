@@ -205,11 +205,14 @@ bool readBackTexture(ID3D11Device* device, ID3D11DeviceContext* context,
 // Drives a real `HudOverlay` with a clock the test owns and a publisher that captures what the
 // production publisher would hand to `OverlayManager`.
 //
-// It copies the pixels out immediately rather than keeping the surface: `publishStrip()` wraps a
-// `QImage` that dies as soon as the publisher returns, which is exactly what production relies on
-// (the manager uploads synchronously). A publisher that kept the surface would be reading freed
-// memory - so this one does the copy the manager would have done, and frees the surface, which is
-// the ownership transfer `updateOverlaySurface()` documents.
+// It copies the pixels out immediately rather than keeping the surface: that is what a renderer
+// which consumes the bitmap right away does (`D3D11VARenderer::notifyOverlayUpdated()` uploads it
+// inside the call), and the copy also lets assertions run after the publisher has returned. The
+// surface it copies from owns its own pixels since CR-03 - `HudOverlay::publishStrip()` allocates
+// and fills a real `SDL_Surface` rather than wrapping the `QImage` it just drew into - so the
+// transfer below (free after copying) is the ownership hand-over `updateOverlaySurface()`
+// documents. `hudSurfaceOutlivesThePublisherCall` covers the other consumer, `SdlRenderer`, which
+// takes the surface at its next frame instead.
 class HudHarness
 {
 public:
@@ -663,6 +666,60 @@ private slots:
         }
 
         harness.hud().endSession();
+    }
+
+    // CR-03: the surface has to stay valid until whatever consumes it has consumed it.
+    //
+    // `D3D11VARenderer` uploads inside `notifyOverlayUpdated()`, but `SdlRenderer` declares no
+    // `notifyOverlayUpdated()` at all - it inherits the base class's no-op - and takes the bitmap
+    // in `renderOverlay()` on its next frame. The old `publishStrip()` handed over a view onto the
+    // `QImage` it had just drawn into and let that image die on return, so a software-decoding
+    // session (`SdlRenderer`) read freed memory. This test is that renderer: it keeps the surface
+    // the publisher returns, reads it afterwards, and only then frees it.
+    void hudSurfaceOutlivesThePublisherCall()
+    {
+        SDL_Surface* handedOver = nullptr;
+        int publishes = 0;
+
+        HudOverlay hud;
+        hud.setClock([]() { return qint64(1000000); });
+        hud.setPublisher([&handedOver, &publishes](SDL_Surface* surface) {
+            if (surface == nullptr) {
+                return true;   // "hide": nothing to read later
+            }
+            if (handedOver != nullptr) {
+                SDL_FreeSurface(handedOver);   // a republish replaces what this fake renderer holds
+            }
+            handedOver = surface;
+            ++publishes;
+            return true;
+        });
+
+        hud.beginSession();
+        QVERIFY(publishes >= 1);
+        QVERIFY(handedOver != nullptr);
+
+        // The structural half of the guarantee: a real allocation, not a view onto a buffer the
+        // HUD owns (SDL_PREALLOC is exactly "surface->pixels is not owned by this surface").
+        QVERIFY2((handedOver->flags & SDL_PREALLOC) == 0,
+                 "the HUD must hand over a surface that owns its pixels");
+
+        // And the observable half: the pixels are still the strip, read after `publishStrip()`
+        // returned and with the `QImage` it drew into long gone.
+        const QImage expected = hud.renderStripAt(0, 0);
+        QCOMPARE(handedOver->w, expected.width());
+        QCOMPARE(handedOver->h, expected.height());
+        QCOMPARE(handedOver->format->format, SDL_PIXELFORMAT_ARGB8888);
+        QVERIFY2(!SDL_MUSTLOCK(handedOver), "the renderer asserts a surface that needs no locking");
+        for (int y = 0; y < expected.height(); y++) {
+            QCOMPARE(memcmp(static_cast<const uchar*>(handedOver->pixels) + y * handedOver->pitch,
+                            expected.constScanLine(y), size_t(expected.width()) * 4),
+                     0);
+        }
+
+        SDL_FreeSurface(handedOver);   // the late consumer's job, once it has consumed it
+        handedOver = nullptr;
+        hud.endSession();
     }
 
     // D-04/screens.md §25: auto-hide after 4 s, reappear on input. The heartbeat is what makes the

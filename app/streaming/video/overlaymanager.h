@@ -55,6 +55,17 @@ public:
     // Ownership: `surface` is consumed in every case, including refusal - the caller must
     // not free it.
     //
+    // Buffer lifetime (CR-03): because delivery is asynchronous (below), the pixels must stay
+    // valid until the renderer has actually taken them. The surface must therefore own its
+    // pixels - `SDL_CreateRGBSurfaceWithFormat()`, or an equivalent allocation - and must not
+    // be a view onto a buffer whose lifetime the caller ends when this call returns.
+    // `SDL_CreateRGBSurfaceWithFormatFrom()` over a caller-owned image is exactly the
+    // mistake: `D3D11VARenderer` consumes the surface inside `notifyOverlayUpdated()`, but
+    // `SdlRenderer` declares no `notifyOverlayUpdated()` at all (it inherits the no-op
+    // default, `renderer.h`), so it picks the surface up on its next `renderOverlay()` and
+    // would read a buffer that is already gone. A renderer that consumes later, or not at
+    // all, is not a bug in the renderer: this API promises only asynchronous delivery.
+    //
     // Threading: same contract as the rest of this class. Safe from any thread; the surface
     // hand-off is the atomic swap the text path already uses, and the renderer notification
     // is documented as callable from an arbitrary thread. Delivery is asynchronous: the

@@ -34,11 +34,12 @@
 // Qt processing for the whole session ("we want to suspend all Qt processing until the stream is
 // over", `session.cpp:1966`). The engine's own input timers use `SDL_AddTimer` for the same
 // reason. Its callback runs on SDL's timer thread, so every piece of state this class shares
-// with the main thread is `std::atomic`, and the two things it calls out to - rendering a
-// `QImage` with `QPainter`, and the injected publisher - are both safe from an arbitrary thread
-// (Qt image painting needs no GUI thread, and `OverlayManager::updateOverlaySurface()` hands the
-// surface over atomically with its renderer notification explicitly "callable on an arbitrary
-// thread").
+// with the main thread is `std::atomic` (`m_autoHide` included - it is written by
+// `beginSession()` on the main thread and read by `tick()` on the timer thread, ME-02), and the
+// two things it calls out to - rendering a `QImage` with `QPainter`, and the injected publisher -
+// are both safe from an arbitrary thread (Qt image painting needs no GUI thread, and
+// `OverlayManager::updateOverlaySurface()` hands the surface over atomically with its renderer
+// notification explicitly "callable on an arbitrary thread").
 //
 // `setClock()` and `setPublisher()` are configuration, not state: set them once before the first
 // `beginSession()`, never while a session is running.
@@ -51,8 +52,10 @@ public:
 
     // Composites one HUD frame. A null surface means "hide": the overlay is disabled and its
     // content dropped, which is what the engine's own `setOverlayState(type, false)` does. A
-    // non-null surface is `SDL_PIXELFORMAT_ARGB8888`, and ownership transfers in every case,
-    // success or failure - the contract of `OverlayManager::updateOverlaySurface()`.
+    // non-null surface is `SDL_PIXELFORMAT_ARGB8888`, owns its own pixels, and stays valid until
+    // the renderer consumes it - delivery is asynchronous (`OverlayManager::updateOverlaySurface`),
+    // so the publisher must not hold on to it and must not free it. Ownership transfers in every
+    // case, success or failure - the contract of `OverlayManager::updateOverlaySurface()`.
     using Publisher = std::function<bool(SDL_Surface*)>;
 
     HudOverlay();
@@ -104,7 +107,9 @@ private:
     Publisher m_publisher;
     SDL_TimerID m_timer = 0;
     bool m_watchingEvents = false;
-    bool m_autoHide = false;
+    // Written on the main thread by `beginSession()`, read on SDL's timer thread by `tick()`:
+    // atomic for the same reason every other shared member is (ME-02).
+    std::atomic<bool> m_autoHide{false};
     std::atomic<bool> m_sessionActive{false};
     std::atomic<bool> m_visible{false};
     std::atomic<bool> m_publishedVisible{false};

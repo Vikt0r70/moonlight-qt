@@ -11,6 +11,7 @@
 #include <QRectF>
 
 #include <cmath>
+#include <cstring>
 
 Q_LOGGING_CATEGORY(seathubHud, "seathub.hud")
 
@@ -302,17 +303,36 @@ void HudOverlay::publishStrip()
         return;
     }
 
-    // No copy: the surface points straight at the image's buffer, so the image must outlive the
-    // publisher call. It does - the manager uploads the pixels into a D3D11 texture
-    // synchronously inside that call before freeing the surface.
-    SDL_Surface* surface = SDL_CreateRGBSurfaceWithFormatFrom(const_cast<uchar*>(image.constBits()),
-                                                             image.width(), image.height(), 32,
-                                                             image.bytesPerLine(),
-                                                             SDL_PIXELFORMAT_ARGB8888);
+    // CR-03: the surface owns its pixels, and the pixels are copied out of `image` here. The
+    // previous version wrapped `image.constBits()` with `SDL_CreateRGBSurfaceWithFormatFrom()` and
+    // let the QImage die on return, justified by a comment claiming the manager uploads
+    // synchronously. That is true of `D3D11VARenderer` (it calls `CreateTexture2D` inside
+    // `notifyOverlayUpdated`) but false of `SdlRenderer`, which declares no `notifyOverlayUpdated`
+    // at all and takes the surface at its *next frame* (`sdlvid.cpp` `renderOverlay`,
+    // `SDL_CreateTextureFromSurface`). The SDL path is reachable in normal use through the
+    // "Force software decoding" option the Settings page exposes, and it was reading freed memory.
+    //
+    // The renderer contract (`OverlayManager::updateOverlaySurface`) is that delivery is
+    // asynchronous and ownership transfers in every case, so the buffer handed over has to stay
+    // valid until whatever consumes it has consumed it - or refused it and freed it.
+    //
+    // `QImage::Format_ARGB32` and `SDL_PIXELFORMAT_ARGB8888` are both 0xAARRGGBB words with
+    // straight (non-premultiplied) alpha - `renderStripAt()` converts back from the premultiplied
+    // format it paints in - so each row copies exactly, byte for byte.
+    SDL_Surface* surface = SDL_CreateRGBSurfaceWithFormat(0, image.width(), image.height(), 32,
+                                                          SDL_PIXELFORMAT_ARGB8888);
     if (surface == nullptr) {
-        qCWarning(seathubHud) << "could not wrap the HUD bitmap:" << SDL_GetError();
+        qCWarning(seathubHud) << "could not allocate the HUD bitmap:" << SDL_GetError();
         return;
     }
+
+    const int rowBytes = image.width() * 4;
+    SDL_LockSurface(surface);
+    for (int y = 0; y < image.height(); ++y) {
+        memcpy(static_cast<uchar*>(surface->pixels) + (y * surface->pitch),
+               image.constScanLine(y), static_cast<size_t>(rowBytes));
+    }
+    SDL_UnlockSurface(surface);
 
     m_publisher(surface);
 }
@@ -349,7 +369,7 @@ void HudOverlay::beginSession()
     if (SDL_WasInit(SDL_INIT_EVENTS) != 0) {
         SDL_AddEventWatch(&HudOverlay::watchEvents, this);
         m_watchingEvents = true;
-        m_autoHide = true;
+        m_autoHide.store(true);
     }
     else {
         qCWarning(seathubHud) << "SDL's events subsystem is not initialised, so the HUD cannot"
@@ -408,7 +428,7 @@ void HudOverlay::tick()
     const qint64 now = nowMs();
     m_elapsedSeconds.store((now - m_sessionStartedMs.load()) / 1000);
 
-    const bool wanted = !m_autoHide || (now - m_lastActivityMs.load()) < kAutoHideMs;
+    const bool wanted = !m_autoHide.load() || (now - m_lastActivityMs.load()) < kAutoHideMs;
     m_visible.store(wanted);
 
     if (wanted) {
