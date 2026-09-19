@@ -11,3 +11,15 @@ config.tests/*/Makefile
 installer/packages/*/data/
 installer/packages/*/meta/license.txt
 installer/config/seathub.ico
+
+# Test build output. The suites are built in place (`qmake <suite>.pro && jom` inside tests/), so
+# the generated Makefile, moc/object files, binaries and any `-o <suite>-out.txt` report land beside
+# the sources. tests/ is entirely this fork's (upstream ships no test tree).
+tests/Makefile
+tests/.qmake.stash
+tests/target_wrapper.bat
+tests/*.obj
+tests/*.exe
+tests/*.moc
+tests/moc_*
+tests/*-out.txt
