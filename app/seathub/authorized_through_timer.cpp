@@ -1,6 +1,7 @@
 #include "authorized_through_timer.h"
 
 #include <QLoggingCategory>
+#include <QThread>
 
 #include <limits>
 
@@ -33,6 +34,14 @@ AuthorizedThroughTimer::AuthorizedThroughTimer(QObject* parent)
     });
 }
 
+bool AuthorizedThroughTimer::onOwnThread() const
+{
+    // `thread()` goes null only when the QThread that owned this object has been destroyed, in
+    // which case there is no queue left to hand work to and running here is the only option.
+    QThread* owner = thread();
+    return owner == nullptr || owner == QThread::currentThread();
+}
+
 qint64 AuthorizedThroughTimer::msUntil(const QDateTime& nowUtc, const QDateTime& horizonUtc)
 {
     if (!nowUtc.isValid() || !horizonUtc.isValid()) {
@@ -51,6 +60,15 @@ qint64 AuthorizedThroughTimer::remainingMs() const
 
 void AuthorizedThroughTimer::arm(const QString& authorizedThroughIso)
 {
+    if (!onOwnThread()) {
+        // The arming call comes from the facade on the main thread; the QTimer lives on the network
+        // thread. Qt refuses `QTimer::start()` from a foreign thread, which is how the horizon
+        // became unreachable and left the billing-safety stop (D-33/D-34) armed on paper only.
+        QMetaObject::invokeMethod(this, [this, authorizedThroughIso]() { arm(authorizedThroughIso); },
+                                  Qt::QueuedConnection);
+        return;
+    }
+
     const QDateTime parsed = QDateTime::fromString(authorizedThroughIso, Qt::ISODate);
 
     if (authorizedThroughIso.isEmpty() || !parsed.isValid()) {
@@ -77,11 +95,17 @@ void AuthorizedThroughTimer::arm(const QString& authorizedThroughIso)
 
 void AuthorizedThroughTimer::extend(const QString& authorizedThroughIso)
 {
+    // Delegates rather than marshalling twice: `arm()` is the single guarded entry point.
     arm(authorizedThroughIso);
 }
 
 void AuthorizedThroughTimer::disarm()
 {
+    if (!onOwnThread()) {
+        QMetaObject::invokeMethod(this, [this]() { disarm(); }, Qt::QueuedConnection);
+        return;
+    }
+
     if (m_timer->isActive()) {
         m_timer->stop();
     }
@@ -103,6 +127,11 @@ void AuthorizedThroughTimer::schedule()
 
 void AuthorizedThroughTimer::hardStop()
 {
+    if (!onOwnThread()) {
+        QMetaObject::invokeMethod(this, [this]() { hardStop(); }, Qt::QueuedConnection);
+        return;
+    }
+
     // The control plane said the session is over, or the customer pressed End. Same path as the
     // horizon: stop locally, then let the facade run teardown.
     disarm();

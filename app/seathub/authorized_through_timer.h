@@ -23,6 +23,13 @@
 // A later `authorized_through` (the control plane extending the session, renewing the lease)
 // re-arms the timer to the new horizon. That is the extension path; there is no other.
 //
+// Threading: the facade moves this object onto the network thread `ControlPlaneClient` owns, so
+// the QTimer fires while upstream has the Qt main thread suspended for the stream
+// (`app/streaming/session.cpp:1965-1966`). `arm()`, `extend()` and `disarm()` are called from the
+// main thread, so each re-invokes itself queued when it is not on the owning thread; without that
+// the timer start was refused by Qt ("Timers cannot be started from another thread" - a warning and
+// a no-op) and the billing-safety horizon could never fire (CR-02).
+//
 // There is no maximum session length (STREAM-11). This timer does not impose one - it enforces
 // the horizon the control plane set, which moves forward for as long as the customer keeps
 // paying. A session that is never extended and never ended locally will still be ended by the
@@ -62,6 +69,9 @@ signals:
 
 private:
     void schedule();
+    /// True when the calling thread is the one this object lives on (or when it lives on no
+    /// thread at all, which only happens after its thread has been destroyed).
+    bool onOwnThread() const;
 
     QTimer* m_timer = nullptr;
     QDateTime m_horizon;

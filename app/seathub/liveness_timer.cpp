@@ -1,6 +1,7 @@
 #include "liveness_timer.h"
 
 #include <QLoggingCategory>
+#include <QThread>
 
 Q_LOGGING_CATEGORY(seathubLiveness, "seathub.liveness")
 
@@ -18,6 +19,14 @@ LivenessTimer::LivenessTimer(QObject* parent)
 {
     m_timer->setInterval(m_intervalMs);
     connect(m_timer, &QTimer::timeout, this, &LivenessTimer::tick);
+}
+
+bool LivenessTimer::onOwnThread() const
+{
+    // `thread()` goes null only when the QThread that owned this object has been destroyed, in
+    // which case there is no queue left to hand work to and running here is the only option.
+    QThread* owner = thread();
+    return owner == nullptr || owner == QThread::currentThread();
 }
 
 void LivenessTimer::setControlPlane(ControlPlaneClient* client)
@@ -38,6 +47,11 @@ void LivenessTimer::setGraceMs(int milliseconds)
 
 void LivenessTimer::setReportedState(const QString& state)
 {
+    if (!onOwnThread()) {
+        QMetaObject::invokeMethod(this, [this, state]() { setReportedState(state); },
+                                  Qt::QueuedConnection);
+        return;
+    }
     if (m_reportedState == state) {
         return;
     }
@@ -48,6 +62,11 @@ void LivenessTimer::setReportedState(const QString& state)
 
 void LivenessTimer::setErrorCode(const QString& reference)
 {
+    if (!onOwnThread()) {
+        QMetaObject::invokeMethod(this, [this, reference]() { setErrorCode(reference); },
+                                  Qt::QueuedConnection);
+        return;
+    }
     // Dropped rather than sent when it does not match ADR-0008's shape, so the control plane
     // never has to reject a body this client built.
     const QString sanitised = ControlPlaneClient::isValidErrorCode(reference) ? reference
@@ -67,6 +86,16 @@ bool LivenessTimer::isRunning() const
 void LivenessTimer::start(const QString& sessionId)
 {
     if (sessionId.isEmpty()) {
+        return;
+    }
+
+    if (!onOwnThread()) {
+        // Hand the start to the thread that owns the QTimer. Qt refuses `QTimer::start()` from a
+        // foreign thread - "Timers cannot be started from another thread" is a warning followed by
+        // a no-op, not a failure - so the main-thread caller used to get exactly one report (the
+        // immediate `tick()` below) and then silence for the rest of the stream.
+        QMetaObject::invokeMethod(this, [this, sessionId]() { start(sessionId); },
+                                  Qt::QueuedConnection);
         return;
     }
 
@@ -90,6 +119,11 @@ void LivenessTimer::start(const QString& sessionId)
 
 void LivenessTimer::stop()
 {
+    if (!onOwnThread()) {
+        QMetaObject::invokeMethod(this, [this]() { stop(); }, Qt::QueuedConnection);
+        return;
+    }
+
     if (m_timer->isActive()) {
         m_timer->stop();
         emit runningChanged();
@@ -102,6 +136,11 @@ void LivenessTimer::stop()
 
 void LivenessTimer::tick()
 {
+    if (!onOwnThread()) {
+        QMetaObject::invokeMethod(this, [this]() { tick(); }, Qt::QueuedConnection);
+        return;
+    }
+
     if (m_sessionId.isEmpty() || m_client == nullptr) {
         return;
     }

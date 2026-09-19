@@ -35,6 +35,12 @@ class ControlPlaneClient;
 // processing until the stream is over"), so a timer on the Qt main thread would never fire
 // during exactly the interval liveness exists to cover. The facade moves this object onto the
 // network thread `ControlPlaneClient` owns, where an event loop does run.
+//
+// Every entry point (`start`, `stop`, `tick`, `setReportedState`, `setErrorCode`) re-invokes
+// itself queued when it is called from a thread other than the one that owns this object, so the
+// QTimer is only ever started, stopped and read on its own thread. A `QTimer::start()` from a
+// foreign thread is refused by Qt with a warning and nothing else, which is exactly the state
+// that left one liveness report per session and an unreachable billing horizon (CR-02).
 class LivenessTimer : public QObject
 {
     Q_OBJECT
@@ -92,6 +98,9 @@ public slots:
 
 private:
     void handleResult(const ControlPlaneResult& result);
+    /// True when the calling thread is the one this object lives on (or when it lives on no
+    /// thread at all, which only happens after its thread has been destroyed).
+    bool onOwnThread() const;
 
     ControlPlaneClient* m_client = nullptr;
     QTimer* m_timer = nullptr;
