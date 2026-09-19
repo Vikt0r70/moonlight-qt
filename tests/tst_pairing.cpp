@@ -287,6 +287,40 @@ private slots:
         QVERIFY(!controller.sessionId().contains(QLatin1String(kPin)));
     }
 
+    void authorizationGrantedCarriesTheQualityProfile()
+    {
+        // D-37 / WR-05: the session authorization's `quality_profile` is what
+        // `SettingsBridge::applySessionOverride()` turns into this launch's resolution and frame
+        // rate - in memory, without writing a saved preference (D-12, D-37). The controller is the
+        // only object that ever sees the authorization, so the profile has to ride out on this
+        // signal; if it stopped, the override would silently never be applied and the stream would
+        // fall back to the customer's saved resolution with nothing to show for it.
+        //
+        // This is the same signal that used to carry nothing, which is why the override had no
+        // caller at all (`applySessionOverride()` was orphaned - verifier G5).
+        PairingController controller;
+        auto* fake = new FakeNetworkAccessManager;
+        auto* seam = new RecordingSeam;
+        wire(controller, fake);
+        controller.setSeam(seam);
+
+        fake->statuses = { 200 };
+        fake->bodies = { authorizationBody(QString::fromLatin1(kPin)) };
+
+        QSignalSpy granted(&controller, &PairingController::authorizationGranted);
+        QSignalSpy completed(&controller, &PairingController::pairingCompleted);
+
+        controller.start(QString::fromLatin1(kSessionId));
+        QTRY_COMPARE(completed.count(), 1);
+
+        QCOMPARE(granted.count(), 1);
+        QCOMPARE(granted.at(0).at(0).toString(), QStringLiteral("1080p60"));
+
+        // The profile is the only field on this signal. The lease, the ports and the PIN stay
+        // inside the controller - least of all the PIN, which is on no signal at all.
+        QCOMPARE(granted.at(0).size(), 1);
+    }
+
     void conflict_isAWaitNotAFailure()
     {
         // `GET /api/sessions/{id}/pairing` 409s until the host has a pairing target. The early
