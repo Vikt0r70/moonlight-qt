@@ -31,6 +31,7 @@ SOURCES += \
 
 HEADERS += \
     ../app/seathub/teardown_controller.h \
+    ../app/seathub/teardown_guard.h \
     ../app/seathub/control_plane_client.h \
     ../app/seathub/token_store.h \
     ../app/seathub/error_map.h

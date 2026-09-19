@@ -776,8 +776,14 @@ void TstUiScreens::agentConfigPanelMasksTheTokenAndNeverRendersIt()
     const QString masked = described.value(QStringLiteral("token_masked")).toString();
     QVERIFY2(!masked.isEmpty(), "a token that was found must come back masked");
     QVERIFY2(!masked.contains(token), "the mask must not contain the token");
-    QVERIFY2(!masked.contains(token.right(8)),
-             "the mask must not disclose the token's tail either");
+
+    // The mask's shape is `agent_config.h`'s design: the first four characters, eight bullets, the
+    // last four. Both four-character ends are shown on purpose - a support reader needs something
+    // to match against - so the assertion is what is true of the design. It used to assert that the
+    // token's last *eight* characters were absent, under a message claiming the mask hid the tail;
+    // the design never claimed that, and the assertion passed only because eight characters is a
+    // wider window than the mask reveals (defect F-11).
+    QCOMPARE(masked, token.left(4) + QString(8, QChar(0x2022)) + token.right(4));
 
     // A file that is not there is an ordinary answer with a reason, and no invented code.
     const QVariantMap missing = AgentConfig::describe(QUrl::fromLocalFile(path + QStringLiteral(".gone")));

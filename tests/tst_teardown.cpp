@@ -26,6 +26,7 @@
 #include <QTimer>
 
 #include "seathub/teardown_controller.h"
+#include "seathub/teardown_guard.h"
 
 namespace {
 
@@ -361,6 +362,84 @@ private slots:
         QTest::qWait(20);
         QCOMPARE(fake->calls, callsAtCancel);
         QCOMPARE(controller.stage(), TeardownStage::Idle);
+    }
+
+    // --- defect F-9: a second session must tear down too ------------------------------------
+
+    void aSecondSessionTearsDownEvenThoughTheStageStaysDone()
+    {
+        // The verifier's second blocker, as an assertion. `TeardownController::stage()` reaches
+        // `Done` when a teardown finishes and stays there - `cancel()` is the only other writer and
+        // only `signOut()` calls it. So the expression `SeatHubClient::handleReadyForDeletion()`
+        // guarded session teardown with - `stage() != TeardownStage::Done` - is false from the
+        // second session onward, and the second session (and every one after it) skipped
+        // `POST /api/sessions/{id}/end`, the rig-side disable/unpair, the local clear and
+        // `teardownCompleted()` entirely. That is how STREAM-10 went unmet: the client kept its
+        // token, and nothing on the rig was disabled or unpaired.
+        //
+        // The replacement is a per-session flag the facade resets in `beginSession()` and claims
+        // through `markStarted()`, so this test drives exactly that.
+        TeardownController controller;
+        auto* client = new ControlPlaneClient(&controller);
+        auto* fake = new FakeNetworkAccessManager;
+        client->setNetworkAccessManager(fake);
+        controller.setControlPlane(client);
+
+        TokenStore store;
+        store.setDirectory(m_dir->path());
+        controller.setTokenStore(&store);
+
+        controller.setVerifyIntervalMs(1);
+
+        const QString endPath =
+            QString(QStringLiteral("/api/sessions/%1/end").arg(QLatin1String(kSessionId)));
+
+        // --- session one, driven to its end
+        QVERIFY(store.storeToken(TokenStore::refreshTokenName(),
+                                 QStringLiteral("sb_rt_SESSION-ONE")));
+        const QString tokenPath = store.pathFor(TokenStore::refreshTokenName());
+        QVERIFY(QFile::exists(tokenPath));
+
+        fake->statuses = { 202, 200 };
+        fake->bodies = { sessionBody(QStringLiteral("ENDING")),
+                         sessionBody(QStringLiteral("COMPLETED")) };
+
+        SessionTeardownGuard guard;
+        guard.reset();
+        QVERIFY(guard.markStarted());
+
+        QSignalSpy firstCompleted(&controller, &TeardownController::teardownCompleted);
+        controller.teardown(QString::fromLatin1(kSessionId), QString::fromLatin1(kClientUuid));
+        QTRY_COMPARE(firstCompleted.count(), 1);
+
+        QCOMPARE(fake->paths.count(endPath), 1);
+        QVERIFY2(!QFile::exists(tokenPath), "session one must leave nothing behind");
+
+        // The sticky state the old guard read. Asserting it is the point: it is the fact that made
+        // a stage-based guard wrong, and nothing between two sessions resets it.
+        QCOMPARE(controller.stage(), TeardownStage::Done);
+
+        // --- session two begins, exactly as `SeatHubClient::beginSession()` marks it
+        guard.reset();
+        QVERIFY2(guard.markStarted(),
+                 "the second session must be allowed to tear down even though the stage is Done");
+
+        QVERIFY(store.storeToken(TokenStore::refreshTokenName(),
+                                 QStringLiteral("sb_rt_SESSION-TWO")));
+        QVERIFY(QFile::exists(tokenPath));
+
+        QSignalSpy secondCompleted(&controller, &TeardownController::teardownCompleted);
+        controller.teardown(QString::fromLatin1(kSessionId), QString::fromLatin1(kClientUuid));
+        QTRY_COMPARE(secondCompleted.count(), 1);
+
+        // The authorisation is not decoration on a path that then refuses: the request went out,
+        // and the store was cleared a second time.
+        QCOMPARE(fake->paths.count(endPath), 2);
+        QVERIFY2(!QFile::exists(tokenPath),
+                 "STREAM-10: the second session must clear the store too");
+
+        // And the flag is claimed exactly once, so a duplicate cannot re-run a teardown.
+        QVERIFY2(!guard.markStarted(), "a session's teardown is claimed exactly once");
     }
 };
 
