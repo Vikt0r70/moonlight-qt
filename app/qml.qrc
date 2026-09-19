@@ -8,6 +8,8 @@
         <file>gui/HomeScreen.qml</file>
         <file>gui/ErrorScreen.qml</file>
         <file>gui/SeatHubOTPField.qml</file>
+        <file>gui/SeatHubButton.qml</file>
+        <file>gui/SeatHubStepper.qml</file>
         <file>gui/SettingsPage.qml</file>
         <file>gui/SeatHubToggle.qml</file>
         <file>gui/SeatHubSelect.qml</file>
@@ -16,7 +18,6 @@
         <file>gui/ForcedUpdateModal.qml</file>
         <file>gui/PcView.qml</file>
         <file>gui/AppView.qml</file>
-        <file>gui/SettingsView.qml</file>
         <file>gui/StreamSegue.qml</file>
         <file>gui/GamepadMapper.qml</file>
         <file>gui/QuitSegue.qml</file>

@@ -43,6 +43,11 @@ Item {
     z: 1000
     focus: shown
 
+    // ui.md §3.1 has no scrim token, so this is the one untokenised colour in the shell
+    // (audit F19). It is named once here rather than written inline, so it cannot drift into a
+    // second value; a `--scrim` token in ui.md is the fix that would retire it.
+    readonly property color scrimColor: Qt.rgba(0, 0, 0, 0.72)
+
     // Nothing behind this may be clicked, scrolled or dragged while it is up.
     MouseArea {
         anchors.fill: parent
@@ -51,12 +56,33 @@ Item {
         onWheel: function(wheel) { wheel.accepted = true }
     }
 
-    // Nor typed into, nor tabbed out of.
-    Keys.onPressed: function(event) { event.accepted = true }
+    // Nor typed into, nor tabbed out of - with one exception, because swallowing every key
+    // also swallowed Tab and left `Update` unreachable by keyboard (audit F4). Every key is
+    // still refused; Tab is answered by moving the focus ring between this card's root and
+    // its single action, so the ring cannot escape to the page behind. There is still no
+    // dismissal path of any kind (D-41).
+    Keys.onPressed: function(event) {
+        if (event.key === Qt.Key_Tab || event.key === Qt.Key_Backtab) {
+            if (updateAction.enabled)
+                updateAction.forceActiveFocus()
+            event.accepted = true
+            return
+        }
+        event.accepted = true
+    }
+
+    onShownChanged: {
+        if (shown) {
+            if (updateAction.enabled)
+                updateAction.forceActiveFocus()
+            else
+                modal.forceActiveFocus()
+        }
+    }
 
     Rectangle {
         anchors.fill: parent
-        color: Qt.rgba(0, 0, 0, 0.72)
+        color: modal.scrimColor
     }
 
     Rectangle {
@@ -108,7 +134,7 @@ Item {
                          && String(modal.offer.notes).length > 0
                 wrapMode: Text.Wrap
                 text: modal.hasOffer ? String(modal.offer.notes) : ""
-                color: Tokens.foregroundSubtleDefault
+                color: Tokens.foregroundMutedDefault
                 font.family: Tokens.fontSansDefault
                 font.pixelSize: Metrics.fontSm
             }
@@ -178,28 +204,20 @@ Item {
             }
 
             // The one action. There is no second one, by design (D-41).
-            Button {
+            SeatHubButton {
                 id: updateAction
 
                 width: parent.width
-                height: Metrics.touchTarget
                 enabled: updates !== null && updates !== undefined && modal.busy === false
                 text: updates && updates.state === "failed" ? qsTr("Try again") : qsTr("Update")
 
-                contentItem: Text {
-                    text: updateAction.text
-                    color: Tokens.primaryForegroundDefault
-                    font.family: Tokens.fontSansDefault
-                    font.pixelSize: Metrics.fontBody
-                    horizontalAlignment: Text.AlignHCenter
-                    verticalAlignment: Text.AlignVCenter
-                }
-
-                background: Rectangle {
-                    radius: Metrics.radiusSm
-                    color: updateAction.enabled
-                           ? (updateAction.pressed ? Tokens.surface3Default : Tokens.primaryDefault)
-                           : Tokens.surface3Default
+                // Tab must not leave the card (audit F4). Space and Enter still activate the
+                // button through Qt's own handling; only the tab keys are answered here.
+                Keys.onPressed: function(event) {
+                    if (event.key === Qt.Key_Tab || event.key === Qt.Key_Backtab) {
+                        modal.forceActiveFocus()
+                        event.accepted = true
+                    }
                 }
 
                 onClicked: {

@@ -94,7 +94,7 @@ Item {
                     visible: text.length > 0
                     width: parent.width
                     wrapMode: Text.Wrap
-                    color: Tokens.foregroundSubtleDefault
+                    color: Tokens.foregroundMutedDefault
                     font.family: Tokens.fontSansDefault
                     font.pixelSize: Metrics.fontSm
                     lineHeight: 1.4
@@ -111,7 +111,7 @@ Item {
                 font.pixelSize: Metrics.fontBody
 
                 background: Rectangle {
-                    radius: Metrics.radiusXs
+                    radius: Metrics.radiusSm
                     color: Tokens.surface2Default
                     border.color: dropdown.activeFocus ? Tokens.focusDefault : Tokens.borderDefault
                     border.width: dropdown.activeFocus ? 2 : 1
@@ -123,8 +123,34 @@ Item {
                     text: dropdown.displayText
                     elide: Text.ElideRight
                     verticalAlignment: Text.AlignVCenter
-                    color: dropdown.enabled ? Tokens.foregroundDefault : Tokens.foregroundSubtleDefault
+                    color: dropdown.enabled ? Tokens.foregroundDefault : Tokens.foregroundMutedDefault
                     font: dropdown.font
+                }
+
+                // E9: the closed control elides, and so must the popup - the longest codec and
+                // decoder names must not widen the flat page at the 960px minimum window width.
+                // The popup is capped to the control's own width and the row's text elides.
+                popup.width: dropdown.width
+                popup.height: Math.min(contentItem.implicitHeight, 320)
+
+                delegate: ItemDelegate {
+                    id: optionDelegate
+                    width: dropdown.width
+                    text: modelData
+                    font: dropdown.font
+                    highlighted: dropdown.highlightedIndex === index
+
+                    contentItem: Text {
+                        text: optionDelegate.text
+                        elide: Text.ElideRight
+                        verticalAlignment: Text.AlignVCenter
+                        color: Tokens.foregroundDefault
+                        font: dropdown.font
+                    }
+
+                    background: Rectangle {
+                        color: optionDelegate.highlighted ? Tokens.surface3Default : Tokens.surface2Default
+                    }
                 }
 
                 onActivated: {

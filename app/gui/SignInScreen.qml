@@ -7,11 +7,11 @@ import SeatHub.Tokens 1.0
 // Every state `docs/spec/screens.md` requires is here: the empty state (field labels and
 // helper text before anything is typed), the partial state (normal typing with
 // auto-advance), the loading state (BusyIndicator on the button, button keeps its width)
-// and the error state (message above the field, in the destructive token).
+// and the error state (message in the destructive token, with the ADR-0008 reference in
+// mono, shown for both the phone step and the code step - audit F2).
 //
-// Plan 03-02 stubs the control plane: `client.requestOtp` / `client.verifyOtp` accept the
-// input locally. Plan 03-03 replaces those bodies with the real calls; nothing in this
-// file changes when it does.
+// The resend control (audit F6) is the deck's own sequence: `Resend in 0:24` while
+// ADR-0022's 24-second window runs, then the `Send code` action again.
 Item {
     id: root
 
@@ -25,16 +25,32 @@ Item {
     property bool codeSent: false
     property bool verifying: false
     property string errorText: ""
+    property string errorReference: ""
+    property int resendRemaining: 0
+
+    // copy.md §5: countdowns are mono. ADR-0022 fixes the window at 24 seconds.
+    readonly property string countdownText: "0:" + (root.resendRemaining < 10 ? "0" : "")
+                                            + root.resendRemaining
 
     function sendCode() {
         errorText = ""
+        errorReference = ""
         client.requestOtp(phoneField.text)
     }
 
     function verify() {
         errorText = ""
+        errorReference = ""
         verifying = true
         client.verifyOtp(phoneField.text, otpField.code)
+    }
+
+    Timer {
+        id: resendTimer
+        interval: 1000
+        repeat: true
+        running: root.codeSent && root.resendRemaining > 0
+        onTriggered: root.resendRemaining = Math.max(0, root.resendRemaining - 1)
     }
 
     Connections {
@@ -43,13 +59,15 @@ Item {
         function onOtpRequested(phoneE164) {
             root.codeSent = true
             root.verifying = false
+            root.resendRemaining = 24
             otpField.clear()
         }
 
         function onOtpRejected(message, reference) {
             root.verifying = false
             // The message is SeatHub copy; the reference is what support needs (ADR-0008).
-            root.errorText = reference ? message + " Reference " + reference + "." : message
+            root.errorText = message
+            root.errorReference = reference ? reference : ""
             otpField.clear()
         }
 
@@ -90,9 +108,7 @@ Item {
                 width: parent.width
                 height: Metrics.touchTarget
                 enabled: !root.verifying
-                placeholderText: qsTr("+962 7 0000 0000")
                 color: Tokens.foregroundDefault
-                placeholderTextColor: Tokens.foregroundSubtleDefault
                 font.family: Tokens.fontMonoDefault
                 font.pixelSize: Metrics.fontBody
                 background: Rectangle {
@@ -107,10 +123,48 @@ Item {
             Text {
                 // Empty-state helper, verbatim from docs/spec/copy.md §Sign in.
                 text: qsTr("We'll send a code on WhatsApp")
-                color: Tokens.foregroundSubtleDefault
+                color: Tokens.foregroundMutedDefault
                 font.family: Tokens.fontSansDefault
                 font.pixelSize: Metrics.fontCaption
                 visible: !root.codeSent
+            }
+        }
+
+        // --- Error, for both steps (audit F2) ---
+        // Outside both columns on purpose: a rejected phone number has to be visible even
+        // though the code column is still hidden.
+        Column {
+            width: parent.width
+            spacing: Metrics.s2
+            visible: root.errorText.length > 0
+
+            Text {
+                width: parent.width
+                text: root.errorText
+                wrapMode: Text.Wrap
+                color: Tokens.destructiveDefault
+                font.family: Tokens.fontSansDefault
+                font.pixelSize: Metrics.fontSm
+            }
+
+            Row {
+                spacing: Metrics.s2
+                visible: root.errorReference.length > 0
+
+                Text {
+                    text: qsTr("Reference")
+                    color: Tokens.foregroundMutedDefault
+                    font.family: Tokens.fontSansDefault
+                    font.pixelSize: Metrics.fontSm
+                }
+
+                Text {
+                    // ADR-0008: the reference code is always monospace, never translated.
+                    text: root.errorReference
+                    color: Tokens.foregroundDefault
+                    font.family: Tokens.fontMonoDefault
+                    font.pixelSize: Metrics.fontSm
+                }
             }
         }
 
@@ -128,59 +182,47 @@ Item {
                 font.letterSpacing: 0.08 * Metrics.fontLabel
             }
 
-            // Error state: above the field, in the destructive token.
-            Text {
-                width: parent.width
-                text: root.errorText
-                visible: root.errorText.length > 0
-                wrapMode: Text.Wrap
-                color: Tokens.destructiveDefault
-                font.family: Tokens.fontSansDefault
-                font.pixelSize: Metrics.fontSm
-            }
-
             SeatHubOTPField {
                 id: otpField
                 entryEnabled: !root.verifying
                 onCompleted: root.verify()
+            }
+
+            // Resend (audit F6): the countdown while the window runs, the action after it.
+            Row {
+                width: parent.width
+                spacing: Metrics.s3
+
+                Text {
+                    visible: root.resendRemaining > 0
+                    text: qsTr("Resend in %1").arg(root.countdownText)
+                    color: Tokens.foregroundMutedDefault
+                    font.family: Tokens.fontMonoDefault
+                    font.pixelSize: Metrics.fontSm
+                    anchors.verticalCenter: parent.verticalCenter
+                }
+
+                SeatHubButton {
+                    id: resendButton
+                    visible: root.resendRemaining <= 0
+                    variant: "ghost"
+                    text: qsTr("Send code")
+                    enabled: !root.verifying
+
+                    onClicked: root.sendCode()
+                }
             }
         }
 
         // --- Primary action ---
         // Loading state: BusyIndicator beside the label, and the button keeps its width
         // so the layout does not jump.
-        Button {
+        SeatHubButton {
             id: primaryButton
             width: parent.width
-            height: Metrics.touchTarget
             enabled: !root.verifying
+            busy: root.verifying
             text: root.codeSent ? qsTr("Verify and continue") : qsTr("Send code")
-
-            contentItem: Row {
-                spacing: Metrics.s3
-                anchors.centerIn: parent
-
-                BusyIndicator {
-                    visible: root.verifying
-                    running: root.verifying
-                    width: visible ? Metrics.s5 : 0
-                    height: Metrics.s5
-                    anchors.verticalCenter: parent.verticalCenter
-                }
-
-                Text {
-                    text: primaryButton.text
-                    color: Tokens.primaryForegroundDefault
-                    font.family: Tokens.fontSansDefault
-                    font.pixelSize: Metrics.fontBody
-                    anchors.verticalCenter: parent.verticalCenter
-                }
-            }
-
-            background: Rectangle {
-                radius: Metrics.radiusSm
-                color: primaryButton.enabled ? Tokens.primaryDefault : Tokens.surface3Default
-            }
 
             onClicked: root.codeSent ? root.verify() : root.sendCode()
         }

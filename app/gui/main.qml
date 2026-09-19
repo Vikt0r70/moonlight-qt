@@ -19,8 +19,9 @@ import SeatHub.Tokens 1.0
 ApplicationWindow {
     id: window
 
-    width: 960
-    height: 640
+    // screens.md §26 asks for 1100x720 with 960x640 as the supported minimum (audit F17).
+    width: 1100
+    height: 720
     minimumWidth: 960
     minimumHeight: 640
     visible: true
@@ -141,39 +142,25 @@ ApplicationWindow {
         Item {
             Column {
                 anchors.centerIn: parent
-                spacing: Metrics.s5
+                spacing: Metrics.s6
                 width: Math.min(parent.width - Metrics.s16, 420)
 
-                BusyIndicator {
-                    anchors.horizontalCenter: parent.horizontalCenter
-                    running: true
-                    width: Metrics.s10
-                    height: Metrics.s10
+                // The connect phase is the deck's five stages, not a spinner that resets
+                // (ui.md §6, audit F8).
+                SeatHubStepper {
+                    id: stepper
+                    width: parent.width
+                    client: seatHub
                 }
 
-                Text {
+                // A real control, not a Text + MouseArea (audit F3).
+                SeatHubButton {
+                    id: cancelButton
                     width: parent.width
-                    horizontalAlignment: Text.AlignHCenter
-                    text: seatHub.stageText
-                    wrapMode: Text.Wrap
-                    color: Tokens.foregroundDefault
-                    font.family: Tokens.fontSansDefault
-                    font.pixelSize: Metrics.fontH3
-                }
-
-                Text {
-                    width: parent.width
-                    horizontalAlignment: Text.AlignHCenter
+                    variant: "ghost"
                     text: qsTr("Cancel")
-                    color: Tokens.foregroundSubtleDefault
-                    font.family: Tokens.fontSansDefault
-                    font.pixelSize: Metrics.fontCaption
 
-                    MouseArea {
-                        anchors.fill: parent
-                        cursorShape: Qt.PointingHandCursor
-                        onClicked: seatHub.interrupt()
-                    }
+                    onClicked: seatHub.interrupt()
                 }
             }
         }
@@ -189,26 +176,89 @@ ApplicationWindow {
             Column {
                 anchors.centerIn: parent
                 spacing: Metrics.s4
+                width: Math.min(parent.width - Metrics.s16, 420)
 
                 Text {
-                    anchors.horizontalCenter: parent.horizontalCenter
+                    width: parent.width
+                    horizontalAlignment: Text.AlignHCenter
                     text: qsTr("Streaming")
                     color: Tokens.successDefault
                     font.family: Tokens.fontSansDefault
                     font.pixelSize: Metrics.fontH2
                 }
 
-                Text {
-                    anchors.horizontalCenter: parent.horizontalCenter
+                SeatHubButton {
+                    id: endSessionButton
+                    width: parent.width
+                    variant: "destructive"
                     text: qsTr("End session")
-                    color: Tokens.foregroundMutedDefault
-                    font.family: Tokens.fontSansDefault
-                    font.pixelSize: Metrics.fontBody
 
-                    MouseArea {
-                        anchors.fill: parent
-                        cursorShape: Qt.PointingHandCursor
-                        onClicked: seatHub.interrupt()
+                    onClicked: endSessionConfirm.open()
+                }
+            }
+
+            // copy.md §In session "End": a destructive confirm that names the object and the
+            // consequence (copy.md §5, ui.md §7 Confirm/alert dialog). The deck's leading
+            // minute count is omitted because no client surface knows the session's remaining
+            // minutes yet - recorded in 03-UI-REVIEW-FIXES.md rather than filled with an
+            // invented number.
+            Popup {
+                id: endSessionConfirm
+                anchors.centerIn: parent
+                width: Math.min(parent.width - Metrics.s16, 420)
+                modal: true
+                focus: true
+                padding: Metrics.s8
+                closePolicy: Popup.CloseOnEscape
+
+                background: Rectangle {
+                    radius: Metrics.radiusLg
+                    color: Tokens.surface1Default
+                    border.color: Tokens.borderDefault
+                    border.width: 1
+                }
+
+                contentItem: Column {
+                    spacing: Metrics.s4
+
+                    Text {
+                        width: parent.width
+                        wrapMode: Text.Wrap
+                        text: qsTr("End session?")
+                        color: Tokens.foregroundDefault
+                        font.family: Tokens.fontDisplayDefault
+                        font.pixelSize: Metrics.fontH3
+                        font.weight: Font.DemiBold
+                    }
+
+                    Text {
+                        width: parent.width
+                        wrapMode: Text.Wrap
+                        text: qsTr("Unused minutes stay in your account.")
+                        color: Tokens.foregroundMutedDefault
+                        font.family: Tokens.fontSansDefault
+                        font.pixelSize: Metrics.fontSm
+                    }
+
+                    SeatHubButton {
+                        id: confirmEndButton
+                        width: parent.width
+                        variant: "destructive"
+                        text: qsTr("End session")
+
+                        onClicked: {
+                            endSessionConfirm.close()
+                            seatHub.interrupt()
+                        }
+                    }
+
+                    SeatHubButton {
+                        id: keepPlayingButton
+                        width: parent.width
+                        variant: "ghost"
+                        text: qsTr("Keep playing")
+
+                        onClicked: endSessionConfirm.close()
                     }
                 }
             }

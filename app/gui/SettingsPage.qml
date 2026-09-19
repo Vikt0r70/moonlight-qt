@@ -479,7 +479,7 @@ Item {
                                     width: parent.width
                                     wrapMode: Text.Wrap
                                     text: qsTr("Lets combinations like Ctrl+Alt+Del reach the host instead of this PC. Checkbox and dropdown together are the [streamsettings] capturesyskeys key.")
-                                    color: Tokens.foregroundSubtleDefault
+                                    color: Tokens.foregroundMutedDefault
                                     font.family: Tokens.fontSansDefault
                                     font.pixelSize: Metrics.fontSm
                                     lineHeight: 1.4
@@ -546,7 +546,7 @@ Item {
                                 font.pixelSize: Metrics.fontBody
 
                                 background: Rectangle {
-                                    radius: Metrics.radiusXs
+                                    radius: Metrics.radiusSm
                                     color: Tokens.surface2Default
                                     border.color: captureWhenBox.activeFocus ? Tokens.focusDefault : Tokens.borderDefault
                                     border.width: captureWhenBox.activeFocus ? 2 : 1
@@ -560,6 +560,31 @@ Item {
                                     verticalAlignment: Text.AlignVCenter
                                     color: Tokens.foregroundDefault
                                     font: captureWhenBox.font
+                                }
+
+                                // E9: the popup elides too, so neither dropdown can widen the
+                                // flat page at the 960px minimum window width.
+                                popup.width: captureWhenBox.width
+                                popup.height: Math.min(contentItem.implicitHeight, 320)
+
+                                delegate: ItemDelegate {
+                                    id: captureDelegate
+                                    width: captureWhenBox.width
+                                    text: modelData
+                                    font: captureWhenBox.font
+                                    highlighted: captureWhenBox.highlightedIndex === index
+
+                                    contentItem: Text {
+                                        text: captureDelegate.text
+                                        elide: Text.ElideRight
+                                        verticalAlignment: Text.AlignVCenter
+                                        color: Tokens.foregroundDefault
+                                        font: captureWhenBox.font
+                                    }
+
+                                    background: Rectangle {
+                                        color: captureDelegate.highlighted ? Tokens.surface3Default : Tokens.surface2Default
+                                    }
                                 }
 
                                 onActivated: {
@@ -635,22 +660,19 @@ Item {
         Item {
             Layout.fillWidth: true
             Layout.margins: Metrics.s8
-            implicitHeight: backLabel.implicitHeight
+            implicitHeight: backButton.implicitHeight
 
-            Text {
-                id: backLabel
+            // A real control, not a Text + MouseArea (audit F3): focusable, named for a screen
+            // reader, and at least 40px tall.
+            SeatHubButton {
+                id: backButton
+                variant: "ghost"
                 text: qsTr("Back")
-                color: Tokens.foregroundMutedDefault
-                font.family: Tokens.fontSansDefault
-                font.pixelSize: Metrics.fontBody
+                anchors.left: parent.left
 
-                MouseArea {
-                    anchors.fill: parent
-                    cursorShape: Qt.PointingHandCursor
-                    onClicked: {
-                        if (page.client)
-                            page.client.closeSettings()
-                    }
+                onClicked: {
+                    if (page.client)
+                        page.client.closeSettings()
                 }
             }
         }

@@ -81,7 +81,7 @@ Item {
                     visible: text.length > 0
                     width: parent.width
                     wrapMode: Text.Wrap
-                    color: Tokens.foregroundSubtleDefault
+                    color: Tokens.foregroundMutedDefault
                     font.family: Tokens.fontSansDefault
                     font.pixelSize: Metrics.fontSm
                     lineHeight: 1.4

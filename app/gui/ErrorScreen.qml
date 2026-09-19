@@ -49,7 +49,7 @@ Item {
 
             Text {
                 text: qsTr("Reference")
-                color: Tokens.foregroundSubtleDefault
+                color: Tokens.foregroundMutedDefault
                 font.family: Tokens.fontSansDefault
                 font.pixelSize: Metrics.fontSm
                 anchors.verticalCenter: parent.verticalCenter
@@ -66,48 +66,27 @@ Item {
             }
         }
 
-        Button {
+        SeatHubButton {
             id: retryButton
             width: parent.width
-            height: Metrics.touchTarget
             text: qsTr("Try again")
-
-            contentItem: Text {
-                text: retryButton.text
-                color: Tokens.primaryForegroundDefault
-                font.family: Tokens.fontSansDefault
-                font.pixelSize: Metrics.fontBody
-                horizontalAlignment: Text.AlignHCenter
-                verticalAlignment: Text.AlignVCenter
-            }
-
-            background: Rectangle {
-                radius: Metrics.radiusSm
-                color: retryButton.pressed ? Tokens.surface3Default : Tokens.primaryDefault
-            }
 
             onClicked: root.retry()
         }
 
-        Text {
-            text: qsTr("Back to home")
-            color: Tokens.foregroundSubtleDefault
-            font.family: Tokens.fontSansDefault
-            font.pixelSize: Metrics.fontCaption
+        SeatHubButton {
+            id: backButton
             width: parent.width
-            horizontalAlignment: Text.AlignHCenter
+            variant: "ghost"
+            text: qsTr("Back to home")
 
-            MouseArea {
-                anchors.fill: parent
-                cursorShape: Qt.PointingHandCursor
-                onClicked: root.client.dismissError()
-            }
+            onClicked: root.client.dismissError()
         }
     }
 
     function retry() {
-        // Retry means "run the last step again": from the home view that is Play, so the
-        // error is cleared and the customer is returned to a state they can act from.
-        root.client.dismissError()
+        // Retry runs the last step again (audit F21): Play, or the sign-in screen when there
+        // is no identity to play with yet. `SeatHubClient.retry` owns that decision.
+        root.client.retry()
     }
 }
