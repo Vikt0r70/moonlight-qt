@@ -1,6 +1,7 @@
 #include "seathub_client.h"
 
 #include <QLoggingCategory>
+#include <QThread>
 #include <QWindow>
 
 #include <SDL.h>

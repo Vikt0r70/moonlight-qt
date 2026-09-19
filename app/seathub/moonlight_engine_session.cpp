@@ -38,11 +38,12 @@ void MoonlightPairedHost::fetchAppList()
             return;
         }
 
-        // Upstream keeps the list on the computer record and sorts it the same way
+        // Upstream keeps the list on the computer record the same way
         // (`ComputerManager::updateComputer`), so the record this client hands the engine has the
-        // shape the engine expects when it resolves `currentGameId` itself.
+        // shape the engine expects when it resolves `currentGameId` itself. The list is kept in the
+        // host's own order: upstream's `sortAppList()` is private to `NvComputer`, and nothing here
+        // depends on the order - `launchApp()` matches on `currentGameId` or counts, either way.
         m_computer->appList = apps;
-        m_computer->sortAppList();
         m_appListRead = true;
     }
     catch (const QtNetworkReplyException& e) {
@@ -76,7 +77,9 @@ bool MoonlightPairedHost::launchApp(NvApp* out) const
     }
 
     QVector<NvApp> candidates;
-    for (const NvApp& app : m_computer->appList) {
+    // By value: `NvApp::isInitialized()` is not a const member upstream, so a const reference
+    // cannot be asked.
+    for (NvApp app : m_computer->appList) {
         // `hidden` and `isInitialized()` are upstream's own filters (`AppModel` shows exactly the
         // applications that pass them), so "how many applications does this rig serve" is counted
         // the way a customer would count them.
