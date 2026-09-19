@@ -278,7 +278,10 @@ private slots:
 
         const SeatHubFailure failure = failed.at(0).at(0).value<SeatHubFailure>();
         QCOMPARE(failure.failure, QStringLiteral("TEARDOWN_TIMEOUT"));
-        QVERIFY(!failure.reference.isEmpty());
+        // The deadline is the client's own clock, so there is no control-plane reference to show
+        // (ADR-0008: the client may not generate one).
+        QVERIFY2(failure.reference.isEmpty(),
+                 "a local teardown deadline must not invent an ADR-0008 reference code");
         QVERIFY(!failure.error.isEmpty());
         QCOMPARE(controller.stage(), TeardownStage::Failed);
     }

@@ -249,8 +249,10 @@ void TstUpdateFeed::downloadUpdateRefusesWithoutADigest()
     QVERIFY(!client.downloadUpdate(QStringLiteral("https://example.invalid/a.exe"), QString()));
     QCOMPARE(client.state(), QStringLiteral("failed"));
     QVERIFY(!client.failure().value(QStringLiteral("error")).toString().isEmpty());
-    // ADR-0008: a failure without a reference code is a defect.
-    QVERIFY(!client.failure().value(QStringLiteral("reference")).toString().isEmpty());
+    // ADR-0008: the client never generates a reference code, so a refusal it makes itself (no
+    // digest, no URL) carries none - a code support cannot resolve is worse than no code.
+    QVERIFY2(client.failure().value(QStringLiteral("reference")).toString().isEmpty(),
+             "the client must not invent an ADR-0008 reference code");
     QVERIFY(!client.readyToInstall());
 
     // An empty URL is equally unactionable.
@@ -279,7 +281,8 @@ void TstUpdateFeed::updatesAreBlockedDuringAStream()
     client.setStreamingActive(false);
     client.sessionFinished();
     QTRY_VERIFY(client.state() == QStringLiteral("failed"));
-    QVERIFY(!client.failure().value(QStringLiteral("reference")).toString().isEmpty());
+    QVERIFY2(client.failure().value(QStringLiteral("reference")).toString().isEmpty(),
+             "an unreachable feed is the client's own observation, so there is no code to show");
     QVERIFY(!client.readyToInstall());
 }
 

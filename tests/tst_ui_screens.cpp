@@ -34,6 +34,8 @@
 
 #include <cmath>
 
+#include "seathub/agent_config.h"
+
 namespace {
 
 const char* kSansFamily = "Inter";
@@ -323,6 +325,7 @@ private slots:
     void forcedUpdateModalKeepsUpdateTabbableAndUndismissable();
     void settingsDropdownElidesLongOptionNames();
     void disabledActionLabelStaysLegible();
+    void agentConfigPanelMasksTheTokenAndNeverRendersIt();
 };
 
 void TstUiScreens::initTestCase()
@@ -385,7 +388,8 @@ void TstUiScreens::everyShellScreenLoads()
         QStringLiteral("SeatHubOTPField.qml"), QStringLiteral("SeatHubButton.qml"),
         QStringLiteral("SeatHubStepper.qml"), QStringLiteral("SeatHubToggle.qml"),
         QStringLiteral("SeatHubSelect.qml"), QStringLiteral("SeatHubNumberField.qml"),
-        QStringLiteral("SeatHubReadOnlyRow.qml"),
+                              QStringLiteral("SeatHubReadOnlyRow.qml"),
+                              QStringLiteral("AgentConfigPanel.qml"),
     };
 
     QQuickStyle::setStyle(QStringLiteral("Basic"));
@@ -711,8 +715,12 @@ void TstUiScreens::disabledActionLabelStaysLegible()
     QVERIFY2(background, "the button must draw its own background");
 
     const QColor labelColor = label->property("color").value<QColor>();
+    // The fill animates in `--dur-fast` (ui.md §6), so the disabled colour arrives one
+    // animation after the state change: read it the way it settles, and in doing so prove the
+    // motion token is wired rather than merely declared.
+    QTRY_COMPARE(background->property("color").value<QColor>(),
+                 QColor(QStringLiteral("#262626")));   // surface3Default
     const QColor fillColor = background->property("color").value<QColor>();
-    QCOMPARE(fillColor, QColor(QStringLiteral("#262626")));   // surface3Default
     QCOMPARE(labelColor, QColor(QStringLiteral("#a3a3a3")));  // foregroundMutedDefault
 
     // ui.md §3.2: disabled text may drop to 3:1, and it must not drop below. The audit
@@ -728,6 +736,79 @@ void TstUiScreens::disabledActionLabelStaysLegible()
              "the button must draw the spec's 2px focus ring (ui.md §9, audit F14)");
     QVERIFY2(source.contains(QStringLiteral("Tokens.focusDefault")),
              "the focus ring must use the focus token, not a literal colour");
+}
+
+void TstUiScreens::agentConfigPanelMasksTheTokenAndNeverRendersIt()
+{
+    // The file the Node Agent writes, in the agents' own shape
+    // (`seathub-host-agents/crates/node-agent/src/main.rs`).
+    const QString path =
+        QDir(QDir::tempPath()).filePath(QStringLiteral("seathub-agent-config.json"));
+    const QString token = QStringLiteral("0123456789abcdefghijklmnopqrstuv");
+    {
+        QFile file(path);
+        QVERIFY(file.open(QIODevice::WriteOnly | QIODevice::Truncate));
+        file.write(QStringLiteral("{\"host_id\":\"4d5e6f70-1111-2222-3333-444455556666\","
+                                  "\"token\":\"%1\","
+                                  "\"base_url\":\"https://api-sevenhills.damra.co\"}")
+                       .arg(token)
+                       .toUtf8());
+    }
+
+    const QVariantMap described = AgentConfig::describe(QUrl::fromLocalFile(path));
+    QCOMPARE(described.value(QStringLiteral("path")).toString(), path);
+    QCOMPARE(described.value(QStringLiteral("ok")).toBool(), true);
+    QVERIFY2(!described.contains(QStringLiteral("token")),
+             "the agent token must never cross into QML (D-30)");
+
+    const QString masked = described.value(QStringLiteral("token_masked")).toString();
+    QVERIFY2(!masked.isEmpty(), "a token that was found must come back masked");
+    QVERIFY2(!masked.contains(token), "the mask must not contain the token");
+    QVERIFY2(!masked.contains(token.right(8)),
+             "the mask must not disclose the token's tail either");
+
+    // A file that is not there is an ordinary answer with a reason, and no invented code.
+    const QVariantMap missing = AgentConfig::describe(QUrl::fromLocalFile(path + QStringLiteral(".gone")));
+    QCOMPARE(missing.value(QStringLiteral("ok")).toBool(), false);
+    QVERIFY(!missing.value(QStringLiteral("error")).toString().isEmpty());
+    QVERIFY2(missing.value(QStringLiteral("token_masked")).toString().isEmpty(),
+             "nothing was read, so nothing may be shown");
+    QVERIFY2(!missing.value(QStringLiteral("error")).toString().contains(QStringLiteral("SH-")),
+             "ADR-0008: the client does not invent reference codes");
+
+    QFile::remove(path);
+
+    // And the panel renders the path and the mask, and never the token itself.
+    QQuickStyle::setStyle(QStringLiteral("Basic"));
+    QQmlEngine engine;
+    registerTokenSingletons(&engine);
+
+    QString error;
+    QScopedPointer<QObject> panel(instantiate(&engine, QStringLiteral("AgentConfigPanel.qml"), &error));
+    QVERIFY2(panel, qPrintable(error));
+    panel->setProperty("described", described);
+
+    bool sawPath = false;
+    bool sawMask = false;
+    const QList<QObject*> children = panel->findChildren<QObject*>();
+    for (QObject* child : children) {
+        const QVariant textValue = child->property("text");
+        if (!textValue.isValid()) {
+            continue;
+        }
+        const QString text = textValue.toString();
+        QVERIFY2(!text.contains(token),
+                 "the agent token must never appear in a rendered string");
+        if (text == path) {
+            sawPath = true;
+        }
+        if (text.startsWith(QStringLiteral("Agent token"))) {
+            sawMask = true;
+            QVERIFY2(text.contains(masked), "the mask the panel shows is not the mask it read");
+        }
+    }
+    QVERIFY2(sawPath, "the panel must show which file was read");
+    QVERIFY2(sawMask, "the panel must show the masked agent token");
 }
 
 QTEST_MAIN(TstUiScreens)

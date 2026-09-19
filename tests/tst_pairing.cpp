@@ -351,11 +351,13 @@ private slots:
 
         QTRY_COMPARE(failed.count(), 1);
 
-        // A SeatHub failure with a reference and a readable reason - never a dialog, never a
-        // Moonlight error surface (ADR-0008, D-51).
+        // A SeatHub failure with a readable reason - never a dialog, never a Moonlight error
+        // surface (D-51). No reference: this deadline is the client's own, and ADR-0008 says a
+        // reference the client generates resolves to nothing, which is worse than showing none.
         const SeatHubFailure failure = failed.at(0).at(0).value<SeatHubFailure>();
         QVERIFY(!failure.error.isEmpty());
-        QVERIFY(!failure.reference.isEmpty());
+        QVERIFY2(failure.reference.isEmpty(),
+                 "a client-side deadline must not invent an ADR-0008 reference code");
         QCOMPARE(failure.kind, FailureKind::Local);
         QCOMPARE(seam->calls, 0);
         QCOMPARE(controller.state(), QStringLiteral("failed"));

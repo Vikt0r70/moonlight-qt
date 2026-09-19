@@ -24,4 +24,7 @@ INCLUDEPATH += $$PWD/.. $$PWD/../app
 
 DEFINES += FORK_ROOT=\\\"$$PWD/..\\\"
 
-SOURCES += tst_ui_screens.cpp
+SOURCES += tst_ui_screens.cpp \
+    ../app/seathub/agent_config.cpp
+
+HEADERS += ../app/seathub/agent_config.h
