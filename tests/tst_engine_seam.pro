@@ -15,7 +15,12 @@
 #   4. `readyForDeletion()` releases the lifecycle (window restore, `active` false, detached) and
 #      does NOT destroy the session: the facade owns it, and it is still inside the engine's own
 #      frames at that moment.
-#   5. `ProductionPairingSeam` announces the resolved host before it reports success, which is what
+#   5. The state the facade's release decision reads is already in place *at* `readyForDeletion()`:
+#      `SessionLifecycle` clears `active` above the emission, so `releaseEngineSession()` - a direct
+#      same-thread connection to that signal - permits the release instead of refusing it, and the
+#      finished engine object is destroyed exactly once, at its own session's end rather than at the
+#      next session's host resolution (the verifier's W1).
+#   6. `ProductionPairingSeam` announces the resolved host before it reports success, which is what
 #      lets `SeatHubClient::handlePairingCompleted()` find an engine session already attached.
 #
 # No SDL, no engine and no network are linked: the seam's surface type is only ever a pointer here.
