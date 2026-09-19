@@ -24,6 +24,7 @@
 #include <QDir>
 #include <QFile>
 #include <QFont>
+#include <QRegularExpression>
 #include <QQmlComponent>
 #include <QQmlContext>
 #include <QQmlEngine>
@@ -326,6 +327,7 @@ private slots:
     void settingsDropdownElidesLongOptionNames();
     void disabledActionLabelStaysLegible();
     void agentConfigPanelMasksTheTokenAndNeverRendersIt();
+    void theWindowSequenceRestoresOnlyAfterTheEngineIsDone();
 };
 
 void TstUiScreens::initTestCase()
@@ -827,6 +829,71 @@ void TstUiScreens::agentConfigPanelMasksTheTokenAndNeverRendersIt()
     }
     QVERIFY2(sawPath, "the panel must show which file was read");
     QVERIFY2(sawMask, "the panel must show the masked agent token");
+}
+
+void TstUiScreens::theWindowSequenceRestoresOnlyAfterTheEngineIsDone()
+{
+    // D-01 (one visible window at a time), D-03 (restore only once SDL destruction is proven) and
+    // Pitfall 1 (`quitStarting` must not restore) are the phase's most-quoted invariants - and no
+    // automated check touched them. What existed was a hand-run grep in the plan's verify block and
+    // a reading of the file. This reads the same file the grep read, and says exactly which handler
+    // each visibility line is in.
+    //
+    // It is source analysis, not a render: it cannot show that the window sequence is pleasant to
+    // watch, only that there is one place that hides and one place that restores, and that the
+    // restore is not on a signal that fires while SDL is still alive.
+    QFile file(guiDir() + QStringLiteral("/SessionSegue.qml"));
+    QVERIFY2(file.open(QIODevice::ReadOnly), "SessionSegue.qml must be readable");
+    const QString source = QString::fromUtf8(file.readAll());
+
+    // One `function name() { ... }` per handler, and the file's bodies hold no nested braces, so a
+    // body runs to the first closing brace on a line of its own. That closing brace is indented
+    // (`\n    }`), which the first version of this pattern got wrong: it required `}` at column
+    // zero, so every "body" ran to the end of the file and every assertion about which handler a
+    // line lives in was quietly meaningless.
+    const auto bodyOf = [&source](const QString& name) -> QString {
+        const QRegularExpression re(
+            QStringLiteral("function\\s+%1\\s*\\([^)]*\\)\\s*\\{(.*?)\\n\\s*\\}").arg(name),
+            QRegularExpression::DotMatchesEverythingOption);
+        const QRegularExpressionMatch match = re.match(source);
+        return match.hasMatch() ? match.captured(1) : QString();
+    };
+
+    // D-01: the hide is on `connectionStarted`, which the engine emits before it creates its SDL
+    // window (app/streaming/session.cpp).
+    const QString connectionStarted = bodyOf(QStringLiteral("connectionStarted"));
+    QVERIFY2(!connectionStarted.isEmpty(), "connectionStarted() must exist in SessionSegue.qml");
+    QVERIFY2(connectionStarted.contains(QStringLiteral("window.visible = false")),
+             "D-01: connectionStarted must hide the Qt window");
+
+    // D-03 / Pitfall 1: the only restore is on `readyForDeletion`, and neither of the two signals
+    // that fire while SDL is still alive may touch the window.
+    const QString readyForDeletion = bodyOf(QStringLiteral("sessionReadyForDeletion"));
+    QVERIFY2(!readyForDeletion.isEmpty(),
+             "sessionReadyForDeletion() must exist in SessionSegue.qml");
+    QVERIFY2(readyForDeletion.contains(QStringLiteral("window.visible = true")),
+             "D-03: readyForDeletion is where the Qt window comes back");
+
+    const QString quitStarting = bodyOf(QStringLiteral("quitStarting"));
+    QVERIFY2(!quitStarting.isEmpty(), "quitStarting() must exist in SessionSegue.qml");
+    QVERIFY2(!quitStarting.contains(QStringLiteral("visible")),
+             "Pitfall 1: quitStarting fires before SDL destroys its window, so it must not "
+             "restore the Qt window - that would put two windows on screen at once");
+
+    const QString sessionFinished = bodyOf(QStringLiteral("sessionFinished"));
+    QVERIFY2(!sessionFinished.isEmpty(), "sessionFinished() must exist in SessionSegue.qml");
+    QVERIFY2(!sessionFinished.contains(QStringLiteral("visible")),
+             "D-03: at sessionFinished SDL destruction is still pending, so no restore yet");
+
+    // And there is exactly one of each, so "the window comes back" cannot be satisfied twice or
+    // somewhere unnamed.
+    QCOMPARE(source.count(QStringLiteral("window.visible = false")), 1);
+    QCOMPARE(source.count(QStringLiteral("window.visible = true")), 1);
+
+    // The forwarding handler must not hide or restore behind the named function's back.
+    const QString onQuit = bodyOf(QStringLiteral("onQuitStarting"));
+    QVERIFY2(!onQuit.contains(QStringLiteral("visible")),
+             "the Qt signal handler for quitStarting must not touch the window either");
 }
 
 QTEST_MAIN(TstUiScreens)
