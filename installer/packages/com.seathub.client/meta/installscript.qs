@@ -51,10 +51,14 @@ Component.prototype.createOperations = function()
 
     var paths = [
         // %APPDATA%\Seven Hills\SeatHub - where TokenStore actually puts the encrypted credentials.
-        statePath("APPDATA", "/Seven Hills/SeatHub"),
-        // %LOCALAPPDATA%\SeatHub - the directory D-45 names. Nothing is written here today, so this
-        // is belt and braces: if the client ever caches non-roaming state, uninstall still removes it.
-        statePath("LOCALAPPDATA", "/SeatHub")
+        statePath("APPDATA", "/Seven Hills/SeatHub")
+        // F-6: %LOCALAPPDATA%\SeatHub is deliberately NOT registered. SeatHub never writes there
+        // (`TokenStore::defaultDirectory()` resolves to the Roaming path above), but the retired
+        // Tauri client was installed there: registering it would delete that client's
+        // seathub-client.exe and uninstall.exe without removing any of its state or ours, i.e. it
+        // would break a program this installer was never asked to touch. The directory D-45 names
+        // is therefore recorded as a deliberate non-target here, and the D-30/D-45 path question
+        // belongs in the ADR that reconciles the documents with the resolution (see token_store.h).
     ];
 
     for (var i = 0; i < paths.length; ++i) {

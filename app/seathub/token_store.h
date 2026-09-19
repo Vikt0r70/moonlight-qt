@@ -13,10 +13,18 @@
 // tokens, because those services run as LocalSystem; that reasoning does not transfer to an
 // interactive client.)
 //
-// Files live under `QStandardPaths::AppDataLocation` (`%APPDATA%/SeatHub`), one file per named
-// token, holding the raw DPAPI blob and nothing else - no header, no field name, no length.
-// The on-disk artefact is proven to contain no plaintext by `tst_token_store`, which greps the
-// blob for the token's own bytes and hex-dumps it on failure.
+// Files live under `QStandardPaths::AppDataLocation`, one file per named token, holding the raw
+// DPAPI blob and nothing else - no header, no field name, no length. The on-disk artefact is
+// proven to contain no plaintext by `tst_token_store`, which greps the blob for the token's own
+// bytes and hex-dumps it on failure.
+//
+// The location resolves through the application and organization names the client sets in
+// `app/main.cpp` ("Seven Hills" / "SeatHub"), so on Windows it is `%APPDATA%\Seven Hills\SeatHub` -
+// the Roaming profile, not `%LocalAppData%`. That is deliberately recorded here as the *resolved*
+// fact rather than restated as an aspiration: D-30 and D-45 name `%LocalAppData%\SeatHub`, an
+// earlier version of this comment said `%APPDATA%\SeatHub`, and neither matches what the platform
+// actually returns. Reconciling the documents with the code (or the code with the documents) is an
+// ADR decision; changing the path silently would move existing customers' credentials.
 //
 // Its other job is teardown: STREAM-10 requires that the client keeps no stored rig, address
 // or pairing of its own. `clearAll()` is what makes that true, and teardown refuses to report
@@ -39,7 +47,9 @@ public:
 
     explicit TokenStore(QObject* parent = nullptr);
 
-    /// `QStandardPaths::AppDataLocation` - `%APPDATA%/SeatHub` on Windows.
+    /// `QStandardPaths::AppDataLocation` - `%APPDATA%\Seven Hills\SeatHub` on Windows, derived
+    /// from the organization and application names set in `app/main.cpp` (see the note at the top
+    /// of this file about D-30/D-45 naming `%LocalAppData%\SeatHub` instead).
     static QString defaultDirectory();
 
     /// Overrides the directory. Exists for tests and for a portable install; production uses

@@ -216,15 +216,39 @@ private slots:
 
     void defaultDirectory_isThePerUserApplicationDataDirectory()
     {
-        // `%APPDATA%/SeatHub` for `SeatHub.exe`: one store per user account, which is the same
-        // scope DPAPI encrypts for. The store must not invent a path of its own - it uses the
-        // platform's per-user location, named after the application.
+        // The names the client actually installs itself under (`app/main.cpp`): organization
+        // "Seven Hills", application "SeatHub". Set here because this test binary is not the
+        // client, and the resolved path - not the store's code - is what those two names decide.
+        const QString previousOrganization = QCoreApplication::organizationName();
+        const QString previousApplication = QCoreApplication::applicationName();
+        QCoreApplication::setOrganizationName(QStringLiteral("Seven Hills"));
+        QCoreApplication::setApplicationName(QStringLiteral("SeatHub"));
+
+        // One store per user account, which is the same scope DPAPI encrypts for. The store must
+        // not invent a path of its own - it uses the platform's per-user location, named after the
+        // application.
         const QString directory = TokenStore::defaultDirectory();
         QVERIFY(!directory.isEmpty());
         QCOMPARE(directory, QStandardPaths::writableLocation(QStandardPaths::AppDataLocation));
         QVERIFY2(directory.contains(QCoreApplication::applicationName()),
                  qPrintable(QStringLiteral("%1 does not name the application (%2)")
                                 .arg(directory, QCoreApplication::applicationName())));
+
+        // F-5: pin the resolution, so the divergence between it and D-30/D-45's
+        // `%LocalAppData%\SeatHub` is visible in a test run rather than in a comment nobody reads.
+        // `%APPDATA%` is the Roaming profile because the store is per-user and must roam with the
+        // account, exactly like the DPAPI scope it relies on.
+        QVERIFY2(directory.contains(QStringLiteral("Seven Hills")),
+                 qPrintable(QStringLiteral("resolved store directory: %1").arg(directory)));
+        QVERIFY2(directory.endsWith(QStringLiteral("SeatHub")),
+                 qPrintable(QStringLiteral("resolved store directory: %1").arg(directory)));
+#ifdef Q_OS_WIN
+        QVERIFY2(directory.contains(QStringLiteral("Roaming")),
+                 qPrintable(QStringLiteral("resolved store directory: %1").arg(directory)));
+#endif
+
+        QCoreApplication::setOrganizationName(previousOrganization);
+        QCoreApplication::setApplicationName(previousApplication);
     }
 };
 
