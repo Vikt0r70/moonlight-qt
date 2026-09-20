@@ -113,7 +113,11 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "aqtinstall could not be installed." }
           python -m aqt install-qt windows desktop 6.11.2 win64_msvc2022_64 -m qtwebsockets -O C:\Qt
           if ($LASTEXITCODE -ne 0) { throw "Qt 6.11.2 install failed." }
-          python -m aqt install-tool windows desktop tools_ifw -O C:\Qt
+          # Pinned to 4.7 because build-seathub.ps1 defaults -IfwDir to
+          # C:\Qt\Tools\QtInstallerFramework\4.7. Unpinned, aqt installs whatever is current, and the day Qt
+          # ships 4.8 this breaks with "Qt Installer Framework directory not found" and
+          # reads as a new bug rather than a version bump.
+          python -m aqt install-tool windows desktop tools_ifw qt.tools.ifw.47 -O C:\Qt
           if ($LASTEXITCODE -ne 0) { throw "Qt Installer Framework install failed." }
           if (-not (Test-Path -LiteralPath 'C:\Qt\6.11.2\msvc2022_64')) {
             throw "Qt reported success but C:\Qt\6.11.2\msvc2022_64 does not exist."
