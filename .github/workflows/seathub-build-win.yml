@@ -89,12 +89,35 @@ jobs:
       # Desktop C++ workload, and the script finds vcvars64.bat for an install that actually has
       # the VC toolset - via vswhere with -requires, which is the check upstream's build-arch.bat
       # omits.
-      - name: Install Qt 6.11.2 (MSVC 2022 x64) and Qt Installer Framework 4.7
+      # aqtinstall is taken from git, not PyPI, and that is not a preference. Qt changed its
+      # repository layout at 6.11: there is no longer a second `qt6_6112` folder inside the first
+      # one, each architecture subfolder carries its own Updates.xml instead
+      # (miurahr/aqtinstall#959). Released aqtinstall still looks for the old path and answers
+      # "Failed to locate XML data for Qt version '6.11.2'". The fix is miurahr/aqtinstall#1000,
+      # merged 2026-03-24; the newest release, v3.3.0, is from 2025-06-02 and predates it, so
+      # `pip install aqtinstall` cannot get it at any version. Pinned to a commit rather than
+      # `@master` so this build is reproducible; revisit when a release above v3.3.0 ships.
+      #
+      # `qtsvg` is deliberately NOT in -m. It is a Qt Essential and arrives in the base install
+      # (it is listed by `aqt list-qt windows desktop --archives 6.11.2 win64_msvc2022_64`), so
+      # naming it as a module fails with "The packages ['qtsvg'] were not found". That error was
+      # invisible until the version error above was fixed, because it never got that far.
+      - name: Install Qt 6.11.2 (MSVC 2022 x64) and Qt Installer Framework
         shell: pwsh
         run: |
-          python -m pip install --disable-pip-version-check aqtinstall
-          python -m aqt install-qt windows desktop 6.11.2 win64_msvc2022_64 -m qtwebsockets qtsvg -O C:\Qt
+          $ErrorActionPreference = 'Stop'
+          # Every call is checked explicitly. A native command that exits non-zero does not stop a
+          # pwsh run block on its own, which is how a failed Qt install previously reported success
+          # and left the build two minutes later saying only "Qt directory not found".
+          python -m pip install --disable-pip-version-check "aqtinstall @ git+https://github.com/miurahr/aqtinstall.git@076e1659807d0b362a3ed684d54c2e9c775eb9c7"
+          if ($LASTEXITCODE -ne 0) { throw "aqtinstall could not be installed." }
+          python -m aqt install-qt windows desktop 6.11.2 win64_msvc2022_64 -m qtwebsockets -O C:\Qt
+          if ($LASTEXITCODE -ne 0) { throw "Qt 6.11.2 install failed." }
           python -m aqt install-tool windows desktop tools_ifw -O C:\Qt
+          if ($LASTEXITCODE -ne 0) { throw "Qt Installer Framework install failed." }
+          if (-not (Test-Path -LiteralPath 'C:\Qt\6.11.2\msvc2022_64')) {
+            throw "Qt reported success but C:\Qt\6.11.2\msvc2022_64 does not exist."
+          }
 
       - name: Build, deploy and package SeatHub
         shell: pwsh
