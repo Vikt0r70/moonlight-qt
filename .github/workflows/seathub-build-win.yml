@@ -32,7 +32,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          CHANGED=$(git diff --name-only origin/v6.1.0..HEAD -- \
+          CHANGED=$(git diff --name-only v6.1.0..HEAD -- \
             'app/streaming/video/*' 'app/streaming/audio/*' 'app/streaming/input/*' \
             'app/streaming/*.cpp' 'app/streaming/*.h')
           if [ -z "$CHANGED" ]; then
@@ -55,7 +55,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          CHANGED=$(git diff --name-only origin/v6.1.0..HEAD -- \
+          CHANGED=$(git diff --name-only v6.1.0..HEAD -- \
             'app/streaming/video/*' 'app/streaming/audio/*' 'app/streaming/input/*' \
             'app/streaming/*.cpp' 'app/streaming/*.h' | grep -E 'overlaymanager|session\.cpp' || true)
           if [ -z "$CHANGED" ]; then
