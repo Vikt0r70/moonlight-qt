@@ -25,7 +25,8 @@ import SeatHub.Tokens 1.0
 //             Play, the balance element in the header reads `last known`, and Play stays pressable.
 //   error     any other server error is the error view, not a state of this screen.
 //
-// Exactly one control is bright: Play. Top up and Sign out are quiet (ghost) controls.
+// Exactly one control is bright: Play. The top-up control is a quiet (ghost) one. The signed-in identity
+// and Sign out live on the profile (`ProfileScreen.qml`), reached from the header's menu (CUST-08).
 //
 // Long sentences wrap inside the column, and a reference code is never broken across lines.
 Item {
@@ -174,29 +175,6 @@ Item {
             glyph: "↗"
 
             onClicked: root.client.openTopUp()
-        }
-
-        // The signed-in identity. A phone number is not a credential, and no token or
-        // header ever reaches this layer (D-35).
-        Text {
-            width: parent.width
-            text: root.client && root.client.identity ? String(root.client.identity) : ""
-            visible: text.length > 0
-            horizontalAlignment: Text.AlignHCenter
-            color: Tokens.foregroundMutedDefault
-            font.family: Tokens.fontMonoDefault
-            font.pixelSize: Metrics.fontSm
-        }
-
-        // Stays here until the profile screen exists and takes it (a later plan): nothing is removed
-        // before its replacement is there.
-        SeatHubButton {
-            id: signOutButton
-            width: parent.width
-            variant: "ghost"
-            text: qsTr("Sign out")
-
-            onClicked: root.client.signOut()
         }
     }
 }

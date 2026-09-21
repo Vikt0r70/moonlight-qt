@@ -20,6 +20,7 @@
  *****************************************************************************/
 
 #include <QtTest>
+#include <QAbstractListModel>
 #include <QColor>
 #include <QDir>
 #include <QFile>
@@ -173,6 +174,114 @@ double contrastRatio(const QColor& a, const QColor& b)
     return la > lb ? (la + 0.05) / (lb + 0.05) : (lb + 0.05) / (la + 0.05);
 }
 
+// A stand-in for the facade's list models (`customer_lists.h`): the same properties and the same four
+// row roles, with no control plane behind it. `tst_facade_wiring` asserts the real models expose these
+// names, so this file's fake and the real thing cannot drift apart unnoticed.
+class FakeList : public QAbstractListModel
+{
+    Q_OBJECT
+    Q_PROPERTY(QString status READ status NOTIFY stateChanged)
+    Q_PROPERTY(bool loadingMore READ loadingMore NOTIFY stateChanged)
+    Q_PROPERTY(bool moreFailed READ moreFailed NOTIFY stateChanged)
+    Q_PROPERTY(bool hasMore READ hasMore NOTIFY stateChanged)
+    Q_PROPERTY(QString errorText READ errorText NOTIFY stateChanged)
+    Q_PROPERTY(QString errorReference READ errorReference NOTIFY stateChanged)
+    Q_PROPERTY(int count READ count NOTIFY countChanged)
+
+public:
+    struct Row
+    {
+        QString when;
+        QString kind;
+        QString amount;
+        QString tone;
+    };
+
+    QString status() const { return m_status; }
+    bool loadingMore() const { return m_loadingMore; }
+    bool moreFailed() const { return m_moreFailed; }
+    bool hasMore() const { return m_hasMore; }
+    QString errorText() const { return m_errorText; }
+    QString errorReference() const { return m_errorReference; }
+    int count() const { return m_rows.size(); }
+
+    int rowCount(const QModelIndex& parent = QModelIndex()) const override
+    {
+        return parent.isValid() ? 0 : m_rows.size();
+    }
+    QVariant data(const QModelIndex& index, int role) const override
+    {
+        if (!index.isValid() || index.row() >= m_rows.size()) {
+            return QVariant();
+        }
+        const Row& row = m_rows.at(index.row());
+        switch (role) {
+        case Qt::UserRole + 1: return row.when;
+        case Qt::UserRole + 2: return row.kind;
+        case Qt::UserRole + 3: return row.amount;
+        case Qt::UserRole + 4: return row.tone;
+        default: return QVariant();
+        }
+    }
+    QHash<int, QByteArray> roleNames() const override
+    {
+        return { { Qt::UserRole + 1, "whenText" }, { Qt::UserRole + 2, "kindText" },
+                 { Qt::UserRole + 3, "amountText" }, { Qt::UserRole + 4, "tone" } };
+    }
+
+    void setRows(const QList<Row>& rows)
+    {
+        beginResetModel();
+        m_rows = rows;
+        endResetModel();
+        emit countChanged();
+    }
+    void appendRows(const QList<Row>& rows)
+    {
+        beginInsertRows(QModelIndex(), m_rows.size(), m_rows.size() + rows.size() - 1);
+        m_rows.append(rows);
+        endInsertRows();
+        emit countChanged();
+    }
+    void setState(const QString& status, bool hasMore = false, bool loadingMore = false,
+                  bool moreFailed = false, const QString& errorText = QString(),
+                  const QString& errorReference = QString())
+    {
+        m_status = status;
+        m_hasMore = hasMore;
+        m_loadingMore = loadingMore;
+        m_moreFailed = moreFailed;
+        m_errorText = errorText;
+        m_errorReference = errorReference;
+        emit stateChanged();
+    }
+
+    /// `n` ordinary rows: a date, a plain word and a length. Nothing in them names a rig.
+    static QList<Row> plainRows(int n, int from = 0)
+    {
+        QList<Row> rows;
+        for (int i = from; i < from + n; ++i) {
+            rows.append({ QStringLiteral("Sat 12 Sep, 21:%1").arg(i % 60, 2, 10, QLatin1Char('0')),
+                          QStringLiteral("You ended it"), QStringLiteral("%1 min").arg(i + 1),
+                          QString() });
+        }
+        return rows;
+    }
+
+signals:
+    void stateChanged();
+    void countChanged();
+
+private:
+    QList<Row> m_rows;
+    QString m_status = QStringLiteral("idle");
+    bool m_loadingMore = false;
+    bool m_moreFailed = false;
+    bool m_hasMore = false;
+    QString m_errorText;
+    QString m_errorReference;
+};
+
 // A stand-in for SeatHubClient: the properties and invokables the shell screens read
 // (D-35 keeps the surface this small on purpose). Signals are emitted by the test so a
 // screen's reaction to the facade can be asserted without a control plane.
@@ -195,8 +304,81 @@ class FakeShellClient : public QObject
     Q_PROPERTY(bool connectFailed READ connectFailed NOTIFY connectFailedChanged)
     Q_PROPERTY(QString stalledStepText READ stalledStepText NOTIFY connectFailedChanged)
     Q_PROPERTY(QString stalledReasonText READ stalledReasonText NOTIFY connectFailedChanged)
+    Q_PROPERTY(QVariantMap account READ account NOTIFY accountChanged)
+    Q_PROPERTY(QString accountStatus READ accountStatus NOTIFY accountChanged)
+    Q_PROPERTY(QString accountError READ accountError NOTIFY accountChanged)
+    Q_PROPERTY(QString accountErrorReference READ accountErrorReference NOTIFY accountChanged)
+    Q_PROPERTY(QString totalsStatus READ totalsStatus NOTIFY totalsChanged)
+    Q_PROPERTY(QString hoursPlayedText READ hoursPlayedText NOTIFY totalsChanged)
+    Q_PROPERTY(QString creditLeftText READ creditLeftText NOTIFY totalsChanged)
+    Q_PROPERTY(QString totalsError READ totalsError NOTIFY totalsChanged)
+    Q_PROPERTY(QString totalsErrorReference READ totalsErrorReference NOTIFY totalsChanged)
+    Q_PROPERTY(QObject* sessionHistory READ sessionHistory CONSTANT)
+    Q_PROPERTY(QObject* creditHistory READ creditHistory CONSTANT)
+    Q_PROPERTY(QObject* topupHistory READ topupHistory CONSTANT)
 
 public:
+    // --- the profile: the identity, the totals and the three lists, as the facade reports them ---
+    QVariantMap account() const { return m_account; }
+    QString accountStatus() const { return m_accountStatus; }
+    QString accountError() const { return m_accountError; }
+    QString accountErrorReference() const { return m_accountErrorReference; }
+    void setAccount(const QString& username, const QString& email, const QString& phone,
+                    bool emailVerified)
+    {
+        m_account.clear();
+        m_account.insert(QStringLiteral("username"), username);
+        m_account.insert(QStringLiteral("email"), email);
+        m_account.insert(QStringLiteral("phone"), phone);
+        m_account.insert(QStringLiteral("email_verified"), emailVerified);
+        m_accountStatus = QStringLiteral("ready");
+        emit accountChanged();
+    }
+    void setAccountState(const QString& status, const QString& error = QString(),
+                         const QString& reference = QString())
+    {
+        m_account.clear();
+        m_accountStatus = status;
+        m_accountError = error;
+        m_accountErrorReference = reference;
+        emit accountChanged();
+    }
+
+    QString totalsStatus() const { return m_totalsStatus; }
+    QString hoursPlayedText() const { return m_hoursPlayed; }
+    QString creditLeftText() const { return m_creditLeft; }
+    QString totalsError() const { return m_totalsError; }
+    QString totalsErrorReference() const { return m_totalsErrorReference; }
+    void setTotals(const QString& status, const QString& hours = QString(),
+                   const QString& credit = QString(), const QString& error = QString(),
+                   const QString& reference = QString())
+    {
+        m_totalsStatus = status;
+        m_hoursPlayed = hours;
+        m_creditLeft = credit;
+        m_totalsError = error;
+        m_totalsErrorReference = reference;
+        emit totalsChanged();
+    }
+
+    QObject* sessionHistory() { return &m_sessions; }
+    QObject* creditHistory() { return &m_credit; }
+    QObject* topupHistory() { return &m_topups; }
+    FakeList* sessions() { return &m_sessions; }
+    FakeList* credit() { return &m_credit; }
+    FakeList* topups() { return &m_topups; }
+
+    /// What the profile asked the facade to do, in order (`loadFirstPage:sessions`, ...).
+    QStringList calls() const { return m_calls; }
+    Q_INVOKABLE void openProfile() { m_calls.append(QStringLiteral("openProfile")); }
+    Q_INVOKABLE void closeProfile() { m_calls.append(QStringLiteral("closeProfile")); }
+    Q_INVOKABLE void loadFirstPage(const QString& list) { m_calls.append(QStringLiteral("loadFirstPage:") + list); }
+    Q_INVOKABLE void loadNextPage(const QString& list) { m_calls.append(QStringLiteral("loadNextPage:") + list); }
+    Q_INVOKABLE void reloadList(const QString& list) { m_calls.append(QStringLiteral("reloadList:") + list); }
+    Q_INVOKABLE void reloadTotals() { m_calls.append(QStringLiteral("reloadTotals")); }
+    Q_INVOKABLE void reloadAccount() { m_calls.append(QStringLiteral("reloadAccount")); }
+    int profileOpens() const { return m_calls.count(QStringLiteral("openProfile")); }
+
     bool connectFailed() const { return m_connectFailed; }
     QString stalledStepText() const { return m_stalledStepText; }
     QString stalledReasonText() const { return m_stalledReasonText; }
@@ -355,6 +537,8 @@ public:
     void deliverOtpAccepted() { emit otpAccepted(); }
 
 signals:
+    void accountChanged();
+    void totalsChanged();
     void balanceChanged();
     void connectStageChanged();
     void connectFailedChanged();
@@ -388,6 +572,19 @@ private:
     bool m_connectFailed = false;
     QString m_stalledStepText;
     QString m_stalledReasonText;
+    QVariantMap m_account;
+    QString m_accountStatus = QStringLiteral("loading");
+    QString m_accountError;
+    QString m_accountErrorReference;
+    QString m_totalsStatus = QStringLiteral("loading");
+    QString m_hoursPlayed;
+    QString m_creditLeft;
+    QString m_totalsError;
+    QString m_totalsErrorReference;
+    FakeList m_sessions;
+    FakeList m_credit;
+    FakeList m_topups;
+    QStringList m_calls;
     int m_interrupts = 0;
     int m_topUps = 0;
     int m_settingsOpens = 0;
@@ -493,7 +690,22 @@ private slots:
     void theShellGivesEverySignedInViewTheHeaderAndNeitherSignInNorTheSplash();
     void balancePillDrawsEachOfItsStates();
     void balancePillChangesColourExactlyAtTheSpecsThresholds();
-    void menuHasItsTwoItemsAndTopUpAsksTheFacadeForTheWebsite();
+    void menuHasItsThreeItemsAndTopUpAsksTheFacadeForTheWebsite();
+    void theProfileIsRoutedAsAViewInsideHomeAndHomeNoLongerSignsOut();
+    void theProfileShowsTheThreeIdentityRowsReadOnlyWithTheEmailMarkInWords();
+    void aMissingEmailOrPhoneKeepsItsRowAndSaysNotAdded();
+    void longIdentityValuesWrapInsideTheColumnInsteadOfBeingCut();
+    void theIdentityBlockHasItsOwnLoadingAndErrorStates();
+    void theTwoTotalsAreDrawnFromTheServersNumbersAndHaveTheirOwnStates();
+    void theTabsSelectByClickAndByArrowKeysAndOnlyTheSelectedOneIsATabStop();
+    void aListDrawsEachOfItsStates();
+    void aListAsksForTheNextPageOnlyWhenItsRowsEnd();
+    void theProfileAsksOnlyForTheListItShowsAndTheOthersWaitForTheirTab();
+    void oneListFailingLeavesTheOthersTheTotalsAndTheIdentityIntact();
+    void aRowNamesNoRigAndNoProfileFileCanReadOne();
+    void signOutBackAndTheWebsiteLinkFromTheProfileReachTheFacade();
+    void theEmptyActionsGoWhereTheirWordsSay();
+    void theProfileFitsItsWindowAndKeepsTheListWideEnough();
     void menuOpensOnSpaceMovesWithArrowsAndEscapeReturnsFocusToTheTrigger();
     void restoreSplashShowsItsLineAndNeverTheSignInForm();
     void theShellRoutesTheRestoreStateToTheSplashNotToSignIn();
@@ -1257,7 +1469,7 @@ void TstUiScreens::balancePillChangesColourExactlyAtTheSpecsThresholds()
     QVERIFY(!findVisibleTextItem(pill.data(), QStringLiteral("Unavailable")));
 }
 
-void TstUiScreens::menuHasItsTwoItemsAndTopUpAsksTheFacadeForTheWebsite()
+void TstUiScreens::menuHasItsThreeItemsAndTopUpAsksTheFacadeForTheWebsite()
 {
     QQuickStyle::setStyle(QStringLiteral("Basic"));
     QQmlEngine engine;
@@ -1277,21 +1489,30 @@ void TstUiScreens::menuHasItsTwoItemsAndTopUpAsksTheFacadeForTheWebsite()
     QCOMPARE(menu->property("implicitWidth").toInt(), 40);
     QCOMPARE(menu->property("implicitHeight").toInt(), 40);
 
-    // Exactly the two items this plan ships, in order: Top up, then Settings. Profile is not here
-    // yet, so nothing in the menu points at a screen that does not exist.
+    // Exactly the three items the design contract lists, in its order: Profile, Top up, Settings.
     QObject* popup = menu->property("menu").value<QObject*>();
     QVERIFY(popup);
-    QCOMPARE(popup->property("count").toInt(), 2);
+    QCOMPARE(popup->property("count").toInt(), 3);
+    QObject* profile = menu->findChild<QObject*>(QStringLiteral("menuItemProfile"));
     QObject* topUp = menu->findChild<QObject*>(QStringLiteral("menuItemTopUp"));
     QObject* settings = menu->findChild<QObject*>(QStringLiteral("menuItemSettings"));
+    QVERIFY(profile);
     QVERIFY(topUp);
     QVERIFY(settings);
+    QCOMPARE(profile->property("text").toString(), QStringLiteral("Profile"));
     QCOMPARE(topUp->property("text").toString(), QStringLiteral("Top up"));
     QCOMPARE(settings->property("text").toString(), QStringLiteral("Settings"));
 
-    // `Top up` leaves the app, and says so with the external-link mark; `Settings` does not.
+    // `Top up` leaves the app, and says so with the external-link mark; the other two do not.
     QCOMPARE(topUp->property("glyph").toString(), QStringLiteral("↗"));
+    QVERIFY(profile->property("glyph").toString().isEmpty());
     QVERIFY(settings->property("glyph").toString().isEmpty());
+
+    // `Profile` opens the customer's own page, through the facade.
+    QVERIFY(QMetaObject::invokeMethod(profile, "triggered"));
+    QCOMPARE(client.profileOpens(), 1);
+    QCOMPARE(client.topUps(), 0);
+    QCOMPARE(client.settingsOpens(), 0);
 
     // Activating an item calls the facade, and only the facade: no address is built here. The URL
     // itself is asserted against the real facade in `tst_facade_wiring`.
@@ -1370,8 +1591,10 @@ void TstUiScreens::menuOpensOnSpaceMovesWithArrowsAndEscapeReturnsFocusToTheTrig
     QTest::keyClick(window, Qt::Key_Up);
     QTest::keyClick(window, Qt::Key_Return);
     QTRY_VERIFY_WITH_TIMEOUT(!popup->property("opened").toBool(), 3000);
-    QCOMPARE(client.topUps() + client.settingsOpens(), 1);
-    QVERIFY2(client.topUps() == 1, "Down, Down, Up from nothing highlighted lands on the first item");
+    QCOMPARE(client.profileOpens() + client.topUps() + client.settingsOpens(), 1);
+    // Down, Down, Up from nothing highlighted lands on the first item, which is Profile now.
+    QVERIFY2(client.profileOpens() == 1, "the first item is the profile");
+    QCOMPARE(client.topUps(), 0);
 
     // Escape closes it and returns focus to the trigger.
     QTest::keyClick(window, Qt::Key_Space);
@@ -2896,6 +3119,989 @@ void TstUiScreens::noScreenRendersAnInternalStateOrEndReasonKey()
             QVERIFY2(!source.contains(key),
                      qPrintable(QStringLiteral("%1 spells the internal name %2").arg(file, key)));
         }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------
+// Phase 5 plan 09: the profile
+// ---------------------------------------------------------------------------------------------------
+
+namespace {
+
+// `Text.WrapAnywhere` and `Text.AlignRight` as QML's properties report them.
+const int QQuickText_WrapAnywhere = 3;
+const int QQuickText_AlignRight = 2;
+
+// The screens items are found by walking both trees: the QObject children and the Quick item
+// children. Delegates a Repeater or a ListView makes are visual children of the item they sit in and
+// are not always QObject children of anything above it, so `findChild` alone would never see a row.
+QList<QObject*> visualTree(QObject* root)
+{
+    QList<QObject*> all;
+    QSet<QObject*> seen;
+    QList<QObject*> queue;
+    queue.append(root);
+    while (!queue.isEmpty()) {
+        QObject* current = queue.takeFirst();
+        if (!current || seen.contains(current)) {
+            continue;
+        }
+        seen.insert(current);
+        all.append(current);
+        for (QObject* child : current->children()) {
+            queue.append(child);
+        }
+        if (auto* item = qobject_cast<QQuickItem*>(current)) {
+            for (QQuickItem* child : item->childItems()) {
+                queue.append(child);
+            }
+        }
+    }
+    return all;
+}
+
+QList<QObject*> deepChildren(QObject* root, const QString& name)
+{
+    QList<QObject*> found;
+    if (!root) {
+        return found;
+    }
+    for (QObject* object : visualTree(root)) {
+        if (object != root && object->objectName() == name) {
+            found.append(object);
+        }
+    }
+    return found;
+}
+
+QObject* deepChild(QObject* root, const QString& name)
+{
+    const QList<QObject*> found = deepChildren(root, name);
+    return found.isEmpty() ? nullptr : found.first();
+}
+
+// Whether an item is actually shown: a Quick item has its own effective visibility, which follows the
+// visual parents (the QObject parent chain of a delegate is not the one that hides it).
+bool isShown(QObject* object)
+{
+    if (auto* item = qobject_cast<QQuickItem*>(object)) {
+        return item->isVisible();
+    }
+    return effectivelyVisible(object);
+}
+
+bool seesText(QObject* root, const QString& text)
+{
+    for (QObject* object : visualTree(root)) {
+        const QMetaObject* meta = object->metaObject();
+        if (meta->indexOfProperty("text") >= 0 && meta->indexOfProperty("font") >= 0
+                && object->property("text").toString() == text && isShown(object)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// The profile screen on a stand-in facade, sized like the window under the header. It is created with
+/// the facade already set, because the screen asks for its first list as it completes.
+struct ProfileFixture
+{
+    QQmlEngine engine;
+    FakeShellClient client;
+    QScopedPointer<QObject> screen;
+    QString error;
+
+    bool load(int width = 1100, int height = 656, int loadingDelay = 0)
+    {
+        QQuickStyle::setStyle(QStringLiteral("Basic"));
+        registerTokenSingletons(&engine);
+        QQmlComponent component(&engine,
+                                QUrl::fromLocalFile(guiDir() + QStringLiteral("/ProfileScreen.qml")));
+        screen.reset(component.createWithInitialProperties(
+            { { QStringLiteral("client"), QVariant::fromValue(static_cast<QObject*>(&client)) },
+              { QStringLiteral("width"), width },
+              { QStringLiteral("height"), height },
+              { QStringLiteral("loadingDelay"), loadingDelay } }));
+        if (!screen) {
+            error = component.errorString();
+            return false;
+        }
+        return true;
+    }
+
+    QObject* child(const char* name) const { return deepChild(screen.data(), QLatin1String(name)); }
+    bool sees(const QString& text) const { return seesText(screen.data(), text); }
+    bool visible(const char* name) const
+    {
+        QObject* item = child(name);
+        return item && isShown(item);
+    }
+    void click(const char* objectName)
+    {
+        QObject* button = child(objectName);
+        QVERIFY2(button, objectName);
+        QVERIFY(QMetaObject::invokeMethod(button, "clicked"));
+    }
+    void selectTab(int index)
+    {
+        QVERIFY(QMetaObject::invokeMethod(child("tabsBar"), "select", Q_ARG(QVariant, index)));
+    }
+
+    /// A child of one identity row (`value`, `mark`, `markWord`, `label`).
+    static QObject* inRow(QObject* row, const char* name)
+    {
+        return row ? deepChild(row, QLatin1String(name)) : nullptr;
+    }
+    QObject* row(const char* name) const { return child(name); }
+
+    /// Fills everything the profile reads with an ordinary signed-in customer.
+    void ordinary()
+    {
+        client.setAccount(QStringLiteral("lina"), QStringLiteral("lina@example.com"),
+                          QStringLiteral("+962790000000"), true);
+        client.setTotals(QStringLiteral("ready"), QStringLiteral("2 h 15 min"), QStringLiteral("45 min"));
+        client.sessions()->setRows(FakeList::plainRows(3));
+        client.sessions()->setState(QStringLiteral("ready"));
+    }
+
+    QStringList cellTexts(const char* list, const char* cell) const
+    {
+        QStringList texts;
+        QObject* view = child(list);
+        if (!view) {
+            return texts;
+        }
+        for (QObject* item : deepChildren(view, QLatin1String(cell))) {
+            texts.append(item->property("text").toString());
+        }
+        return texts;
+    }
+};
+
+} // namespace
+
+void TstUiScreens::theProfileIsRoutedAsAViewInsideHomeAndHomeNoLongerSignsOut()
+{
+    // The profile is a view inside the home state, like Settings: it keeps the signed-in header, and
+    // a session that ends while it is open still lands on the right view. `main.qml` cannot be
+    // instantiated without the real facade type, so its routing is asserted from its source.
+    const QString main = readSource(guiDir() + QStringLiteral("/main.qml"));
+    QVERIFY2(main.contains(QStringLiteral("seatHub.inProfile ? profileComponent : homeComponent")),
+             "home must route to the profile while `inProfile` holds");
+    QVERIFY(main.contains(QStringLiteral("onInProfileChanged")));
+    QVERIFY(main.contains(QStringLiteral("ProfileScreen {")));
+    QVERIFY2(!main.contains(QStringLiteral("\"profile\"")), "the profile is not an app state");
+
+    // The three new files are in the resource file, or they would not exist at runtime.
+    const QString qrc = readSource(guiDir() + QStringLiteral("/../qml.qrc"));
+    for (const QString& name : { QStringLiteral("ProfileScreen.qml"), QStringLiteral("SeatHubTabs.qml"),
+                                 QStringLiteral("SeatHubListView.qml") }) {
+        QVERIFY2(qrc.contains(name), qPrintable(name));
+    }
+
+    // Sign out moved here: Home neither calls it nor shows the identity line any more.
+    const QString home = readSource(guiDir() + QStringLiteral("/HomeScreen.qml"));
+    const QString profile = readSource(guiDir() + QStringLiteral("/ProfileScreen.qml"));
+    QVERIFY(!home.contains(QStringLiteral("signOut")));
+    QVERIFY(profile.contains(QStringLiteral("signOut")));
+    QVERIFY(!home.contains(QStringLiteral("client.identity")));
+
+    QQuickStyle::setStyle(QStringLiteral("Basic"));
+    QQmlEngine engine;
+    registerTokenSingletons(&engine);
+    FakeShellClient client;
+    QString error;
+    QScopedPointer<QObject> homeScreen(instantiate(&engine, QStringLiteral("HomeScreen.qml"), &error));
+    QVERIFY2(homeScreen, qPrintable(error));
+    QVERIFY(homeScreen->setProperty("client", QVariant::fromValue(static_cast<QObject*>(&client))));
+    QVERIFY(!findVisibleTextItem(homeScreen.data(), QStringLiteral("Sign out")));
+    QVERIFY(!findVisibleTextItem(homeScreen.data(), QStringLiteral("+962 7 0001 0002")));
+    QVERIFY(findVisibleTextItem(homeScreen.data(), QStringLiteral("Play")));
+}
+
+void TstUiScreens::theProfileShowsTheThreeIdentityRowsReadOnlyWithTheEmailMarkInWords()
+{
+    ProfileFixture fx;
+    QVERIFY2(fx.load(), qPrintable(fx.error));
+    fx.ordinary();
+
+    QVERIFY(fx.sees(QStringLiteral("Profile")));
+    QObject* username = fx.row("rowUsername");
+    QObject* email = fx.row("rowEmail");
+    QObject* phone = fx.row("rowPhone");
+    QVERIFY(username && email && phone);
+    QVERIFY(isShown(username) && isShown(email) && isShown(phone));
+
+    QCOMPARE(ProfileFixture::inRow(username, "value")->property("text").toString(), QStringLiteral("lina"));
+    QCOMPARE(ProfileFixture::inRow(email, "value")->property("text").toString(),
+             QStringLiteral("lina@example.com"));
+    QCOMPARE(ProfileFixture::inRow(phone, "value")->property("text").toString(),
+             QStringLiteral("+962790000000"));
+    QCOMPARE(ProfileFixture::inRow(username, "label")->property("text").toString(), QStringLiteral("Username"));
+    QCOMPARE(ProfileFixture::inRow(email, "label")->property("text").toString(), QStringLiteral("Email"));
+    QCOMPARE(ProfileFixture::inRow(phone, "label")->property("text").toString(),
+             QStringLiteral("Phone number"));
+
+    // A phone number is mono; the two names are not.
+    QCOMPARE(ProfileFixture::inRow(phone, "value")->property("font").value<QFont>().family(),
+             QString::fromLatin1(kMonoFamily));
+    QCOMPARE(ProfileFixture::inRow(username, "value")->property("font").value<QFont>().family(),
+             QString::fromLatin1(kSansFamily));
+
+    // The mark is a word as well as a colour: `Verified` with the success dot ...
+    QObject* mark = ProfileFixture::inRow(email, "mark");
+    QVERIFY(mark && isShown(mark));
+    QCOMPARE(ProfileFixture::inRow(email, "markWord")->property("text").toString(), QStringLiteral("Verified"));
+    QVERIFY(!ProfileFixture::inRow(username, "mark")->property("visible").toBool());
+    QVERIFY(!ProfileFixture::inRow(phone, "mark")->property("visible").toBool());
+
+    // ... and `Unverified` with the warn dot once the account says so. No banner, and nothing blocks.
+    fx.client.setAccount(QStringLiteral("lina"), QStringLiteral("lina@example.com"),
+                         QStringLiteral("+962790000000"), false);
+    QCOMPARE(ProfileFixture::inRow(fx.row("rowEmail"), "markWord")->property("text").toString(),
+             QStringLiteral("Unverified"));
+    for (const QString& banner : { QStringLiteral("Verify"), QStringLiteral("Confirm your email"),
+                                   QStringLiteral("Send code"), QStringLiteral("we'll send a code") }) {
+        QVERIFY2(!fx.sees(banner), qPrintable(banner));
+    }
+
+    // Read-only: no field, and no control that would change a username, email or phone.
+    QObject* block = fx.child("identityBlock");
+    QVERIFY(block);
+    for (QObject* item : visualTree(block)) {
+        QVERIFY2(!item->inherits("QQuickTextInput"), "the profile has no editable field");
+        QVERIFY2(!item->inherits("QQuickTextEdit"), "the profile has no editable field");
+        // The one control in the block is the error state Try again, and it is not shown here.
+        QVERIFY2(!(item->inherits("QQuickButton") && isShown(item)),
+                 "the identity rows are not controls");
+    }
+    QVERIFY(!fx.sees(QStringLiteral("Change these on the website")));
+    QVERIFY(!fx.sees(QStringLiteral("Edit")));
+    QVERIFY(!fx.sees(QStringLiteral("Change")));
+}
+
+void TstUiScreens::aMissingEmailOrPhoneKeepsItsRowAndSaysNotAdded()
+{
+    ProfileFixture fx;
+    QVERIFY2(fx.load(), qPrintable(fx.error));
+    fx.ordinary();
+    // A phone-only account has no email; an account may have no phone.
+    fx.client.setAccount(QStringLiteral("lina"), QString(), QString(), false);
+
+    for (const char* name : { "rowEmail", "rowPhone" }) {
+        QObject* row = fx.row(name);
+        QVERIFY(row && isShown(row));
+        QObject* value = ProfileFixture::inRow(row, "value");
+        QVERIFY(value && isShown(value));
+        QCOMPARE(value->property("text").toString(), QStringLiteral("Not added"));
+        // `Not added` is muted, and a missing email has no mark to hang on it.
+        QCOMPARE(value->property("color").value<QColor>(), QColor(QStringLiteral("#a3a3a3")));
+        QVERIFY(!ProfileFixture::inRow(row, "mark")->property("visible").toBool());
+    }
+    // The label is still there: the row is what says `Email` and `Phone number`.
+    QVERIFY(fx.sees(QStringLiteral("Email")));
+    QVERIFY(fx.sees(QStringLiteral("Phone number")));
+    // The rows that are present are unaffected.
+    QCOMPARE(ProfileFixture::inRow(fx.row("rowUsername"), "value")->property("text").toString(),
+             QStringLiteral("lina"));
+}
+
+void TstUiScreens::longIdentityValuesWrapInsideTheColumnInsteadOfBeingCut()
+{
+    ProfileFixture fx;
+    QVERIFY2(fx.load(), qPrintable(fx.error));
+    fx.ordinary();
+    const QString username = QString(60, QLatin1Char('u'));
+    const QString email = QString(70, QLatin1Char('e')) + QStringLiteral("@example.com");
+    fx.client.setAccount(username, email, QStringLiteral("+962790000000"), false);
+
+    for (const char* name : { "rowUsername", "rowEmail" }) {
+        QObject* value = ProfileFixture::inRow(fx.row(name), "value");
+        QVERIFY(value);
+        // Wrapped at any character, never truncated, and never wider than the 320px column.
+        QVERIFY2(value->property("lineCount").toInt() > 1, name);
+        QVERIFY2(!value->property("truncated").toBool(), name);
+        QVERIFY2(value->property("contentWidth").toReal() <= 320.0, name);
+        QCOMPARE(value->property("wrapMode").toInt(), int(QQuickText_WrapAnywhere));
+    }
+    // The whole address is still there, in one piece.
+    QCOMPARE(ProfileFixture::inRow(fx.row("rowEmail"), "value")->property("text").toString(), email);
+    // And the mark has moved under it rather than off the column.
+    QVERIFY(ProfileFixture::inRow(fx.row("rowEmail"), "mark")->property("y").toReal()
+            >= ProfileFixture::inRow(fx.row("rowEmail"), "value")->property("height").toReal());
+}
+
+void TstUiScreens::theIdentityBlockHasItsOwnLoadingAndErrorStates()
+{
+    ProfileFixture fx;
+    QVERIFY2(fx.load(), qPrintable(fx.error));
+    fx.ordinary();
+
+    // Loading (the delay is 0 here): skeletons of the final row shape, and no rows.
+    fx.client.setAccountState(QStringLiteral("loading"));
+    QVERIFY(fx.visible("identityLoading"));
+    QVERIFY(!fx.visible("identityRows"));
+    QVERIFY(!fx.visible("identityError"));
+    // The rest of the page does not notice.
+    QVERIFY(fx.sees(QStringLiteral("Hours played")));
+    QVERIFY(fx.sees(QStringLiteral("2 h 15 min")));
+
+    // Error: the server's sentence, its reference in mono, and a way to try again.
+    fx.client.setAccountState(QStringLiteral("error"), QStringLiteral("We couldn't load your details."),
+                              QStringLiteral("SH-4F7KQ2"));
+    QVERIFY(fx.visible("identityError"));
+    QVERIFY(!fx.visible("identityRows"));
+    QVERIFY(!fx.visible("identityLoading"));
+    QVERIFY(fx.sees(QStringLiteral("◆ We couldn't load your details.")));
+    QObject* reference = fx.child("identityErrorReference");
+    QVERIFY(reference && isShown(reference));
+    QCOMPARE(reference->property("text").toString(), QStringLiteral("SH-4F7KQ2"));
+    QCOMPARE(reference->property("font").value<QFont>().family(), QString::fromLatin1(kMonoFamily));
+    QCOMPARE(reference->property("wrapMode").toInt(), int(QQuickText_NoWrap));
+    fx.click("identityRetry");
+    QVERIFY(fx.client.calls().contains(QStringLiteral("reloadAccount")));
+
+    // An error with no reference draws no reference.
+    fx.client.setAccountState(QStringLiteral("error"), QStringLiteral("We couldn't reach SevenHills."));
+    QVERIFY(!fx.visible("identityErrorReference"));
+
+    // Back to the rows once the identity is read.
+    fx.client.setAccount(QStringLiteral("lina"), QStringLiteral("lina@example.com"),
+                         QStringLiteral("+962790000000"), true);
+    QVERIFY(fx.visible("identityRows"));
+    QVERIFY(!fx.visible("identityLoading"));
+    QVERIFY(!fx.visible("identityError"));
+
+    // A fast answer never flashes a skeleton: with the real delay, nothing shows before it.
+    ProfileFixture slow;
+    QVERIFY2(slow.load(1100, 656, 300), qPrintable(slow.error));
+    slow.ordinary();
+    slow.client.setAccountState(QStringLiteral("loading"));
+    QVERIFY(!slow.visible("identityLoading"));
+    QTRY_VERIFY_WITH_TIMEOUT(slow.visible("identityLoading"), 3000);
+}
+
+void TstUiScreens::theTwoTotalsAreDrawnFromTheServersNumbersAndHaveTheirOwnStates()
+{
+    ProfileFixture fx;
+    QVERIFY2(fx.load(), qPrintable(fx.error));
+    fx.ordinary();
+
+    // Two tiles, labelled as the deck words them, with the value the facade gave: the server's number
+    // formatted in C++, drawn in the mono face at heading size and tabular.
+    QObject* hours = fx.child("tileHours");
+    QObject* credit = fx.child("tileCredit");
+    QVERIFY(hours && credit);
+    QVERIFY(isShown(hours) && isShown(credit));
+    QCOMPARE(ProfileFixture::inRow(hours, "tileLabel")->property("text").toString(), QStringLiteral("Hours played"));
+    QCOMPARE(ProfileFixture::inRow(credit, "tileLabel")->property("text").toString(), QStringLiteral("Credit left"));
+    QObject* hoursValue = ProfileFixture::inRow(hours, "tileValue");
+    QObject* creditValue = ProfileFixture::inRow(credit, "tileValue");
+    QCOMPARE(hoursValue->property("text").toString(), QStringLiteral("2 h 15 min"));
+    QCOMPARE(creditValue->property("text").toString(), QStringLiteral("45 min"));
+    QCOMPARE(hoursValue->property("font").value<QFont>().family(), QString::fromLatin1(kMonoFamily));
+    QCOMPARE(hoursValue->property("font").value<QFont>().pixelSize(), 32);
+
+    // At the 320px column two 32px mono values do not fit side by side, so they stack: each tile takes
+    // the whole column. They are two tiles of one width either way.
+    QObject* block = fx.child("totalsBlock");
+    QVERIFY(block);
+    QVERIFY(!block->property("sideBySide").toBool());
+    QCOMPARE(hours->property("width").toReal(), 320.0);
+    QCOMPARE(hours->property("width").toReal(), credit->property("width").toReal());
+
+    // A value that would not fit is shrunk, never cut.
+    fx.client.setTotals(QStringLiteral("ready"), QStringLiteral("100 h 00 min"), QStringLiteral("100 h 00 min"));
+    QVERIFY(!hoursValue->property("truncated").toBool());
+    QVERIFY(hoursValue->property("contentWidth").toReal() <= hoursValue->property("width").toReal() + 0.5);
+
+    // Loading: skeleton tiles, and no numbers.
+    fx.client.setTotals(QStringLiteral("loading"));
+    QVERIFY(fx.visible("totalsLoading"));
+    QVERIFY(!fx.visible("totalTiles"));
+    QVERIFY(!fx.visible("totalsError"));
+
+    // Error: one tile with the server's sentence and reference and a way to try again; no number and
+    // certainly no zero.
+    fx.client.setTotals(QStringLiteral("error"), QString(), QString(), QStringLiteral("We couldn't total that."),
+                        QStringLiteral("SH-4F7KQ2"));
+    QVERIFY(fx.visible("totalsError"));
+    QVERIFY(!fx.visible("totalTiles"));
+    QVERIFY(fx.sees(QStringLiteral("◆ We couldn't total that.")));
+    QCOMPARE(fx.child("totalsErrorReference")->property("text").toString(), QStringLiteral("SH-4F7KQ2"));
+    QVERIFY(!fx.sees(QStringLiteral("0 min")));
+    fx.click("totalsRetry");
+    QVERIFY(fx.client.calls().contains(QStringLiteral("reloadTotals")));
+
+    // The lists and the identity never noticed.
+    QVERIFY(fx.visible("identityRows"));
+    QVERIFY(fx.visible("list_sessions"));
+}
+
+void TstUiScreens::theTabsSelectByClickAndByArrowKeysAndOnlyTheSelectedOneIsATabStop()
+{
+    // The tabs need a window for real key events, so this builds one (the menu test's technique).
+    QQuickStyle::setStyle(QStringLiteral("Basic"));
+    QQmlEngine engine;
+    registerTokenSingletons(&engine);
+
+    QQmlComponent component(&engine);
+    component.setData(QByteArrayLiteral(
+                          "import QtQuick\n"
+                          "import QtQuick.Controls\n"
+                          "ApplicationWindow {\n"
+                          "    id: win\n"
+                          "    width: 600; height: 200; visible: true\n"
+                          "    SeatHubTabs {\n"
+                          "        objectName: \"underTest\"\n"
+                          "        titles: [\"Sessions\", \"Credit history\", \"Top-ups\"]\n"
+                          "    }\n"
+                          "}\n"),
+                      QUrl::fromLocalFile(guiDir() + QStringLiteral("/tst_tabs_window.qml")));
+    QScopedPointer<QObject> created(component.create());
+    QVERIFY2(created, qPrintable(component.errorString()));
+    auto* window = qobject_cast<QQuickWindow*>(created.data());
+    QVERIFY(window);
+    QVERIFY(QTest::qWaitForWindowExposed(window));
+    window->requestActivate();
+    QVERIFY(QTest::qWaitForWindowActive(window));
+
+    QObject* tabs = deepChild(window, QStringLiteral("underTest"));
+    QVERIFY(tabs);
+    QSignalSpy activated(tabs, SIGNAL(tabActivated(int)));
+    auto tab = [&](int i) {
+        return qobject_cast<QQuickItem*>(deepChild(tabs, QStringLiteral("tab%1").arg(i)));
+    };
+    QVERIFY(tab(0) && tab(1) && tab(2));
+
+    // Three tabs, each a real button at least 40px tall, named as the deck words them.
+    QCOMPARE(tab(0)->property("text").toString(), QStringLiteral("Sessions"));
+    QCOMPARE(tab(1)->property("text").toString(), QStringLiteral("Credit history"));
+    QCOMPARE(tab(2)->property("text").toString(), QStringLiteral("Top-ups"));
+    for (int i = 0; i < 3; ++i) {
+        QVERIFY(tab(i)->inherits("QQuickButton"));
+        QVERIFY(tab(i)->height() >= 40);
+    }
+
+    // The selected tab is marked by a fill AND by its text, not by colour alone: a fill the others
+    // lack, the semibold weight the others lack, and it is the only tab stop.
+    QCOMPARE(tabs->property("currentIndex").toInt(), 0);
+    auto weightOf = [&](int i) {
+        QObject* label = tab(i)->property("contentItem").value<QObject*>();
+        return label->property("font").value<QFont>().weight();
+    };
+    auto fillOf = [&](int i) {
+        QObject* background = tab(i)->property("background").value<QObject*>();
+        return background->property("color").value<QColor>();
+    };
+    QCOMPARE(weightOf(0), QFont::DemiBold);
+    QCOMPARE(weightOf(1), QFont::Normal);
+    QVERIFY(fillOf(0).alpha() > 0);
+    QCOMPARE(fillOf(1).alpha(), 0);
+    QVERIFY(tab(0)->property("activeFocusOnTab").toBool());
+    QVERIFY(!tab(1)->property("activeFocusOnTab").toBool());
+    QVERIFY(!tab(2)->property("activeFocusOnTab").toBool());
+
+    // A click selects it.
+    QVERIFY(QMetaObject::invokeMethod(tab(1), "clicked"));
+    QCOMPARE(tabs->property("currentIndex").toInt(), 1);
+    QCOMPARE(activated.count(), 1);
+    QCOMPARE(activated.at(0).at(0).toInt(), 1);
+    QCOMPARE(weightOf(1), QFont::DemiBold);
+    QCOMPARE(weightOf(0), QFont::Normal);
+    QTRY_VERIFY_WITH_TIMEOUT(tab(1)->hasActiveFocus(), 3000);
+    QVERIFY(tab(1)->property("activeFocusOnTab").toBool());
+    QVERIFY(!tab(0)->property("activeFocusOnTab").toBool());
+
+    // The arrow keys move between tabs, and stop at the ends.
+    QTest::keyClick(window, Qt::Key_Right);
+    QTRY_COMPARE_WITH_TIMEOUT(tabs->property("currentIndex").toInt(), 2, 3000);
+    QTest::keyClick(window, Qt::Key_Right);
+    QCOMPARE(tabs->property("currentIndex").toInt(), 2);
+    QTest::keyClick(window, Qt::Key_Left);
+    QTRY_COMPARE_WITH_TIMEOUT(tabs->property("currentIndex").toInt(), 1, 3000);
+    QTest::keyClick(window, Qt::Key_Left);
+    QTest::keyClick(window, Qt::Key_Left);
+    QTRY_COMPARE_WITH_TIMEOUT(tabs->property("currentIndex").toInt(), 0, 3000);
+    QVERIFY(tab(0)->hasActiveFocus());
+}
+
+namespace {
+
+/// A list view of its own, with a stand-in list, sized like the region under the tabs.
+struct ListFixture
+{
+    QQmlEngine engine;
+    FakeList list;
+    QScopedPointer<QObject> view;
+    QString error;
+
+    bool load(int width = 528, int height = 300, int loadingDelay = 0)
+    {
+        QQuickStyle::setStyle(QStringLiteral("Basic"));
+        registerTokenSingletons(&engine);
+        QQmlComponent component(&engine,
+                                QUrl::fromLocalFile(guiDir() + QStringLiteral("/SeatHubListView.qml")));
+        view.reset(component.createWithInitialProperties(
+            { { QStringLiteral("list"), QVariant::fromValue(static_cast<QObject*>(&list)) },
+              { QStringLiteral("width"), width },
+              { QStringLiteral("height"), height },
+              { QStringLiteral("loadingDelay"), loadingDelay },
+              { QStringLiteral("loadingText"), QStringLiteral("Loading your sessions…") },
+              { QStringLiteral("emptyText"), QStringLiteral("No sessions yet.") },
+              { QStringLiteral("emptyActionText"), QStringLiteral("Back to home") } }));
+        if (!view) {
+            error = component.errorString();
+            return false;
+        }
+        return true;
+    }
+    QObject* child(const char* name) const { return deepChild(view.data(), QLatin1String(name)); }
+    bool visible(const char* name) const
+    {
+        QObject* item = child(name);
+        return item && isShown(item);
+    }
+    bool sees(const QString& text) const { return seesText(view.data(), text); }
+    void layout() { QMetaObject::invokeMethod(child("rows"), "forceLayout"); }
+};
+
+} // namespace
+
+void TstUiScreens::aListDrawsEachOfItsStates()
+{
+    ListFixture fx;
+    QVERIFY2(fx.load(), qPrintable(fx.error));
+
+    // Nothing asked for yet: nothing drawn.
+    QVERIFY(!fx.visible("loadingState") && !fx.visible("emptyState") && !fx.visible("errorState")
+            && !fx.visible("rows"));
+
+    // Loading: skeleton rows of the final shape, and the named line.
+    fx.list.setState(QStringLiteral("loading"));
+    QVERIFY(fx.visible("loadingState"));
+    QVERIFY(fx.sees(QStringLiteral("Loading your sessions…")));
+    QCOMPARE(deepChildren(fx.child("loadingState"), QStringLiteral("skeletonRows")).size() >= 0, true);
+    QVERIFY(!fx.visible("rows"));
+
+    // Empty: one sentence and one action, no rows, no skeletons.
+    fx.list.setState(QStringLiteral("ready"));
+    QVERIFY(fx.visible("emptyState"));
+    QVERIFY(fx.sees(QStringLiteral("No sessions yet.")));
+    QObject* action = fx.child("emptyAction");
+    QVERIFY(action && isShown(action));
+    QCOMPARE(action->property("text").toString(), QStringLiteral("Back to home"));
+    QSignalSpy emptyAction(fx.view.data(), SIGNAL(emptyActionTriggered()));
+    QVERIFY(QMetaObject::invokeMethod(action, "clicked"));
+    QCOMPARE(emptyAction.count(), 1);
+    QVERIFY(!fx.visible("loadingState") && !fx.visible("errorState") && !fx.visible("rows"));
+
+    // Populated: the rows, each already display text; the cells are 44px tall.
+    fx.list.setRows({ { QStringLiteral("Sat 12 Sep, 21:40"), QStringLiteral("You ended it"),
+                        QStringLiteral("2 h 15 min"), QString() },
+                      { QStringLiteral("Fri 11 Sep, 13:00"), QStringLiteral("Balance ran out"),
+                        QStringLiteral("45 min"), QString() } });
+    fx.list.setState(QStringLiteral("ready"));
+    fx.layout();
+    QVERIFY(fx.visible("rows"));
+    QVERIFY(!fx.visible("emptyState") && !fx.visible("loadingState") && !fx.visible("errorState"));
+    QCOMPARE(deepChildren(fx.child("rows"), QStringLiteral("whenCell")).size(), 2);
+    QObject* firstWhen = deepChildren(fx.child("rows"), QStringLiteral("whenCell")).first();
+    QCOMPARE(firstWhen->property("height").toInt(), 44);
+    QVERIFY(fx.sees(QStringLiteral("Sat 12 Sep, 21:40")));
+    QVERIFY(fx.sees(QStringLiteral("Balance ran out")));
+    QVERIFY(fx.sees(QStringLiteral("2 h 15 min")));
+    // Dates and lengths are mono; the words are not.
+    QCOMPARE(firstWhen->property("font").value<QFont>().family(), QString::fromLatin1(kMonoFamily));
+    QObject* amount = deepChildren(fx.child("rows"), QStringLiteral("amountCell")).first();
+    QCOMPARE(amount->property("font").value<QFont>().family(), QString::fromLatin1(kMonoFamily));
+    QCOMPARE(amount->property("horizontalAlignment").toInt(), int(QQuickText_AlignRight));
+    QObject* kind = deepChildren(fx.child("rows"), QStringLiteral("kindCell")).first();
+    QCOMPARE(kind->property("font").value<QFont>().family(), QString::fromLatin1(kSansFamily));
+
+    // End of feed: the server has no more, so the closing line shows under the rows.
+    QVERIFY2(fx.sees(QStringLiteral("You've reached the end.")), "the last page ends the list");
+    QVERIFY(fx.visible("endOfFeed"));
+    QVERIFY(!fx.visible("footerLoading") && !fx.visible("footerError"));
+
+    // Next page loading: the footer row with the named line; the rows stay.
+    fx.list.setState(QStringLiteral("ready"), /*hasMore*/ true, /*loadingMore*/ true);
+    fx.layout();
+    QVERIFY(fx.visible("footerLoading"));
+    QVERIFY(!fx.visible("endOfFeed"));
+    QVERIFY(fx.sees(QStringLiteral("Loading your sessions…")));
+    QVERIFY(fx.sees(QStringLiteral("Sat 12 Sep, 21:40")));
+
+    // A later page failed: the same reason and reference in the footer row, every loaded row kept.
+    fx.list.setState(QStringLiteral("ready"), true, false, true, QStringLiteral("We couldn't load that page."),
+                     QStringLiteral("SH-4F7KQ2"));
+    fx.layout();
+    QVERIFY(fx.visible("footerError"));
+    QVERIFY(fx.sees(QStringLiteral("◆ We couldn't load that page.")));
+    QCOMPARE(fx.child("footerErrorReference")->property("text").toString(), QStringLiteral("SH-4F7KQ2"));
+    QVERIFY(fx.sees(QStringLiteral("Sat 12 Sep, 21:40")));
+    QVERIFY(fx.sees(QStringLiteral("Balance ran out")));
+    QSignalSpy retry(fx.view.data(), SIGNAL(retryRequested()));
+    QVERIFY(QMetaObject::invokeMethod(fx.child("footerRetry"), "clicked"));
+    QCOMPARE(retry.count(), 1);
+
+    // The first page failed: the server's sentence, its reference in mono, a way to try again.
+    fx.list.setRows({});
+    fx.list.setState(QStringLiteral("error"), false, false, false, QStringLiteral("We couldn't load your sessions."),
+                     QStringLiteral("SH-4F7KQ2"));
+    QVERIFY(fx.visible("errorState"));
+    QVERIFY(!fx.visible("rows") && !fx.visible("emptyState") && !fx.visible("loadingState"));
+    QVERIFY(fx.sees(QStringLiteral("◆ We couldn't load your sessions.")));
+    QObject* reference = fx.child("errorReference");
+    QVERIFY(reference && isShown(reference));
+    QCOMPARE(reference->property("text").toString(), QStringLiteral("SH-4F7KQ2"));
+    QCOMPARE(reference->property("font").value<QFont>().family(), QString::fromLatin1(kMonoFamily));
+    QCOMPARE(reference->property("wrapMode").toInt(), int(QQuickText_NoWrap));
+    QVERIFY(QMetaObject::invokeMethod(fx.child("retryButton"), "clicked"));
+    QCOMPARE(retry.count(), 2);
+
+    // An error with no reference draws no reference.
+    fx.list.setState(QStringLiteral("error"), false, false, false, QStringLiteral("We couldn't reach SevenHills."));
+    QVERIFY(!fx.visible("errorReference"));
+
+    // Overflow: a long word in a row wraps to a second line inside the 44px row, never off the region.
+    fx.list.setRows({ { QStringLiteral("Sat 12 Sep, 21:40"),
+                        QStringLiteral("Not started in time, not charged"), QStringLiteral("0 min"),
+                        QString() } });
+    fx.list.setState(QStringLiteral("ready"));
+    fx.layout();
+    QObject* longKind = deepChildren(fx.child("rows"), QStringLiteral("kindCell")).first();
+    QVERIFY(longKind->property("contentWidth").toReal() <= longKind->property("width").toReal() + 0.5);
+    QVERIFY(longKind->property("contentHeight").toReal() <= 44.0);
+
+    // A top-up row carries its dot beside the word: the mark is never colour alone.
+    fx.list.setRows({ { QStringLiteral("Sun 13 Sep, 12:00"), QStringLiteral("Waiting"), QString(),
+                        QStringLiteral("waiting") },
+                      { QStringLiteral("Thu 10 Sep, 12:00"), QStringLiteral("Credited"),
+                        QStringLiteral("+5 h 00 min"), QStringLiteral("credited") } });
+    fx.list.setState(QStringLiteral("ready"));
+    fx.layout();
+    QVERIFY(fx.sees(QStringLiteral("Waiting")));
+    QVERIFY(fx.sees(QStringLiteral("Credited")));
+    QVERIFY(fx.sees(QStringLiteral("+5 h 00 min")));
+
+    // The skeleton waits for its delay: a fast answer never flashes it.
+    ListFixture slow;
+    QVERIFY2(slow.load(528, 300, 300), qPrintable(slow.error));
+    slow.list.setState(QStringLiteral("loading"));
+    QVERIFY(!slow.visible("loadingState"));
+    QTRY_VERIFY_WITH_TIMEOUT(slow.visible("loadingState"), 3000);
+    slow.list.setState(QStringLiteral("ready"));
+    QVERIFY(!slow.visible("loadingState"));
+}
+
+void TstUiScreens::aListAsksForTheNextPageOnlyWhenItsRowsEnd()
+{
+    ListFixture fx;
+    QVERIFY2(fx.load(528, 300), qPrintable(fx.error));
+    QSignalSpy asked(fx.view.data(), SIGNAL(nextPageRequested()));
+
+    // Fifteen rows are taller than the 300px region and the server has more: nothing is asked for
+    // while the top of the list is showing.
+    fx.list.setRows(FakeList::plainRows(15));
+    fx.list.setState(QStringLiteral("ready"), /*hasMore*/ true);
+    fx.layout();
+    QCOMPARE(asked.count(), 0);
+    QObject* rows = fx.child("rows");
+    QVERIFY(rows->property("contentHeight").toReal() > rows->property("height").toReal());
+
+    // The scrollbar shows while there is more than fits.
+    QCOMPARE(rows->property("contentHeight").toReal() > rows->property("height").toReal(), true);
+
+    // Reaching the end asks for the next page.
+    QVERIFY(QMetaObject::invokeMethod(rows, "positionViewAtEnd"));
+    QTRY_VERIFY_WITH_TIMEOUT(asked.count() >= 1, 3000);
+
+    // While a page is loading, or after one failed, it does not ask on its own.
+    asked.clear();
+    fx.list.setState(QStringLiteral("ready"), true, /*loadingMore*/ true);
+    fx.layout();
+    QVERIFY(QMetaObject::invokeMethod(rows, "positionViewAtEnd"));
+    fx.list.setState(QStringLiteral("ready"), true, false, /*moreFailed*/ true,
+                     QStringLiteral("We couldn't load that page."));
+    fx.layout();
+    QVERIFY(QMetaObject::invokeMethod(rows, "positionViewAtEnd"));
+    QTest::qWait(150);
+    QCOMPARE(asked.count(), 0);
+
+    // With no more to give, reaching the end asks for nothing.
+    fx.list.setState(QStringLiteral("ready"), /*hasMore*/ false);
+    fx.layout();
+    QVERIFY(QMetaObject::invokeMethod(rows, "positionViewAtEnd"));
+    QTest::qWait(150);
+    QCOMPARE(asked.count(), 0);
+
+    // Three rows that do not fill the region, with more to come, ask for the next at once: there is
+    // no scrolling to reach an end that is already showing.
+    ListFixture short_;
+    QVERIFY2(short_.load(528, 600), qPrintable(short_.error));
+    QSignalSpy askedShort(short_.view.data(), SIGNAL(nextPageRequested()));
+    short_.list.setRows(FakeList::plainRows(3));
+    short_.list.setState(QStringLiteral("ready"), true);
+    short_.layout();
+    QTRY_VERIFY_WITH_TIMEOUT(askedShort.count() >= 1, 3000);
+}
+
+void TstUiScreens::theProfileAsksOnlyForTheListItShowsAndTheOthersWaitForTheirTab()
+{
+    ProfileFixture fx;
+    QVERIFY2(fx.load(), qPrintable(fx.error));
+    fx.ordinary();
+
+    // On opening: the sessions tab is showing, so only sessions are asked for.
+    QCOMPARE(fx.client.calls(), QStringList{ QStringLiteral("loadFirstPage:sessions") });
+    QVERIFY(fx.visible("list_sessions"));
+    QVERIFY(!fx.visible("list_credit"));
+    QVERIFY(!fx.visible("list_topups"));
+
+    // Opening a tab asks for that list, and only that list.
+    fx.selectTab(1);
+    QCOMPARE(fx.client.calls().last(), QStringLiteral("loadFirstPage:credit"));
+    QVERIFY(fx.visible("list_credit"));
+    QVERIFY(!fx.visible("list_sessions"));
+    QCOMPARE(fx.client.calls().size(), 2);
+
+    fx.selectTab(2);
+    QCOMPARE(fx.client.calls().last(), QStringLiteral("loadFirstPage:topups"));
+    QVERIFY(fx.visible("list_topups"));
+    QCOMPARE(fx.client.calls().size(), 3);
+
+    // The tabs carry the deck's words, in order.
+    QVERIFY(fx.sees(QStringLiteral("Sessions")));
+    QVERIFY(fx.sees(QStringLiteral("Credit history")));
+    QVERIFY(fx.sees(QStringLiteral("Top-ups")));
+
+    // Reaching the end of a list asks the facade for that list's next page, by name.
+    fx.client.topups()->setRows(FakeList::plainRows(15));
+    fx.client.topups()->setState(QStringLiteral("ready"), true);
+    QObject* view = fx.child("list_topups");
+    QVERIFY(view);
+    QVERIFY(QMetaObject::invokeMethod(deepChild(view, QStringLiteral("rows")), "forceLayout"));
+    QVERIFY(QMetaObject::invokeMethod(deepChild(view, QStringLiteral("rows")), "positionViewAtEnd"));
+    QTRY_VERIFY_WITH_TIMEOUT(fx.client.calls().contains(QStringLiteral("loadNextPage:topups")), 3000);
+
+    // Each list's own `Try again`: a failed first page starts that list over; a failed later page asks
+    // for that same page again.
+    fx.selectTab(0);
+    fx.client.sessions()->setRows({});
+    fx.client.sessions()->setState(QStringLiteral("error"), false, false, false, QStringLiteral("Try later."),
+                                   QStringLiteral("SH-4F7KQ2"));
+    QVERIFY(QMetaObject::invokeMethod(deepChild(fx.child("list_sessions"), QStringLiteral("retryButton")),
+                                      "clicked"));
+    QVERIFY(fx.client.calls().contains(QStringLiteral("reloadList:sessions")));
+
+    fx.client.sessions()->setRows(FakeList::plainRows(2));
+    fx.client.sessions()->setState(QStringLiteral("ready"), true, false, true, QStringLiteral("Try later."));
+    QVERIFY(QMetaObject::invokeMethod(deepChild(fx.child("list_sessions"), QStringLiteral("footerRetry")),
+                                      "clicked"));
+    QVERIFY(fx.client.calls().contains(QStringLiteral("loadNextPage:sessions")));
+}
+
+void TstUiScreens::oneListFailingLeavesTheOthersTheTotalsAndTheIdentityIntact()
+{
+    ProfileFixture fx;
+    QVERIFY2(fx.load(), qPrintable(fx.error));
+    fx.ordinary();
+    fx.client.credit()->setRows({ { QStringLiteral("Sat 12 Sep, 21:40"), QStringLiteral("Top-up"),
+                                    QStringLiteral("+5 h 00 min"), QString() } });
+    fx.client.credit()->setState(QStringLiteral("ready"));
+    fx.client.topups()->setRows({});
+    fx.client.topups()->setState(QStringLiteral("ready"));
+
+    // Sessions fails.
+    fx.client.sessions()->setRows({});
+    fx.client.sessions()->setState(QStringLiteral("error"), false, false, false,
+                                   QStringLiteral("We couldn't load your sessions."), QStringLiteral("SH-4F7KQ2"));
+    QVERIFY(fx.visible("list_sessions"));
+    QVERIFY(fx.sees(QStringLiteral("◆ We couldn't load your sessions.")));
+
+    // The identity block and both totals are intact.
+    QVERIFY(fx.visible("identityRows"));
+    QVERIFY(fx.sees(QStringLiteral("lina@example.com")));
+    QVERIFY(fx.visible("totalTiles"));
+    QVERIFY(fx.sees(QStringLiteral("2 h 15 min")));
+
+    // And the other two lists are their own: credit history has its row, top-ups is empty.
+    fx.selectTab(1);
+    QVERIFY(fx.sees(QStringLiteral("+5 h 00 min")));
+    QVERIFY(!fx.sees(QStringLiteral("We couldn't load your sessions.")));
+    fx.selectTab(2);
+    QVERIFY(fx.sees(QStringLiteral("No top-ups yet.")));
+    QVERIFY(!fx.sees(QStringLiteral("We couldn't load your sessions.")));
+
+    // The reverse: the totals fail and every list and the identity carry on.
+    fx.selectTab(1);
+    fx.client.setTotals(QStringLiteral("error"), QString(), QString(), QStringLiteral("We couldn't total that."));
+    QVERIFY(fx.visible("totalsError"));
+    QVERIFY(fx.sees(QStringLiteral("+5 h 00 min")));
+    QVERIFY(fx.visible("identityRows"));
+
+    // And the identity fails while the lists and totals carry on.
+    fx.client.setTotals(QStringLiteral("ready"), QStringLiteral("2 h 15 min"), QStringLiteral("45 min"));
+    fx.client.setAccountState(QStringLiteral("error"), QStringLiteral("We couldn't load your details."));
+    QVERIFY(fx.visible("identityError"));
+    QVERIFY(fx.visible("totalTiles"));
+    QVERIFY(fx.sees(QStringLiteral("+5 h 00 min")));
+}
+
+void TstUiScreens::aRowNamesNoRigAndNoProfileFileCanReadOne()
+{
+    // CUST-01, T-05-37. Every row is built from the four roles the model gives it, and a delegate that
+    // asked for a fifth would fail to load: so what a row can show is what the model gave it.
+    ListFixture fx;
+    QVERIFY2(fx.load(), qPrintable(fx.error));
+    fx.list.setRows(FakeList::plainRows(4));
+    fx.list.setState(QStringLiteral("ready"));
+    fx.layout();
+    QObject* rows = fx.child("rows");
+    QVERIFY(rows);
+    int cells = 0;
+    for (const char* name : { "whenCell", "kindCell", "amountCell" }) {
+        for (QObject* cell : deepChildren(rows, QLatin1String(name))) {
+            ++cells;
+            const QString text = cell->property("text").toString();
+            QVERIFY2(!text.contains(QStringLiteral("Rig"), Qt::CaseSensitive), qPrintable(text));
+            QVERIFY2(!text.contains(QStringLiteral("host"), Qt::CaseInsensitive), qPrintable(text));
+        }
+    }
+    QCOMPARE(cells, 12);
+
+    // And none of the three files can read a machine: no host or rig-identity member in any of them.
+    for (const QString& name : { QStringLiteral("ProfileScreen.qml"), QStringLiteral("SeatHubListView.qml"),
+                                 QStringLiteral("SeatHubTabs.qml") }) {
+        const QString source = readSource(guiDir() + QLatin1Char('/') + name);
+        QVERIFY2(!source.isEmpty(), qPrintable(name));
+        // A word starting `host` (not the `ghost` button variant): no host member of any spelling.
+        QVERIFY2(!source.contains(QRegularExpression(QStringLiteral("\\bhost"),
+                                                     QRegularExpression::CaseInsensitiveOption)),
+                 qPrintable(name));
+        QVERIFY2(!source.contains(QStringLiteral("rigName")), qPrintable(name));
+        QVERIFY2(!source.contains(QStringLiteral("rig_name")), qPrintable(name));
+        // Nor do they build a number: no sum, count or total is computed in QML.
+        QVERIFY2(!source.contains(QStringLiteral("reduce(")), qPrintable(name));
+        QVERIFY2(!source.contains(QStringLiteral("parseInt")), qPrintable(name));
+        QVERIFY2(!source.contains(QStringLiteral("+= ")), qPrintable(name));
+    }
+}
+
+void TstUiScreens::signOutBackAndTheWebsiteLinkFromTheProfileReachTheFacade()
+{
+    ProfileFixture fx;
+    QVERIFY2(fx.load(), qPrintable(fx.error));
+    fx.ordinary();
+
+    // Sign out is here now, and it is the facade's own (it revokes, deletes the credential and lands
+    // on sign-in even offline: `tst_facade_wiring` proves those). No confirmation stands in between.
+    QObject* signOut = fx.child("signOutButton");
+    QVERIFY(signOut && isShown(signOut));
+    QCOMPARE(signOut->property("text").toString(), QStringLiteral("Sign out"));
+    QCOMPARE(signOut->property("variant").toString(), QStringLiteral("ghost"));
+    fx.click("signOutButton");
+    QCOMPARE(fx.client.signOuts(), 1);
+
+    // Back leaves the profile.
+    fx.click("backButton");
+    QVERIFY(fx.client.calls().contains(QStringLiteral("closeProfile")));
+
+    // The plain link opens the website's home page, by name, and promises nothing: it is worded
+    // `Open the website`, never as an instruction to change details there.
+    QObject* link = fx.child("openWebsiteButton");
+    QVERIFY(link && isShown(link));
+    QCOMPARE(link->property("text").toString(), QStringLiteral("Open the website"));
+    QCOMPARE(link->property("glyph").toString(), QStringLiteral("↗"));
+    fx.click("openWebsiteButton");
+    QCOMPARE(fx.client.opened(), QStringList{ QStringLiteral("home") });
+    QVERIFY(!fx.sees(QStringLiteral("Change these on the website")));
+
+    // The screen builds no address: it asks the facade by name.
+    const QString source = readSource(guiDir() + QStringLiteral("/ProfileScreen.qml"));
+    QVERIFY(!source.contains(QStringLiteral("http")));
+    QVERIFY(!source.contains(QStringLiteral("sevenhills")));
+    QVERIFY(source.contains(QStringLiteral("client.openWebsite(\"home\")")));
+}
+
+void TstUiScreens::theEmptyActionsGoWhereTheirWordsSay()
+{
+    ProfileFixture fx;
+    QVERIFY2(fx.load(), qPrintable(fx.error));
+    fx.ordinary();
+    fx.client.sessions()->setRows({});
+    fx.client.sessions()->setState(QStringLiteral("ready"));
+    fx.client.credit()->setRows({});
+    fx.client.credit()->setState(QStringLiteral("ready"));
+    fx.client.topups()->setRows({});
+    fx.client.topups()->setState(QStringLiteral("ready"));
+
+    // Sessions: one sentence and `Back to home`.
+    QVERIFY(fx.sees(QStringLiteral("No sessions yet.")));
+    QObject* action = deepChild(fx.child("list_sessions"), QStringLiteral("emptyAction"));
+    QCOMPARE(action->property("text").toString(), QStringLiteral("Back to home"));
+    QVERIFY(QMetaObject::invokeMethod(action, "clicked"));
+    QVERIFY(fx.client.calls().contains(QStringLiteral("closeProfile")));
+    QCOMPARE(fx.client.topUps(), 0);
+
+    // Credit history and top-ups: one sentence and `Top up`, which opens the website.
+    fx.selectTab(1);
+    QVERIFY(fx.sees(QStringLiteral("No credit history yet.")));
+    action = deepChild(fx.child("list_credit"), QStringLiteral("emptyAction"));
+    QCOMPARE(action->property("text").toString(), QStringLiteral("Top up"));
+    QVERIFY(QMetaObject::invokeMethod(action, "clicked"));
+    QCOMPARE(fx.client.topUps(), 1);
+
+    fx.selectTab(2);
+    QVERIFY(fx.sees(QStringLiteral("No top-ups yet.")));
+    action = deepChild(fx.child("list_topups"), QStringLiteral("emptyAction"));
+    QCOMPARE(action->property("text").toString(), QStringLiteral("Top up"));
+    QVERIFY(QMetaObject::invokeMethod(action, "clicked"));
+    QCOMPARE(fx.client.topUps(), 2);
+
+    // Loading names the thing loading, per list.
+    fx.client.credit()->setState(QStringLiteral("loading"));
+    fx.client.topups()->setState(QStringLiteral("loading"));
+    QVERIFY(fx.sees(QStringLiteral("Loading your top-ups…")));
+    fx.selectTab(1);
+    QVERIFY(fx.sees(QStringLiteral("Loading your credit history…")));
+    fx.selectTab(0);
+    fx.client.sessions()->setState(QStringLiteral("loading"));
+    QVERIFY(fx.sees(QStringLiteral("Loading your sessions…")));
+}
+
+void TstUiScreens::theProfileFitsItsWindowAndKeepsTheListWideEnough()
+{
+    // Default window under the header: 1100 x 656. Nothing in the left column scrolls, so Sign out is
+    // where it is always expected to be.
+    {
+        ProfileFixture fx;
+        QVERIFY2(fx.load(1100, 656), qPrintable(fx.error));
+        fx.ordinary();
+        QObject* left = fx.child("leftColumn");
+        QVERIFY(left);
+        QVERIFY2(left->property("contentHeight").toReal() <= left->property("height").toReal() + 0.5,
+                 "at the default size the left column fits without scrolling");
+        // About twelve 44px rows are visible at once in the list region (owner decision O7).
+        QObject* right = fx.child("rightColumn");
+        QVERIFY(right);
+        QVERIFY(right->property("width").toReal() >= 528.0);
+    }
+    // Smallest window under the header: 960 x 576. The list keeps the 528px the three row cells need,
+    // and whatever the left column cannot fit scrolls, so nothing is unreachable.
+    {
+        ProfileFixture fx;
+        QVERIFY2(fx.load(960, 576), qPrintable(fx.error));
+        fx.ordinary();
+        QObject* right = fx.child("rightColumn");
+        QVERIFY(right);
+        QVERIFY2(right->property("width").toReal() >= 528.0, "the list is at least 528px wide at 960px");
+        QObject* left = fx.child("leftColumn");
+        const bool fits = left->property("contentHeight").toReal() <= left->property("height").toReal() + 0.5;
+        const bool scrolls = left->property("contentHeight").toReal() > left->property("height").toReal();
+        QVERIFY(fits || scrolls);
+        QVERIFY(fx.visible("signOutButton"));
     }
 }
 

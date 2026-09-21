@@ -4,9 +4,10 @@ import SeatHub.Tokens 1.0
 
 // The header's small menu (D-19, 05-UI-SPEC "Menu").
 //
-// A 40x40 trigger and a popup anchored under it, right-aligned. This plan ships two items - `Top up`
-// and `Settings` - and the profile joins them when its screen exists, so nothing here points at a
-// screen that is not there yet.
+// A 40x40 trigger and a popup anchored under it, right-aligned, with three items in the design
+// contract's order: `Profile`, `Top up` and `Settings`.
+//
+// `Profile` opens the customer's own page (`ProfileScreen.qml`, a view inside Home like Settings).
 //
 // `Top up` leaves the app: it asks the facade to open the website's top-up page, and it carries the
 // external-link mark. No address is built in this file - the facade owns every website address, and
@@ -131,6 +132,13 @@ Item {
             color: Tokens.surface3Default
             border.width: 1
             border.color: Tokens.borderDefault
+        }
+
+        MenuRow {
+            objectName: "menuItemProfile"
+            text: qsTr("Profile")
+
+            onTriggered: root.client.openProfile()
         }
 
         MenuRow {

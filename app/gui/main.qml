@@ -51,9 +51,11 @@ ApplicationWindow {
         // exactly the flash the restore splash exists to prevent.
         case "restoring":  return restoreComponent
         case "signed_out": return signInComponent
-        // Settings is a view inside the home state, not a state of its own: a session can end
-        // while the page is open, and the page must still be the right view when it does.
-        case "home":       return seatHub.inSettings ? settingsComponent : homeComponent
+        // Settings and the profile are views inside the home state, not states of their own: a
+        // session can end while either page is open, and it must still be the right view when it
+        // does (and both keep the signed-in header, which `showsHeader` gives to "home").
+        case "home":       return seatHub.inSettings ? settingsComponent
+                                  : (seatHub.inProfile ? profileComponent : homeComponent)
         case "connecting": return connectingComponent
         case "streaming":  return streamingComponent
         case "error":      return errorComponent
@@ -108,6 +110,10 @@ ApplicationWindow {
         }
 
         function onInSettingsChanged() {
+            viewLoader.sourceComponent = window.componentForState(seatHub.appState)
+        }
+
+        function onInProfileChanged() {
             viewLoader.sourceComponent = window.componentForState(seatHub.appState)
         }
     }
@@ -167,6 +173,15 @@ ApplicationWindow {
         id: homeComponent
 
         HomeScreen {
+            client: seatHub
+        }
+    }
+
+    // The customer's own page (CUST-08, CUST-14): identity, two totals and three histories.
+    Component {
+        id: profileComponent
+
+        ProfileScreen {
             client: seatHub
         }
     }

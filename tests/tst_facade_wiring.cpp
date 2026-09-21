@@ -2946,6 +2946,44 @@ private slots:
         QTRY_COMPARE_WITH_TIMEOUT(client.hoursPlayedText(), QStringLiteral("3 h 20 min"), 15000);
     }
 
+    void theFacadeAndTheListModelsExposeExactlyWhatTheProfileScreenReads()
+    {
+        // `tst_ui_screens` drives the profile with stand-ins for the facade and the list models. This
+        // is the other half: the real ones have every property, role and invokable those stand-ins
+        // have, under the same names, so a rename on either side fails a suite instead of a customer.
+        SeatHubClient client;
+
+        const QMetaObject* facade = client.metaObject();
+        for (const char* name : { "inProfile", "account", "accountStatus", "accountError",
+                                  "accountErrorReference", "totalsStatus", "hoursPlayedText",
+                                  "creditLeftText", "totalsError", "totalsErrorReference",
+                                  "sessionHistory", "creditHistory", "topupHistory" }) {
+            QVERIFY2(facade->indexOfProperty(name) >= 0, name);
+        }
+        for (const char* signature : { "openProfile()", "closeProfile()", "loadFirstPage(QString)",
+                                       "loadNextPage(QString)", "reloadList(QString)", "reloadTotals()",
+                                       "reloadAccount()", "signOut()", "openTopUp()",
+                                       "openWebsite(QString)" }) {
+            QVERIFY2(facade->indexOfMethod(signature) >= 0, signature);
+        }
+
+        const QList<CustomerListModel*> lists = { client.sessionHistory(), client.creditHistory(),
+                                                  client.topupHistory() };
+        for (CustomerListModel* list : lists) {
+            const QMetaObject* meta = list->metaObject();
+            for (const char* name : { "status", "loadingMore", "moreFailed", "hasMore", "errorText",
+                                      "errorReference", "count" }) {
+                QVERIFY2(meta->indexOfProperty(name) >= 0, name);
+            }
+            const QHash<int, QByteArray> roles = list->roleNames();
+            QCOMPARE(roles.size(), 4);
+            QCOMPARE(roles.value(CustomerListModel::WhenRole), QByteArrayLiteral("whenText"));
+            QCOMPARE(roles.value(CustomerListModel::KindRole), QByteArrayLiteral("kindText"));
+            QCOMPARE(roles.value(CustomerListModel::AmountRole), QByteArrayLiteral("amountText"));
+            QCOMPARE(roles.value(CustomerListModel::ToneRole), QByteArrayLiteral("tone"));
+        }
+    }
+
     // The words and the dates (D-15) ----------------------------------------------------------------------
 
     void endReasonShortText_data()
