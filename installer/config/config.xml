@@ -18,6 +18,11 @@
               mechanism, so the Maintenance Tool can only repair or remove what is already
               installed. Updates arrive through the JSON feed (GET /api/releases/client).
   No signing: the package is unsigned (D-43). SmartScreen will warn once; that is accepted.
+  ControlScript  controlscript.qs, beside this file: removes an installed SeatHub before the target
+              directory check refuses the folder, keeping the customer's sign-in (see the script).
+              binarycreator resolves the name relative to this file's directory and embeds it, so
+              scripts\build-seathub.ps1 (`-c installer\config\config.xml`) needs no change.
+              Version stays 0.1.0: the refusal keys only on SeatHubMaintenanceTool.exe existing.
 -->
 <Installer>
     <Name>SeatHub</Name>
@@ -30,4 +35,5 @@
     <InstallerApplicationIcon>seathub</InstallerApplicationIcon>
     <RunProgram>@TargetDir@/SeatHub.exe</RunProgram>
     <RunProgramDescription>Launch SeatHub</RunProgramDescription>
+    <ControlScript>controlscript.qs</ControlScript>
 </Installer>
