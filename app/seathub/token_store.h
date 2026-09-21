@@ -48,11 +48,51 @@ public:
     static QString accessTokenName();
     /// The slot 0.1.x wrote the same credential under, back when sign-in stored a refresh token
     /// (its OTP path stored the access token there once refresh tokens stopped existing). Nothing
-    /// writes it any more; it survives as a name because an installed 0.1.4 that updates to this
-    /// build has its credential there.
+    /// writes it any more. It survives as a name because an installed 0.1.4 that updates to this
+    /// build has its credential there, and `recoverAtStartup()` carries it across (WINDOWS #22).
     static QString refreshTokenName();
 
     explicit TokenStore(QObject* parent = nullptr);
+
+    /// What `recoverAtStartup()` did, for the caller's log and for the tests. No member ever holds
+    /// a credential.
+    struct RecoveryReport
+    {
+        /// The access slot already held a usable credential, so nothing was touched.
+        bool alreadySignedIn = false;
+        /// A credential found in the 0.1.x slot was moved into the access slot.
+        bool migratedLegacySlot = false;
+        /// A credential parked by the installer's update backup was taken back.
+        bool recoveredFromBackup = false;
+        /// Blobs that would not unprotect for this account (corrupt, or written by another
+        /// account) and were deleted rather than trusted.
+        int discardedBlobs = 0;
+    };
+
+    /// Keeps a customer signed in through an update, as a property of the client rather than of the
+    /// installer's ordering. Run once at startup, before the credential is read:
+    ///
+    ///   1. If the access slot already holds a credential, do nothing.
+    ///   2. Slot migration: if the 0.1.x slot holds one, move it to the access slot and clear the
+    ///      old one.
+    ///   3. Update-backup recovery: if neither slot holds one, look in the backup root (the user's
+    ///      temporary directory) for the folder the installer's control script parks the token
+    ///      directory in during an update (`SeatHub-sign-in-<epoch ms>`, see
+    ///      `installer/config/controlscript.qs`), take the newest usable one back, and delete the
+    ///      folder so a copy of the credential is not left lying around.
+    ///
+    /// The bytes stay DPAPI-protected throughout. A blob that will not unprotect for this account
+    /// is discarded. The outcome is logged, never the credential.
+    ///
+    /// Deliberately NOT run from the constructor: tests (and a portable install) point the store at
+    /// another directory with `setDirectory()` after constructing it, and a constructor-time
+    /// recovery would have run against the real per-user directory first.
+    RecoveryReport recoverAtStartup();
+
+    /// Where `recoverAtStartup()` looks for update backups. Defaults to the user's temporary
+    /// directory (`QDir::tempPath()`); a test points it at a scratch folder.
+    void setBackupRoot(const QString& directory);
+    QString backupRoot() const { return m_backupRoot; }
 
     /// `QStandardPaths::AppDataLocation` - `%APPDATA%\Seven Hills\SeatHub` on Windows, derived
     /// from the organization and application names set in `app/main.cpp` (see the note at the top
@@ -112,5 +152,11 @@ signals:
     void storeFailed(const SeatHubFailure& failure);
 
 private:
+    /// Step 2 of `recoverAtStartup()`. True when a credential was moved.
+    bool migrateLegacySlot(RecoveryReport* report);
+    /// Step 3 of `recoverAtStartup()`. True when a credential was taken back.
+    bool recoverFromUpdateBackup(RecoveryReport* report);
+
     QString m_directory;
+    QString m_backupRoot;
 };

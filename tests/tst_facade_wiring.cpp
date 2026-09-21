@@ -20,7 +20,7 @@
  *
  * What this suite proves that nothing else could:
  *
- *   1. The facade compiles and links at all, and constructs in its signed-out state.
+ *   1. The facade compiles and links at all, and constructs in its restore state (Phase 5 plan 02).
  *   2. The composite runs: the facade drives the attached engine (Play, D-02 interrupt, the
  *      streaming/home transition on the lifecycle's signals) - the hop the gap-closure report
  *      could only read.
@@ -277,6 +277,7 @@ class TstFacadeWiring : public QObject
 
 private:
     QScopedPointer<QTemporaryDir> m_dir;
+    QScopedPointer<QTemporaryDir> m_backupRoot;
     FakeControlPlane* m_fake = nullptr;
 
     /// The control-plane client only lives on the network thread the facade moves it to, so the
@@ -300,10 +301,15 @@ private:
 
     /// A real stored credential, so "teardown leaves the sign-in alone" is a statement about the
     /// disk and not about a flag. The value is a marker, never a credential.
+    ///
+    /// The store is pointed at the scratch directory AND its update-backup root at another scratch
+    /// directory: `recoverAtStartup()` looks in the user's real temporary directory by default, and
+    /// a customer's real `SeatHub-sign-in-*` backup must never be a thing a test can consume.
     bool storeACredential(SeatHubClient& client, QString* pathOut)
     {
         TokenStore* store = client.credentialStore();
         store->setDirectory(m_dir->path());
+        store->setBackupRoot(m_backupRoot->path());
         if (!store->storeToken(TokenStore::accessTokenName(),
                                QString::fromLatin1(kPlaintextMarker))) {
             return false;
@@ -312,10 +318,11 @@ private:
         return QFile::exists(*pathOut);
     }
 
-    /// Points a fresh facade's store at the scratch directory without storing anything.
+    /// Points a fresh facade's store at the scratch directories without storing anything.
     void isolateStore(SeatHubClient& client)
     {
         client.credentialStore()->setDirectory(m_dir->path());
+        client.credentialStore()->setBackupRoot(m_backupRoot->path());
     }
 
     /// The account and wallet the control plane answers for a signed-in customer.
@@ -358,6 +365,8 @@ private slots:
     {
         m_dir.reset(new QTemporaryDir);
         QVERIFY(m_dir->isValid());
+        m_backupRoot.reset(new QTemporaryDir);
+        QVERIFY(m_backupRoot->isValid());
         m_fake = nullptr;
     }
 
@@ -365,6 +374,7 @@ private slots:
     {
         m_fake = nullptr;
         m_dir.reset();
+        m_backupRoot.reset();
     }
 
     // --- the facade compiles, links and starts in the right state ------------------------------
@@ -715,6 +725,28 @@ private slots:
         m_fake->answerWallet(200, walletBody(60));
         client.refreshBalance();
         QTRY_COMPARE_WITH_TIMEOUT(client.balanceText(), QStringLiteral("1 h 00 min"), 15000);
+    }
+
+    void aCredentialWrittenBy014IsRestoredFromItsOldSlot()
+    {
+        // 0.1.4 stored the credential under the refresh-token slot name. An install that updates
+        // to this build must open on Home, not on sign-in (Pitfall 6, WINDOWS #22).
+        SeatHubClient client;
+        isolateStore(client);
+        QVERIFY(client.credentialStore()->storeToken(TokenStore::refreshTokenName(),
+                                                     QStringLiteral("opaque-access-token")));
+        armControlPlane(client);
+        m_fake->answerMe(200, accountBody());
+        m_fake->answerWallet(200, walletBody(30));
+
+        client.restoreSession();
+        QTRY_COMPARE_WITH_TIMEOUT(client.appState(), QStringLiteral("home"), 15000);
+
+        QCOMPARE(m_fake->authorizationFor(QStringLiteral("/api/me")),
+                 QByteArrayLiteral("Bearer opaque-access-token"));
+        QVERIFY(client.credentialStore()->hasToken(TokenStore::accessTokenName()));
+        QVERIFY2(!client.credentialStore()->hasToken(TokenStore::refreshTokenName()),
+                 "the old slot is emptied once the credential is carried across");
     }
 
     void signInByCodeStoresTheCredentialInTheAccessSlotAndReadsTheBalance()

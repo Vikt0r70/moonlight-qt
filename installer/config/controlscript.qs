@@ -304,7 +304,25 @@ function seathubLeaf(path)
     return parts[parts.length - 1];
 }
 
+// Every line is also appended to %TEMP%\SeatHub-update-log.txt, beside the SeatHub-sign-in-<ms>
+// backup folder. InstallationLog.txt lives in the install folder, which the purge above deletes, so
+// after a real update it can hold none of this - and WINDOWS #22 (a verified 0.1.3 -> 0.1.4 update
+// that left the backup behind and signed the customer out) could not say which branch ran. This
+// file survives the purge. It never carries a credential: the lines above name paths, exit codes
+// and outcomes only. The client also carries the sign-in across an update on its own
+// (TokenStore::recoverAtStartup), so a failure to write this file must never affect the update.
 function seathubLog(message)
 {
     console.log("SeatHub: " + message);
+    try {
+        var temp = installer.environmentVariable("TEMP");
+        if (temp !== "") {
+            // operations.html: "AppendFile" filename text - text is treated as ASCII.
+            installer.performOperation("AppendFile",
+                [seathubJoin(temp, "SeatHub-update-log.txt"),
+                 new Date().toISOString() + " SeatHub: " + message + "\r\n"]);
+        }
+    } catch (e) {
+        // The log is evidence, not part of the update.
+    }
 }

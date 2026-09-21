@@ -848,6 +848,10 @@ void SeatHubClient::restoreSession()
     }
     m_restoreStarted = true;
 
+    // A credential written by 0.1.4, or parked by an update, is in the access slot after this
+    // (WINDOWS #22). Outcomes are logged by the store; the credential never is.
+    m_tokenStore->recoverAtStartup();
+
     const QString credential = m_tokenStore->retrieveToken(TokenStore::accessTokenName());
     if (credential.isEmpty()) {
         qCInfo(seathubClient) << "no stored credential; showing sign-in";

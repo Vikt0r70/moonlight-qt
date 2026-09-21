@@ -11,6 +11,7 @@
 #include <QtTest>
 #include <QDir>
 #include <QFile>
+#include <QFileInfo>
 #include <QScopedPointer>
 #include <QStandardPaths>
 #include <QTemporaryDir>
@@ -46,17 +47,56 @@ private:
     // shared directory would let one test's stored token satisfy the next test's
     // "there is nothing stored" assertion.
     QScopedPointer<QTemporaryDir> m_dir;
+    // Stands in for the user's temporary directory, where the installer parks an update backup.
+    // Every recovery test points the store here: the default is the real %TEMP%, which may hold a
+    // real customer's `SeatHub-sign-in-*` backup that no test may consume.
+    QScopedPointer<QTemporaryDir> m_temp;
+
+    // A DPAPI blob of `value`, as the bytes a token file would hold.
+    static QByteArray blobFor(const QString& value)
+    {
+        return TokenStore::protect(value.toUtf8());
+    }
+
+    static bool writeFile(const QString& path, const QByteArray& bytes)
+    {
+        QDir().mkpath(QFileInfo(path).absolutePath());
+        QFile file(path);
+        return file.open(QIODevice::WriteOnly) && file.write(bytes) == bytes.size();
+    }
+
+    // The folder the installer's control script creates: `<temp>/SeatHub-sign-in-<epoch ms>/`,
+    // holding a copy of the token directory under its own leaf name (`SeatHub`).
+    QString backupFolder(const QString& stamp) const
+    {
+        return QDir(m_temp->path()).filePath(QStringLiteral("SeatHub-sign-in-") + stamp);
+    }
+    QString backupBlobPath(const QString& stamp, const QString& fileName) const
+    {
+        return QDir(backupFolder(stamp)).filePath(QStringLiteral("SeatHub/") + fileName);
+    }
+
+    TokenStore* newStore()
+    {
+        auto* store = new TokenStore;
+        store->setDirectory(m_dir->path());
+        store->setBackupRoot(m_temp->path());
+        return store;
+    }
 
 private slots:
     void init()
     {
         m_dir.reset(new QTemporaryDir);
         QVERIFY(m_dir->isValid());
+        m_temp.reset(new QTemporaryDir);
+        QVERIFY(m_temp->isValid());
     }
 
     void cleanup()
     {
         m_dir.reset();
+        m_temp.reset();
     }
 
     // --- DPAPI primitives ------------------------------------------------------------------
@@ -212,6 +252,172 @@ private slots:
         QVERIFY(store.clearAll());
 
         QVERIFY(QFile::exists(QDir(m_dir->path()).filePath(QStringLiteral("settings.json"))));
+    }
+
+    // --- keeping sign-in through an update (Phase 5 plan 02, WINDOWS #22) -----------------------
+    //
+    // Two recovery steps run once at startup, before the credential is read. Both are exercised
+    // against the real DPAPI, on scratch directories.
+
+    void migration_carriesA014CredentialIntoTheAccessSlot()
+    {
+        // 0.1.4 stored the credential under the refresh-token slot name. An install that updates to
+        // this build must find it in the access slot on first launch, with the old slot emptied.
+        QScopedPointer<TokenStore> store(newStore());
+        QVERIFY(store->storeToken(TokenStore::refreshTokenName(), QString::fromLatin1(kToken)));
+
+        const TokenStore::RecoveryReport report = store->recoverAtStartup();
+
+        QVERIFY(report.migratedLegacySlot);
+        QVERIFY(!report.recoveredFromBackup);
+        QCOMPARE(store->retrieveToken(TokenStore::accessTokenName()), QString::fromLatin1(kToken));
+        QVERIFY2(!store->hasToken(TokenStore::refreshTokenName()),
+                 "the old slot must be empty once the credential has moved");
+        // Still DPAPI-protected at rest: migration re-protects, it never writes plaintext.
+        QVERIFY(!TokenStore::fileContainsPlaintext(store->pathFor(TokenStore::accessTokenName()),
+                                                   QString::fromLatin1(kToken)));
+    }
+
+    void recovery_takesBackTheInstallersBackupAndDeletesTheFolder()
+    {
+        // What the owner's verified 0.1.3 -> 0.1.4 update left behind: the token directory gone,
+        // and the installer's copy in TEMP. The folder name shape is the control script's.
+        const QString stamp = QStringLiteral("1790006258640");
+        QVERIFY(writeFile(backupBlobPath(stamp, QStringLiteral("refresh.dpapi")),
+                          blobFor(QString::fromLatin1(kToken))));
+
+        QScopedPointer<TokenStore> store(newStore());
+        QVERIFY(!store->hasToken(TokenStore::accessTokenName()));
+        QVERIFY(!store->hasToken(TokenStore::refreshTokenName()));
+
+        const TokenStore::RecoveryReport report = store->recoverAtStartup();
+
+        QVERIFY(report.recoveredFromBackup);
+        QCOMPARE(store->retrieveToken(TokenStore::accessTokenName()), QString::fromLatin1(kToken));
+        QVERIFY(!store->hasToken(TokenStore::refreshTokenName()));
+        QVERIFY2(!QFileInfo::exists(backupFolder(stamp)),
+                 "a copy of the customer's credential must not be left lying around in TEMP");
+    }
+
+    void recovery_takesTheNewestBackupWhenThereAreSeveral()
+    {
+        QVERIFY(writeFile(backupBlobPath(QStringLiteral("1790000000000"),
+                                         QStringLiteral("refresh.dpapi")),
+                          blobFor(QStringLiteral("older-credential"))));
+        QVERIFY(writeFile(backupBlobPath(QStringLiteral("1790006258640"),
+                                         QStringLiteral("refresh.dpapi")),
+                          blobFor(QStringLiteral("newest-credential"))));
+
+        QScopedPointer<TokenStore> store(newStore());
+        QVERIFY(store->recoverAtStartup().recoveredFromBackup);
+
+        QCOMPARE(store->retrieveToken(TokenStore::accessTokenName()),
+                 QStringLiteral("newest-credential"));
+    }
+
+    void recovery_discardsACorruptOrForeignBlobWithoutThrowing()
+    {
+        // A blob another Windows account wrote (or anything that is not DPAPI output) fails to
+        // unprotect for this account. It is "no credential", never trusted and never copied.
+        const QByteArray notABlob = QByteArrayLiteral("written by some other account");
+
+        // In the old slot:
+        {
+            QScopedPointer<TokenStore> store(newStore());
+            QVERIFY(writeFile(store->pathFor(TokenStore::refreshTokenName()), notABlob));
+
+            const TokenStore::RecoveryReport report = store->recoverAtStartup();
+
+            QVERIFY(!report.migratedLegacySlot);
+            QVERIFY(!report.recoveredFromBackup);
+            QCOMPARE(report.discardedBlobs, 1);
+            QVERIFY(!store->hasToken(TokenStore::accessTokenName()));
+            QVERIFY2(!store->hasToken(TokenStore::refreshTokenName()),
+                     "an unusable blob is deleted, not kept");
+        }
+
+        // In an update backup:
+        {
+            const QString stamp = QStringLiteral("1790006258640");
+            QVERIFY(writeFile(backupBlobPath(stamp, QStringLiteral("refresh.dpapi")), notABlob));
+
+            QScopedPointer<TokenStore> store(newStore());
+            const TokenStore::RecoveryReport report = store->recoverAtStartup();
+
+            QVERIFY(!report.recoveredFromBackup);
+            QCOMPARE(report.discardedBlobs, 1);
+            QVERIFY(!store->hasToken(TokenStore::accessTokenName()));
+            QVERIFY(!store->hasToken(TokenStore::refreshTokenName()));
+            QVERIFY2(!QFileInfo::exists(backupFolder(stamp)),
+                     "a backup that holds nothing usable is not left behind either");
+        }
+    }
+
+    void recovery_doesNothingWhenTheAccessSlotAlreadyHoldsACredential()
+    {
+        QScopedPointer<TokenStore> store(newStore());
+        QVERIFY(store->storeToken(TokenStore::accessTokenName(), QStringLiteral("current")));
+        QVERIFY(store->storeToken(TokenStore::refreshTokenName(), QStringLiteral("stale")));
+        const QString stamp = QStringLiteral("1790006258640");
+        QVERIFY(writeFile(backupBlobPath(stamp, QStringLiteral("refresh.dpapi")),
+                          blobFor(QStringLiteral("backup"))));
+
+        const TokenStore::RecoveryReport report = store->recoverAtStartup();
+
+        QVERIFY(report.alreadySignedIn);
+        QVERIFY(!report.migratedLegacySlot);
+        QVERIFY(!report.recoveredFromBackup);
+        QCOMPARE(store->retrieveToken(TokenStore::accessTokenName()), QStringLiteral("current"));
+        // Nothing was read, moved or deleted.
+        QCOMPARE(store->retrieveToken(TokenStore::refreshTokenName()), QStringLiteral("stale"));
+        QVERIFY(QFileInfo::exists(backupFolder(stamp)));
+    }
+
+    void recovery_leavesAloneWhatIsNotAnInstallerBackup()
+    {
+        // Only a folder named the way the control script names it is ever read or deleted.
+        const QString wrongName = QDir(m_temp->path()).filePath(QStringLiteral("SeatHub-sign-in-abc"));
+        const QString otherName = QDir(m_temp->path()).filePath(QStringLiteral("Other"));
+        QVERIFY(writeFile(QDir(wrongName).filePath(QStringLiteral("SeatHub/refresh.dpapi")),
+                          blobFor(QStringLiteral("not ours"))));
+        QVERIFY(writeFile(QDir(otherName).filePath(QStringLiteral("SeatHub/refresh.dpapi")),
+                          blobFor(QStringLiteral("not ours either"))));
+
+        QScopedPointer<TokenStore> store(newStore());
+        const TokenStore::RecoveryReport report = store->recoverAtStartup();
+
+        QVERIFY(!report.recoveredFromBackup);
+        QVERIFY(!store->hasToken(TokenStore::accessTokenName()));
+        QVERIFY(QFileInfo::exists(wrongName));
+        QVERIFY(QFileInfo::exists(otherName));
+    }
+
+    void recovery_copiesOnlyTheTwoSlotFilesThisStoreWrites()
+    {
+        // A valid blob under any other name in a TEMP folder is not this store's to import.
+        const QString stamp = QStringLiteral("1790006258640");
+        QVERIFY(writeFile(backupBlobPath(stamp, QStringLiteral("refresh.dpapi")),
+                          blobFor(QStringLiteral("the credential"))));
+        QVERIFY(writeFile(backupBlobPath(stamp, QStringLiteral("planted.dpapi")),
+                          blobFor(QStringLiteral("something else"))));
+
+        QScopedPointer<TokenStore> store(newStore());
+        QVERIFY(store->recoverAtStartup().recoveredFromBackup);
+
+        QVERIFY(!QFileInfo::exists(QDir(m_dir->path()).filePath(QStringLiteral("planted.dpapi"))));
+        QCOMPARE(store->retrieveToken(TokenStore::accessTokenName()),
+                 QStringLiteral("the credential"));
+    }
+
+    void recovery_withNothingToRecoverIsQuiet()
+    {
+        QScopedPointer<TokenStore> store(newStore());
+        const TokenStore::RecoveryReport report = store->recoverAtStartup();
+        QVERIFY(!report.alreadySignedIn);
+        QVERIFY(!report.migratedLegacySlot);
+        QVERIFY(!report.recoveredFromBackup);
+        QCOMPARE(report.discardedBlobs, 0);
+        QVERIFY(!store->hasToken(TokenStore::accessTokenName()));
     }
 
     void defaultDirectory_isThePerUserApplicationDataDirectory()
