@@ -125,9 +125,12 @@ function seathubStopClient(client)
     // is not running", "semi blocking (to keep the main thread to paint the UI)".
     // MEASURED: that semi-blocking wait is a nested event loop, so the wizard stays clickable, and
     // for a process that does not close on request it lasts 30 s (a Next press meanwhile gets the
-    // stock "already contains an installation" error). So only call it when SeatHub is really
-    // running - the in-app updater has usually quit it already - and check afterwards, because
-    // killProcess compares paths exactly.
+    // stock "already contains an installation" error). 4.7.0 source: it posts WM_CLOSE, waits up to
+    // 30 s, then terminates. So only call it when SeatHub is really running, after a short grace:
+    // the in-app updater has already told SeatHub to quit and it may still be finishing. Check
+    // afterwards, because killProcess compares paths exactly.
+    for (var i = 0; i < 5 && installer.isProcessRunning(client); ++i)
+        seathubSleepOneSecond();
     if (!installer.isProcessRunning(client))
         return true;
     installer.killProcess(client);
