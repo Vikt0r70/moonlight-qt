@@ -38,6 +38,8 @@ SOURCES += \
     ../app/seathub/session_lifecycle.cpp \
     ../app/seathub/engine_session.cpp \
     ../app/seathub/control_plane_client.cpp \
+    ../app/seathub/countries.cpp \
+    ../app/seathub/region.cpp \
     ../app/seathub/duration_text.cpp \
     ../app/seathub/token_store.cpp \
     ../app/seathub/session_websocket.cpp \
@@ -61,6 +63,9 @@ HEADERS += \
     ../app/seathub/session_lifecycle.h \
     ../app/seathub/engine_session.h \
     ../app/seathub/control_plane_client.h \
+    ../app/seathub/countries.h \
+    ../app/seathub/region.h \
+    ../app/seathub/web_origin.h \
     ../app/seathub/duration_text.h \
     ../app/seathub/token_store.h \
     ../app/seathub/session_websocket.h \
@@ -78,3 +83,6 @@ HEADERS += \
     ../app/seathub/seathub_version.h \
     ../app/settings/streamingpreferences.h \
     ../app/utils.h
+
+# The facade exposes the bundled country list, which is read from the binary (Phase 5 plan 06).
+RESOURCES += ../app/seathub/countries.qrc

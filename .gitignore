@@ -22,4 +22,5 @@ tests/*.obj
 tests/*.exe
 tests/*.moc
 tests/moc_*
+tests/qrc_*
 tests/*-out.txt

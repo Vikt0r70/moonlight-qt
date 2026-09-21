@@ -26,6 +26,9 @@
 #include <QTimer>
 
 #include "seathub/control_plane_client.h"
+#include "seathub/countries.h"
+#include "seathub/region.h"
+#include "seathub/web_origin.h"
 
 namespace {
 
@@ -315,6 +318,136 @@ private slots:
         QFETCH(QString, expected);
 
         QCOMPARE(ControlPlaneClient::normalisePhoneE164(raw), expected);
+    }
+
+    // --- Phase 5 plan 06: a number typed the way its country writes it becomes E.164 -----------
+    //
+    // The chosen country's dial code is applied, one leading trunk zero is dropped, separators are
+    // ignored, and a number already written with a plus or a double zero is believed as it stands.
+    // These are the website's own rules (`auth-validation.ts` `toE164`). The six cases the plan
+    // names are the first rows; the rest are the edges around them.
+
+    void phoneNormalisationWithACountry_data()
+    {
+        QTest::addColumn<QString>("raw");
+        QTest::addColumn<QString>("dial");
+        QTest::addColumn<QString>("expected");
+
+        const QString jo = QStringLiteral("+962");
+        // 1. A local number with its trunk zero, the way a customer in Amman writes it.
+        QTest::newRow("local-with-trunk-zero") << QStringLiteral("0790000000") << jo
+                                               << QStringLiteral("+962790000000");
+        // 2. The same number without one.
+        QTest::newRow("local-without-trunk-zero") << QStringLiteral("790000000") << jo
+                                                  << QStringLiteral("+962790000000");
+        // 3. Already international: believed over the country the tag shows.
+        QTest::newRow("already-international-plus") << QStringLiteral("+447911123456") << jo
+                                                    << QStringLiteral("+447911123456");
+        QTest::newRow("already-international-double-zero") << QStringLiteral("00447911123456") << jo
+                                                           << QStringLiteral("+447911123456");
+        // 4. Written with separators.
+        QTest::newRow("separators") << QStringLiteral("(079) 000-00.00") << jo
+                                    << QStringLiteral("+962790000000");
+        // 5. Arabic-Indic and Persian digits are read as the Latin digits they are.
+        QTest::newRow("arabic-indic-digits")
+            << QString::fromUtf16(u"٠٧٩٠٠٠٠٠٠٠")
+            << jo << QStringLiteral("+962790000000");
+        QTest::newRow("persian-digits")
+            << QString::fromUtf16(u"۰۷۹۰۰۰۰۰۰۰")
+            << jo << QStringLiteral("+962790000000");
+        // 6. Too short after the country code is applied: refused, not sent.
+        QTest::newRow("too-short") << QStringLiteral("079") << jo << QString();
+        // Edges: a country whose dial code carries an area code; no dial code means nothing is
+        // guessed; letters are refused.
+        QTest::newRow("dial-with-area-code") << QStringLiteral("5550123") << QStringLiteral("+1876")
+                                             << QStringLiteral("+18765550123");
+        QTest::newRow("no-dial-code-no-guess") << QStringLiteral("0790000000") << QString()
+                                               << QString();
+        QTest::newRow("letters-are-refused") << QStringLiteral("07900abc00") << jo << QString();
+    }
+
+    void phoneNormalisationWithACountry()
+    {
+        QFETCH(QString, raw);
+        QFETCH(QString, dial);
+        QFETCH(QString, expected);
+
+        QCOMPARE(ControlPlaneClient::normalisePhoneE164(raw, dial), expected);
+    }
+
+    // --- Phase 5 plan 06: the bundled country list is the website's, and the default is Jordan ---
+    //
+    // `countries.json` is a copy of `seathub-web/src/lib/countries.ts`. The fork cannot read the
+    // website's file (it is another repository), so the copy is pinned here by its size and by the
+    // entry the default depends on; the plan's own verify compares it with the website's list.
+    // Changing either list means changing the other and this number in the same breath.
+
+    void countryList_isTheWebsitesListInSizeAndInTheEntryTheDefaultDependsOn()
+    {
+        const QVariantList rows = SeatHubCountries::all();
+        QCOMPARE(rows.size(), 197);
+
+        const QVariantMap jordan = SeatHubCountries::find(SeatHubCountries::defaultIso());
+        QCOMPARE(SeatHubCountries::defaultIso(), QStringLiteral("JO"));
+        QCOMPARE(jordan.value(QStringLiteral("name")).toString(), QStringLiteral("Jordan"));
+        QCOMPARE(jordan.value(QStringLiteral("dial")).toString(), QStringLiteral("+962"));
+    }
+
+    void countryList_hasWellFormedRowsWithUniqueIsoCodes()
+    {
+        QSet<QString> seen;
+        for (const QVariant& row : SeatHubCountries::all()) {
+            const QVariantMap map = row.toMap();
+            const QString iso = map.value(QStringLiteral("iso")).toString();
+            QVERIFY2(iso.size() == 2 && iso == iso.toUpper(), qPrintable(iso));
+            QVERIFY2(!seen.contains(iso), qPrintable(iso));
+            seen.insert(iso);
+            QVERIFY(!map.value(QStringLiteral("name")).toString().isEmpty());
+            const QString dial = map.value(QStringLiteral("dial")).toString();
+            QVERIFY2(QRegularExpression(QStringLiteral("^\\+[1-9][0-9]{0,6}$")).match(dial).hasMatch(),
+                     qPrintable(iso + QLatin1Char(' ') + dial));
+        }
+        // Names with non-ASCII letters survived the trip through the resource.
+        QCOMPARE(SeatHubCountries::find(QStringLiteral("ci")).value(QStringLiteral("name")).toString(),
+                 QString::fromUtf16(u"Côte d'Ivoire"));
+    }
+
+    // --- Phase 5 plan 06: where the country tag starts -----------------------------------------
+
+    void region_machineThenLocaleThenTheDefault()
+    {
+        // The machine's own region wins.
+        QCOMPARE(SeatHubRegion::pick(QStringLiteral("GB"), QStringLiteral("US")), QStringLiteral("GB"));
+        // Case does not matter, and the answer is upper-case.
+        QCOMPARE(SeatHubRegion::pick(QStringLiteral("gb"), QString()), QStringLiteral("GB"));
+        // A machine answer that is not a country the list knows is no answer.
+        QCOMPARE(SeatHubRegion::pick(QStringLiteral("001"), QStringLiteral("US")), QStringLiteral("US"));
+        QCOMPARE(SeatHubRegion::pick(QStringLiteral("ZZ"), QStringLiteral("DE")), QStringLiteral("DE"));
+        // Neither: Jordan, the website's default.
+        QCOMPARE(SeatHubRegion::pick(QString(), QString()), QStringLiteral("JO"));
+        QCOMPARE(SeatHubRegion::pick(QStringLiteral("ZZ"), QStringLiteral("QQ")), QStringLiteral("JO"));
+    }
+
+    void region_theMachinesOwnAnswerIsAlwaysARowInTheList()
+    {
+        // Whatever this machine reports, the tag never starts on a country the picker lacks.
+        const QString initial = SeatHubRegion::initialCountryCode();
+        QVERIFY2(SeatHubCountries::contains(initial), qPrintable(initial));
+    }
+
+    // --- Phase 5 plan 06: the website addresses are the spec's four strings --------------------
+
+    void webOrigin_holdsTheSpecsAddressesAndNothingElse()
+    {
+        QCOMPARE(QString::fromLatin1(SeatHubWeb::kOrigin), QStringLiteral("https://sevenhills.damra.co"));
+        QCOMPARE(SeatHubWeb::url(SeatHubWeb::kTopUpPath).toString(),
+                 QStringLiteral("https://sevenhills.damra.co/topup"));
+        QCOMPARE(SeatHubWeb::url(SeatHubWeb::kSignUpPath).toString(),
+                 QStringLiteral("https://sevenhills.damra.co/login?mode=signup"));
+        QCOMPARE(SeatHubWeb::url(SeatHubWeb::kResetPasswordPath).toString(),
+                 QStringLiteral("https://sevenhills.damra.co/forgot-password"));
+        // A path the spec does not record yields no address at all.
+        QVERIFY(SeatHubWeb::url("/somewhere-else").isEmpty());
     }
 
     // --- ME-04: ids cannot add structure to the route they are pasted into -------------------

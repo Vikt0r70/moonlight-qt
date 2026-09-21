@@ -235,23 +235,50 @@ bool ControlPlaneClient::isPhoneE164(const QString& phoneE164)
     return re.match(phoneE164).hasMatch();
 }
 
-QString ControlPlaneClient::normalisePhoneE164(const QString& raw)
+QString ControlPlaneClient::normalisePhoneE164(const QString& raw, const QString& dialCode)
 {
-    // The normalisation rule (ME-03), stated once, in one place, and tested:
-    //   1. drop the separators a person types between digits: space, '(', ')', '-' and '.';
-    //   2. a leading `00` is how the international prefix is often written - map it to '+';
-    //   3. whatever remains must match `^\+[1-9][0-9]{7,14}$` exactly, the pattern
-    //      `docs/spec/openapi.yaml` puts on `phone_e164`. Anything else returns an empty string
-    //      and the caller rejects locally instead of spending a round trip.
-    // Nothing is guessed: no country code is supplied, because the spec defines no default for
-    // this field.
+    // The normalisation rule (ME-03), stated once, in one place, and tested. It is the website's
+    // own (`seathub-web/src/lib/auth-validation.ts` `toE164`), so a number typed the same way in
+    // either surface reaches the server as the same E.164:
+    //   1. digits typed as Arabic-Indic (U+0660..0669) or Persian (U+06F0..06F9) numerals are read
+    //      as the Latin digits they are;
+    //   2. drop the separators a person types between digits: space, '(', ')', '-' and '.';
+    //   3. a number already written with a leading '+' is believed as it stands, and so is one
+    //      written with the international prefix `00` (mapped to '+') - what the customer typed
+    //      wins over the country the tag shows;
+    //   4. otherwise the number is national: `dialCode` (the chosen country's, `+962`) is put in
+    //      front of it after one leading trunk '0' is dropped (`0790000000` in Jordan). With no
+    //      `dialCode` nothing is guessed - the spec defines no default - and the number is refused;
+    //   5. whatever results must match `^\+[1-9][0-9]{7,14}$` exactly, the pattern
+    //      `docs/spec/openapi.yaml` puts on `phone_e164`. Anything else returns an empty string and
+    //      the caller rejects locally instead of spending a round trip. The server validates again.
+    // No phone-parsing library is used: these are the same minimal rules the website applies.
     static const QRegularExpression separators(QStringLiteral("[\\s()\\-.]+"));
 
-    QString digits = raw;
+    QString digits;
+    digits.reserve(raw.size());
+    for (const QChar ch : raw) {
+        const ushort u = ch.unicode();
+        if (u >= 0x0660 && u <= 0x0669) {
+            digits.append(QChar(u - 0x0660 + u'0'));
+        }
+        else if (u >= 0x06F0 && u <= 0x06F9) {
+            digits.append(QChar(u - 0x06F0 + u'0'));
+        }
+        else {
+            digits.append(ch);
+        }
+    }
     digits.remove(separators);
 
     if (digits.startsWith(QLatin1String("00"))) {
         digits = QStringLiteral("+") + digits.mid(2);
+    }
+    else if (!digits.startsWith(QLatin1Char('+')) && !dialCode.isEmpty()) {
+        if (digits.startsWith(QLatin1Char('0'))) {
+            digits.remove(0, 1);
+        }
+        digits = dialCode + digits;
     }
 
     return isPhoneE164(digits) ? digits : QString();

@@ -189,11 +189,15 @@ public:
     /// (`^\+[1-9][0-9]{7,14}$`).
     static bool isPhoneE164(const QString& phoneE164);
 
-    /// Normalises a phone number the way the sign-in field is allowed to be typed: strips the
-    /// separators people actually type (`space ( ) - .`), turns a leading `00` into `+`, and
-    /// returns an empty string when what is left is not E.164. Deciding here keeps `requestOtp`
-    /// and `verifyOtp` from sending two spellings of the same number.
-    static QString normalisePhoneE164(const QString& raw);
+    /// Normalises a phone number the way the sign-in field is allowed to be typed, into E.164:
+    /// Arabic-Indic and Persian digits become Latin ones, the separators people actually type
+    /// (`space ( ) - .`) are dropped, a leading `+` or `00` is believed as already international,
+    /// and otherwise `dialCode` (the chosen country's, e.g. `+962`) is applied after one leading
+    /// trunk `0` is removed. With no `dialCode` a national number is refused rather than guessed.
+    /// Returns an empty string when what is left is not E.164. Deciding here keeps `requestOtp`
+    /// and `verifyOtp` from sending two spellings of the same number, and matches the website's
+    /// own `toE164`.
+    static QString normalisePhoneE164(const QString& raw, const QString& dialCode = QString());
 
     /// Percent-encodes one path segment (a session id) so it cannot add structure to the route it
     /// is interpolated into.

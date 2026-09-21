@@ -211,6 +211,8 @@ SOURCES += \
     seathub/hud_overlay.cpp \
     seathub/control_plane_client.cpp \
     seathub/duration_text.cpp \
+    seathub/countries.cpp \
+    seathub/region.cpp \
     seathub/token_store.cpp \
     seathub/session_websocket.cpp \
     seathub/pairing_controller.cpp \
@@ -267,6 +269,9 @@ HEADERS += \
     seathub/hud_overlay.h \
     seathub/control_plane_client.h \
     seathub/duration_text.h \
+    seathub/countries.h \
+    seathub/region.h \
+    seathub/web_origin.h \
     seathub/token_store.h \
     seathub/session_websocket.h \
     seathub/pairing_controller.h \
@@ -489,7 +494,8 @@ wayland {
 
 RESOURCES += \
     resources.qrc \
-    qml.qrc
+    qml.qrc \
+    seathub/countries.qrc
 
 # No TRANSLATIONS. ADR-0043 retires every language toggle on every surface, and the 27 locale
 # files listed here were the retired Moonlight client's translations - reachable only through

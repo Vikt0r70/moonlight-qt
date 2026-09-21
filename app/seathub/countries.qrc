@@ -1,0 +1,5 @@
+<RCC>
+    <qresource prefix="/seathub">
+        <file>countries.json</file>
+    </qresource>
+</RCC>

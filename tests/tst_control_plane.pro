@@ -22,8 +22,16 @@ INCLUDEPATH += $$PWD/.. $$PWD/../app
 SOURCES += \
     tst_control_plane.cpp \
     ../app/seathub/control_plane_client.cpp \
+    ../app/seathub/countries.cpp \
+    ../app/seathub/region.cpp \
     ../app/seathub/error_map.cpp
 
 HEADERS += \
     ../app/seathub/control_plane_client.h \
+    ../app/seathub/countries.h \
+    ../app/seathub/region.h \
+    ../app/seathub/web_origin.h \
     ../app/seathub/error_map.h
+
+# The bundled country list is read from the binary, so the binary carries it (Phase 5 plan 06).
+RESOURCES += ../app/seathub/countries.qrc
