@@ -734,11 +734,14 @@ void SeatHubClient::verifyOtp(const QString& phoneE164, const QString& code)
                 return;
             }
 
-            // D-30: the long-lived credential goes to disk only as a DPAPI blob. The access
-            // token stays in memory - it is short-lived, it is on every request, and it has no
-            // reason to be at rest at all. `storeToken` is the only write path, and it writes no
-            // plaintext.
-            if (!m_tokenStore->storeToken(TokenStore::refreshTokenName(), pair.refreshToken)) {
+            // D-30 / ADR-0050 D-10: the long-lived credential goes to disk only as a DPAPI blob.
+            // Under permanent sessions there is no refresh token; the access token itself is the
+            // durable, non-expiring credential, so it is what persists. (When a refresh token is
+            // present - older servers - keep storing that instead.) `storeToken` writes no
+            // plaintext, and it is the only write path.
+            const QString durableCredential =
+                pair.refreshToken.isEmpty() ? pair.accessToken : pair.refreshToken;
+            if (!m_tokenStore->storeToken(TokenStore::refreshTokenName(), durableCredential)) {
                 const SeatHubFailure failure = SeatHubFailure::local(
                     QStringLiteral("This PC wouldn't let us save your sign-in."));
                 emit otpRejected(failure.error, failure.reference);

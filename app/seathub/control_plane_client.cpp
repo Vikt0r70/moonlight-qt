@@ -100,8 +100,11 @@ bool SessionInfo::parse(const QJsonObject& body, SessionInfo* out)
 
 bool AuthTokenPair::parse(const QJsonObject& body, AuthTokenPair* out)
 {
-    if (!out || !body.contains(QStringLiteral("access_token"))
-        || !body.contains(QStringLiteral("refresh_token"))) {
+    // ADR-0050 D-10: sessions are permanent. The control plane returns a single, non-expiring
+    // access_token and NO refresh_token (and no expiry fields). Require only access_token; the
+    // refresh/expiry fields are optional and absent under the permanent-token model. Requiring
+    // refresh_token here is what silently rejected every valid sign-in after Phase 4.
+    if (!out || !body.contains(QStringLiteral("access_token"))) {
         return false;
     }
 
@@ -110,6 +113,10 @@ bool AuthTokenPair::parse(const QJsonObject& body, AuthTokenPair* out)
     pair.refreshToken = body.value(QStringLiteral("refresh_token")).toString();
     pair.accessExpiresAt = body.value(QStringLiteral("access_expires_at")).toString();
     pair.refreshExpiresAt = body.value(QStringLiteral("refresh_expires_at")).toString();
+
+    if (pair.accessToken.isEmpty()) {
+        return false;
+    }
 
     *out = pair;
     return true;
