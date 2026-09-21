@@ -142,3 +142,161 @@ jobs:
       # NOT YET EXERCISED: this job has not been run. It is the proven local recipe wired into CI,
       # and the first CI run is what confirms the runner's Qt layout and MSVC discovery. Until then
       # the local `pwsh -File scripts\build-seathub.ps1` is the recipe of record.
+
+  # Publish the freshly built client to the release feed (Phase 3 UAT test 8 / D-40, ADR-0026).
+  # Mirrors the control repo's owner-app.yml publish job. The client is verified by checksum only
+  # (D-43): no signature is sent, and the feed row's signature stays null. Publishing sets this row
+  # `is_current` and clears the previous one in a single transaction (see app/releases.py), so this
+  # supersedes the retired Tauri `client` row without a manual delete.
+  #
+  # Only runs on a push to seathub/main (never on PRs). If the release secrets are not set on this
+  # repo yet, the build still succeeds and this job SKIPS with a loud warning rather than failing red
+  # — set the five secrets below to turn publishing on.
+  publish:
+    name: Publish client to the release feed
+    needs: seathub-windows-build
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/seathub/main'
+    concurrency:
+      group: client-app-publish
+      cancel-in-progress: false
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: SeatHub-Setup
+          path: dist
+
+      - name: Check the release credentials are present
+        id: creds
+        env:
+          CONTROL_URL: ${{ secrets.SEATHUB_CONTROL_URL }}
+          RELEASE_USER: ${{ secrets.SEATHUB_RELEASE_USER }}
+          RELEASE_PASSWORD: ${{ secrets.SEATHUB_RELEASE_PASSWORD }}
+          VPS: ${{ secrets.SEATHUB_VPS_HOST }}
+          VPS_KEY: ${{ secrets.SEATHUB_VPS_KEY }}
+        run: |
+          missing=""
+          [ -n "$CONTROL_URL" ] || missing="$missing SEATHUB_CONTROL_URL"
+          [ -n "$RELEASE_USER" ] || missing="$missing SEATHUB_RELEASE_USER"
+          [ -n "$RELEASE_PASSWORD" ] || missing="$missing SEATHUB_RELEASE_PASSWORD"
+          [ -n "$VPS" ] || missing="$missing SEATHUB_VPS_HOST"
+          [ -n "$VPS_KEY" ] || missing="$missing SEATHUB_VPS_KEY"
+          if [ -n "$missing" ]; then
+            echo "::warning::Client publish skipped. Set these secrets on this repo to enable it:$missing"
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Resolve the installer and version
+        id: artifact
+        if: steps.creds.outputs.ok == 'true'
+        run: |
+          set -euo pipefail
+          file=$(ls dist/SeatHub-Setup-*.exe | head -1 || true)
+          [ -n "$file" ] || { echo "::error::No SeatHub-Setup-*.exe in the build artifact"; exit 1; }
+          base=$(basename "$file")
+          version=$(echo "$base" | sed -E 's/^SeatHub-Setup-(.+)\.exe$/\1/')
+          echo "installer=$base" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Installer: $base (version $version)"
+
+      - name: Set up the deploy key
+        if: steps.creds.outputs.ok == 'true'
+        env:
+          VPS: ${{ secrets.SEATHUB_VPS_HOST }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "${{ secrets.SEATHUB_VPS_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "${VPS#*@}" >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Upload the installer to the VPS
+        if: steps.creds.outputs.ok == 'true'
+        env:
+          VPS: ${{ secrets.SEATHUB_VPS_HOST }}
+          INSTALLER: ${{ steps.artifact.outputs.installer }}
+        run: |
+          set -euo pipefail
+          ssh -o BatchMode=yes "$VPS" 'mkdir -p ~/seathub/downloads'
+          scp -o BatchMode=yes "dist/$INSTALLER" "$VPS:~/seathub/downloads/"
+          ssh -o BatchMode=yes "$VPS" "chmod 644 ~/seathub/downloads/'$INSTALLER'"
+
+      - name: Prove the download works
+        if: steps.creds.outputs.ok == 'true'
+        env:
+          CONTROL_URL: ${{ secrets.SEATHUB_CONTROL_URL }}
+          INSTALLER: ${{ steps.artifact.outputs.installer }}
+        run: |
+          set -euo pipefail
+          url="$CONTROL_URL/downloads/$INSTALLER"
+          code=$(curl -sS -o /dev/null -w '%{http_code}' -I "$url")
+          if [ "$code" != "200" ]; then
+            echo "::error::$url answered $code. The API container may have started before ~/seathub/downloads existed; re-run deploy.yml to restart it."
+            exit 1
+          fi
+          echo "$url is reachable"
+
+      - name: Put this build in the client release feed
+        if: steps.creds.outputs.ok == 'true'
+        env:
+          CONTROL_URL: ${{ secrets.SEATHUB_CONTROL_URL }}
+          RELEASE_USER: ${{ secrets.SEATHUB_RELEASE_USER }}
+          RELEASE_PASSWORD: ${{ secrets.SEATHUB_RELEASE_PASSWORD }}
+          INSTALLER: ${{ steps.artifact.outputs.installer }}
+          VERSION: ${{ steps.artifact.outputs.version }}
+        run: |
+          set -euo pipefail
+          tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
+          # Excerpt of a server reply that is safe to log: credentials struck out, echoed input/ctx
+          # keys dropped, one line, cut to 300 chars.
+          snippet() {
+            if [ ! -s "$1" ]; then echo "(empty body)"; return; fi
+            jq -Rrs --arg u "$RELEASE_USER" --arg p "$RELEASE_PASSWORD" '
+              def strike($v): if $v == "" then . else split($v) | join("[redacted]") end;
+              def strikeboth($v): strike($v | @json | .[1:-1]) | strike($v);
+              strikeboth($u) | strikeboth($p)
+              | . as $text
+              | (try (fromjson | walk(if type == "object" then del(.input, .ctx) else . end) | tojson) catch $text)
+              | gsub("[\r\n]+"; " ") | .[0:300]' "$1" || echo "(unreadable body)"
+          }
+          status=$(curl -sS -o "$tmp/login.json" -w '%{http_code}' -X POST "$CONTROL_URL/api/auth/login" \
+            -H 'Content-Type: application/json' \
+            -d "$(jq -n --arg i "$RELEASE_USER" --arg p "$RELEASE_PASSWORD" '{identifier: $i, password: $p}')" 2>/dev/null) || {
+            echo "::error::Could not reach the control plane to sign in (curl exit $?)."; exit 1; }
+          if [ "$status" != "200" ]; then
+            echo "::error::Sign-in as the release account was refused (HTTP $status): \"$(snippet "$tmp/login.json")\". SEATHUB_RELEASE_USER must be the operator's EMAIL and SEATHUB_RELEASE_PASSWORD its current password."
+            exit 1
+          fi
+          token=$(jq -r '.access_token // empty' "$tmp/login.json") || token=""
+          [ -n "$token" ] || { echo "::error::Signed in but the reply carried no access_token."; exit 1; }
+
+          digest=$(shasum -a 256 "dist/$INSTALLER" | awk '{print $1}')
+          # D-43: checksum-only, no signature field.
+          body=$(jq -n \
+            --arg version "$VERSION" \
+            --arg url "$CONTROL_URL/downloads/$INSTALLER" \
+            --arg sha256 "$digest" \
+            --arg notes "SeatHub client $VERSION" \
+            '{app: "client", version: $version, url: $url, sha256: $sha256, notes: $notes}')
+          status=$(curl -sS -o "$tmp/publish.json" -w '%{http_code}' -X POST "$CONTROL_URL/api/operator/releases" \
+            -H 'Content-Type: application/json' -H "Authorization: Bearer $token" \
+            -d "$body" 2>/dev/null) || { echo "::error::Could not reach the control plane to publish (curl exit $?)."; exit 1; }
+          if [ "$status" != "201" ]; then
+            echo "::error::Publishing the client was refused (HTTP $status): \"$(snippet "$tmp/publish.json")\""
+            exit 1
+          fi
+          echo "Published client $(jq -r '.version' "$tmp/publish.json") -> $(jq -r '.url' "$tmp/publish.json")"
+
+      - name: Read the feed back as the client would
+        if: steps.creds.outputs.ok == 'true'
+        env:
+          CONTROL_URL: ${{ secrets.SEATHUB_CONTROL_URL }}
+          VERSION: ${{ steps.artifact.outputs.version }}
+        run: |
+          set -euo pipefail
+          feed=$(curl -sS "$CONTROL_URL/api/releases/client")
+          echo "$feed" | jq .
+          [ "$(echo "$feed" | jq -r '.version')" = "$VERSION" ] || { echo "::error::feed is not serving $VERSION"; exit 1; }
+          [ "$(echo "$feed" | jq -r '.sha256')" != "null" ] || { echo "::error::feed row has no sha256, so no installed client can verify this build"; exit 1; }
+          echo "Feed now serves client $VERSION with a checksum. The retired Tauri row is superseded."
