@@ -9,4 +9,4 @@
 // when the client is replaced (D-52). The packaged binary's file version still comes from
 // upstream's `app/version.txt`; aligning that is Plan 03-06's packaging work.
 
-#define SEATHUB_VERSION "0.1.4"
+#define SEATHUB_VERSION "0.1.5"
