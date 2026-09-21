@@ -24,6 +24,10 @@
 #include <QDir>
 #include <QFile>
 #include <QFont>
+#include <QKeyEvent>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QRegularExpression>
 #include <QQmlComponent>
 #include <QQmlContext>
@@ -55,6 +59,22 @@ QString guiDir()
         }
     }
     return QString();
+}
+
+// The bundled country list, read from the file the app compiles in as a resource.
+QVariantList bundledCountries()
+{
+    QFile file(guiDir() + QStringLiteral("/../seathub/countries.json"));
+    if (!file.open(QIODevice::ReadOnly)) {
+        return QVariantList();
+    }
+    return QJsonDocument::fromJson(file.readAll()).array().toVariantList();
+}
+
+QString readSource(const QString& path)
+{
+    QFile file(path);
+    return file.open(QIODevice::ReadOnly) ? QString::fromUtf8(file.readAll()) : QString();
 }
 
 void registerTokenSingletons(QQmlEngine* engine)
@@ -166,8 +186,16 @@ class FakeShellClient : public QObject
     Q_PROPERTY(qint64 balanceMinutes READ balanceMinutes NOTIFY balanceChanged)
     Q_PROPERTY(QString balanceText READ balanceText NOTIFY balanceChanged)
     Q_PROPERTY(bool balanceStale READ balanceStale NOTIFY balanceChanged)
+    Q_PROPERTY(QVariantList countries READ countries CONSTANT)
+    Q_PROPERTY(QString defaultCountryCode READ defaultCountryCode CONSTANT)
+    Q_PROPERTY(bool animationEffects READ animationEffects CONSTANT)
 
 public:
+    QVariantList countries() const { return bundledCountries(); }
+    QString defaultCountryCode() const { return QStringLiteral("JO"); }
+    // Off: the field's reveal is instant, so a test reads the end state without waiting on a timer.
+    bool animationEffects() const { return false; }
+
     qint64 balanceMinutes() const { return m_balanceMinutes; }
     QString balanceText() const { return m_balanceText; }
     bool balanceStale() const { return m_balanceStale; }
@@ -210,12 +238,53 @@ public:
     Q_INVOKABLE void signOut() { ++m_signOuts; }
     Q_INVOKABLE void retry() { ++m_retries; }
     Q_INVOKABLE void dismissError() { ++m_dismissals; }
-    Q_INVOKABLE void requestOtp(const QString& phone) { m_lastPhone = phone; }
+    Q_INVOKABLE void requestOtp(const QString& phone)
+    {
+        m_lastPhone = phone;
+        m_otpRequests.append(phone);
+    }
     Q_INVOKABLE void verifyOtp(const QString& phone, const QString& code)
     {
         m_lastPhone = phone;
         m_lastCode = code;
     }
+    // A stand-in for the facade's E.164 builder: the dial code in front of the digits, one trunk
+    // zero dropped, a leading plus or double zero believed. The real rules are tested in
+    // `tst_control_plane`; this only has to give the screen a number to send.
+    Q_INVOKABLE QString toE164(const QString& typed, const QString& dial) const
+    {
+        QString digits = typed;
+        digits.remove(QRegularExpression(QStringLiteral("[^0-9+]")));
+        if (digits.startsWith(QLatin1String("00"))) {
+            digits = QStringLiteral("+") + digits.mid(2);
+        }
+        if (!digits.startsWith(QLatin1Char('+'))) {
+            if (digits.startsWith(QLatin1Char('0'))) {
+                digits.remove(0, 1);
+            }
+            digits = dial + digits;
+        }
+        return digits.size() >= 9 ? digits : QString();
+    }
+    Q_INVOKABLE void signInWithPassword(const QString& identifier, const QString& password)
+    {
+        m_passwordAttempts.append(qMakePair(identifier, password));
+    }
+    Q_INVOKABLE bool openWebsite(const QString& target)
+    {
+        m_opened.append(target);
+        return true;
+    }
+
+    QStringList otpRequests() const { return m_otpRequests; }
+    QList<QPair<QString, QString>> passwordAttempts() const { return m_passwordAttempts; }
+    QStringList opened() const { return m_opened; }
+
+    void deliverPasswordRejected(const QString& message, const QString& reference)
+    {
+        emit passwordSignInRejected(message, reference);
+    }
+    void deliverPasswordAccepted() { emit passwordSignInAccepted(); }
 
     int starts() const { return m_starts; }
     int signOuts() const { return m_signOuts; }
@@ -239,8 +308,13 @@ signals:
     void otpRequested(const QString& phoneE164);
     void otpRejected(const QString& message, const QString& reference);
     void otpAccepted();
+    void passwordSignInRejected(const QString& message, const QString& reference);
+    void passwordSignInAccepted();
 
 private:
+    QStringList m_otpRequests;
+    QList<QPair<QString, QString>> m_passwordAttempts;
+    QStringList m_opened;
     qint64 m_balanceMinutes = -1;
     QString m_balanceText;
     bool m_balanceStale = false;
@@ -349,6 +423,21 @@ private slots:
     void theShellRoutesTheRestoreStateToTheSplashNotToSignIn();
     void signInScreenReachesThePhoneStepError();
     void signInScreenCountsDownToResend();
+    void identifierFieldShowsTheTagAtThreeDigitsAndHidesItOnALetter();
+    void identifierFieldNamesTheCountryANumberWritesForItself();
+    void identifierFieldKeepsTheDigitsWhenTheCountryChanges();
+    void aLongEmailScrollsInsideTheFieldInsteadOfResizingIt();
+    void theTagRevealsThroughOpacityAndATransformNeverALayoutProperty();
+    void countryPickerSearchesByNameOrDialDigitsAndSaysSoWhenNothingMatches();
+    void countryPickerHighlightsTheCountryInForceAndPicksIt();
+    void countryPickerReadsOnlyTheBundledListAndElidesLongNames();
+    void signInRoutesAPhoneToTheCodeStepAndKeepsTheNumberOnBack();
+    void signInRoutesAnEmailToThePasswordStep();
+    void signInNamesAFieldLevelMistakeBeforeAnythingIsSent();
+    void signInShowsARefusalVerbatimAndClearsThePassword();
+    void signInKeepsTheWidthOfTheBusyControl();
+    void signInOpensTheWebsiteForSignupAndResetAndHasNoScreenOfItsOwn();
+    void noSeatHubScreenBuildsAWebsiteAddressItself();
     void forcedUpdateModalKeepsUpdateTabbableAndUndismissable();
     void settingsDropdownElidesLongOptionNames();
     void disabledActionLabelStaysLegible();
@@ -420,6 +509,8 @@ void TstUiScreens::everyShellScreenLoads()
                               QStringLiteral("AgentConfigPanel.qml"),
                               QStringLiteral("BalancePill.qml"),
                               QStringLiteral("RestoreSplash.qml"),
+                              QStringLiteral("SeatHubIdentifierField.qml"),
+                              QStringLiteral("SeatHubCountryPicker.qml"),
     };
 
     QQuickStyle::setStyle(QStringLiteral("Basic"));
@@ -708,9 +799,10 @@ void TstUiScreens::signInScreenReachesThePhoneStepError()
     QVERIFY2(screen, qPrintable(error));
     QVERIFY(screen->setProperty("client", QVariant::fromValue(static_cast<QObject*>(&client))));
 
-    // The phone step is what is on screen before a code is ever sent.
-    QVERIFY2(findVisibleTextItem(screen.data(), QStringLiteral("Enter your phone number")),
-             "the phone step is the first thing sign-in shows");
+    // The one field is what is on screen before a code is ever sent (Phase 5: the field takes an
+    // email or a phone number, so its label is no longer "Enter your phone number").
+    QVERIFY2(findVisibleTextItem(screen.data(), QStringLiteral("Email or phone")),
+             "the identifier step is the first thing sign-in shows");
     QVERIFY2(!findVisibleTextItem(screen.data(), QStringLiteral("Enter the 6-digit code")),
              "the code step must stay hidden until the control plane says it sent a code");
 
@@ -760,6 +852,629 @@ void TstUiScreens::signInScreenCountsDownToResend()
         }
     }
     QVERIFY2(sawResendButton, "resending must be a real control, not a MouseArea on a Text");
+}
+
+// ------------------------------------------------------------------------------------------------
+// Phase 5 plan 06: one field for an email or a phone number, its country tag and picker
+// ------------------------------------------------------------------------------------------------
+
+namespace {
+
+// TextInput.Normal and TextInput.Password (`QQuickTextInput::EchoMode`).
+const int kEchoNormal = 0;
+const int kEchoPassword = 2;
+
+// A loaded identifier field with the bundled list, the machine's-region default and no animation.
+struct FieldFixture
+{
+    QQmlEngine engine;
+    QScopedPointer<QObject> field;
+    QString error;
+
+    bool load()
+    {
+        QQuickStyle::setStyle(QStringLiteral("Basic"));
+        registerTokenSingletons(&engine);
+        field.reset(instantiate(&engine, QStringLiteral("SeatHubIdentifierField.qml"), &error));
+        if (!field) {
+            return false;
+        }
+        field->setProperty("animate", false);
+        field->setProperty("countries", QVariant::fromValue(bundledCountries()));
+        field->setProperty("defaultCountryCode", QStringLiteral("JO"));
+        return true;
+    }
+
+    void type(const QString& text) { field->setProperty("text", text); }
+    QString mode() const { return field->property("mode").toString(); }
+    bool tagShown() const { return field->property("tagShown").toBool(); }
+    QString iso() const { return field->property("countryIso").toString(); }
+    QString dial() const { return field->property("countryDial").toString(); }
+    double reveal() const { return field->property("reveal").toDouble(); }
+};
+
+} // namespace
+
+void TstUiScreens::identifierFieldShowsTheTagAtThreeDigitsAndHidesItOnALetter()
+{
+    FieldFixture fx;
+    QVERIFY2(fx.load(), qPrintable(fx.error));
+
+    // Nothing typed: no tag, no mode.
+    QCOMPARE(fx.mode(), QStringLiteral("empty"));
+    QVERIFY(!fx.tagShown());
+    QCOMPARE(fx.reveal(), 0.0);
+
+    // One and two digits are a number being typed, but not yet enough for the tag (screens.md §22).
+    fx.type(QStringLiteral("07"));
+    QCOMPARE(fx.mode(), QStringLiteral("partial"));
+    QVERIFY(!fx.tagShown());
+
+    // Three digits: the tag appears, on the machine's region by default.
+    fx.type(QStringLiteral("079"));
+    QCOMPARE(fx.mode(), QStringLiteral("phone"));
+    QVERIFY(fx.tagShown());
+    QCOMPARE(fx.reveal(), 1.0);
+    QCOMPARE(fx.iso(), QStringLiteral("JO"));
+    QCOMPARE(fx.dial(), QStringLiteral("+962"));
+
+    // Separators and a leading plus do not change what it is; Arabic-Indic digits are read as digits.
+    fx.type(QStringLiteral("(079) 000-00.00"));
+    QVERIFY(fx.tagShown());
+    fx.type(QString::fromUtf16(u"\u0660\u0667\u0669"));
+    QCOMPARE(fx.mode(), QStringLiteral("phone"));
+    QVERIFY(fx.tagShown());
+
+    // A letter hides it at once, and so does an at-sign.
+    fx.type(QStringLiteral("079a"));
+    QCOMPARE(fx.mode(), QStringLiteral("email"));
+    QVERIFY(!fx.tagShown());
+    QCOMPARE(fx.reveal(), 0.0);
+
+    fx.type(QStringLiteral("079"));
+    QVERIFY(fx.tagShown());
+    fx.type(QStringLiteral("079@"));
+    QCOMPARE(fx.mode(), QStringLiteral("email"));
+    QVERIFY(!fx.tagShown());
+
+    // An email as a whole is an email, and never grows a tag.
+    fx.type(QStringLiteral("lina@example.com"));
+    QCOMPARE(fx.mode(), QStringLiteral("email"));
+    QVERIFY(!fx.tagShown());
+    QVERIFY(fx.field->property("looksLikeEmail").toBool());
+
+    // Back to nothing: the tag goes with the text.
+    fx.type(QString());
+    QVERIFY(!fx.tagShown());
+}
+
+void TstUiScreens::identifierFieldNamesTheCountryANumberWritesForItself()
+{
+    FieldFixture fx;
+    QVERIFY2(fx.load(), qPrintable(fx.error));
+
+    // A leading plus wins over the tag, and the tag then shows the country the number matched.
+    fx.type(QStringLiteral("+447911123456"));
+    QVERIFY(fx.tagShown());
+    QCOMPARE(fx.iso(), QStringLiteral("GB"));
+    QCOMPARE(fx.dial(), QStringLiteral("+44"));
+    // ...without changing the country the customer picked.
+    QCOMPARE(fx.field->property("countryCode").toString(), QStringLiteral("JO"));
+
+    // So does the international prefix written as a double zero.
+    fx.type(QStringLiteral("00966501234567"));
+    QCOMPARE(fx.iso(), QStringLiteral("SA"));
+
+    // The longest dial code is the match: `+1876` is Jamaica, not the `+1` of Canada or the US.
+    fx.type(QStringLiteral("+18765550123"));
+    QCOMPARE(fx.iso(), QStringLiteral("JM"));
+    fx.type(QStringLiteral("+14155550123"));
+    QCOMPARE(fx.dial(), QStringLiteral("+1"));
+
+    // A number with no prefix is the picked country's.
+    fx.type(QStringLiteral("0790000000"));
+    QCOMPARE(fx.iso(), QStringLiteral("JO"));
+}
+
+void TstUiScreens::identifierFieldKeepsTheDigitsWhenTheCountryChanges()
+{
+    FieldFixture fx;
+    QVERIFY2(fx.load(), qPrintable(fx.error));
+
+    fx.type(QStringLiteral("0790000000"));
+    QCOMPARE(fx.iso(), QStringLiteral("JO"));
+
+    QVERIFY(QMetaObject::invokeMethod(fx.field.data(), "setCountry", Q_ARG(QVariant, QStringLiteral("GB"))));
+
+    QCOMPARE(fx.field->property("text").toString(), QStringLiteral("0790000000"));
+    QCOMPARE(fx.iso(), QStringLiteral("GB"));
+    QCOMPARE(fx.dial(), QStringLiteral("+44"));
+    // The dial code a national number is completed with follows the tag.
+    QCOMPARE(fx.field->property("selectedDial").toString(), QStringLiteral("+44"));
+    QVERIFY(fx.tagShown());
+}
+
+void TstUiScreens::aLongEmailScrollsInsideTheFieldInsteadOfResizingIt()
+{
+    FieldFixture fx;
+    QVERIFY2(fx.load(), qPrintable(fx.error));
+
+    QObject* input = fx.field->findChild<QObject*>(QStringLiteral("identifierInput"));
+    QObject* frame = fx.field->findChild<QObject*>(QStringLiteral("identifierFrame"));
+    QVERIFY(input && frame);
+
+    fx.type(QStringLiteral("lina@example.com"));
+    const double fieldWidth = fx.field->property("width").toDouble();
+    const double fieldHeight = fx.field->property("height").toDouble();
+    const double frameWidth = frame->property("width").toDouble();
+    const double inputWidth = input->property("width").toDouble();
+    QVERIFY(inputWidth > 0);
+
+    fx.type(QString(200, QLatin1Char('a')) + QStringLiteral("@example.com"));
+    QCOMPARE(fx.field->property("width").toDouble(), fieldWidth);
+    QCOMPARE(fx.field->property("height").toDouble(), fieldHeight);
+    QCOMPARE(frame->property("width").toDouble(), frameWidth);
+    QCOMPARE(input->property("width").toDouble(), inputWidth);
+    // The text is wider than the box it sits in, so it scrolls there: it does not wrap either.
+    QVERIFY(input->property("contentWidth").toDouble() > inputWidth);
+    QCOMPARE(input->property("clip").toBool(), true);
+}
+
+void TstUiScreens::theTagRevealsThroughOpacityAndATransformNeverALayoutProperty()
+{
+    // The motion contract (`ui.md` §6, screens.md §22): nothing animates a width, an x or a padding.
+    // QML cannot be measured frame by frame in a test, so the source is what is read: every
+    // animation, and every Behavior, in the three sign-in files.
+    const QStringList files = { QStringLiteral("SeatHubIdentifierField.qml"),
+                                QStringLiteral("SeatHubCountryPicker.qml"),
+                                QStringLiteral("SignInScreen.qml") };
+    const QRegularExpression layoutProperty(
+        QStringLiteral("(?:width|height|x|y|implicitWidth|implicitHeight|padding|leftPadding|"
+                       "rightPadding|topPadding|bottomPadding|leftMargin|rightMargin|spacing)"));
+    const QRegularExpression behaviorOn(QStringLiteral("Behavior\\s+on\\s+([A-Za-z_.]+)"));
+    const QRegularExpression animatedProperty(
+        QStringLiteral("(?:Number|Property|Parallel|Sequential)?Animation\\s+on\\s+([A-Za-z_.]+)"));
+    const QRegularExpression propertyList(
+        QStringLiteral("\\bproperties?\\s*:\\s*\"([^\"]+)\""));
+
+    bool sawReveal = false;
+    for (const QString& file : files) {
+        const QString source = readSource(guiDir() + QLatin1Char('/') + file);
+        QVERIFY2(!source.isEmpty(), qPrintable(file));
+
+        for (const QRegularExpression& re : { behaviorOn, animatedProperty }) {
+            QRegularExpressionMatchIterator it = re.globalMatch(source);
+            while (it.hasNext()) {
+                const QString property = it.next().captured(1);
+                QVERIFY2(!QRegularExpression(QStringLiteral("^(?:") + layoutProperty.pattern()
+                                             + QStringLiteral(")$")).match(property).hasMatch(),
+                         qPrintable(file + QStringLiteral(" animates the layout property ") + property));
+                if (property == QLatin1String("reveal")) {
+                    sawReveal = true;
+                }
+            }
+        }
+        QRegularExpressionMatchIterator named = propertyList.globalMatch(source);
+        while (named.hasNext()) {
+            const QString list = named.next().captured(1);
+            for (const QString& property : list.split(QLatin1Char(','))) {
+                QVERIFY2(!QRegularExpression(QStringLiteral("^(?:") + layoutProperty.pattern()
+                                             + QStringLiteral(")$")).match(property.trimmed()).hasMatch(),
+                         qPrintable(file + QStringLiteral(" animates the layout property ") + property));
+            }
+        }
+    }
+    QVERIFY2(sawReveal, "the tag's reveal is the one animated value");
+
+    // The reveal drives opacity and a transform, and the animation is 180ms ease-out.
+    const QString field = readSource(guiDir() + QStringLiteral("/SeatHubIdentifierField.qml"));
+    QVERIFY(field.contains(QStringLiteral("opacity: root.reveal")));
+    QVERIFY(field.contains(QStringLiteral("Translate { x: (1 - root.reveal) * -8 }")));
+    QVERIFY(field.contains(QStringLiteral("duration: Metrics.motionBase")));
+    QVERIFY(field.contains(QStringLiteral("Easing.OutCubic")));
+    // With Windows' animation effects off there is no transition.
+    QVERIFY(field.contains(QStringLiteral("enabled: root.animate")));
+    // The tag is a real button that reads its own country aloud.
+    QVERIFY(field.contains(QRegularExpression(QStringLiteral("Button\\s*\\{\\s*id:\\s*tagButton"))));
+    QVERIFY(field.contains(QStringLiteral("Accessible.name: qsTr(\"Country code: %1\").arg(root.country.name)")));
+}
+
+void TstUiScreens::countryPickerSearchesByNameOrDialDigitsAndSaysSoWhenNothingMatches()
+{
+    QQuickStyle::setStyle(QStringLiteral("Basic"));
+    QQmlEngine engine;
+    registerTokenSingletons(&engine);
+
+    QString error;
+    QScopedPointer<QObject> picker(instantiate(&engine, QStringLiteral("SeatHubCountryPicker.qml"), &error));
+    QVERIFY2(picker, qPrintable(error));
+    const QVariantList countries = bundledCountries();
+    QVERIFY(countries.size() > 100);
+    picker->setProperty("model", QVariant::fromValue(countries));
+
+    auto matched = [&picker](const QString& query) {
+        picker->setProperty("query", query);
+        return picker->property("matchedIsoList").toString().split(QLatin1Char(','),
+                                                                    Qt::SkipEmptyParts);
+    };
+
+    // Nothing typed: every country.
+    QCOMPARE(matched(QString()).size(), countries.size());
+    QVERIFY(!picker->property("noMatches").toBool());
+
+    // By name, anywhere in it, in any case.
+    QVERIFY(matched(QStringLiteral("jord")).contains(QStringLiteral("JO")));
+    QVERIFY(matched(QStringLiteral("KINGDOM")).contains(QStringLiteral("GB")));
+    {
+        const QStringList united = matched(QStringLiteral("united"));
+        QCOMPARE(QSet<QString>(united.begin(), united.end()).size(), 3);
+    }
+    // // Arab Emirates, Kingdom, States
+
+    // By the digits a dial code starts with: `962`, `+962` and `00962` all mean the same.
+    for (const QString& query : { QStringLiteral("962"), QStringLiteral("+962"), QStringLiteral("00962") }) {
+        const QStringList hits = matched(query);
+        QVERIFY2(hits.contains(QStringLiteral("JO")), qPrintable(query));
+        QVERIFY2(hits.size() < 10, qPrintable(query));
+    }
+    QVERIFY(matched(QStringLiteral("+44")).contains(QStringLiteral("GB")));
+    // A dial-code query matches from the start of the code, not from its middle.
+    QVERIFY(!matched(QStringLiteral("62")).contains(QStringLiteral("JO")));
+
+    // Nothing matches: a sentence says so, and the list is gone.
+    QVERIFY(matched(QStringLiteral("zzzzzz")).isEmpty());
+    QVERIFY(picker->property("noMatches").toBool());
+    QObject* line = picker->findChild<QObject*>(QStringLiteral("noMatchLine"));
+    QVERIFY(line);
+    QCOMPARE(line->property("text").toString(), QStringLiteral("No country matches that."));
+    QVERIFY(line->property("visible").toBool());
+    QObject* list = picker->findChild<QObject*>(QStringLiteral("countryList"));
+    QVERIFY(list);
+    QVERIFY(!list->property("visible").toBool());
+
+    // And the line is quiet again once something matches.
+    QVERIFY(!matched(QStringLiteral("jordan")).isEmpty());
+    QVERIFY(!line->property("visible").toBool());
+}
+
+void TstUiScreens::countryPickerHighlightsTheCountryInForceAndPicksIt()
+{
+    QQuickStyle::setStyle(QStringLiteral("Basic"));
+    QQmlEngine engine;
+    registerTokenSingletons(&engine);
+
+    QString error;
+    QScopedPointer<QObject> picker(instantiate(&engine, QStringLiteral("SeatHubCountryPicker.qml"), &error));
+    QVERIFY2(picker, qPrintable(error));
+    picker->setProperty("model", QVariant::fromValue(bundledCountries()));
+    picker->setProperty("selectedIso", QStringLiteral("SA"));
+
+    QSignalSpy picked(picker.data(), SIGNAL(picked(QString)));
+    QSignalSpy dismissed(picker.data(), SIGNAL(dismissed()));
+
+    // Opening puts the highlight on the country in force: choosing at once picks it.
+    QVERIFY(QMetaObject::invokeMethod(picker.data(), "reset"));
+    QVERIFY(QMetaObject::invokeMethod(picker.data(), "pickCurrent"));
+    QCOMPARE(picked.count(), 1);
+    QCOMPARE(picked.first().first().toString(), QStringLiteral("SA"));
+
+    // A search leaves the first match highlighted, so Enter picks it.
+    picker->setProperty("query", QStringLiteral("jord"));
+    QObject* search = picker->findChild<QObject*>(QStringLiteral("countrySearch"));
+    QVERIFY(search);
+    search->setProperty("text", QStringLiteral("jord"));
+    QVERIFY(QMetaObject::invokeMethod(picker.data(), "pickCurrent"));
+    QCOMPARE(picked.count(), 2);
+    QCOMPARE(picked.last().first().toString(), QStringLiteral("JO"));
+
+    // Escape asks the host to close the popup; it picks nothing.
+    QKeyEvent press(QEvent::KeyPress, Qt::Key_Escape, Qt::NoModifier);
+    QCoreApplication::sendEvent(search, &press);
+    QCOMPARE(dismissed.count(), 1);
+    QCOMPARE(picked.count(), 2);
+}
+
+void TstUiScreens::countryPickerReadsOnlyTheBundledListAndElidesLongNames()
+{
+    const QString source = readSource(guiDir() + QStringLiteral("/SeatHubCountryPicker.qml"));
+    QVERIFY(!source.isEmpty());
+
+    // It fetches nothing: no network object, no address, no include.
+    for (const QString& forbidden : { QStringLiteral("XMLHttpRequest"), QStringLiteral("http://"),
+                                      QStringLiteral("https://"), QStringLiteral("WebSocket"),
+                                      QStringLiteral("Qt.include"), QStringLiteral("fetch(") }) {
+        QVERIFY2(!source.contains(forbidden), qPrintable(forbidden));
+    }
+    // Its data is the model it is given, and the field gives it the facade's bundled list.
+    QVERIFY(source.contains(QStringLiteral("property var model")));
+    const QString field = readSource(guiDir() + QStringLiteral("/SeatHubIdentifierField.qml"));
+    QVERIFY(field.contains(QStringLiteral("model: root.countries")));
+    QVERIFY(readSource(guiDir() + QStringLiteral("/SignInScreen.qml"))
+                .contains(QStringLiteral("root.client.countries")));
+
+    // A long name elides in its row, and the whole name is the row's accessible name.
+    QVERIFY(source.contains(QStringLiteral("elide: Text.ElideRight")));
+    QVERIFY(source.contains(QStringLiteral("Accessible.name: row.modelData.name + \", \" + row.modelData.dial")));
+    // The list is at most 256px and scrolls inside itself.
+    QVERIFY(source.contains(QStringLiteral("height: Math.min(contentHeight, 256)")));
+    QVERIFY(source.contains(QStringLiteral("clip: true")));
+    // Escape closes it.
+    QVERIFY(source.contains(QStringLiteral("Keys.onEscapePressed: root.dismissed()")));
+
+    // And the data really is bundled: the resource file the app links, with the list in it.
+    const QString countries = readSource(guiDir() + QStringLiteral("/../seathub/countries.qrc"));
+    QVERIFY(countries.contains(QStringLiteral("countries.json")));
+    const QString app = readSource(guiDir() + QStringLiteral("/../app.pro"));
+    QVERIFY(app.contains(QStringLiteral("seathub/countries.qrc")));
+}
+
+namespace {
+
+// The sign-in screen with a stand-in facade, the field's animation off, ready to type into.
+struct SignInFixture
+{
+    QQmlEngine engine;
+    FakeShellClient client;
+    QScopedPointer<QObject> screen;
+    QString error;
+
+    bool load()
+    {
+        QQuickStyle::setStyle(QStringLiteral("Basic"));
+        registerTokenSingletons(&engine);
+        screen.reset(instantiate(&engine, QStringLiteral("SignInScreen.qml"), &error));
+        if (!screen) {
+            return false;
+        }
+        screen->setProperty("client", QVariant::fromValue(static_cast<QObject*>(&client)));
+        // A window-sized parent, so the card has a width to be measured against.
+        screen->setProperty("width", 960);
+        screen->setProperty("height", 640);
+        return true;
+    }
+
+    QObject* child(const char* name) const { return screen->findChild<QObject*>(QLatin1String(name)); }
+    QObject* field() const { return child("identifierField"); }
+    void type(const QString& text) { field()->setProperty("text", text); }
+    void call(const char* method) { QVERIFY(QMetaObject::invokeMethod(screen.data(), method)); }
+    void click(const char* objectName)
+    {
+        QObject* button = child(objectName);
+        QVERIFY2(button, objectName);
+        QVERIFY(QMetaObject::invokeMethod(button, "clicked"));
+    }
+    QString step() const { return screen->property("step").toString(); }
+    bool sees(const QString& text) const { return findVisibleTextItem(screen.data(), text) != nullptr; }
+};
+
+} // namespace
+
+void TstUiScreens::signInRoutesAPhoneToTheCodeStepAndKeepsTheNumberOnBack()
+{
+    SignInFixture fx;
+    QVERIFY2(fx.load(), qPrintable(fx.error));
+    QVERIFY(fx.field());
+    QCOMPARE(fx.step(), QStringLiteral("identifier"));
+    QVERIFY(fx.sees(QStringLiteral("Email or phone")));
+    QVERIFY(fx.sees(QStringLiteral(
+        "Enter an email address, or pick your country and enter your phone number.")));
+    QVERIFY(fx.sees(QStringLiteral("Continue")));
+
+    // A number typed the way a customer in Amman writes it: the code is asked for, as E.164.
+    fx.type(QStringLiteral("0790000000"));
+    fx.call("continueFromIdentifier");
+    QCOMPARE(fx.client.otpRequests(), QStringList{ QStringLiteral("+962790000000") });
+    // The screen waits for the server; the step has not changed yet, and the control is busy.
+    QCOMPARE(fx.step(), QStringLiteral("identifier"));
+    QVERIFY(fx.child("primaryAction")->property("busy").toBool());
+
+    fx.client.deliverOtpRequested(QStringLiteral("+962790000000"));
+    QCOMPARE(fx.step(), QStringLiteral("code"));
+    QVERIFY(fx.sees(QStringLiteral("Enter the 6-digit code")));
+    QVERIFY(fx.sees(QStringLiteral("Verify and continue")));
+    QVERIFY(!fx.sees(QStringLiteral("Continue")));
+    QVERIFY(!fx.child("primaryAction")->property("busy").toBool());
+
+    // Back returns to the field with what was typed still in it.
+    fx.click("backButton");
+    QCOMPARE(fx.step(), QStringLiteral("identifier"));
+    QCOMPARE(fx.field()->property("text").toString(), QStringLiteral("0790000000"));
+    QVERIFY(fx.field()->property("tagShown").toBool());
+
+    // A number typed with its own country code is believed over the tag.
+    fx.type(QStringLiteral("+447911123456"));
+    fx.call("continueFromIdentifier");
+    QCOMPARE(fx.client.otpRequests().last(), QStringLiteral("+447911123456"));
+}
+
+void TstUiScreens::signInRoutesAnEmailToThePasswordStep()
+{
+    SignInFixture fx;
+    QVERIFY2(fx.load(), qPrintable(fx.error));
+
+    fx.type(QStringLiteral("lina@example.com"));
+    fx.call("continueFromIdentifier");
+
+    // No code is asked for and nothing is sent: the password step is the next thing.
+    QVERIFY(fx.client.otpRequests().isEmpty());
+    QCOMPARE(fx.step(), QStringLiteral("password"));
+    QVERIFY(fx.sees(QStringLiteral("Password")));
+    QVERIFY(fx.sees(QStringLiteral("Sign in")));
+    QVERIFY(fx.sees(QStringLiteral("Show password")));
+    QVERIFY(!fx.sees(QStringLiteral("Enter the 6-digit code")));
+
+    // The password is hidden until the reveal control is used, and the control says what it does.
+    QObject* password = fx.child("passwordField");
+    QVERIFY(password);
+    QCOMPARE(password->property("echoMode").toInt(), kEchoPassword);
+    fx.click("revealPassword");
+    QCOMPARE(password->property("echoMode").toInt(), kEchoNormal);
+    QVERIFY(fx.sees(QStringLiteral("Hide password")));
+    fx.click("revealPassword");
+    QCOMPARE(password->property("echoMode").toInt(), kEchoPassword);
+
+    // Sign in sends the identifier as typed and the password.
+    password->setProperty("text", QStringLiteral("correct horse battery"));
+    fx.call("signInWithPassword");
+    QCOMPARE(fx.client.passwordAttempts().size(), 1);
+    QCOMPARE(fx.client.passwordAttempts().first().first, QStringLiteral("lina@example.com"));
+    QCOMPARE(fx.client.passwordAttempts().first().second, QStringLiteral("correct horse battery"));
+    QVERIFY(fx.child("primaryAction")->property("busy").toBool());
+
+    // Accepted: the screen reports it, and the password is not kept.
+    QSignalSpy signedIn(fx.screen.data(), SIGNAL(signedIn()));
+    fx.client.deliverPasswordAccepted();
+    QCOMPARE(signedIn.count(), 1);
+    QVERIFY(password->property("text").toString().isEmpty());
+
+    // Back from the password step keeps the email, drops the password and hides it again.
+    fx.click("backButton");
+    QCOMPARE(fx.step(), QStringLiteral("identifier"));
+    QCOMPARE(fx.field()->property("text").toString(), QStringLiteral("lina@example.com"));
+    QVERIFY(password->property("text").toString().isEmpty());
+    QVERIFY(!fx.field()->property("tagShown").toBool());
+}
+
+void TstUiScreens::signInNamesAFieldLevelMistakeBeforeAnythingIsSent()
+{
+    SignInFixture fx;
+    QVERIFY2(fx.load(), qPrintable(fx.error));
+
+    // Nothing typed.
+    fx.call("continueFromIdentifier");
+    QVERIFY(fx.sees(QStringLiteral("Enter your email or phone number.")));
+
+    // Too few digits to be a number.
+    fx.type(QStringLiteral("12"));
+    fx.call("continueFromIdentifier");
+    QVERIFY(fx.sees(QStringLiteral("That doesn't look like a phone number.")));
+    QVERIFY(!fx.sees(QStringLiteral("Enter your email or phone number.")));
+
+    // Something that is not an address.
+    fx.type(QStringLiteral("lina@"));
+    fx.call("continueFromIdentifier");
+    QVERIFY(fx.sees(QStringLiteral("Enter your email or phone number.")));
+
+    // A blank password, on the password step.
+    fx.type(QStringLiteral("lina@example.com"));
+    fx.call("continueFromIdentifier");
+    QCOMPARE(fx.step(), QStringLiteral("password"));
+    fx.call("signInWithPassword");
+    QVERIFY(fx.sees(QStringLiteral("Enter your password.")));
+
+    // None of it reached the facade.
+    QVERIFY(fx.client.otpRequests().isEmpty());
+    QVERIFY(fx.client.passwordAttempts().isEmpty());
+
+    // And the message goes when the customer edits the field.
+    fx.child("passwordField")->setProperty("text", QStringLiteral("x"));
+    QVERIFY(!fx.sees(QStringLiteral("Enter your password.")));
+}
+
+void TstUiScreens::signInShowsARefusalVerbatimAndClearsThePassword()
+{
+    SignInFixture fx;
+    QVERIFY2(fx.load(), qPrintable(fx.error));
+
+    fx.type(QStringLiteral("lina@example.com"));
+    fx.call("continueFromIdentifier");
+    QObject* password = fx.child("passwordField");
+    password->setProperty("text", QStringLiteral("hunter22hunter"));
+    fx.call("signInWithPassword");
+
+    const QString sentence = QString::fromUtf16(u"That account is disabled \u2014 contact support.");
+    fx.client.deliverPasswordRejected(sentence, QStringLiteral("SH-5M8NP3"));
+
+    QVERIFY2(fx.sees(sentence), "the server's own sentence, word for word");
+    QObject* reference = findVisibleTextItem(fx.screen.data(), QStringLiteral("SH-5M8NP3"));
+    QVERIFY2(reference, "the ADR-0008 reference must be shown");
+    QCOMPARE(reference->property("font").value<QFont>().family(), QString::fromLatin1(kMonoFamily));
+    // The password is held for one attempt only, and the control is usable again.
+    QVERIFY(password->property("text").toString().isEmpty());
+    QVERIFY(!fx.child("primaryAction")->property("busy").toBool());
+    QVERIFY(fx.child("primaryAction")->property("enabled").toBool());
+
+    // The offline sentence is a refusal like any other.
+    const QString offline = QStringLiteral("We couldn't reach SevenHills. Try again in a moment.");
+    fx.client.deliverPasswordRejected(offline, QString());
+    QVERIFY(fx.sees(offline));
+    QVERIFY(!fx.sees(sentence));
+}
+
+void TstUiScreens::signInKeepsTheWidthOfTheBusyControl()
+{
+    SignInFixture fx;
+    QVERIFY2(fx.load(), qPrintable(fx.error));
+
+    QObject* primary = fx.child("primaryAction");
+    QVERIFY(primary);
+    const double idleWidth = primary->property("width").toDouble();
+    QVERIFY(idleWidth > 0);
+    QVERIFY(primary->property("enabled").toBool());
+
+    fx.type(QStringLiteral("0790000000"));
+    fx.call("continueFromIdentifier");
+    QVERIFY(primary->property("busy").toBool());
+    QVERIFY(!primary->property("enabled").toBool());
+    QCOMPARE(primary->property("width").toDouble(), idleWidth);
+    // The label stays put while it is busy: the width does not move because the text does not.
+    QCOMPARE(primary->property("text").toString(), QStringLiteral("Continue"));
+}
+
+void TstUiScreens::signInOpensTheWebsiteForSignupAndResetAndHasNoScreenOfItsOwn()
+{
+    SignInFixture fx;
+    QVERIFY2(fx.load(), qPrintable(fx.error));
+
+    QVERIFY(fx.sees(QStringLiteral("New here? Create an account")));
+    QVERIFY(fx.sees(QStringLiteral("Forgot password?")));
+
+    fx.click("createAccountLink");
+    fx.click("forgotPasswordLink");
+    // The screen asks by name; the facade owns the addresses, and no credential goes with either.
+    QCOMPARE(fx.client.opened(), (QStringList{ QStringLiteral("signup"), QStringLiteral("reset") }));
+
+    // The reset link is on the password step too.
+    fx.type(QStringLiteral("lina@example.com"));
+    fx.call("continueFromIdentifier");
+    fx.click("forgotPasswordLink");
+    QCOMPARE(fx.client.opened().last(), QStringLiteral("reset"));
+
+    // Signup and reset are the website's: the client has no screen for either.
+    const QDir gui(guiDir());
+    for (const QString& name : gui.entryList({ QStringLiteral("*.qml") })) {
+        for (const QString& retired : { QStringLiteral("signup"), QStringLiteral("register"),
+                                        QStringLiteral("forgot"), QStringLiteral("reset") }) {
+            QVERIFY2(!name.contains(retired, Qt::CaseInsensitive),
+                     qPrintable(QStringLiteral("the client has no ") + retired + QStringLiteral(" screen: ") + name));
+        }
+    }
+    const QString main = readSource(guiDir() + QStringLiteral("/main.qml"));
+    QVERIFY(!main.contains(QStringLiteral("SignUp"), Qt::CaseInsensitive));
+}
+
+void TstUiScreens::noSeatHubScreenBuildsAWebsiteAddressItself()
+{
+    // T-05-25: a link is built in one place (`web_origin.h`, joined by `SeatHubClient::websiteUrl`),
+    // so it cannot end up carrying anything it should not. No SeatHub-authored QML file may hold an
+    // address. The three upstream Moonlight files that do (a docs link and a store link, none of
+    // them a SeatHub screen) are not this client's and are left as they are.
+    const QStringList upstream = { QStringLiteral("AutoResizingComboBox.qml"),
+                                   QStringLiteral("NavigableMessageDialog.qml"),
+                                   QStringLiteral("PcView.qml") };
+    const QDir gui(guiDir());
+    int checked = 0;
+    for (const QString& name : gui.entryList({ QStringLiteral("*.qml") })) {
+        if (upstream.contains(name)) {
+            continue;
+        }
+        ++checked;
+        const QString source = readSource(gui.filePath(name));
+        QVERIFY2(!source.contains(QStringLiteral("https://")), qPrintable(name));
+        QVERIFY2(!source.contains(QStringLiteral("http://")), qPrintable(name));
+        QVERIFY2(!source.contains(QStringLiteral("sevenhills.damra.co")), qPrintable(name));
+    }
+    QVERIFY(checked > 10);
 }
 
 void TstUiScreens::forcedUpdateModalKeepsUpdateTabbableAndUndismissable()

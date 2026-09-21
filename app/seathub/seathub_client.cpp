@@ -1,5 +1,6 @@
 #include "seathub_client.h"
 
+#include <QDesktopServices>
 #include <QLoggingCategory>
 #include <QThread>
 #include <QWindow>
@@ -7,10 +8,13 @@
 #include <SDL.h>
 
 #include "agent_config.h"
+#include "countries.h"
 #include "duration_text.h"
+#include "region.h"
 #include "session_lifecycle.h"
 #include "settings_bridge.h"
 #include "update_feed_client.h"
+#include "web_origin.h"
 
 // The production pairing handshake and the host record it resolves. Included here and nowhere
 // else: these are the translation units that reach into `app/backend/`, which is how the rest of
@@ -41,6 +45,13 @@ const char* kOtpMismatch = "That code didn't match. Try again or resend.";
 // `docs/spec/copy.md`, Sign-in Path B (phone): the string for a number that is not E.164 after
 // normalisation. Documented copy, not invented here.
 const char* kPhoneInvalid = "That doesn't look like a phone number.";
+// `docs/spec/copy.md` § Sign in: said before anything is sent. The screen checks both first; the
+// facade repeats them so no caller can spend a round trip on an empty field.
+const char* kIdentifierMissing = "Enter your email or phone number.";
+const char* kPasswordMissing = "Enter your password.";
+// `docs/spec/copy.md` § Signup code errors: "When the server cannot be reached at all". Shown by
+// every sign-in step when the request never reached the control plane.
+const char* kOfflineSentence = "We couldn't reach SevenHills. Try again in a moment.";
 
 // homeStatus values (audit F1). Four states of the one home view, from `screens.md` §23 and the
 // copy deck: the populated state, the named loading state, the "no rig" empty state and the
@@ -247,6 +258,12 @@ SeatHubClient::SeatHubClient(QObject* parent)
       m_liveness(new LivenessTimer(nullptr)),
       m_horizon(new AuthorizedThroughTimer(nullptr))
 {
+    // The sign-in field's data: read from the binary, never fetched (Phase 5 D-02).
+    m_countries = SeatHubCountries::all();
+    m_defaultCountryCode = SeatHubRegion::initialCountryCode();
+    m_animationEffects = SeatHubSystem::animationEffectsEnabled();
+    m_urlOpener = [](const QUrl& url) { return QDesktopServices::openUrl(url); };
+
     connect(m_session, &SessionLifecycle::stageStarting, this, &SeatHubClient::handleStageStarting);
     connect(m_session, &SessionLifecycle::stageFailed, this, &SeatHubClient::handleStageFailed);
     connect(m_session, &SessionLifecycle::connectionStarted, this, &SeatHubClient::handleConnectionStarted);
@@ -697,9 +714,11 @@ void SeatHubClient::requestOtp(const QString& phoneE164)
             if (!result.ok) {
                 // This is where an HTTP 200 carrying `status:false` lands (Pitfall 4). The
                 // control plane's own sentence is what the customer reads, and its `SH-` code is
-                // what support searches on - the client does not substitute either.
-                const SeatHubFailure failure = result.toFailure();
-                emit otpRejected(failure.error, failure.reference);
+                // what support searches on - the client does not substitute either. Only a request
+                // that never arrived says the offline sentence.
+                QString reference;
+                const QString message = signInFailureText(result, &reference);
+                emit otpRejected(message, reference);
                 return;
             }
             emit otpRequested(phone);
@@ -730,8 +749,9 @@ void SeatHubClient::verifyOtp(const QString& phoneE164, const QString& code)
     m_controlPlane->verifyOtp(phone, code, [this, phone](const ControlPlaneResult& result) {
         onClientThread(this, [this, phone, result]() {
             if (!result.ok) {
-                const SeatHubFailure failure = result.toFailure();
-                emit otpRejected(failure.error, failure.reference);
+                QString reference;
+                const QString message = signInFailureText(result, &reference);
+                emit otpRejected(message, reference);
                 return;
             }
 
@@ -743,31 +763,140 @@ void SeatHubClient::verifyOtp(const QString& phoneE164, const QString& code)
                 return;
             }
 
-            // D-30 / ADR-0050 D-10: the long-lived credential goes to disk only as a DPAPI blob.
-            // Sessions are permanent, so the access token itself is the durable, non-expiring
-            // credential and it lives in the access slot - the slot the launch-time restore
-            // reads. `storeToken` writes no plaintext, and it is the only write path.
-            if (!m_tokenStore->storeToken(TokenStore::accessTokenName(), pair.accessToken)) {
-                const SeatHubFailure failure = SeatHubFailure::local(
-                    QStringLiteral("This PC wouldn't let us save your sign-in."));
-                emit otpRejected(failure.error, failure.reference);
+            QString failureText;
+            if (!adoptSignIn(pair, phone, &failureText)) {
+                emit otpRejected(failureText, QString());
                 return;
             }
-            // Whatever 0.1.x left in its own slot is now stale; two credentials at rest would let
-            // a later launch restore the wrong one.
-            m_tokenStore->clearToken(TokenStore::refreshTokenName());
-
-            m_controlPlane->setAccessToken(pair.accessToken);
-
-            ++m_authEpoch;
-            m_signedIn = true;
-            m_account.clear();
-            m_identity = phone;
-            emit identityChanged();
             emit otpAccepted();
             setAppState(QString::fromLatin1(kStateHome));
         });
     });
+}
+
+QString SeatHubClient::toE164(const QString& typed, const QString& dialCode) const
+{
+    return ControlPlaneClient::normalisePhoneE164(typed, dialCode);
+}
+
+QString SeatHubClient::signInFailureText(const ControlPlaneResult& result, QString* reference)
+{
+    // No HTTP status at all means the request never reached the control plane (`statusCode` is 0 on
+    // that path). The deck has one sentence for that and it is the only one this screen adds.
+    if (result.statusCode == 0) {
+        if (reference) {
+            reference->clear();
+        }
+        return QString::fromLatin1(kOfflineSentence);
+    }
+    const SeatHubFailure failure = result.toFailure();
+    if (reference) {
+        *reference = failure.reference;
+    }
+    return failure.error;
+}
+
+bool SeatHubClient::adoptSignIn(const AuthTokenPair& pair, const QString& identity,
+                                QString* failureText)
+{
+    // D-30 / ADR-0050 D-10: the long-lived credential goes to disk only as a DPAPI blob.
+    // Sessions are permanent, so the access token itself is the durable, non-expiring
+    // credential and it lives in the access slot - the slot the launch-time restore
+    // reads. `storeToken` writes no plaintext, and it is the only write path.
+    if (!m_tokenStore->storeToken(TokenStore::accessTokenName(), pair.accessToken)) {
+        if (failureText) {
+            *failureText = SeatHubFailure::local(
+                               QStringLiteral("This PC wouldn't let us save your sign-in.")).error;
+        }
+        return false;
+    }
+    // Whatever 0.1.x left in its own slot is now stale; two credentials at rest would let
+    // a later launch restore the wrong one.
+    m_tokenStore->clearToken(TokenStore::refreshTokenName());
+
+    m_controlPlane->setAccessToken(pair.accessToken);
+
+    ++m_authEpoch;
+    m_signedIn = true;
+    m_account.clear();
+    m_identity = identity;
+    emit identityChanged();
+    return true;
+}
+
+void SeatHubClient::signInWithPassword(const QString& identifier, const QString& password)
+{
+    // Nothing is normalised: the server decides whether this is an email or a phone number and
+    // which account it names. Surrounding space is not part of an identifier, so it is dropped.
+    const QString who = identifier.trimmed();
+    if (who.isEmpty()) {
+        emit passwordSignInRejected(QString::fromLatin1(kIdentifierMissing), QString());
+        return;
+    }
+    if (password.isEmpty()) {
+        emit passwordSignInRejected(QString::fromLatin1(kPasswordMissing), QString());
+        return;
+    }
+
+    startNetworkThreads();
+
+    // The callback captures the identifier only. The password is handed to the request and is in no
+    // closure, member or log line here (T-05-27).
+    m_controlPlane->login(who, password, [this, who](const ControlPlaneResult& result) {
+        onClientThread(this, [this, who, result]() {
+            if (!result.ok) {
+                // The server's own sentence, verbatim: the three refusals (`No account uses that
+                // email or phone.`, `That password is wrong.`, `That account is disabled -
+                // contact support.`) are distinct on purpose (ADR-0050 accepted-risk register).
+                QString reference;
+                const QString message = signInFailureText(result, &reference);
+                emit passwordSignInRejected(message, reference);
+                return;
+            }
+
+            AuthTokenPair pair;
+            if (!AuthTokenPair::parse(result.body, &pair)) {
+                const SeatHubFailure failure = SeatHubFailure::local(
+                    QStringLiteral("Sign-in didn't finish. Try again."));
+                emit passwordSignInRejected(failure.error, failure.reference);
+                return;
+            }
+
+            QString failureText;
+            if (!adoptSignIn(pair, who, &failureText)) {
+                emit passwordSignInRejected(failureText, QString());
+                return;
+            }
+            emit passwordSignInAccepted();
+            setAppState(QString::fromLatin1(kStateHome));
+        });
+    });
+}
+
+QString SeatHubClient::websiteUrl(const QString& target) const
+{
+    const char* path = nullptr;
+    if (target == QLatin1String("signup")) {
+        path = SeatHubWeb::kSignUpPath;
+    }
+    else if (target == QLatin1String("reset")) {
+        path = SeatHubWeb::kResetPasswordPath;
+    }
+    else if (target == QLatin1String("topup")) {
+        path = SeatHubWeb::kTopUpPath;
+    }
+    return path ? SeatHubWeb::url(path).toString() : QString();
+}
+
+bool SeatHubClient::openWebsite(const QString& target)
+{
+    const QString address = websiteUrl(target);
+    if (address.isEmpty()) {
+        return false;
+    }
+    // The address only: the log line names the target, never a credential (there is none in it).
+    qCInfo(seathubClient) << "opening the website" << target;
+    return m_urlOpener ? m_urlOpener(QUrl(address)) : false;
 }
 
 QVariantMap SeatHubClient::readAgentConfigFile(const QUrl& fileUrl)

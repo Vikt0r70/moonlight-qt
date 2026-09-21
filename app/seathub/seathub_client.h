@@ -17,8 +17,11 @@
 #include <QObject>
 #include <QString>
 #include <QUrl>
+#include <QVariantList>
 #include <QVariantMap>
 #include <QWindow>
+
+#include <functional>
 
 #include "authorized_through_timer.h"
 #include "control_plane_client.h"
@@ -138,6 +141,18 @@ class SeatHubClient : public QObject
     /// one, and the view says so; a failed read never blanks it and never signs anybody out.
     Q_PROPERTY(bool balanceStale READ balanceStale NOTIFY balanceChanged)
 
+    /// The bundled country list the sign-in field's tag and picker read: `{iso, name, dial}` rows,
+    /// name-sorted, read from the binary (`countries.h`). Nothing is fetched.
+    Q_PROPERTY(QVariantList countries READ countries CONSTANT)
+
+    /// The ISO code the country tag starts on: the machine's own region, then the locale's
+    /// territory, then Jordan (`region.h`). Always a row in `countries`.
+    Q_PROPERTY(QString defaultCountryCode READ defaultCountryCode CONSTANT)
+
+    /// False when Windows' "Animation effects" setting is off, so the country tag appears and hides
+    /// without its transition (`screens.md` §22). True everywhere else.
+    Q_PROPERTY(bool animationEffects READ animationEffects CONSTANT)
+
 public:
     explicit SeatHubClient(QObject* parent = nullptr);
     /// Stops the control-plane thread and joins it before anything that could still be running
@@ -166,6 +181,9 @@ public:
     bool balanceStale() const { return m_balanceStale; }
     QString homeStatus() const { return m_homeStatus; }
     QString endReasonText() const { return m_endReasonText; }
+    QVariantList countries() const { return m_countries; }
+    QString defaultCountryCode() const { return m_defaultCountryCode; }
+    bool animationEffects() const { return m_animationEffects; }
 
     /// The Qt window the visibility sequence hides and restores. Called once by main.qml.
     Q_INVOKABLE void setHostWindow(QWindow* window);
@@ -183,6 +201,33 @@ public:
 
     /// Sign-in step 2 (D-55 shell, stubbed in Plan 03-02).
     Q_INVOKABLE void verifyOtp(const QString& phoneE164, const QString& code);
+
+    /// What a phone number typed into the sign-in field becomes as E.164, or an empty string when
+    /// it is not one. `dialCode` is the chosen country's (`+962`); a number already written with a
+    /// leading `+` or `00` is believed as it stands. The screen asks before it sends anything, so a
+    /// mis-typed number is named on the field and never spends a round trip.
+    Q_INVOKABLE QString toE164(const QString& typed, const QString& dialCode) const;
+
+    /// Sign in with an email and a password (`POST /api/auth/login`, the email step of the
+    /// sign-in screen). The identifier is sent as typed (only surrounding space is dropped) and the
+    /// server decides what it is. On success the credential is stored exactly as the code path
+    /// stores it and the client lands on Home; on refusal the server's own sentence and reference
+    /// come back through `passwordSignInRejected`. The password lives for the length of the
+    /// request: it is not stored, not kept by this object and not logged.
+    Q_INVOKABLE void signInWithPassword(const QString& identifier, const QString& password);
+
+    /// The website address for `target` (`signup`, `reset` or `topup`), or an empty string for
+    /// anything else. QML never builds an address itself; these come from `web_origin.h`, carry no
+    /// parameters and so can never carry a credential.
+    Q_INVOKABLE QString websiteUrl(const QString& target) const;
+
+    /// Opens `websiteUrl(target)` in the customer's browser. False (and nothing opened) for an
+    /// unknown target.
+    Q_INVOKABLE bool openWebsite(const QString& target);
+
+    /// Replaces what opens an address (the default is the desktop's browser). A test uses this so
+    /// it can see what would have been opened without launching one.
+    void setUrlOpener(std::function<bool(const QUrl&)> opener) { m_urlOpener = std::move(opener); }
 
     /// Launch (CUST-08, D-06): reads the stored credential, confirms it with `GET /api/me`, and
     /// opens on Home. Called once by main.qml; further calls are ignored.
@@ -266,6 +311,14 @@ signals:
     /// Step 2 accepted the code.
     void otpAccepted();
 
+    /// The email-and-password sign-in was refused, locally or by the server. `message` is the
+    /// sentence to show (the server's own, verbatim, or the offline or field-level one from the
+    /// copy deck); `reference` is the ADR-0008 code when the server gave one.
+    void passwordSignInRejected(const QString& message, const QString& reference);
+
+    /// The email-and-password sign-in succeeded; the credential is stored and Home is next.
+    void passwordSignInAccepted();
+
 private slots:
     void handleStageStarting(const QString& stage);
     void handleStageFailed(const QString& stage, int errorCode, const QString& failingPorts);
@@ -320,6 +373,14 @@ private:
     void resetBalance();
     /// Fills `m_identity` and `m_account` from a confirmed account.
     void setAccount(const AccountInfo& account);
+    /// The success tail both sign-in routes share: the credential goes to the access slot as a DPAPI
+    /// blob, whatever 0.1.x left in its own slot is dropped, the control-plane client takes it, and
+    /// the facade becomes signed in as `identity`. False (with `failureText` set) when this PC would
+    /// not save the credential; nothing is then signed in.
+    bool adoptSignIn(const AuthTokenPair& pair, const QString& identity, QString* failureText);
+    /// The sentence a failed sign-in call shows: the copy deck's offline sentence when the request
+    /// never reached the control plane, otherwise the server's own words, verbatim.
+    static QString signInFailureText(const ControlPlaneResult& result, QString* reference);
     /// True once `beginSession()` has attached a real control-plane session.
     bool inControlPlaneSession() const;
     /// Play with no access token: there is nothing to allocate a session with, so the engine
@@ -349,6 +410,11 @@ private:
     QVariantMap m_failure;
     QString m_identity;
     QVariantMap m_account;
+
+    QVariantList m_countries;
+    QString m_defaultCountryCode;
+    bool m_animationEffects = true;
+    std::function<bool(const QUrl&)> m_urlOpener;
 
     /// True from a confirmed sign-in (or a restore that could not reach the control plane, where
     /// the credential is kept and trusted) until sign-out. This - not `m_identity`, which an

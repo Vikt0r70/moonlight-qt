@@ -55,6 +55,7 @@
 #include <QWindow>
 
 #include "seathub/control_plane_client.h"
+#include "seathub/countries.h"
 #include "seathub/duration_text.h"
 #include "seathub/engine_session.h"
 #include "seathub/moonlight_engine_session.h"
@@ -63,6 +64,7 @@
 #include "seathub/session_lifecycle.h"
 #include "seathub/teardown_controller.h"
 #include "seathub/token_store.h"
+#include "seathub/web_origin.h"
 
 // ---------------------------------------------------------------- the two stitched seams -------
 //
@@ -177,6 +179,27 @@ public:
         QMutexLocker lock(&m_mutex);
         m_logoutStatus = status;
     }
+    /// What `POST /api/auth/login` answers (status 0 is a transport failure).
+    void answerLogin(int status, const QByteArray& body)
+    {
+        QMutexLocker lock(&m_mutex);
+        m_loginStatus = status;
+        m_loginBody = body;
+    }
+
+    /// What `POST /api/auth/otp/request` answers (status 0 is a transport failure).
+    void answerOtpRequest(int status)
+    {
+        QMutexLocker lock(&m_mutex);
+        m_otpRequestStatus = status;
+    }
+
+    /// The body the last request for `path` carried.
+    QByteArray bodyFor(const QString& path) const
+    {
+        QMutexLocker lock(&m_mutex);
+        return m_bodies.value(path);
+    }
 
     /// The `Authorization` header the last request for `path` carried.
     QByteArray authorizationFor(const QString& path) const
@@ -186,15 +209,22 @@ public:
     }
 
 protected:
-    QNetworkReply* createRequest(Operation, const QNetworkRequest& request, QIODevice*) override
+    QNetworkReply* createRequest(Operation, const QNetworkRequest& request,
+                                 QIODevice* outgoing) override
     {
         const QString path = request.url().path();
-        int meStatus, walletStatus, logoutStatus;
-        QByteArray meBody, walletBody;
+        int meStatus, walletStatus, logoutStatus, loginStatus, otpRequestStatus;
+        QByteArray meBody, walletBody, loginBody;
         {
             QMutexLocker lock(&m_mutex);
             m_paths.append(path);
             m_auth.insert(path, request.rawHeader("Authorization"));
+            if (outgoing) {
+                m_bodies.insert(path, outgoing->peek(outgoing->size()));
+            }
+            loginStatus = m_loginStatus;
+            loginBody = m_loginBody;
+            otpRequestStatus = m_otpRequestStatus;
             meStatus = m_meStatus;
             meBody = m_meBody;
             walletStatus = m_walletStatus;
@@ -210,6 +240,12 @@ protected:
         }
         if (path == QLatin1String("/api/auth/logout")) {
             return new FakeReply(logoutStatus, QByteArray(), this);
+        }
+        if (path == QLatin1String("/api/auth/login")) {
+            return new FakeReply(loginStatus, loginBody, this);
+        }
+        if (path == QLatin1String("/api/auth/otp/request")) {
+            return new FakeReply(otpRequestStatus, QByteArrayLiteral("{}"), this);
         }
         if (path == QLatin1String("/api/auth/otp/verify")) {
             return new FakeReply(200, QByteArrayLiteral("{\"access_token\":\"sb_at_from_otp\"}"), this);
@@ -245,6 +281,10 @@ private:
     mutable QMutex m_mutex;
     QStringList m_paths;
     QHash<QString, QByteArray> m_auth;
+    QHash<QString, QByteArray> m_bodies;
+    int m_loginStatus = 200;
+    QByteArray m_loginBody;
+    int m_otpRequestStatus = 200;
     int m_meStatus = 200;
     QByteArray m_meBody;
     int m_walletStatus = 200;
@@ -765,6 +805,230 @@ private slots:
         QTRY_COMPARE_WITH_TIMEOUT(client.balanceText(), QStringLiteral("1 h 30 min"), 15000);
         QCOMPARE(m_fake->authorizationFor(QStringLiteral("/api/wallet")),
                  QByteArrayLiteral("Bearer sb_at_from_otp"));
+    }
+
+    // --- Phase 5 plan 06: the email-and-password route and the website links --------------------
+
+    static QByteArray refusalBody(const QString& sentence, const QString& reference)
+    {
+        QJsonObject body;
+        body.insert(QStringLiteral("error"), sentence);
+        body.insert(QStringLiteral("reference"), reference);
+        return QJsonDocument(body).toJson(QJsonDocument::Compact);
+    }
+
+    void aPasswordSignInStoresTheCredentialTheSameWayTheCodePathDoesAndReachesHome()
+    {
+        SeatHubClient client;
+        isolateStore(client);
+        armControlPlane(client);
+        m_fake->answerLogin(200, QByteArrayLiteral("{\"access_token\":\"sb_at_from_login\"}"));
+        m_fake->answerWallet(200, walletBody(45));
+        // A 0.1.x install left a credential in the old slot: two at rest would let a later launch
+        // restore the wrong one.
+        QVERIFY(client.credentialStore()->storeToken(TokenStore::refreshTokenName(),
+                                                     QStringLiteral("sb_rt_OLD-SLOT")));
+
+        QSignalSpy accepted(&client, &SeatHubClient::passwordSignInAccepted);
+        QSignalSpy rejected(&client, &SeatHubClient::passwordSignInRejected);
+
+        // Surrounding space is not part of an identifier; nothing else is normalised.
+        client.signInWithPassword(QStringLiteral("  Lina@Example.com "),
+                                  QStringLiteral("correct horse battery"));
+        QTRY_COMPARE_WITH_TIMEOUT(client.appState(), QStringLiteral("home"), 15000);
+
+        QCOMPARE(accepted.count(), 1);
+        QCOMPARE(rejected.count(), 0);
+
+        // The account sign-in route, unauthenticated, with the identifier as typed.
+        QVERIFY(m_fake->requestPaths().contains(QStringLiteral("/api/auth/login")));
+        QVERIFY(m_fake->authorizationFor(QStringLiteral("/api/auth/login")).isEmpty());
+        const QJsonObject sent = QJsonDocument::fromJson(
+            m_fake->bodyFor(QStringLiteral("/api/auth/login"))).object();
+        QCOMPARE(sent.value(QStringLiteral("identifier")).toString(),
+                 QStringLiteral("Lina@Example.com"));
+        QCOMPARE(sent.value(QStringLiteral("password")).toString(),
+                 QStringLiteral("correct horse battery"));
+
+        // The credential is stored exactly as the code path stores it: the access slot, nothing in
+        // the old refresh slot, and the same bearer on the next request.
+        QCOMPARE(client.credentialStore()->retrieveToken(TokenStore::accessTokenName()),
+                 QStringLiteral("sb_at_from_login"));
+        QVERIFY(!client.credentialStore()->hasToken(TokenStore::refreshTokenName()));
+        QCOMPARE(client.identity(), QStringLiteral("Lina@Example.com"));
+        QTRY_COMPARE_WITH_TIMEOUT(client.balanceText(), QStringLiteral("45 min"), 15000);
+        QCOMPARE(m_fake->authorizationFor(QStringLiteral("/api/wallet")),
+                 QByteArrayLiteral("Bearer sb_at_from_login"));
+
+        // The password is nowhere on disk in the clear (the store holds DPAPI blobs only).
+        const QStringList files = QDir(m_dir->path()).entryList(QDir::Files);
+        for (const QString& name : files) {
+            QFile blob(QDir(m_dir->path()).filePath(name));
+            QVERIFY(blob.open(QIODevice::ReadOnly));
+            const QByteArray bytes = blob.readAll();
+            QVERIFY(!bytes.contains("correct horse battery"));
+            QVERIFY(!bytes.contains("sb_at_from_login"));
+        }
+    }
+
+    void eachPasswordRefusalIsShownVerbatimWithItsReference_data()
+    {
+        QTest::addColumn<int>("status");
+        QTest::addColumn<QString>("sentence");
+        QTest::addColumn<QString>("reference");
+
+        QTest::newRow("no-account") << 404
+                                    << QStringLiteral("No account uses that email or phone.")
+                                    << QStringLiteral("SH-3K2XQ1");
+        QTest::newRow("wrong-password") << 401 << QStringLiteral("That password is wrong.")
+                                        << QStringLiteral("SH-4F7KQ2");
+        QTest::newRow("disabled")
+            << 403 << QString::fromUtf16(u"That account is disabled \u2014 contact support.")
+            << QStringLiteral("SH-5M8NP3");
+    }
+
+    void eachPasswordRefusalIsShownVerbatimWithItsReference()
+    {
+        QFETCH(int, status);
+        QFETCH(QString, sentence);
+        QFETCH(QString, reference);
+
+        SeatHubClient client;
+        isolateStore(client);
+        armControlPlane(client);
+        m_fake->answerLogin(status, refusalBody(sentence, reference));
+
+        QSignalSpy accepted(&client, &SeatHubClient::passwordSignInAccepted);
+        QSignalSpy rejected(&client, &SeatHubClient::passwordSignInRejected);
+
+        client.signInWithPassword(QStringLiteral("lina@example.com"), QStringLiteral("hunter22hunter"));
+        QTRY_COMPARE_WITH_TIMEOUT(rejected.count(), 1, 15000);
+
+        QCOMPARE(rejected.first().at(0).toString(), sentence);
+        QCOMPARE(rejected.first().at(1).toString(), reference);
+        QCOMPARE(accepted.count(), 0);
+        // A refusal signs nobody in and stores nothing.
+        QVERIFY(client.appState() != QStringLiteral("home"));
+        QVERIFY(!client.credentialStore()->hasToken(TokenStore::accessTokenName()));
+        QVERIFY(!client.controlPlane()->hasAccessToken());
+    }
+
+    void aPasswordSignInThatNeverReachesTheServerSaysTheOfflineSentence()
+    {
+        SeatHubClient client;
+        isolateStore(client);
+        armControlPlane(client);
+        m_fake->answerLogin(0, QByteArray());
+
+        QSignalSpy rejected(&client, &SeatHubClient::passwordSignInRejected);
+        client.signInWithPassword(QStringLiteral("lina@example.com"), QStringLiteral("hunter22hunter"));
+        QTRY_COMPARE_WITH_TIMEOUT(rejected.count(), 1, 15000);
+
+        QCOMPARE(rejected.first().at(0).toString(),
+                 QStringLiteral("We couldn't reach SevenHills. Try again in a moment."));
+        QVERIFY(rejected.first().at(1).toString().isEmpty());
+        QVERIFY(!client.credentialStore()->hasToken(TokenStore::accessTokenName()));
+    }
+
+    void anEmptyIdentifierOrPasswordIsNamedBeforeAnythingIsSent()
+    {
+        SeatHubClient client;
+        isolateStore(client);
+        armControlPlane(client);
+
+        QSignalSpy rejected(&client, &SeatHubClient::passwordSignInRejected);
+        client.signInWithPassword(QStringLiteral("   "), QStringLiteral("hunter22hunter"));
+        client.signInWithPassword(QStringLiteral("lina@example.com"), QString());
+
+        QCOMPARE(rejected.count(), 2);
+        QCOMPARE(rejected.at(0).at(0).toString(), QStringLiteral("Enter your email or phone number."));
+        QCOMPARE(rejected.at(1).at(0).toString(), QStringLiteral("Enter your password."));
+        QVERIFY2(!m_fake->requestPaths().contains(QStringLiteral("/api/auth/login")),
+                 "a field-level mistake must not cost a round trip");
+    }
+
+    void theCodePathSaysTheOfflineSentenceToo()
+    {
+        SeatHubClient client;
+        isolateStore(client);
+        armControlPlane(client);
+        m_fake->answerOtpRequest(0);
+
+        QSignalSpy rejected(&client, &SeatHubClient::otpRejected);
+        client.requestOtp(QStringLiteral("+962790000000"));
+        QTRY_COMPARE_WITH_TIMEOUT(rejected.count(), 1, 15000);
+        QCOMPARE(rejected.first().at(0).toString(),
+                 QStringLiteral("We couldn't reach SevenHills. Try again in a moment."));
+        QVERIFY(rejected.first().at(1).toString().isEmpty());
+    }
+
+    void aNationalNumberWithNoCountryIsRefusedLocallyAndNamed()
+    {
+        SeatHubClient client;
+        isolateStore(client);
+        armControlPlane(client);
+
+        QSignalSpy rejected(&client, &SeatHubClient::otpRejected);
+        client.requestOtp(QStringLiteral("0790000000"));
+        QCOMPARE(rejected.count(), 1);
+        QCOMPARE(rejected.first().at(0).toString(),
+                 QStringLiteral("That doesn't look like a phone number."));
+        QVERIFY(!m_fake->requestPaths().contains(QStringLiteral("/api/auth/otp/request")));
+    }
+
+    void theWebsiteLinksAreTheSpecsAddressesAndCarryNoCredential()
+    {
+        SeatHubClient client;
+        isolateStore(client);
+        armControlPlane(client);
+        m_fake->answerMe(200, accountBody());
+        m_fake->answerWallet(200, walletBody(10));
+        client.credentialStore()->storeToken(TokenStore::accessTokenName(),
+                                             QStringLiteral("opaque-access-token"));
+        client.restoreSession();
+        QTRY_COMPARE_WITH_TIMEOUT(client.appState(), QStringLiteral("home"), 15000);
+
+        QCOMPARE(client.websiteUrl(QStringLiteral("signup")),
+                 QStringLiteral("https://sevenhills.damra.co/login?mode=signup"));
+        QCOMPARE(client.websiteUrl(QStringLiteral("reset")),
+                 QStringLiteral("https://sevenhills.damra.co/forgot-password"));
+        QCOMPARE(client.websiteUrl(QStringLiteral("topup")),
+                 QStringLiteral("https://sevenhills.damra.co/topup"));
+        QVERIFY(client.websiteUrl(QStringLiteral("anywhere-else")).isEmpty());
+
+        // What would open is recorded, not launched.
+        QList<QUrl> opened;
+        client.setUrlOpener([&opened](const QUrl& url) {
+            opened.append(url);
+            return true;
+        });
+        QVERIFY(client.openWebsite(QStringLiteral("signup")));
+        QVERIFY(client.openWebsite(QStringLiteral("reset")));
+        QVERIFY(!client.openWebsite(QStringLiteral("anywhere-else")));
+        QCOMPARE(opened.size(), 2);
+
+        // Signed in, with a credential in memory and on disk - and no address holds any of it: no
+        // token, no identity, and no query beyond the one `signup` path the spec records.
+        for (const QUrl& url : opened) {
+            const QString text = url.toString();
+            QVERIFY2(!text.contains(QStringLiteral("opaque-access-token")), qPrintable(text));
+            QVERIFY2(!text.contains(QStringLiteral("lina")), qPrintable(text));
+            QVERIFY2(!text.contains(QStringLiteral("6f1c6f5e")), qPrintable(text));
+            QVERIFY2(!text.contains(QStringLiteral("token"), Qt::CaseInsensitive), qPrintable(text));
+        }
+        QCOMPARE(opened.at(0).query(), QStringLiteral("mode=signup"));
+        QVERIFY(opened.at(1).query().isEmpty());
+    }
+
+    void theFacadeHandsTheScreenTheBundledCountriesAndARegionThatIsOneOfThem()
+    {
+        SeatHubClient client;
+        QCOMPARE(client.countries().size(), SeatHubCountries::all().size());
+        QVERIFY(client.countries().size() > 0);
+        QVERIFY(SeatHubCountries::contains(client.defaultCountryCode()));
+        QCOMPARE(client.toE164(QStringLiteral("0790000000"), QStringLiteral("+962")),
+                 QStringLiteral("+962790000000"));
+        QCOMPARE(client.toE164(QStringLiteral("0790000000"), QString()), QString());
     }
 
     void signOutRevokesOnTheServerThenClearsTheStore()

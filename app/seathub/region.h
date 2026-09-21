@@ -29,3 +29,12 @@ QString localeRegion();
 QString initialCountryCode();
 
 } // namespace SeatHubRegion
+
+namespace SeatHubSystem {
+
+/// False when Windows' "Animation effects" setting is off (Settings > Accessibility > Visual
+/// effects), in which case the sign-in field's country tag appears and hides without a transition
+/// (`screens.md` §22). True on every other platform and whenever the setting cannot be read.
+bool animationEffectsEnabled();
+
+} // namespace SeatHubSystem

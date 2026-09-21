@@ -31,6 +31,10 @@ Button {
     /// nothing on the page moves when work starts.
     property bool busy: false
 
+    /// A trailing glyph after the label, for a control that leaves the app (the website links carry
+    /// the external-link arrow). Decoration only: the accessible name stays the label.
+    property string glyph: ""
+
     readonly property bool isGhost: root.variant === "ghost"
     readonly property bool isDestructive: root.variant === "destructive"
 
@@ -66,6 +70,15 @@ Button {
                                  : (root.isDestructive ? Tokens.destructiveForegroundDefault
                                                        : (root.isGhost ? Tokens.foregroundMutedDefault
                                                                        : Tokens.primaryForegroundDefault))
+            font.family: Tokens.fontSansDefault
+            font.pixelSize: root.isGhost ? Metrics.fontCaption : Metrics.fontBody
+            anchors.verticalCenter: parent.verticalCenter
+        }
+
+        Text {
+            visible: root.glyph.length > 0
+            text: root.glyph
+            color: Tokens.foregroundMutedDefault
             font.family: Tokens.fontSansDefault
             font.pixelSize: root.isGhost ? Metrics.fontCaption : Metrics.fontBody
             anchors.verticalCenter: parent.verticalCenter
