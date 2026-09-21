@@ -205,11 +205,20 @@ jobs:
         if: steps.creds.outputs.ok == 'true'
         env:
           VPS: ${{ secrets.SEATHUB_VPS_HOST }}
+          VPS_KEY: ${{ secrets.SEATHUB_VPS_KEY }}
         run: |
           mkdir -p ~/.ssh
-          printf '%s\n' "${{ secrets.SEATHUB_VPS_KEY }}" > ~/.ssh/id_ed25519
+          printf '%s\n' "$VPS_KEY" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
-          ssh-keyscan -H "${VPS#*@}" >> ~/.ssh/known_hosts 2>/dev/null
+          if [ ! -s ~/.ssh/id_ed25519 ]; then
+            echo "::error::SEATHUB_VPS_KEY is empty. Set it from the private key file: gh secret set SEATHUB_VPS_KEY --repo Vikt0r70/moonlight-qt < path/to/key"
+            exit 1
+          fi
+          # ssh-keyscan is best-effort host-key pre-seeding; a failure must NOT abort the job (the
+          # step runs under `bash -e`). StrictHostKeyChecking=accept-new on the ssh/scp calls below
+          # covers first contact either way.
+          host="${VPS##*@}"; host="${host%%[[:space:]]*}"
+          ssh-keyscan -H "$host" >> ~/.ssh/known_hosts 2>/dev/null || echo "::warning::ssh-keyscan could not pre-seed the host key; relying on accept-new."
 
       - name: Upload the installer to the VPS
         if: steps.creds.outputs.ok == 'true'
@@ -218,9 +227,9 @@ jobs:
           INSTALLER: ${{ steps.artifact.outputs.installer }}
         run: |
           set -euo pipefail
-          ssh -o BatchMode=yes "$VPS" 'mkdir -p ~/seathub/downloads'
-          scp -o BatchMode=yes "dist/$INSTALLER" "$VPS:~/seathub/downloads/"
-          ssh -o BatchMode=yes "$VPS" "chmod 644 ~/seathub/downloads/'$INSTALLER'"
+          ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new "$VPS" 'mkdir -p ~/seathub/downloads'
+          scp -o BatchMode=yes -o StrictHostKeyChecking=accept-new "dist/$INSTALLER" "$VPS:~/seathub/downloads/"
+          ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new "$VPS" "chmod 644 ~/seathub/downloads/'$INSTALLER'"
 
       - name: Prove the download works
         if: steps.creds.outputs.ok == 'true'
