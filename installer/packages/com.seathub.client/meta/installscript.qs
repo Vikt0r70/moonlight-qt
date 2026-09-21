@@ -49,6 +49,17 @@ Component.prototype.createOperations = function()
 {
     component.createOperations();
 
+    // Start Menu shortcut so the installed client is launchable from Search / All apps, not only by
+    // navigating to Program Files. Per-machine install (D-42), so it lands in the All Users Programs
+    // folder (@AllUsersStartMenuProgramsPath@ is a documented predefined variable). IFW undoes the
+    // operations added here on uninstall, so the shortcut needs no separate cleanup registration.
+    component.addOperation("CreateShortcut",
+                           "@TargetDir@/SeatHub.exe",
+                           "@AllUsersStartMenuProgramsPath@/SeatHub.lnk",
+                           "workingDirectory=@TargetDir@",
+                           "iconPath=@TargetDir@/SeatHub.exe",
+                           "description=SeatHub");
+
     var paths = [
         // %APPDATA%\Seven Hills\SeatHub - where TokenStore actually puts the encrypted credentials.
         statePath("APPDATA", "/Seven Hills/SeatHub")

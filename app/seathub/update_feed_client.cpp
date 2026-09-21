@@ -17,6 +17,14 @@
 #include <QStandardPaths>
 #include <QUrl>
 
+#ifdef Q_OS_WIN
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <shellapi.h>
+#endif
+
 Q_LOGGING_CATEGORY(seathubUpdates, "seathub.updates")
 
 namespace {
@@ -436,7 +444,20 @@ bool UpdateFeedClient::installDownloaded()
     // The installer is unsigned (D-43), so Windows shows its own SmartScreen warning, and the
     // per-machine install raises a UAC prompt (D-42). Both are expected, not defects. No
     // arguments are invented for it - the installer's own flow runs as published.
+#ifdef Q_OS_WIN
+    // The installer's manifest requires administrator (per-machine, D-42). CreateProcess - which
+    // QProcess::startDetached uses - cannot launch an elevation-required binary; it fails with
+    // ERROR_ELEVATION_REQUIRED and the update hangs at "Starting the installer". Only
+    // ShellExecute's "runas" verb raises the UAC prompt that lets the install proceed.
+    const QString nativePath = QDir::toNativeSeparators(m_downloadedPath);
+    const std::wstring exePath = nativePath.toStdWString();
+    const HINSTANCE rc =
+        ShellExecuteW(nullptr, L"runas", exePath.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+    // ShellExecute returns a value <= 32 on failure (including the user declining the UAC prompt).
+    const bool started = (reinterpret_cast<INT_PTR>(rc) > 32);
+#else
     const bool started = QProcess::startDetached(m_downloadedPath, QStringList());
+#endif
     if (!started) {
         finishWithError(QStringLiteral("The installer couldn't be started."), QString());
         return false;
