@@ -22,6 +22,10 @@ INCLUDEPATH += $$PWD/.. $$PWD/../app
 
 DEFINES += FORK_ROOT=\\\"$$PWD/..\\\"
 
+# ShellExecuteW - the elevated installer launch (D-42) - lives in shell32. A console testcase does
+# not get it from qmake's defaults, so without this the suite stops linking.
+win32: LIBS += -lshell32
+
 SOURCES += tst_update_feed.cpp \
     ../app/seathub/update_feed_client.cpp \
     ../app/seathub/error_map.cpp

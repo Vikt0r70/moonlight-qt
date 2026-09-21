@@ -28,7 +28,8 @@ INCLUDEPATH += $$PWD/.. $$PWD/../app
 
 win32 {
     INCLUDEPATH += $$PWD/../libs/windows/include $$PWD/../libs/windows/include/x64
-    LIBS += -L$$PWD/../libs/windows/lib/x64 -lSDL2 -lcrypt32
+    # shell32: ShellExecuteW, the update feed client's elevated installer launch (D-42).
+    LIBS += -L$$PWD/../libs/windows/lib/x64 -lSDL2 -lcrypt32 -lshell32
 }
 
 SOURCES += \
