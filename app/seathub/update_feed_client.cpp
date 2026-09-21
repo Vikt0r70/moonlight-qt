@@ -35,6 +35,7 @@ const char* kStateAvailable = "available";
 const char* kStateDownloading = "downloading";
 const char* kStateVerifying = "verifying";
 const char* kStateReady = "ready";
+const char* kStateInstalling = "installing";
 const char* kStateFailed = "failed";
 
 const char* kNoChecksum =
@@ -102,6 +103,7 @@ QString normalizedVersion(const QString& version)
 UpdateFeedClient::UpdateFeedClient(QObject* parent)
     : QObject(parent),
       m_network(new QNetworkAccessManager(this)),
+      m_launcher(&UpdateFeedClient::launchInstaller),
       m_baseUrl(defaultBaseUrl()),
       m_installedVersion(QString::fromLatin1(SEATHUB_VERSION)),
       m_state(QString::fromLatin1(kStateIdle))
@@ -418,9 +420,17 @@ bool UpdateFeedClient::downloadUpdate(const QString& url, const QString& expecte
         m_progress = 100;
         emit progressChanged();
         emit readyToInstallChanged();
-        emit verified(m_available.value(QStringLiteral("version")).toString(), path);
+        // "ready" before `verified`, so anything answering the signal sees the state it describes.
         setState(QString::fromLatin1(kStateReady));
         qCInfo(seathubUpdates) << "update verified against its expected checksum";
+        emit verified(m_available.value(QStringLiteral("version")).toString(), path);
+
+        // One press carries through (D-41: the modal has a single action, and it started this
+        // download). Nothing else ever called installDownloaded() once the modal went busy, so the
+        // update stopped here with the modal claiming the installer was starting. Queued, not
+        // called inline: the launch blocks while the UAC prompt is up (D-42), which does not belong
+        // inside a network reply's finished handler, and the hop lets the view take "ready" first.
+        QMetaObject::invokeMethod(this, [this]() { installDownloaded(); }, Qt::QueuedConnection);
     });
 
     return true;
@@ -429,6 +439,10 @@ bool UpdateFeedClient::downloadUpdate(const QString& url, const QString& expecte
 bool UpdateFeedClient::installDownloaded()
 {
     if (m_streaming || m_downloadedPath.isEmpty()) {
+        return false;
+    }
+    if (m_state == QLatin1String(kStateInstalling)) {
+        // Already launching: a second start would raise a second UAC prompt for the same update.
         return false;
     }
     if (!verifyFileChecksum(m_downloadedPath, m_expectedSha256)) {
@@ -441,6 +455,31 @@ bool UpdateFeedClient::installDownloaded()
         return false;
     }
 
+    // "installing" is set here and nowhere else - where the launch is actually attempted - so the
+    // modal's "Starting the installer" copy is never shown for a launch that has not happened.
+    clearFailure();
+    setState(QString::fromLatin1(kStateInstalling));
+    qCInfo(seathubUpdates) << "starting the installer" << QDir::toNativeSeparators(m_downloadedPath);
+
+    const bool started = m_launcher(m_downloadedPath);
+    if (!started) {
+        // A declined UAC prompt or a failed start. The modal shows why it stopped, and the
+        // verified package is kept, so Try again re-runs the launch (re-verifying first) rather
+        // than downloading the installer again. The failure is this PC's, not the network's.
+        qCWarning(seathubUpdates) << "the installer did not start";
+        setFailure(SeatHubFailure::local(QStringLiteral("The installer couldn't be started."))
+                       .toVariantMap());
+        setState(QString::fromLatin1(kStateFailed));
+        return false;
+    }
+
+    qCInfo(seathubUpdates) << "installer launched; asking the application to quit";
+    emit installRequested();
+    return true;
+}
+
+bool UpdateFeedClient::launchInstaller(const QString& path)
+{
     // The installer is unsigned (D-43), so Windows shows its own SmartScreen warning, and the
     // per-machine install raises a UAC prompt (D-42). Both are expected, not defects. No
     // arguments are invented for it - the installer's own flow runs as published.
@@ -449,23 +488,22 @@ bool UpdateFeedClient::installDownloaded()
     // QProcess::startDetached uses - cannot launch an elevation-required binary; it fails with
     // ERROR_ELEVATION_REQUIRED and the update hangs at "Starting the installer". Only
     // ShellExecute's "runas" verb raises the UAC prompt that lets the install proceed.
-    const QString nativePath = QDir::toNativeSeparators(m_downloadedPath);
+    const QString nativePath = QDir::toNativeSeparators(path);
     const std::wstring exePath = nativePath.toStdWString();
     const HINSTANCE rc =
         ShellExecuteW(nullptr, L"runas", exePath.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+    const DWORD lastError = GetLastError();
     // ShellExecute returns a value <= 32 on failure (including the user declining the UAC prompt).
     const bool started = (reinterpret_cast<INT_PTR>(rc) > 32);
-#else
-    const bool started = QProcess::startDetached(m_downloadedPath, QStringList());
-#endif
     if (!started) {
-        finishWithError(QStringLiteral("The installer couldn't be started."), QString());
-        return false;
+        // Both numbers, so the log tells a declined prompt from a missing or blocked file.
+        qCWarning(seathubUpdates) << "ShellExecuteW(runas) failed: code"
+                                  << reinterpret_cast<INT_PTR>(rc) << "last error" << lastError;
     }
-
-    qCInfo(seathubUpdates) << "installer launched; asking the application to quit";
-    emit installRequested();
-    return true;
+#else
+    const bool started = QProcess::startDetached(path, QStringList());
+#endif
+    return started;
 }
 
 // ------------------------------------------------------------------------------------ state

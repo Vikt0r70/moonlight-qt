@@ -4,6 +4,8 @@
 #include <QString>
 #include <QVariantMap>
 
+#include <functional>
+
 class QNetworkAccessManager;
 class QNetworkReply;
 class QFile;
@@ -32,7 +34,9 @@ class UpdateFeedClient : public QObject
 {
     Q_OBJECT
 
-    /// idle | checking | available | downloading | verifying | ready | failed
+    /// idle | checking | available | downloading | verifying | ready | installing | failed
+    /// `ready` is transient: a verified download moves on to `installing` by itself. `installing`
+    /// is set only when the installer's launch is actually attempted.
     Q_PROPERTY(QString state READ state NOTIFY stateChanged)
     /// version, url, sha256, notes, rollback. Empty when there is nothing to offer.
     Q_PROPERTY(QVariantMap availableUpdate READ availableUpdate NOTIFY availableUpdateChanged)
@@ -78,6 +82,8 @@ public:
     /// Launches the verified installer and asks the application to quit so the installer can
     /// replace it. The installer is unsigned (D-43), so Windows shows its own SmartScreen
     /// warning and the per-machine install raises a UAC prompt (D-42) - both expected.
+    /// Runs by itself once a download verifies (one press, D-41). Callers only need it to retry
+    /// a launch that failed - a declined UAC prompt - while the verified package is still on disk.
     Q_INVOKABLE bool installDownloaded();
 
     QString state() const { return m_state; }
@@ -88,6 +94,12 @@ public:
     bool blockedBySession() const { return m_streaming; }
     bool readyToInstall() const { return !m_downloadedPath.isEmpty(); }
     QString downloadedPath() const { return m_downloadedPath; }
+
+    /// Starts the verified installer at `path`; false when it did not start (including a declined
+    /// UAC prompt). The default is `launchInstaller`. Tests replace it so that no real installer
+    /// runs and no UAC prompt is raised.
+    using InstallerLauncher = std::function<bool(const QString& path)>;
+    void setInstallerLauncher(InstallerLauncher launcher) { m_launcher = std::move(launcher); }
 
     void setInstalledVersion(const QString& version);
     void setPinnedSha256(const QString& sha256) { m_pinnedSha256 = sha256; }
@@ -109,12 +121,16 @@ signals:
     void blockedBySessionChanged();
     void readyToInstallChanged();
     void checkFinished();
-    /// Emitted after a verified download, so the modal can move to its install step.
+    /// Emitted after a verified download. The client starts the installer itself straight after;
+    /// nothing has to answer this for the update to proceed.
     void verified(QString version, QString path);
     /// The application should exit so the installer can replace the running binary.
     void installRequested();
 
 private:
+    /// The production launcher: an elevated start of the per-machine installer (D-42).
+    static bool launchInstaller(const QString& path);
+
     void setState(const QString& state);
     void setFailure(const QVariantMap& failure);
     void clearFailure();
@@ -124,6 +140,7 @@ private:
     QNetworkAccessManager* m_network = nullptr;
     QNetworkReply* m_reply = nullptr;
     QFile* m_downloadFile = nullptr;
+    InstallerLauncher m_launcher;
 
     QString m_baseUrl;
     QString m_installedVersion;

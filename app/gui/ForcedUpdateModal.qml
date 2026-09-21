@@ -33,10 +33,13 @@ Item {
     readonly property bool hasOffer: offeredVersion.length > 0
     // D-41 + Pitfall 8: nothing while a stream is running.
     readonly property bool shown: hasOffer && updates.blockedBySession !== true
+    // `ready` is a verified download on its way to `installing`: the client starts the installer
+    // by itself, because the one press that began the download is the only one there is (D-41).
     readonly property bool busy: updates !== null && updates !== undefined
                                  && (updates.state === "downloading"
                                      || updates.state === "verifying"
-                                     || updates.state === "ready")
+                                     || updates.state === "ready"
+                                     || updates.state === "installing")
 
     anchors.fill: parent
     visible: shown
@@ -146,11 +149,14 @@ Item {
                 spacing: Metrics.s1
                 visible: modal.busy
 
+                // "Starting the installer" only while the launch is really being attempted
+                // (`installing`); a verified download that has not been launched yet still reads
+                // as the finished check, so the copy never claims a launch that has not happened.
                 Text {
-                    text: updates && updates.state === "verifying"
-                          ? qsTr("Checking the download: %1%").arg(updates.progress)
-                          : (updates && updates.state === "ready"
-                             ? qsTr("Starting the installer\u2026")
+                    text: updates && updates.state === "installing"
+                          ? qsTr("Starting the installer\u2026")
+                          : (updates && (updates.state === "verifying" || updates.state === "ready")
+                             ? qsTr("Checking the download: %1%").arg(updates.progress)
                              : qsTr("Downloading: %1%").arg(updates ? updates.progress : 0))
                     color: Tokens.foregroundMutedDefault
                     font.family: Tokens.fontMonoDefault
@@ -223,15 +229,19 @@ Item {
                 onClicked: {
                     if (updates === null || updates === undefined)
                         return
-                    if (updates.state === "available" || updates.state === "failed") {
+                    if (updates.state === "failed" && updates.readyToInstall === true) {
+                        // The launch failed (usually a declined UAC prompt) but the verified
+                        // package is still on disk: Try again re-runs the launch, which re-checks
+                        // the digest first, instead of downloading the whole installer again.
+                        updates.installDownloaded()
+                    }
+                    else if (updates.state === "available" || updates.state === "failed") {
                         // The digest the offer carries is the one baked in from the release pin
                         // at release prep. When it is empty the client refuses to install and
-                        // says so, rather than running an unverified binary (D-43).
+                        // says so, rather than running an unverified binary (D-43). A verified
+                        // download goes on to launch the installer by itself.
                         updates.downloadUpdate(String(updates.availableUpdate.url),
                                                String(updates.availableUpdate.sha256))
-                    }
-                    else if (updates.state === "ready") {
-                        updates.installDownloaded()
                     }
                 }
             }

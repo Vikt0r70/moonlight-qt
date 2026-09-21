@@ -21,6 +21,7 @@
 #include <QQmlEngine>
 #include <QQuickItem>
 #include <QQuickStyle>
+#include <QSignalSpy>
 #include <QTemporaryDir>
 #include <QUrl>
 
@@ -68,6 +69,36 @@ QQuickItem* hostItem(QObject* modal)
     item->setParentItem(host);
     return item;
 }
+
+// NIST's published SHA-256 vector for "abc".
+const char* const kAbcSha256 = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+
+// A stand-in "installer" served through QNetworkAccessManager's own file:// backend, so the real
+// download -> verify -> install path runs end to end without a socket or the real release feed.
+QString writeAbcPackage(const QString& directory, const QString& name)
+{
+    const QString path = directory + QLatin1Char('/') + name;
+    QFile file(path);
+    if (!file.open(QIODevice::WriteOnly)) {
+        return QString();
+    }
+    file.write(QByteArrayLiteral("abc"));
+    file.close();
+    return path;
+}
+
+// Every piece of text the modal currently shows, for asserting what the customer reads.
+QStringList visibleTexts(QObject* root)
+{
+    QStringList texts;
+    for (QObject* node : root->findChildren<QObject*>()) {
+        QQuickItem* item = qobject_cast<QQuickItem*>(node);
+        if (item != nullptr && node->inherits("QQuickText") && item->isVisible()) {
+            texts.append(node->property("text").toString());
+        }
+    }
+    return texts;
+}
 }
 
 // The forced-update modal reads the release client through these members only, so the QML tests
@@ -80,6 +111,7 @@ class FakeUpdates : public QObject
     Q_PROPERTY(int progress READ progress WRITE setProgress NOTIFY progressChanged)
     Q_PROPERTY(QVariantMap failure READ failure WRITE setFailure NOTIFY failureChanged)
     Q_PROPERTY(bool blockedBySession READ blockedBySession WRITE setBlockedBySession NOTIFY blockedBySessionChanged)
+    Q_PROPERTY(bool readyToInstall READ readyToInstall WRITE setReadyToInstall NOTIFY readyToInstallChanged)
 
 public:
     QString state() const { return m_state; }
@@ -92,6 +124,8 @@ public:
     void setFailure(const QVariantMap& failure) { m_failure = failure; emit failureChanged(); }
     bool blockedBySession() const { return m_blocked; }
     void setBlockedBySession(bool blocked) { m_blocked = blocked; emit blockedBySessionChanged(); }
+    bool readyToInstall() const { return m_readyToInstall; }
+    void setReadyToInstall(bool ready) { m_readyToInstall = ready; emit readyToInstallChanged(); }
 
     Q_INVOKABLE bool downloadUpdate(const QString&, const QString&) { ++m_downloads; return true; }
     Q_INVOKABLE bool downloadUpdate() { ++m_downloads; return true; }
@@ -106,6 +140,7 @@ signals:
     void progressChanged();
     void failureChanged();
     void blockedBySessionChanged();
+    void readyToInstallChanged();
 
 private:
     QString m_state = QStringLiteral("idle");
@@ -113,6 +148,7 @@ private:
     QVariantMap m_failure;
     int m_progress = 0;
     bool m_blocked = false;
+    bool m_readyToInstall = false;
     int m_downloads = 0;
     int m_installs = 0;
 };
@@ -131,6 +167,9 @@ private slots:
     void updatesAreBlockedDuringAStream();
     void forcedUpdateModalBlocksInteraction();
     void forcedUpdateModalIsNotShownDuringAStream();
+    void aVerifiedDownloadStartsTheInstallerWithoutASecondPress();
+    void aFailedLaunchIsShownAndTryAgainRetriesTheLaunch();
+    void forcedUpdateModalOnlySaysStartingWhileTheInstallerIsLaunched();
 
 private:
     QTemporaryDir m_dir;
@@ -400,6 +439,171 @@ void TstUpdateFeed::forcedUpdateModalIsNotShownDuringAStream()
     // Nothing to offer means nothing on screen, whatever the state says.
     updates.setAvailableUpdate(QVariantMap());
     QCOMPARE(root->property("visible").toBool(), false);
+}
+
+void TstUpdateFeed::aVerifiedDownloadStartsTheInstallerWithoutASecondPress()
+{
+    // The "hangs at Starting the installer" defect (WINDOWS #21, CUST-18): a verified download
+    // stopped in "ready" with the modal's only action disabled, so nothing ever launched the
+    // installer. The one press - the download - has to carry through to the launch on its own.
+    QVERIFY(m_dir.isValid());
+    const QString source = writeAbcPackage(m_dir.path(), QStringLiteral("tst_update_feed-auto.exe"));
+    QVERIFY(!source.isEmpty());
+
+    UpdateFeedClient client;
+    client.setBaseUrl(QStringLiteral("http://127.0.0.1:1"));
+
+    QStringList launchedPaths;
+    QStringList statesAtLaunch;
+    client.setInstallerLauncher([&](const QString& path) {
+        launchedPaths.append(path);
+        statesAtLaunch.append(client.state());
+        return true;
+    });
+    QSignalSpy verified(&client, &UpdateFeedClient::verified);
+    QSignalSpy requested(&client, &UpdateFeedClient::installRequested);
+
+    QVERIFY(client.downloadUpdate(QUrl::fromLocalFile(source).toString(),
+                                  QString::fromLatin1(kAbcSha256)));
+
+    QTRY_COMPARE(requested.count(), 1);
+    QCOMPARE(verified.count(), 1);
+    QCOMPARE(launchedPaths.size(), 1);
+    // The bytes that run are the bytes that were verified, and the launch happens in the one state
+    // whose copy says the installer is starting.
+    QCOMPARE(launchedPaths.first(), client.downloadedPath());
+    QCOMPARE(statesAtLaunch.first(), QStringLiteral("installing"));
+    QCOMPARE(client.state(), QStringLiteral("installing"));
+    QVERIFY(client.failure().isEmpty());
+
+    // Exactly one launch: nothing queued behind it starts the installer a second time.
+    QTest::qWait(100);
+    QCOMPARE(launchedPaths.size(), 1);
+    QCOMPARE(requested.count(), 1);
+
+    QFile::remove(client.downloadedPath());
+}
+
+void TstUpdateFeed::aFailedLaunchIsShownAndTryAgainRetriesTheLaunch()
+{
+    // A declined UAC prompt, or any other failed start, must end on a visible failure - never on
+    // "Starting the installer" forever. The verified package stays on disk, so Try again re-runs
+    // the launch (re-verifying first) instead of downloading the whole installer again.
+    QVERIFY(m_dir.isValid());
+    const QString source =
+        writeAbcPackage(m_dir.path(), QStringLiteral("tst_update_feed-declined.exe"));
+    QVERIFY(!source.isEmpty());
+
+    UpdateFeedClient client;
+    client.setBaseUrl(QStringLiteral("http://127.0.0.1:1"));
+
+    int attempts = 0;
+    bool starts = false;
+    client.setInstallerLauncher([&](const QString&) {
+        ++attempts;
+        return starts;
+    });
+    QSignalSpy requested(&client, &UpdateFeedClient::installRequested);
+
+    QVERIFY(client.downloadUpdate(QUrl::fromLocalFile(source).toString(),
+                                  QString::fromLatin1(kAbcSha256)));
+
+    QTRY_COMPARE(client.state(), QStringLiteral("failed"));
+    QCOMPARE(attempts, 1);
+    QCOMPARE(requested.count(), 0);
+    // Something on this machine failed, not the network, and the client invents no reference.
+    QCOMPARE(client.failure().value(QStringLiteral("kind")).toString(), QStringLiteral("local"));
+    QVERIFY(!client.failure().value(QStringLiteral("error")).toString().isEmpty());
+    QVERIFY2(client.failure().value(QStringLiteral("reference")).toString().isEmpty(),
+             "the client must not invent an ADR-0008 reference code");
+    QVERIFY(client.readyToInstall());
+
+    starts = true;
+    QVERIFY(client.installDownloaded());
+    QCOMPARE(attempts, 2);
+    QCOMPARE(requested.count(), 1);
+    QCOMPARE(client.state(), QStringLiteral("installing"));
+    QVERIFY(client.failure().isEmpty());
+
+    QFile::remove(client.downloadedPath());
+}
+
+void TstUpdateFeed::forcedUpdateModalOnlySaysStartingWhileTheInstallerIsLaunched()
+{
+    QQmlEngine engine;
+    qmlRegisterSingletonType(QUrl::fromLocalFile(guiDir() + QStringLiteral("/Tokens.qml")),
+                             "SeatHub.Tokens", 1, 0, "Tokens");
+    qmlRegisterSingletonType(QUrl::fromLocalFile(guiDir() + QStringLiteral("/Metrics.qml")),
+                             "SeatHub.Tokens", 1, 0, "Metrics");
+
+    QQmlComponent component(&engine, QUrl::fromLocalFile(guiDir() + QStringLiteral("/ForcedUpdateModal.qml")));
+    QScopedPointer<QObject> root(component.create());
+    if (!root) {
+        QFAIL(qPrintable(component.errorString()));
+    }
+    QVERIFY(hostItem(root.data()) != nullptr);
+
+    FakeUpdates updates;
+    QVariantMap offer;
+    offer.insert(QStringLiteral("version"), QStringLiteral("0.2.0"));
+    offer.insert(QStringLiteral("url"), QStringLiteral("https://example.invalid/a.exe"));
+    offer.insert(QStringLiteral("sha256"), QString::fromLatin1(kAbcSha256));
+    updates.setAvailableUpdate(offer);
+    updates.setState(QStringLiteral("downloading"));
+    QVERIFY(root->setProperty("updates", QVariant::fromValue(static_cast<QObject*>(&updates))));
+    QVERIFY(root->property("visible").toBool());
+
+    QList<QObject*> buttons;
+    for (QObject* node : root->findChildren<QObject*>()) {
+        if (node->inherits("QQuickButton")) {
+            buttons.append(node);
+        }
+    }
+    QCOMPARE(buttons.size(), 1);
+    QObject* action = buttons.first();
+
+    const QString starting = QStringLiteral("Starting the installer") + QChar(0x2026);
+    const QString launchFailed = QStringLiteral("The installer couldn't be started.");
+
+    // Verified, not yet launched: the copy may not claim a launch that has not been attempted.
+    updates.setProgress(100);
+    updates.setState(QStringLiteral("ready"));
+    QVERIFY2(!visibleTexts(root.data()).contains(starting),
+             qPrintable(QStringLiteral("state ready shows: ") + visibleTexts(root.data()).join(QStringLiteral(" | "))));
+    QCOMPARE(action->property("enabled").toBool(), false);
+
+    // The launch is under way: now, and only now, the copy says so, and there is nothing to press.
+    updates.setState(QStringLiteral("installing"));
+    QVERIFY2(visibleTexts(root.data()).contains(starting),
+             qPrintable(QStringLiteral("state installing shows: ") + visibleTexts(root.data()).join(QStringLiteral(" | "))));
+    QCOMPARE(root->property("busy").toBool(), true);
+    QCOMPARE(action->property("enabled").toBool(), false);
+
+    // The launch failed (a declined UAC prompt): the reason is on screen, the false "starting"
+    // line is gone, and Try again retries the launch of the package already verified on disk.
+    QVariantMap failure;
+    failure.insert(QStringLiteral("kind"), QStringLiteral("local"));
+    failure.insert(QStringLiteral("error"), launchFailed);
+    failure.insert(QStringLiteral("reference"), QString());
+    updates.setFailure(failure);
+    updates.setReadyToInstall(true);
+    updates.setState(QStringLiteral("failed"));
+    QVERIFY(!visibleTexts(root.data()).contains(starting));
+    QVERIFY(visibleTexts(root.data()).contains(launchFailed));
+    QCOMPARE(action->property("enabled").toBool(), true);
+    QCOMPARE(action->property("text").toString(), QStringLiteral("Try again"));
+
+    const int downloadsBefore = updates.downloads();
+    const int installsBefore = updates.installs();
+    QMetaObject::invokeMethod(action, "clicked");
+    QCOMPARE(updates.installs(), installsBefore + 1);
+    QCOMPARE(updates.downloads(), downloadsBefore);
+
+    // With no verified package on disk (a failed download or checksum), Try again downloads again.
+    updates.setReadyToInstall(false);
+    QMetaObject::invokeMethod(action, "clicked");
+    QCOMPARE(updates.downloads(), downloadsBefore + 1);
+    QCOMPARE(updates.installs(), installsBefore + 1);
 }
 
 QTEST_MAIN(TstUpdateFeed)

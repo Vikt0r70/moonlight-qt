@@ -245,6 +245,7 @@ class FakeUpdates : public QObject
     Q_PROPERTY(int progress READ progress NOTIFY changed)
     Q_PROPERTY(QVariantMap failure READ failure NOTIFY changed)
     Q_PROPERTY(bool blockedBySession READ blockedBySession NOTIFY changed)
+    Q_PROPERTY(bool readyToInstall READ readyToInstall NOTIFY changed)
 
 public:
     QString state() const { return m_state; }
@@ -252,6 +253,7 @@ public:
     int progress() const { return m_progress; }
     QVariantMap failure() const { return m_failure; }
     bool blockedBySession() const { return m_blockedBySession; }
+    bool readyToInstall() const { return false; }
 
     void offerUpdate()
     {
