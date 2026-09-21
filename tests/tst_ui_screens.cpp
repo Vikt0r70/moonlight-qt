@@ -190,8 +190,21 @@ class FakeShellClient : public QObject
     Q_PROPERTY(QVariantList countries READ countries CONSTANT)
     Q_PROPERTY(QString defaultCountryCode READ defaultCountryCode CONSTANT)
     Q_PROPERTY(bool animationEffects READ animationEffects CONSTANT)
+    Q_PROPERTY(bool liveSession READ liveSession NOTIFY liveSessionChanged)
 
 public:
+    bool liveSession() const { return m_liveSession; }
+    void setLiveSession(bool live)
+    {
+        m_liveSession = live;
+        emit liveSessionChanged();
+    }
+    void setIdentity(const QString& identity)
+    {
+        m_identity = identity;
+        emit identityChanged();
+    }
+
     QVariantList countries() const { return bundledCountries(); }
     QString defaultCountryCode() const { return QStringLiteral("JO"); }
     // Off: the field's reveal is instant, so a test reads the end state without waiting on a timer.
@@ -309,6 +322,7 @@ public:
 
 signals:
     void balanceChanged();
+    void liveSessionChanged();
     void homeStatusChanged();
     void endReasonTextChanged();
     void identityChanged();
@@ -333,6 +347,7 @@ private:
     QVariantMap m_failure;
     QString m_lastPhone;
     QString m_lastCode;
+    bool m_liveSession = false;
     int m_topUps = 0;
     int m_settingsOpens = 0;
     int m_starts = 0;
@@ -426,7 +441,12 @@ private slots:
     void metricsAreParsedFromTheGeneratedTokens();
     void everyShellScreenLoads();
     void homeScreenRendersEachHomeState();
+    void homePlayReadsResumeSessionWhileASessionIsLiveAndResumesIt();
+    void homeShowsTheServersRefusalVerbatimWithAQuietTopUpBeneathPlay();
+    void noHomeStateRendersACountAQueuePositionOrANotifyControl();
+    void homeWrapsLongSentencesAndNeverBreaksAReference();
     void homeScreenRendersTheSessionEndReason();
+    void theClientRaisesNoNotificationOfAnyKind();
     void homeNoLongerCarriesTheBalanceElement();
     void appHeaderCarriesTheWordmarkTheBalanceAndTheMenuInThatOrder();
     void theShellGivesEverySignedInViewTheHeaderAndNeitherSignInNorTheSplash();
@@ -574,6 +594,44 @@ void TstUiScreens::everyShellScreenLoads()
              "the retired 27-locale language switcher must not be in the resource");
 }
 
+namespace {
+
+// The buttons a screen shows, visible ones only.
+QList<QObject*> visibleButtons(QObject* root)
+{
+    QList<QObject*> buttons;
+    for (QObject* item : root->findChildren<QObject*>()) {
+        if (item->inherits("QQuickButton") && effectivelyVisible(item)) {
+            buttons.append(item);
+        }
+    }
+    return buttons;
+}
+
+// Every line Home used to hold that the copy deck no longer carries.
+const QStringList kRetiredHomeLines = {
+    QStringLiteral("Ready"),
+    QStringLiteral("Open SeatHub and press Play."),
+    QStringLiteral("All rigs are busy right now."),
+    QStringLiteral("Notify me"),
+};
+
+// Where `object` sits in `column`'s stacking order, whichever of the column's own children it is or
+// lives inside. A Column lays its children out in declaration order, and an item tree that is not on
+// a screen has not been laid out yet, so the order is read from the tree rather than from `y`.
+int stackIndexIn(QObject* object, QObject* column)
+{
+    QQuickItem* parentColumn = qobject_cast<QQuickItem*>(column);
+    for (QQuickItem* item = qobject_cast<QQuickItem*>(object); item; item = item->parentItem()) {
+        if (item->parentItem() == parentColumn) {
+            return parentColumn->childItems().indexOf(item);
+        }
+    }
+    return -1;
+}
+
+} // namespace
+
 void TstUiScreens::homeScreenRendersEachHomeState()
 {
     QQuickStyle::setStyle(QStringLiteral("Basic"));
@@ -586,41 +644,273 @@ void TstUiScreens::homeScreenRendersEachHomeState()
     QVERIFY2(screen, qPrintable(error));
     QVERIFY(screen->setProperty("client", QVariant::fromValue(static_cast<QObject*>(&client))));
 
-    // ready: the populated state screens.md §23 draws.
-    client.setHomeStatus(QStringLiteral("ready"));
-    QVERIFY2(findVisibleTextItem(screen.data(), QStringLiteral("Ready")),
-             "Home must render the populated state");
-    QVERIFY2(findVisibleTextItem(screen.data(), QStringLiteral("Open SeatHub and press Play.")),
-             "Home must keep the copy deck's Ready sentence");
+    QObject* play = screen->findChild<QObject*>(QStringLiteral("playButton"));
+    QVERIFY2(play, "Home's primary action must be a real button, reachable by keyboard (audit F3)");
+    QVERIFY(play->inherits("QQuickButton"));
+    QVERIFY(play->property("activeFocusOnTab").toBool());
 
-    // checking: the named loading state (copy.md §5, "name the thing loading").
+    // ready: nothing but Play. The two lines the deck no longer carries are gone.
+    client.setHomeStatus(QStringLiteral("ready"));
+    QVERIFY(effectivelyVisible(play));
+    QCOMPARE(play->property("text").toString(), QStringLiteral("Play"));
+    QVERIFY(play->property("enabled").toBool());
+    QVERIFY(!play->property("busy").toBool());
+    QVERIFY(screen->findChild<QObject*>(QStringLiteral("stateLine"))->property("text")
+                .toString().isEmpty());
+    for (const QString& retired : kRetiredHomeLines) {
+        QVERIFY2(!findVisibleTextItem(screen.data(), retired), qPrintable(retired));
+    }
+
+    // checking: the named loading state (copy.md section 5, "name the thing loading"), and Play is
+    // busy so nothing on the page moves when work starts.
     client.setHomeStatus(QStringLiteral("checking"));
-    const QString checking = QStringLiteral("Checking availability\u2026");
-    QObject* checkingItem = findVisibleTextItem(screen.data(), checking);
-    QVERIFY2(checkingItem, "Home must render a named loading state while Play allocates");
+    QVERIFY2(findVisibleTextItem(screen.data(), QStringLiteral("Checking availability…")),
+             "Home must render a named loading state while Play allocates");
+    QVERIFY(play->property("busy").toBool());
 
-    // busy: the empty state, copy.md's Play-flow sentence, verbatim.
+    // busy: nothing is free. The deck's one sentence, verbatim, and Play is still pressable.
     client.setHomeStatus(QStringLiteral("busy"));
-    QVERIFY2(findVisibleTextItem(screen.data(), QStringLiteral("All rigs are busy right now.")),
-             "Home must render the no-rig empty state from copy.md");
+    QVERIFY2(findVisibleTextItem(screen.data(), QStringLiteral("None available right now.")),
+             "Home must render the no-rig sentence from copy.md");
+    QVERIFY(play->property("enabled").toBool());
+    QVERIFY(!play->property("busy").toBool());
+    QVERIFY2(!findVisibleTextItem(screen.data(), QStringLiteral("Checking availability…")),
+             "the loading line must not outlive the state");
+    for (const QString& retired : kRetiredHomeLines) {
+        QVERIFY2(!findVisibleTextItem(screen.data(), retired), qPrintable(retired));
+    }
 
-    // offline: copy.md §Support & errors, offline sentence, verbatim.
+    // offline: copy.md section Support & errors, the full sentence, verbatim. Play stays pressable
+    // so a customer whose Wi-Fi came back can just press it.
+    const QString offline =
+        QStringLiteral("Can't reach SevenHills right now. Showing the last known balance.");
     client.setHomeStatus(QStringLiteral("offline"));
-    QVERIFY2(findVisibleTextItem(screen.data(), QStringLiteral("Can't reach SevenHills right now.")),
-             "Home must render the offline state from copy.md");
+    QVERIFY2(findVisibleTextItem(screen.data(), offline),
+             "Home must render the whole offline sentence from copy.md");
+    QVERIFY(play->property("enabled").toBool());
+    QVERIFY(effectivelyVisible(play));
 
-    // Back to ready, and Play is still the one action (screens.md §23).
+    // refused has its own test. Back to ready: Play is the one action and no state line is left.
     client.setHomeStatus(QStringLiteral("ready"));
-    QObject* play = nullptr;
-    for (QObject* item : screen->findChildren<QObject*>()) {
-        if (item->inherits("QQuickButton") && item->property("text").toString()
-                == QStringLiteral("Play")) {
-            play = item;
-            break;
+    QVERIFY(effectivelyVisible(play));
+    QVERIFY2(!findVisibleTextItem(screen.data(), offline), "a state's line must not outlive the state");
+}
+
+void TstUiScreens::homePlayReadsResumeSessionWhileASessionIsLiveAndResumesIt()
+{
+    QQuickStyle::setStyle(QStringLiteral("Basic"));
+    QQmlEngine engine;
+    registerTokenSingletons(&engine);
+
+    FakeShellClient client;
+    QString error;
+    QScopedPointer<QObject> screen(instantiate(&engine, QStringLiteral("HomeScreen.qml"), &error));
+    QVERIFY2(screen, qPrintable(error));
+    QVERIFY(screen->setProperty("client", QVariant::fromValue(static_cast<QObject*>(&client))));
+    QObject* play = screen->findChild<QObject*>(QStringLiteral("playButton"));
+    QVERIFY(play);
+
+    QCOMPARE(play->property("text").toString(), QStringLiteral("Play"));
+
+    // copy.md C3: the label changes while a session is live, and it is still the one control.
+    client.setLiveSession(true);
+    QCOMPARE(play->property("text").toString(), QStringLiteral("Resume session"));
+    QVERIFY(!findVisibleTextItem(screen.data(), QStringLiteral("Play")));
+
+    // Pressing it is the facade's `start()`, which resumes rather than asks for another session (the
+    // facade's own test asserts that half).
+    QVERIFY(QMetaObject::invokeMethod(play, "clicked"));
+    QCOMPARE(client.starts(), 1);
+
+    // A live session does not change the state lines: resume and the no-rig line are separate.
+    client.setHomeStatus(QStringLiteral("busy"));
+    QCOMPARE(play->property("text").toString(), QStringLiteral("Resume session"));
+
+    client.setLiveSession(false);
+    QCOMPARE(play->property("text").toString(), QStringLiteral("Play"));
+
+    // Play is the largest control on the screen: 64px, taller than every other button.
+    QCOMPARE(play->property("implicitHeight").toInt(), 64);
+    for (QObject* button : visibleButtons(screen.data())) {
+        if (button != play) {
+            QVERIFY(button->property("implicitHeight").toInt() < 64);
         }
     }
-    QVERIFY2(play, "Home's primary action must be a real button, reachable by keyboard (audit F3)");
-    QVERIFY(play->property("activeFocusOnTab").toBool());
+}
+
+void TstUiScreens::homeShowsTheServersRefusalVerbatimWithAQuietTopUpBeneathPlay()
+{
+    QQuickStyle::setStyle(QStringLiteral("Basic"));
+    QQmlEngine engine;
+    registerTokenSingletons(&engine);
+
+    FakeShellClient client;
+    QString error;
+    QScopedPointer<QObject> screen(instantiate(&engine, QStringLiteral("HomeScreen.qml"), &error));
+    QVERIFY2(screen, qPrintable(error));
+    QVERIFY(screen->setProperty("client", QVariant::fromValue(static_cast<QObject*>(&client))));
+
+    QObject* play = screen->findChild<QObject*>(QStringLiteral("playButton"));
+    QObject* topUp = screen->findChild<QObject*>(QStringLiteral("topUpButton"));
+    QVERIFY(play);
+    QVERIFY(topUp);
+
+    // Before a refusal there is no top-up control on Home: it is the menu's job until the server
+    // says no.
+    client.setHomeStatus(QStringLiteral("ready"));
+    QVERIFY(!effectivelyVisible(topUp));
+
+    // The server's own sentence and its reference. Whatever they say is shown exactly as they came:
+    // the client neither rewrites the sentence nor applies a balance rule of its own.
+    const QString sentence =
+        QStringLiteral("You need at least 15 minutes of credit to start a session.");
+    client.setFailure(sentence, QStringLiteral("SH-4F7KQ2"));
+    client.setHomeStatus(QStringLiteral("refused"));
+
+    QObject* sentenceItem = findVisibleTextItem(screen.data(), sentence);
+    QVERIFY2(sentenceItem, "the refusal must be shown in the server's own words");
+    QCOMPARE(sentenceItem->property("color").value<QColor>(), QColor(QStringLiteral("#ef4444")));
+    QVERIFY2(findVisibleTextItem(screen.data(), QStringLiteral("◆")),
+             "colour is never the only signal: the refusal carries a glyph");
+    QObject* referenceItem = findVisibleTextItem(screen.data(), QStringLiteral("SH-4F7KQ2"));
+    QVERIFY2(referenceItem, "the ADR-0008 reference must be rendered");
+    QCOMPARE(referenceItem->property("font").value<QFont>().family(),
+             QString::fromLatin1(kMonoFamily));
+
+    // A refusal is not the error view: Home still shows Play, pressable.
+    QVERIFY(effectivelyVisible(play));
+    QVERIFY(play->property("enabled").toBool());
+
+    // A quiet top-up control under Play: ghost, with the external-link mark, and it asks the facade.
+    QVERIFY(effectivelyVisible(topUp));
+    QCOMPARE(topUp->property("variant").toString(), QStringLiteral("ghost"));
+    QCOMPARE(topUp->property("glyph").toString(), QStringLiteral("↗"));
+    QCOMPARE(topUp->property("text").toString(), QStringLiteral("Top up"));
+    QObject* column = play->parent();
+    QVERIFY2(stackIndexIn(topUp, column) > stackIndexIn(play, column),
+             "the top-up control sits beneath Play");
+    QVERIFY2(stackIndexIn(sentenceItem, column) >= 0
+                 && stackIndexIn(sentenceItem, column) < stackIndexIn(play, column),
+             "the refusal sits above Play");
+
+    QVERIFY(QMetaObject::invokeMethod(topUp, "clicked"));
+    QCOMPARE(client.topUps(), 1);
+
+    // A different sentence from the server is shown as it is, not looked up in a table of the client's.
+    const QString other = QStringLiteral("You already have a session running.");
+    client.setFailure(other, QStringLiteral("SH-9K2XQ1"));
+    QVERIFY(findVisibleTextItem(screen.data(), other));
+    QVERIFY(!findVisibleTextItem(screen.data(), sentence));
+
+    // Leaving the refused state takes the refusal and the top-up control away.
+    client.setHomeStatus(QStringLiteral("ready"));
+    QVERIFY(!findVisibleTextItem(screen.data(), other));
+    QVERIFY(!findVisibleTextItem(screen.data(), QStringLiteral("SH-9K2XQ1")));
+    QVERIFY(!effectivelyVisible(topUp));
+
+    // The client holds no balance rule: this screen does not even read the balance.
+    const QString source = readSource(guiDir() + QStringLiteral("/HomeScreen.qml"));
+    QVERIFY2(!source.contains(QStringLiteral("balanceMinutes")),
+             "Home must not read the balance: whether a customer may play is the server's answer");
+}
+
+void TstUiScreens::noHomeStateRendersACountAQueuePositionOrANotifyControl()
+{
+    QQuickStyle::setStyle(QStringLiteral("Basic"));
+    QQmlEngine engine;
+    registerTokenSingletons(&engine);
+
+    FakeShellClient client;
+    // No identity, so the only digits that could be on screen are a fleet count or a queue position.
+    client.setIdentity(QString());
+    QString error;
+    QScopedPointer<QObject> screen(instantiate(&engine, QStringLiteral("HomeScreen.qml"), &error));
+    QVERIFY2(screen, qPrintable(error));
+    QVERIFY(screen->setProperty("client", QVariant::fromValue(static_cast<QObject*>(&client))));
+
+    const QStringList states = { QStringLiteral("ready"), QStringLiteral("checking"),
+                                 QStringLiteral("busy"), QStringLiteral("offline") };
+    const QStringList forbiddenWords = { QStringLiteral("notify"),   QStringLiteral("queue"),
+                                         QStringLiteral("position"), QStringLiteral("estimate"),
+                                         QStringLiteral("waiting"), QStringLiteral("ahead of"),
+                                         QStringLiteral("machines"), QStringLiteral("rigs") };
+    for (bool live : { false, true }) {
+        client.setLiveSession(live);
+        for (const QString& state : states) {
+            client.setHomeStatus(state);
+
+            // Nothing that names a number of machines, a place in a line or a notification: no digit
+            // anywhere, and none of the words that would say so.
+            for (QObject* item : textItems(screen.data())) {
+                if (!effectivelyVisible(item)) {
+                    continue;
+                }
+                const QString text = item->property("text").toString();
+                const QString where = state + QStringLiteral(": ") + text;
+                QVERIFY2(!text.contains(QRegularExpression(QStringLiteral("[0-9]"))), qPrintable(where));
+                for (const QString& word : forbiddenWords) {
+                    QVERIFY2(!text.contains(word, Qt::CaseInsensitive), qPrintable(where));
+                }
+            }
+
+            // Exactly one bright control, and it is Play: everything else is quiet.
+            int bright = 0;
+            for (QObject* button : visibleButtons(screen.data())) {
+                const QString label = button->property("text").toString();
+                QVERIFY2(!label.contains(QStringLiteral("Notify"), Qt::CaseInsensitive),
+                         qPrintable(label));
+                if (button->property("variant").toString() == QStringLiteral("primary")) {
+                    ++bright;
+                    QVERIFY(label == QStringLiteral("Play")
+                            || label == QStringLiteral("Resume session"));
+                }
+            }
+            QCOMPARE(bright, 1);
+        }
+    }
+
+    // The balance is data: it is not on Home at all, so it cannot compete with Play.
+    QVERIFY(!screen->findChild<QObject*>(QStringLiteral("balancePill")));
+}
+
+void TstUiScreens::homeWrapsLongSentencesAndNeverBreaksAReference()
+{
+    QQuickStyle::setStyle(QStringLiteral("Basic"));
+    QQmlEngine engine;
+    registerTokenSingletons(&engine);
+
+    FakeShellClient client;
+    QString error;
+    QScopedPointer<QObject> screen(instantiate(&engine, QStringLiteral("HomeScreen.qml"), &error));
+    QVERIFY2(screen, qPrintable(error));
+    QVERIFY(screen->setProperty("client", QVariant::fromValue(static_cast<QObject*>(&client))));
+    // The 960x640 minimum window: the column is 420px at most.
+    QVERIFY(screen->setProperty("width", 960));
+    QVERIFY(screen->setProperty("height", 640));
+
+    const QString longSentence = QStringLiteral(
+        "This is a much longer sentence than any the deck holds, written to prove that it wraps "
+        "inside the column instead of running off the edge of the window or being clipped.");
+    client.setFailure(longSentence, QStringLiteral("SH-4F7KQ2"));
+    client.setHomeStatus(QStringLiteral("refused"));
+
+    QObject* sentence = screen->findChild<QObject*>(QStringLiteral("refusalText"));
+    QVERIFY(sentence);
+    QVERIFY2(sentence->property("wrapMode").toInt() != 0, "a long sentence must wrap");
+    QVERIFY2(sentence->property("lineCount").toInt() > 1, "the long sentence must have wrapped");
+    QVERIFY2(sentence->property("width").toDouble() <= 420, "and stay inside the 420px column");
+
+    // The reference is one line, always: a broken code cannot be read aloud or searched for.
+    QObject* reference = screen->findChild<QObject*>(QStringLiteral("refusalReference"));
+    QVERIFY(reference);
+    QCOMPARE(reference->property("wrapMode").toInt(), 0); // Text.NoWrap
+    QCOMPARE(reference->property("lineCount").toInt(), 1);
+
+    // The one line of the other states wraps too.
+    client.setHomeStatus(QStringLiteral("offline"));
+    QObject* line = screen->findChild<QObject*>(QStringLiteral("stateLine"));
+    QVERIFY(line);
+    QVERIFY(line->property("wrapMode").toInt() != 0);
 }
 
 void TstUiScreens::homeScreenRendersTheSessionEndReason()
@@ -798,7 +1088,8 @@ void TstUiScreens::theShellGivesEverySignedInViewTheHeaderAndNeitherSignInNorThe
                                  QStringLiteral("ErrorScreen.qml"), QStringLiteral("SignInScreen.qml"),
                                  QStringLiteral("RestoreSplash.qml"),
                                  QStringLiteral("ForcedUpdateModal.qml") }) {
-        QVERIFY2(!readSource(guiDir() + QLatin1Char('/') + name).contains(QStringLiteral("AppHeader")),
+        QVERIFY2(!readSource(guiDir() + QLatin1Char('/') + name)
+                       .contains(QRegularExpression(QStringLiteral("AppHeader\s*\{"))),
                  qPrintable(name + QStringLiteral(" must not carry a header of its own")));
     }
 
@@ -1039,6 +1330,42 @@ void TstUiScreens::menuOpensOnSpaceMovesWithArrowsAndEscapeReturnsFocusToTheTrig
     QTest::keyClick(window, Qt::Key_Escape);
     QTRY_VERIFY_WITH_TIMEOUT(!popup->property("opened").toBool(), 3000);
     QTRY_VERIFY_WITH_TIMEOUT(trigger->hasActiveFocus(), 3000);
+}
+
+void TstUiScreens::theClientRaisesNoNotificationOfAnyKind()
+{
+    // CUST-09, D-20: the client raises no tray icon, no balloon, no operating-system notice and no
+    // sound for any event, the balance running low included: state changes are shown in place. This
+    // scans the client's own sources for the mechanisms that would, so adding one fails here.
+    const QStringList forbidden = {
+        QStringLiteral("QSystemTrayIcon"),       QStringLiteral("showMessage("),
+        QStringLiteral("QSoundEffect"),          QStringLiteral("SoundEffect"),
+        QStringLiteral("QSound"),                QStringLiteral("QMediaPlayer"),
+        QStringLiteral("QAudioOutput"),          QStringLiteral("QApplication::beep"),
+        QStringLiteral("QGuiApplication::beep"), QStringLiteral("MessageBeep"),
+        QStringLiteral("Shell_NotifyIcon"),      QStringLiteral("ToastNotification"),
+        QStringLiteral("Platform.SystemTrayIcon"),
+    };
+
+    const QDir seathub(guiDir() + QStringLiteral("/../seathub"));
+    const QDir gui(guiDir());
+    QStringList files;
+    for (const QString& name :
+         seathub.entryList({ QStringLiteral("*.cpp"), QStringLiteral("*.h") })) {
+        files.append(seathub.filePath(name));
+    }
+    for (const QString& name : gui.entryList({ QStringLiteral("*.qml") })) {
+        files.append(gui.filePath(name));
+    }
+    QVERIFY2(files.size() > 40, "the scan must actually see the client's sources");
+    for (const QString& path : files) {
+        const QString source = readSource(path);
+        QVERIFY2(!source.isEmpty(), qPrintable(path));
+        for (const QString& pattern : forbidden) {
+            QVERIFY2(!source.contains(pattern),
+                     qPrintable(QFileInfo(path).fileName() + QStringLiteral(" uses ") + pattern));
+        }
+    }
 }
 
 void TstUiScreens::restoreSplashShowsItsLineAndNeverTheSignInForm()

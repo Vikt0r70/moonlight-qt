@@ -104,14 +104,23 @@ class SeatHubClient : public QObject
     /// `SH-XXXXXX` for the current failure, or empty (ADR-0008).
     Q_PROPERTY(QString reference READ reference NOTIFY failureChanged)
 
-    /// The home screen's own state: "ready" | "checking" | "busy" | "offline" (audit F1).
-    /// Separate from `appState` because all four are the home view: "checking" while Play's
-    /// allocation request is in flight, "busy" when the control plane refused it with
-    /// `NO_HOST_AVAILABLE` (`copy.md` §Play flow, "No rig"), "offline" when the control plane
-    /// could not be reached at all (`copy.md` §Support & errors, "Offline"), and "ready" for the
-    /// populated state `screens.md` §23 draws. QML turns each into a sentence; none of them is a
-    /// failure, so none of them raises the error screen.
+    /// The home screen's own state: "ready" | "checking" | "busy" | "offline" | "refused"
+    /// (audit F1, `screens.md` §23). Separate from `appState` because all five are the home view:
+    /// "checking" while Play's allocation request is in flight, "busy" when the control plane refused
+    /// it with `NO_HOST_AVAILABLE` (`copy.md` §Play flow, "No rig"), "offline" when the control plane
+    /// could not be reached at all (`copy.md` §Support & errors, "Offline"), "refused" when the
+    /// control plane answered and said no in its own words (the balance floor, or a session this
+    /// customer already has) - `failure` and `reference` then hold that sentence and its code, shown
+    /// as they are - and "ready" for the populated state `screens.md` §23 draws. QML turns each into
+    /// a sentence; none of them is a failure, so none of them raises the error screen.
     Q_PROPERTY(QString homeStatus READ homeStatus NOTIFY homeStatusChanged)
+
+    /// True while a control-plane session is attached and the server has not reported it over: Home
+    /// then reads `Resume session` in place of `Play`, and `start()` resumes that session instead of
+    /// asking for a new one. It is derived from what this client itself knows (an attached session
+    /// that has not ended), not from a server read: nothing discovers a live session at launch yet,
+    /// so after a restart it is false until Plan 08's session reads set it.
+    Q_PROPERTY(bool liveSession READ liveSession NOTIFY liveSessionChanged)
 
     /// The last session's end reason as the sentence `docs/spec/copy.md` §Session end reasons
     /// gives it, or empty. Styled text: the minute count in it is wrapped in the mono family,
@@ -190,13 +199,16 @@ public:
     QString defaultCountryCode() const { return m_defaultCountryCode; }
     bool animationEffects() const { return m_animationEffects; }
     bool signedIn() const { return m_signedIn; }
+    bool liveSession() const { return m_liveSession; }
 
     /// The Qt window the visibility sequence hides and restores. Called once by main.qml.
     Q_INVOKABLE void setHostWindow(QWindow* window);
 
     /// Play (D-35). Asks the control plane for a session (`POST /api/sessions`) when there is an
-    /// access token to ask with, then drives the engine lifecycle from the allocation. Without a
-    /// token - the documented Plan 03-02 tracer path - it drives the engine lifecycle directly.
+    /// access token to ask with, then drives the engine lifecycle from the allocation. While a
+    /// session is live (`liveSession`) it resumes that session instead of asking for a new one.
+    /// Without a token - the documented Plan 03-02 tracer path - it drives the engine lifecycle
+    /// directly.
     Q_INVOKABLE void start();
 
     /// D-02: end the active stream immediately.
@@ -313,6 +325,7 @@ signals:
     void endReasonTextChanged();
     void balanceChanged();
     void signedInChanged();
+    void liveSessionChanged();
 
     /// Step 1 succeeded - the view should show the code field.
     void otpRequested(const QString& phoneE164);
@@ -378,6 +391,12 @@ private:
     void setInSettings(bool inSettings);
     /// The one writer of `m_signedIn`, so `signedInChanged()` can never be missed.
     void setSignedIn(bool signedIn);
+    /// The one writer of `m_sessionId`, and of whether that session has ended, so `liveSession` can
+    /// never be left stale by a path that forgot to say so.
+    void setAttachedSession(const QString& sessionId);
+    void setAttachedSessionEnded(bool ended);
+    /// Recomputes `m_liveSession` from the two and says so when it changed.
+    void updateLiveSession();
     /// Applies the answer to the launch-time `GET /api/me` (see `restoreSession()`).
     void applyRestoreResult(const ControlPlaneResult& result);
     /// Applies an answer to `GET /api/wallet`. `epoch` is the credential generation the read was
@@ -478,6 +497,10 @@ private:
 
     /// The session the real control-plane path is running, or empty when no session is attached.
     QString m_sessionId;
+    /// True once the control plane has reported `m_sessionId` terminal. A session that is over is not
+    /// one Home offers to resume, even while its teardown has not finished.
+    bool m_sessionEnded = false;
+    bool m_liveSession = false;
     /// What pairing returned about this client: the SHA-256 fingerprint of its own certificate,
     /// which is the identity a host-side reader of Sunshine's client list can match to this
     /// client's record. It is the only thing that identifies this client - never the rig's name,

@@ -53,13 +53,14 @@ const char* kPasswordMissing = "Enter your password.";
 // every sign-in step when the request never reached the control plane.
 const char* kOfflineSentence = "We couldn't reach SevenHills. Try again in a moment.";
 
-// homeStatus values (audit F1). Four states of the one home view, from `screens.md` §23 and the
-// copy deck: the populated state, the named loading state, the "no rig" empty state and the
-// offline state.
+// homeStatus values (audit F1). Five states of the one home view, from `screens.md` §23 and the
+// copy deck: the populated state, the named loading state, the "no rig" empty state, the offline
+// state and the server's own refusal, shown in its own words.
 const char* kHomeReady = "ready";
 const char* kHomeChecking = "checking";
 const char* kHomeBusy = "busy";
 const char* kHomeOffline = "offline";
+const char* kHomeRefused = "refused";
 
 // The quality profile Play asks for. `ADR-0011` fixes the vocabulary; `1080p60` is its base
 // value and the one the control plane uses in its own examples.
@@ -449,7 +450,8 @@ void SeatHubClient::beginSession(const QString& sessionId)
         return;
     }
 
-    m_sessionId = sessionId;
+    setAttachedSession(sessionId);
+    setAttachedSessionEnded(false);
     m_clientUuid.clear();
     // A new session's teardown has not been asked for yet. Without this the second and later
     // sessions in one run never tear down (defect F-9; `teardown_guard.h`).
@@ -524,6 +526,32 @@ void SeatHubClient::setSignedIn(bool signedIn)
     }
     m_signedIn = signedIn;
     emit signedInChanged();
+}
+
+void SeatHubClient::setAttachedSession(const QString& sessionId)
+{
+    m_sessionId = sessionId;
+    if (sessionId.isEmpty()) {
+        m_sessionEnded = false;
+    }
+    updateLiveSession();
+}
+
+void SeatHubClient::setAttachedSessionEnded(bool ended)
+{
+    m_sessionEnded = ended;
+    updateLiveSession();
+}
+
+void SeatHubClient::updateLiveSession()
+{
+    const bool live = !m_sessionId.isEmpty() && !m_sessionEnded;
+    if (m_liveSession == live) {
+        return;
+    }
+    qCInfo(seathubClient) << "live session" << m_liveSession << "->" << live;
+    m_liveSession = live;
+    emit liveSessionChanged();
 }
 
 void SeatHubClient::setInSettings(bool inSettings)
@@ -605,6 +633,15 @@ void SeatHubClient::start()
         return;
     }
 
+    // A session this client already has, and the server has not reported over, is Resume session:
+    // it is picked up again, not replaced by a request for another one - the control plane would
+    // refuse that request anyway (a customer has at most one live session).
+    if (m_liveSession) {
+        qCInfo(seathubClient) << "resuming the attached session";
+        beginSession(m_sessionId);
+        return;
+    }
+
     beginPlayRequest();
 }
 
@@ -671,6 +708,21 @@ void SeatHubClient::applyPlayFailure(const ControlPlaneResult& result)
     // for what is very often a dropped Wi-Fi connection.
     if (result.statusCode == 0 && result.reference.isEmpty()) {
         setHomeStatus(QString::fromLatin1(kHomeOffline));
+        return;
+    }
+
+    // The control plane answered and said no, in its own words: the balance floor (402), or a
+    // refusal of the allocation itself that is not "nothing is free" (409, e.g. the customer
+    // already has a session). These are the two responses `POST /api/sessions` documents besides
+    // the unknown-profile 400. The customer stays on Home and reads that sentence and its reference
+    // as the server wrote them, with a quiet way to top up beside it. The client applies no balance
+    // rule of its own - it does not know the floor - so it is only ever the server that refuses.
+    // Every other answer (400, 401, 5xx, a body that is not a refusal) is a real failure and keeps
+    // the error screen.
+    if (result.statusCode == 402 || result.statusCode == 409) {
+        m_failure = result.toFailure().toVariantMap();
+        emit failureChanged();
+        setHomeStatus(QString::fromLatin1(kHomeRefused));
         return;
     }
 
@@ -965,7 +1017,7 @@ void SeatHubClient::signOut()
     // from this machine (T-05-07).
     m_tokenStore->clearAll();
 
-    m_sessionId.clear();
+    setAttachedSession(QString());
     m_clientUuid.clear();
 
     setSignedIn(false);
@@ -1299,8 +1351,11 @@ void SeatHubClient::handleSessionState(const SessionInfo& session)
 
     if (session.isTerminal()) {
         // The server considers this session over - the wallet ran out, the owner's reservation
-        // arrived, or an operator ended it. Stop locally; teardown follows from
-        // `handleReadyForDeletion()`.
+        // arrived, or an operator ended it. Home no longer offers to resume it, even while its
+        // teardown is still running. Stop locally; teardown follows from `handleReadyForDeletion()`.
+        if (session.id.isEmpty() || session.id == m_sessionId) {
+            setAttachedSessionEnded(true);
+        }
         m_liveness->stop();
         if (m_appState == QLatin1String(kStateStreaming)
                 || m_appState == QLatin1String(kStateConnecting)) {
@@ -1468,7 +1523,7 @@ void SeatHubClient::handleTeardownCompleted()
     m_horizon->disarm();
     m_sessionChannel->close();
 
-    m_sessionId.clear();
+    setAttachedSession(QString());
     m_clientUuid.clear();
     // The session's teardown claim goes with its id. The next `beginSession()` resets it anyway;
     // clearing it here keeps "no session" and "no claim" the same state, which is what the guard

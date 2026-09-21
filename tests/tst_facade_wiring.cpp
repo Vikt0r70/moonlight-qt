@@ -179,6 +179,13 @@ public:
         QMutexLocker lock(&m_mutex);
         m_logoutStatus = status;
     }
+    /// What `POST /api/sessions` (Play) answers. Status 0 is a transport failure.
+    void answerPlay(int status, const QByteArray& body)
+    {
+        QMutexLocker lock(&m_mutex);
+        m_playStatus = status;
+        m_playBody = body;
+    }
     /// What `POST /api/auth/login` answers (status 0 is a transport failure).
     void answerLogin(int status, const QByteArray& body)
     {
@@ -213,8 +220,8 @@ protected:
                                  QIODevice* outgoing) override
     {
         const QString path = request.url().path();
-        int meStatus, walletStatus, logoutStatus, loginStatus, otpRequestStatus;
-        QByteArray meBody, walletBody, loginBody;
+        int meStatus, walletStatus, logoutStatus, loginStatus, otpRequestStatus, playStatus;
+        QByteArray meBody, walletBody, loginBody, playBody;
         {
             QMutexLocker lock(&m_mutex);
             m_paths.append(path);
@@ -224,6 +231,8 @@ protected:
             }
             loginStatus = m_loginStatus;
             loginBody = m_loginBody;
+            playStatus = m_playStatus;
+            playBody = m_playBody;
             otpRequestStatus = m_otpRequestStatus;
             meStatus = m_meStatus;
             meBody = m_meBody;
@@ -237,6 +246,9 @@ protected:
         }
         if (path == QLatin1String("/api/wallet")) {
             return new FakeReply(walletStatus, walletBody, this);
+        }
+        if (path == QLatin1String("/api/sessions")) {
+            return new FakeReply(playStatus, playBody, this);
         }
         if (path == QLatin1String("/api/auth/logout")) {
             return new FakeReply(logoutStatus, QByteArray(), this);
@@ -284,6 +296,8 @@ private:
     QHash<QString, QByteArray> m_bodies;
     int m_loginStatus = 200;
     QByteArray m_loginBody;
+    int m_playStatus = 201;
+    QByteArray m_playBody;
     int m_otpRequestStatus = 200;
     int m_meStatus = 200;
     QByteArray m_meBody;
@@ -394,6 +408,35 @@ private:
         return seen;
     }
 
+    /// A signed-in facade on Home with `minutes` in the wallet, its control plane faked and pointed at
+    /// an address that resolves nowhere (a session's channel opens against it and simply fails).
+    void reachHome(SeatHubClient& client, int minutes)
+    {
+        isolateStore(client);
+        client.controlPlane()->setBaseUrl(QStringLiteral("https://control.invalid"));
+        armControlPlane(client);
+        m_fake->answerMe(200, accountBody());
+        m_fake->answerWallet(200, walletBody(minutes));
+        QVERIFY(client.credentialStore()->storeToken(TokenStore::accessTokenName(),
+                                                     QString::fromLatin1(kAccessToken)));
+        client.restoreSession();
+        QTRY_COMPARE_WITH_TIMEOUT(client.appState(), QStringLiteral("home"), 15000);
+        QTRY_COMPARE_WITH_TIMEOUT(client.balanceMinutes(), qint64(minutes), 15000);
+    }
+
+    static QByteArray playRefusalBody(const QString& sentence, const QString& reference,
+                                      const QString& failure = QString())
+    {
+        QJsonObject body;
+        body.insert(QStringLiteral("status"), false);
+        body.insert(QStringLiteral("error"), sentence);
+        body.insert(QStringLiteral("reference"), reference);
+        if (!failure.isEmpty()) {
+            body.insert(QStringLiteral("failure"), failure);
+        }
+        return QJsonDocument(body).toJson(QJsonDocument::Compact);
+    }
+
 private slots:
     void initTestCase()
     {
@@ -492,6 +535,7 @@ private slots:
         QVERIFY(storeACredential(client, &tokenPath));
 
         client.beginSession(QStringLiteral("session-one"));
+        QVERIFY2(client.liveSession(), "a session is live from the moment it is attached");
         armControlPlane(client);
 
         QSignalSpy completed(client.teardown(), &TeardownController::teardownCompleted);
@@ -504,6 +548,7 @@ private slots:
 
         QTRY_COMPARE_WITH_TIMEOUT(completed.count(), 1, 15000);
         QCOMPARE(failed.count(), 0);
+        QVERIFY2(!client.liveSession(), "a session that has been torn down is not offered for resume");
 
         // Step 1 went out on the documented route, for this session.
         QCOMPARE(m_fake->countOfPathEndingWith(QStringLiteral("/end")), 1);
@@ -1119,6 +1164,170 @@ private slots:
         client.restoreSession();
         QTRY_COMPARE_WITH_TIMEOUT(client.appState(), QStringLiteral("signed_out"), 15000);
         QVERIFY(!client.signedIn());
+    }
+
+    // --- Phase 5 plan 07: what Home needs from the facade ----------------------------------------
+
+    void aRefusalFromTheServerIsShownOnHomeInItsOwnWordsAndAnythingElseIsAnError_data()
+    {
+        QTest::addColumn<int>("status");
+        QTest::addColumn<QString>("failure");
+        QTest::addColumn<QString>("expectedHome");
+        QTest::addColumn<QString>("expectedApp");
+
+        // The balance floor and a session the customer already has: the server said no, in words.
+        QTest::newRow("the balance floor (402)")
+            << 402 << QString() << "refused" << "home";
+        QTest::newRow("a session already live (409)")
+            << 409 << "USER_HAS_NONTERMINAL_SESSION" << "refused" << "home";
+        // Nothing free is its own line, not a refusal.
+        QTest::newRow("nothing free (409)")
+            << 409 << "NO_HOST_AVAILABLE" << "busy" << "home";
+        // Anything else is a real failure and keeps the error view.
+        QTest::newRow("an unknown profile (400)") << 400 << QString() << "ready" << "error";
+        QTest::newRow("the server broke (500)") << 500 << QString() << "ready" << "error";
+        QTest::newRow("a refused credential (401)") << 401 << QString() << "ready" << "error";
+        // A request that never arrived is the offline line.
+        QTest::newRow("no route to the control plane") << 0 << QString() << "offline" << "home";
+    }
+
+    void aRefusalFromTheServerIsShownOnHomeInItsOwnWordsAndAnythingElseIsAnError()
+    {
+        QFETCH(int, status);
+        QFETCH(QString, failure);
+        QFETCH(QString, expectedHome);
+        QFETCH(QString, expectedApp);
+
+        SeatHubClient client;
+        // A balance of nothing: the client must still ask, because it has no rule of its own about
+        // whether a customer may play - only the server refuses (CUST-10, T-05-32).
+        reachHome(client, 0);
+        QVERIFY(!QTest::currentTestFailed());
+
+        const QString sentence = QStringLiteral("The server's own sentence, exactly as written.");
+        m_fake->answerPlay(status, playRefusalBody(sentence, QStringLiteral("SH-4F7KQ2"), failure));
+
+        client.start();
+        QTRY_COMPARE_WITH_TIMEOUT(client.homeStatus() == QLatin1String("checking"), false, 15000);
+        QTRY_COMPARE_WITH_TIMEOUT(client.appState(), expectedApp, 15000);
+        QCOMPARE(client.homeStatus(), expectedHome);
+
+        // It asked, once, whatever the balance.
+        QCOMPARE(m_fake->requestPaths().count(QStringLiteral("/api/sessions")), 1);
+
+        if (expectedHome == QLatin1String("refused")) {
+            // The sentence and the reference are the server's, unchanged, and readable while Home is
+            // showing; the client did not turn the refusal into a failure screen.
+            QCOMPARE(client.failure().value(QStringLiteral("error")).toString(), sentence);
+            QCOMPARE(client.reference(), QStringLiteral("SH-4F7KQ2"));
+            QVERIFY(!client.liveSession());
+        }
+        if (expectedHome == QLatin1String("busy") || expectedHome == QLatin1String("offline")) {
+            QVERIFY(client.failure().isEmpty());
+        }
+        if (expectedApp == QLatin1String("error")) {
+            QVERIFY(!client.failure().isEmpty());
+        }
+
+        // Pressing Play again asks again, and clears whatever was on screen from the last answer.
+        m_fake->answerPlay(500, playRefusalBody(sentence, QStringLiteral("SH-9K2XQ1")));
+        client.dismissError();
+        QCOMPARE(client.appState(), QStringLiteral("home"));
+    }
+
+    void aSessionTheServerHasNotEndedIsLiveAndPlayResumesItInsteadOfAskingForAnother()
+    {
+        SeatHubClient client;
+        reachHome(client, 90);
+        QVERIFY(!QTest::currentTestFailed());
+        QVERIFY(!client.liveSession());
+        QSignalSpy liveChanges(&client, &SeatHubClient::liveSessionChanged);
+
+        // A session is attached (Play's allocation returned it). The rig has no answer in this test,
+        // so pairing fails and the customer lands on the error view with the session still attached.
+        client.beginSession(QStringLiteral("session-live"));
+        QVERIFY(client.liveSession());
+        QCOMPARE(liveChanges.count(), 1);
+        QTRY_COMPARE_WITH_TIMEOUT(client.appState(), QStringLiteral("error"), 15000);
+        QVERIFY2(client.liveSession(), "a failed step does not end the session on the server");
+
+        // Back on Home the session is still live: Play reads Resume session (the screen binds to this
+        // flag), and pressing it resumes that session. It does NOT ask for a new one.
+        client.dismissError();
+        QCOMPARE(client.appState(), QStringLiteral("home"));
+        QVERIFY(client.liveSession());
+        const int pairingBefore =
+            m_fake->requestPaths().count(QStringLiteral("/api/sessions/session-live/pairing"));
+        QVERIFY(pairingBefore >= 1);
+
+        client.start();
+        QCOMPARE(client.appState(), QStringLiteral("connecting"));
+        QTRY_VERIFY_WITH_TIMEOUT(
+            m_fake->requestPaths().count(QStringLiteral("/api/sessions/session-live/pairing"))
+                > pairingBefore,
+            15000);
+        QCOMPARE(m_fake->requestPaths().count(QStringLiteral("/api/sessions")), 0);
+
+        // Sign-out forgets it: the next customer on this PC is never offered this one's session.
+        QTRY_COMPARE_WITH_TIMEOUT(client.appState(), QStringLiteral("error"), 15000);
+        client.signOut();
+        QVERIFY(!client.liveSession());
+    }
+
+    void aSessionTheServerReportsOverIsNoLongerOfferedForResume()
+    {
+        SeatHubClient client;
+        reachHome(client, 90);
+        QVERIFY(!QTest::currentTestFailed());
+
+        client.beginSession(QStringLiteral("session-live"));
+        QTRY_COMPARE_WITH_TIMEOUT(client.appState(), QStringLiteral("error"), 15000);
+        client.dismissError();
+        QVERIFY(client.liveSession());
+
+        // The control plane says it is over (the wallet ran out, an operator ended it). It arrives on
+        // the session channel, on the network thread, and reaches the facade the way it does in
+        // production: queued.
+        SessionInfo info;
+        info.id = QStringLiteral("session-live");
+        info.state = QStringLiteral("COMPLETED");
+        info.endReason = QStringLiteral("BALANCE_EXHAUSTED");
+        SessionWebSocket* channel = client.sessionChannel();
+        QMetaObject::invokeMethod(
+            channel, [channel, info]() { emit channel->sessionStateReceived(info); },
+            Qt::BlockingQueuedConnection);
+        QTRY_VERIFY_WITH_TIMEOUT(!client.liveSession(), 15000);
+
+        // So Play is Play again, and pressing it asks the server for a new session.
+        m_fake->answerPlay(402, playRefusalBody(QStringLiteral("Not enough credit."),
+                                            QStringLiteral("SH-3K2XQ1")));
+        client.start();
+        QTRY_COMPARE_WITH_TIMEOUT(client.homeStatus(), QStringLiteral("refused"), 15000);
+        QCOMPARE(m_fake->requestPaths().count(QStringLiteral("/api/sessions")), 1);
+    }
+
+    void aSessionThatEndsAndTearsDownIsNoLongerLive()
+    {
+        SeatHubClient client;
+        auto* engine = new FakeEngineSession;
+        client.session()->attachSession(engine);
+        client.controlPlane()->setBaseUrl(QStringLiteral("https://control.invalid"));
+        client.controlPlane()->setAccessToken(QString::fromLatin1(kAccessToken));
+        client.teardown()->setVerifyIntervalMs(1);
+        QString tokenPath;
+        QVERIFY(storeACredential(client, &tokenPath));
+
+        client.beginSession(QStringLiteral("session-one"));
+        QVERIFY(client.liveSession());
+        armControlPlane(client);
+
+        QSignalSpy completed(client.teardown(), &TeardownController::teardownCompleted);
+        emit engine->readyForDeletion();
+        QTRY_COMPARE_WITH_TIMEOUT(completed.count(), 1, 15000);
+        QTRY_VERIFY_WITH_TIMEOUT(!client.liveSession(), 15000);
+
+        client.session()->attachSession(nullptr);
+        delete engine;
     }
 
     void theFacadeHandsTheScreenTheBundledCountriesAndARegionThatIsOneOfThem()
