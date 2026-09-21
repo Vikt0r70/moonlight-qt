@@ -33,6 +33,7 @@
 #include <QQmlContext>
 #include <QQmlEngine>
 #include <QQuickItem>
+#include <QQuickWindow>
 #include <QQuickStyle>
 #include <QUrl>
 #include <QVariantMap>
@@ -234,7 +235,12 @@ public:
     }
 
     Q_INVOKABLE void start() { ++m_starts; }
-    Q_INVOKABLE void openSettings() {}
+    Q_INVOKABLE void openSettings() { ++m_settingsOpens; }
+    Q_INVOKABLE bool openTopUp()
+    {
+        ++m_topUps;
+        return true;
+    }
     Q_INVOKABLE void signOut() { ++m_signOuts; }
     Q_INVOKABLE void retry() { ++m_retries; }
     Q_INVOKABLE void dismissError() { ++m_dismissals; }
@@ -286,6 +292,8 @@ public:
     }
     void deliverPasswordAccepted() { emit passwordSignInAccepted(); }
 
+    int topUps() const { return m_topUps; }
+    int settingsOpens() const { return m_settingsOpens; }
     int starts() const { return m_starts; }
     int signOuts() const { return m_signOuts; }
     int retries() const { return m_retries; }
@@ -325,6 +333,8 @@ private:
     QVariantMap m_failure;
     QString m_lastPhone;
     QString m_lastCode;
+    int m_topUps = 0;
+    int m_settingsOpens = 0;
     int m_starts = 0;
     int m_signOuts = 0;
     int m_retries = 0;
@@ -417,8 +427,13 @@ private slots:
     void everyShellScreenLoads();
     void homeScreenRendersEachHomeState();
     void homeScreenRendersTheSessionEndReason();
-    void homeHostsTheBalanceElement();
+    void homeNoLongerCarriesTheBalanceElement();
+    void appHeaderCarriesTheWordmarkTheBalanceAndTheMenuInThatOrder();
+    void theShellGivesEverySignedInViewTheHeaderAndNeitherSignInNorTheSplash();
     void balancePillDrawsEachOfItsStates();
+    void balancePillChangesColourExactlyAtTheSpecsThresholds();
+    void menuHasItsTwoItemsAndTopUpAsksTheFacadeForTheWebsite();
+    void menuOpensOnSpaceMovesWithArrowsAndEscapeReturnsFocusToTheTrigger();
     void restoreSplashShowsItsLineAndNeverTheSignInForm();
     void theShellRoutesTheRestoreStateToTheSplashNotToSignIn();
     void signInScreenReachesThePhoneStepError();
@@ -508,6 +523,8 @@ void TstUiScreens::everyShellScreenLoads()
                               QStringLiteral("SeatHubReadOnlyRow.qml"),
                               QStringLiteral("AgentConfigPanel.qml"),
                               QStringLiteral("BalancePill.qml"),
+                              QStringLiteral("AppHeader.qml"),
+                              QStringLiteral("SeatHubMenu.qml"),
                               QStringLiteral("RestoreSplash.qml"),
                               QStringLiteral("SeatHubIdentifierField.qml"),
                               QStringLiteral("SeatHubCountryPicker.qml"),
@@ -639,7 +656,7 @@ void TstUiScreens::homeScreenRendersTheSessionEndReason()
              "a cleared end reason must not stay on screen");
 }
 
-void TstUiScreens::homeHostsTheBalanceElement()
+void TstUiScreens::homeNoLongerCarriesTheBalanceElement()
 {
     QQuickStyle::setStyle(QStringLiteral("Basic"));
     QQmlEngine engine;
@@ -653,17 +670,147 @@ void TstUiScreens::homeHostsTheBalanceElement()
     QVERIFY2(screen, qPrintable(error));
     QVERIFY(screen->setProperty("client", QVariant::fromValue(static_cast<QObject*>(&client))));
 
-    // Home carries the balance element (CUST-06), and it shows the facade's own text - the client
-    // draws it and does no arithmetic.
-    QObject* pill = screen->findChild<QObject*>(QStringLiteral("balancePill"));
-    QVERIFY2(pill, "Home must host the balance element");
-    QVERIFY2(findVisibleTextItem(pill, QStringLiteral("2 h 15 min")),
-             "the balance element must show the formatted balance");
+    // The balance moved to the header, which is on every signed-in screen (CUST-06, D-19). Two
+    // pills on Home would be two sources of the same number.
+    QVERIFY2(!screen->findChild<QObject*>(QStringLiteral("balancePill")),
+             "Home must not carry its own balance element: the header does");
+    QVERIFY(!findVisibleTextItem(screen.data(), QStringLiteral("2 h 15 min")));
+}
+
+void TstUiScreens::appHeaderCarriesTheWordmarkTheBalanceAndTheMenuInThatOrder()
+{
+    QQuickStyle::setStyle(QStringLiteral("Basic"));
+    QQmlEngine engine;
+    registerTokenSingletons(&engine);
+
+    FakeShellClient client;
+    client.setBalance(135, QStringLiteral("2 h 15 min"), false);
+
+    QString error;
+    QScopedPointer<QObject> header(instantiate(&engine, QStringLiteral("AppHeader.qml"), &error));
+    QVERIFY2(header, qPrintable(error));
+    QVERIFY(header->setProperty("client", QVariant::fromValue(static_cast<QObject*>(&client))));
+
+    // A 64px row (`s16`), the design contract's height. Its width comes from the window in the app;
+    // here it is given one so the right-hand items have somewhere to anchor.
+    QCOMPARE(header->property("height").toInt(), 64);
+    QVERIFY(header->setProperty("width", 960));
+
+    // The balance element is in it and shows the facade's own text: the client draws it and does no
+    // arithmetic (CUST-06).
+    QObject* pill = header->findChild<QObject*>(QStringLiteral("balancePill"));
+    QVERIFY2(pill, "the header must carry the balance element");
+    QVERIFY(findVisibleTextItem(pill, QStringLiteral("2 h 15 min")));
 
     // And it follows the facade: a new balance is drawn without a reload.
     client.setBalance(45, QStringLiteral("45 min"), false);
     QVERIFY(findVisibleTextItem(pill, QStringLiteral("45 min")));
     QVERIFY(!findVisibleTextItem(pill, QStringLiteral("2 h 15 min")));
+
+    // The menu is in it, and the balance is not a control: nothing about the pill takes focus or a
+    // click, so the customer's eye stays on Play (values).
+    QObject* menu = header->findChild<QObject*>(QStringLiteral("seatHubMenu"));
+    QVERIFY2(menu, "the header must carry the menu");
+    QVERIFY2(!pill->property("activeFocusOnTab").toBool(), "the balance element is not focusable");
+    for (QObject* item : pill->findChildren<QObject*>()) {
+        QVERIFY2(!item->inherits("QQuickButton"), "the balance element is data, not a button");
+        QVERIFY2(!item->inherits("QQuickMouseArea"), "the balance element takes no clicks");
+    }
+
+    // Wordmark, then balance, then menu, left to right, each measured in the header's own
+    // coordinates.
+    QObject* wordmark = findVisibleTextItem(header.data(), QStringLiteral("SeatHub"));
+    QVERIFY2(wordmark, "the header must carry the wordmark");
+    auto xIn = [&](QObject* object) {
+        double x = 0;
+        for (QQuickItem* item = qobject_cast<QQuickItem*>(object);
+             item && item != static_cast<QQuickItem*>(header.data()); item = item->parentItem()) {
+            x += item->x();
+        }
+        return x;
+    };
+    QVERIFY2(xIn(wordmark) < xIn(pill), "the wordmark is on the left of the balance");
+    QVERIFY2(xIn(pill) < xIn(menu), "the balance comes before the menu button");
+}
+
+void TstUiScreens::theShellGivesEverySignedInViewTheHeaderAndNeitherSignInNorTheSplash()
+{
+    // `main.qml` instantiates the real SeatHubClient, which only the application registers, so it
+    // cannot be loaded here (05-02 deviation 2 set this technique). What can be tested for real is
+    // the rule itself: `showsHeader()` is lifted out of the source and evaluated for every state
+    // the facade can be in, and the wiring around it is read as source.
+    QFile file(guiDir() + QStringLiteral("/main.qml"));
+    QVERIFY2(file.open(QIODevice::ReadOnly), "main.qml must be readable");
+    const QString source = QString::fromUtf8(file.readAll());
+
+    const QRegularExpression fn(
+        QStringLiteral("(function showsHeader\\(state, signedIn\\) \\{.*?\\n    \\})"),
+        QRegularExpression::DotMatchesEverythingOption);
+    const QRegularExpressionMatch match = fn.match(source);
+    QVERIFY2(match.hasMatch(), "main.qml must define showsHeader(state, signedIn)");
+
+    QQuickStyle::setStyle(QStringLiteral("Basic"));
+    QQmlEngine engine;
+    QQmlComponent probe(&engine);
+    probe.setData((QStringLiteral("import QtQml\nQtObject {\n") + match.captured(1)
+                   + QStringLiteral("\n}\n")).toUtf8(),
+                  QUrl(QStringLiteral("qrc:/tst_header_rule.qml")));
+    QScopedPointer<QObject> rule(probe.create());
+    QVERIFY2(rule, qPrintable(probe.errorString()));
+
+    auto shows = [&](const QString& state, bool signedIn) {
+        QVariant answer;
+        QMetaObject::invokeMethod(rule.data(), "showsHeader", Q_RETURN_ARG(QVariant, answer),
+                                  Q_ARG(QVariant, state), Q_ARG(QVariant, signedIn));
+        return answer.toBool();
+    };
+
+    // Every signed-in view has it: Home (and Settings, which is a view inside home), Connecting,
+    // and the error view.
+    for (const QString& state : { QStringLiteral("home"), QStringLiteral("connecting"),
+                                  QStringLiteral("streaming"), QStringLiteral("error") }) {
+        QVERIFY2(shows(state, true), qPrintable(state + QStringLiteral(" must carry the header")));
+    }
+
+    // Sign-in and the restore splash never do, and nothing does before a customer is signed in.
+    QVERIFY(!shows(QStringLiteral("signed_out"), false));
+    QVERIFY(!shows(QStringLiteral("signed_out"), true));
+    QVERIFY(!shows(QStringLiteral("restoring"), false));
+    QVERIFY(!shows(QStringLiteral("restoring"), true));
+    QVERIFY(!shows(QStringLiteral("home"), false));
+    QVERIFY(!shows(QStringLiteral("error"), false));
+    QVERIFY2(!shows(QStringLiteral("a state nobody named"), true),
+             "an unnamed state must not grow a header by accident");
+
+    // The wiring: one header, under the forced-update modal, with the loader laid out below it, and
+    // none of the screens carrying a copy of their own.
+    QCOMPARE(source.count(QStringLiteral("AppHeader {")), 1);
+    QVERIFY(source.contains(QStringLiteral("client: seatHub")));
+    QVERIFY(source.contains(
+        QStringLiteral("visible: window.showsHeader(seatHub.appState, seatHub.signedIn)")));
+    QVERIFY2(source.contains(QStringLiteral("anchors.top: appHeader.visible ? appHeader.bottom")),
+             "the view loader must sit below the header, not behind it");
+    QVERIFY2(source.indexOf(QStringLiteral("AppHeader {"))
+                 < source.indexOf(QStringLiteral("ForcedUpdateModal {")),
+             "the forced-update modal must still cover the header");
+
+    for (const QString& name : { QStringLiteral("HomeScreen.qml"), QStringLiteral("SettingsPage.qml"),
+                                 QStringLiteral("ErrorScreen.qml"), QStringLiteral("SignInScreen.qml"),
+                                 QStringLiteral("RestoreSplash.qml"),
+                                 QStringLiteral("ForcedUpdateModal.qml") }) {
+        QVERIFY2(!readSource(guiDir() + QLatin1Char('/') + name).contains(QStringLiteral("AppHeader")),
+                 qPrintable(name + QStringLiteral(" must not carry a header of its own")));
+    }
+
+    // Compiled in: a control missing from the resource file would not exist at runtime.
+    QFile qrc(guiDir() + QStringLiteral("/../qml.qrc"));
+    QVERIFY(qrc.open(QIODevice::ReadOnly));
+    const QString qrcText = QString::fromUtf8(qrc.readAll());
+    for (const QString& name : { QStringLiteral("AppHeader.qml"), QStringLiteral("SeatHubMenu.qml"),
+                                 QStringLiteral("BalancePill.qml") }) {
+        QVERIFY2(qrcText.contains(QStringLiteral("gui/") + name),
+                 qPrintable(name + QStringLiteral(" is not in app/qml.qrc")));
+    }
 }
 
 void TstUiScreens::balancePillDrawsEachOfItsStates()
@@ -722,6 +869,176 @@ void TstUiScreens::balancePillDrawsEachOfItsStates()
     const QString text = QString::fromUtf8(source.readAll());
     QVERIFY2(!text.contains(QStringLiteral(" min\"")) && !text.contains(QStringLiteral(" h \"")),
              "the balance element must not format a duration itself");
+}
+
+void TstUiScreens::balancePillChangesColourExactlyAtTheSpecsThresholds()
+{
+    // `screens.md` section 25 and `timing.md`: warn at 10 minutes and under, danger at 2 minutes and
+    // under. The thresholds are the spec's, so the boundary values are pinned on both sides.
+    QQuickStyle::setStyle(QStringLiteral("Basic"));
+    QQmlEngine engine;
+    registerTokenSingletons(&engine);
+
+    FakeShellClient client;
+    QString error;
+    QScopedPointer<QObject> pill(instantiate(&engine, QStringLiteral("BalancePill.qml"), &error));
+    QVERIFY2(pill, qPrintable(error));
+    QVERIFY(pill->setProperty("client", QVariant::fromValue(static_cast<QObject*>(&client))));
+
+    struct Case { qint64 minutes; const char* level; };
+    const Case cases[] = { { 61, "normal" }, { 11, "normal" }, { 10, "low" },
+                           { 3, "low" },     { 2, "critical" }, { 0, "critical" } };
+    for (const Case& c : cases) {
+        client.setBalance(c.minutes, QStringLiteral("x"), false);
+        QCOMPARE(pill->property("level").toString(), QString::fromLatin1(c.level));
+    }
+
+    // Colour is never the only signal: the two glyphs differ from each other, and a normal balance has
+    // neither.
+    client.setBalance(11, QStringLiteral("11 min"), false);
+    QVERIFY(!findVisibleTextItem(pill.data(), QStringLiteral("▲")));
+    QVERIFY(!findVisibleTextItem(pill.data(), QStringLiteral("◆")));
+    client.setBalance(10, QStringLiteral("10 min"), false);
+    QVERIFY(findVisibleTextItem(pill.data(), QStringLiteral("▲")));
+    QVERIFY(!findVisibleTextItem(pill.data(), QStringLiteral("◆")));
+    client.setBalance(2, QStringLiteral("2 min"), false);
+    QVERIFY(findVisibleTextItem(pill.data(), QStringLiteral("◆")));
+    QVERIFY(!findVisibleTextItem(pill.data(), QStringLiteral("▲")));
+
+    // A stale value is not judged against the thresholds: the read that made it stale may be hours
+    // old, and a warning colour on a number that may no longer be true would say something the client
+    // does not know.
+    client.setBalance(2, QStringLiteral("2 min"), true);
+    QCOMPARE(pill->property("level").toString(), QStringLiteral("muted"));
+
+    // Never read and nothing failed yet: the first-read skeleton, with neither a value nor a word.
+    client.setBalance(-1, QString(), false);
+    QVERIFY(pill->property("loading").toBool());
+    QVERIFY(!findVisibleTextItem(pill.data(), QStringLiteral("Unavailable")));
+}
+
+void TstUiScreens::menuHasItsTwoItemsAndTopUpAsksTheFacadeForTheWebsite()
+{
+    QQuickStyle::setStyle(QStringLiteral("Basic"));
+    QQmlEngine engine;
+    registerTokenSingletons(&engine);
+
+    FakeShellClient client;
+    QString error;
+    QScopedPointer<QObject> menu(instantiate(&engine, QStringLiteral("SeatHubMenu.qml"), &error));
+    QVERIFY2(menu, qPrintable(error));
+    QVERIFY(menu->setProperty("client", QVariant::fromValue(static_cast<QObject*>(&client))));
+
+    // The trigger is a real button with the accessible name `Menu`, tabbable, and 40x40.
+    QObject* trigger = menu->property("trigger").value<QObject*>();
+    QVERIFY(trigger);
+    QVERIFY(trigger->inherits("QQuickButton"));
+    QVERIFY(trigger->property("activeFocusOnTab").toBool());
+    QCOMPARE(menu->property("implicitWidth").toInt(), 40);
+    QCOMPARE(menu->property("implicitHeight").toInt(), 40);
+
+    // Exactly the two items this plan ships, in order: Top up, then Settings. Profile is not here
+    // yet, so nothing in the menu points at a screen that does not exist.
+    QObject* popup = menu->property("menu").value<QObject*>();
+    QVERIFY(popup);
+    QCOMPARE(popup->property("count").toInt(), 2);
+    QObject* topUp = menu->findChild<QObject*>(QStringLiteral("menuItemTopUp"));
+    QObject* settings = menu->findChild<QObject*>(QStringLiteral("menuItemSettings"));
+    QVERIFY(topUp);
+    QVERIFY(settings);
+    QCOMPARE(topUp->property("text").toString(), QStringLiteral("Top up"));
+    QCOMPARE(settings->property("text").toString(), QStringLiteral("Settings"));
+
+    // `Top up` leaves the app, and says so with the external-link mark; `Settings` does not.
+    QCOMPARE(topUp->property("glyph").toString(), QStringLiteral("↗"));
+    QVERIFY(settings->property("glyph").toString().isEmpty());
+
+    // Activating an item calls the facade, and only the facade: no address is built here. The URL
+    // itself is asserted against the real facade in `tst_facade_wiring`.
+    QVERIFY(QMetaObject::invokeMethod(topUp, "triggered"));
+    QCOMPARE(client.topUps(), 1);
+    QCOMPARE(client.settingsOpens(), 0);
+    QVERIFY(QMetaObject::invokeMethod(settings, "triggered"));
+    QCOMPARE(client.settingsOpens(), 1);
+    QCOMPARE(client.topUps(), 1);
+
+    const QString source = readSource(guiDir() + QStringLiteral("/SeatHubMenu.qml"));
+    QVERIFY2(source.contains(QStringLiteral("client.openTopUp()")),
+             "the top-up item must ask the facade, not open an address itself");
+    QVERIFY(!source.contains(QStringLiteral("Qt.openUrlExternally")));
+    QVERIFY(!source.contains(QStringLiteral("http")));
+
+    // A click outside closes it, and Escape does.
+    const int policy = popup->property("closePolicy").toInt();
+    QVERIFY2(policy & 0x01, "a click outside must close the menu");  // Popup.CloseOnPressOutside
+    QVERIFY2(policy & 0x10, "Escape must close the menu");           // Popup.CloseOnEscape
+}
+
+void TstUiScreens::menuOpensOnSpaceMovesWithArrowsAndEscapeReturnsFocusToTheTrigger()
+{
+    // The keyboard behaviour the design contract asks for, driven with real key events in a real
+    // (if unseen) window: Space opens, the arrow keys move, Escape closes and the trigger has focus
+    // again. This is the one test here that needs a window, so it builds one.
+    QQuickStyle::setStyle(QStringLiteral("Basic"));
+    QQmlEngine engine;
+    registerTokenSingletons(&engine);
+
+    FakeShellClient client;
+    QQmlComponent component(&engine);
+    component.setData(QByteArrayLiteral(
+                          "import QtQuick\n"
+                          "import QtQuick.Controls\n"
+                          "ApplicationWindow {\n"
+                          "    id: win\n"
+                          "    width: 400; height: 300; visible: true\n"
+                          "    property var client: null\n"
+                          "    SeatHubMenu {\n"
+                          "        objectName: \"underTest\"\n"
+                          "        anchors.right: parent.right\n"
+                          "        anchors.top: parent.top\n"
+                          "        client: win.client\n"
+                          "    }\n"
+                          "}\n"),
+                      QUrl::fromLocalFile(guiDir() + QStringLiteral("/tst_menu_window.qml")));
+    QScopedPointer<QObject> created(component.create());
+    QVERIFY2(created, qPrintable(component.errorString()));
+    auto* window = qobject_cast<QQuickWindow*>(created.data());
+    QVERIFY(window);
+    QVERIFY(window->setProperty("client", QVariant::fromValue(static_cast<QObject*>(&client))));
+    QVERIFY(QTest::qWaitForWindowExposed(window));
+    window->requestActivate();
+    QVERIFY(QTest::qWaitForWindowActive(window));
+
+    QObject* menu = window->findChild<QObject*>(QStringLiteral("underTest"));
+    QVERIFY(menu);
+    auto* trigger = menu->property("trigger").value<QQuickItem*>();
+    QObject* popup = menu->property("menu").value<QObject*>();
+    QVERIFY(trigger);
+    QVERIFY(popup);
+
+    trigger->forceActiveFocus();
+    QVERIFY(trigger->hasActiveFocus());
+    QVERIFY(!popup->property("opened").toBool());
+
+    // Space opens it.
+    QTest::keyClick(window, Qt::Key_Space);
+    QTRY_VERIFY_WITH_TIMEOUT(popup->property("opened").toBool(), 3000);
+
+    // The arrow keys move through the items and Enter activates one.
+    QTest::keyClick(window, Qt::Key_Down);
+    QTest::keyClick(window, Qt::Key_Down);
+    QTest::keyClick(window, Qt::Key_Up);
+    QTest::keyClick(window, Qt::Key_Return);
+    QTRY_VERIFY_WITH_TIMEOUT(!popup->property("opened").toBool(), 3000);
+    QCOMPARE(client.topUps() + client.settingsOpens(), 1);
+    QVERIFY2(client.topUps() == 1, "Down, Down, Up from nothing highlighted lands on the first item");
+
+    // Escape closes it and returns focus to the trigger.
+    QTest::keyClick(window, Qt::Key_Space);
+    QTRY_VERIFY_WITH_TIMEOUT(popup->property("opened").toBool(), 3000);
+    QTest::keyClick(window, Qt::Key_Escape);
+    QTRY_VERIFY_WITH_TIMEOUT(!popup->property("opened").toBool(), 3000);
+    QTRY_VERIFY_WITH_TIMEOUT(trigger->hasActiveFocus(), 3000);
 }
 
 void TstUiScreens::restoreSplashShowsItsLineAndNeverTheSignInForm()

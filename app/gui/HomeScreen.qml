@@ -44,19 +44,6 @@ Item {
         spacing: Metrics.s6
         width: Math.min(parent.width - Metrics.s16, 420)
 
-        // The persistent balance element (CUST-06, D-19). It is the top of the column here; the
-        // header that carries it on every signed-in screen is a later plan's.
-        Item {
-            width: parent.width
-            height: balancePill.height
-
-            BalancePill {
-                id: balancePill
-                anchors.horizontalCenter: parent.horizontalCenter
-                client: root.client
-            }
-        }
-
         Text {
             id: stateText
             width: parent.width

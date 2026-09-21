@@ -6,6 +6,8 @@
         <file>gui/SessionSegue.qml</file>
         <file>gui/SignInScreen.qml</file>
         <file>gui/HomeScreen.qml</file>
+        <file>gui/AppHeader.qml</file>
+        <file>gui/SeatHubMenu.qml</file>
         <file>gui/BalancePill.qml</file>
         <file>gui/RestoreSplash.qml</file>
         <file>gui/ErrorScreen.qml</file>

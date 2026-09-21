@@ -517,6 +517,15 @@ void SeatHubClient::setAppState(const QString& state)
     }
 }
 
+void SeatHubClient::setSignedIn(bool signedIn)
+{
+    if (m_signedIn == signedIn) {
+        return;
+    }
+    m_signedIn = signedIn;
+    emit signedInChanged();
+}
+
 void SeatHubClient::setInSettings(bool inSettings)
 {
     if (m_inSettings == inSettings) {
@@ -817,7 +826,7 @@ bool SeatHubClient::adoptSignIn(const AuthTokenPair& pair, const QString& identi
     m_controlPlane->setAccessToken(pair.accessToken);
 
     ++m_authEpoch;
-    m_signedIn = true;
+    setSignedIn(true);
     m_account.clear();
     m_identity = identity;
     emit identityChanged();
@@ -899,6 +908,11 @@ bool SeatHubClient::openWebsite(const QString& target)
     return m_urlOpener ? m_urlOpener(QUrl(address)) : false;
 }
 
+bool SeatHubClient::openTopUp()
+{
+    return openWebsite(QStringLiteral("topup"));
+}
+
 QVariantMap SeatHubClient::readAgentConfigFile(const QUrl& fileUrl)
 {
     const QVariantMap described = AgentConfig::describe(fileUrl);
@@ -954,7 +968,7 @@ void SeatHubClient::signOut()
     m_sessionId.clear();
     m_clientUuid.clear();
 
-    m_signedIn = false;
+    setSignedIn(false);
     m_account.clear();
     m_identity.clear();
     emit identityChanged();
@@ -1010,7 +1024,7 @@ void SeatHubClient::applyRestoreResult(const ControlPlaneResult& result)
         AccountInfo account;
         if (AccountInfo::parse(result.body, &account)) {
             ++m_authEpoch;
-            m_signedIn = true;
+            setSignedIn(true);
             setAccount(account);
             setHomeStatus(QString::fromLatin1(kHomeReady));
             setAppState(QString::fromLatin1(kStateHome));
@@ -1037,7 +1051,7 @@ void SeatHubClient::applyRestoreResult(const ControlPlaneResult& result)
     qCInfo(seathubClient) << "could not confirm the stored credential (status" << result.statusCode
                           << "); staying signed in, offline";
     ++m_authEpoch;
-    m_signedIn = true;
+    setSignedIn(true);
     setHomeStatus(QString::fromLatin1(kHomeOffline));
     setAppState(QString::fromLatin1(kStateHome));
 }

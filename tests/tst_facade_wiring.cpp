@@ -1020,6 +1020,107 @@ private slots:
         QVERIFY(opened.at(1).query().isEmpty());
     }
 
+    // --- Phase 5 plan 07: the header's two facade needs -----------------------------------------
+
+    void theTopUpInvokableOpensTheSpecsExactAddressAndNothingElse()
+    {
+        // The menu's `Top up` and Home's quiet top-up control both call this and nothing else: the
+        // view holds no address and spells no target (T-05-31).
+        SeatHubClient client;
+        isolateStore(client);
+        armControlPlane(client);
+        m_fake->answerMe(200, accountBody());
+        m_fake->answerWallet(200, walletBody(10));
+        client.credentialStore()->storeToken(TokenStore::accessTokenName(),
+                                             QStringLiteral("opaque-access-token"));
+        client.restoreSession();
+        QTRY_COMPARE_WITH_TIMEOUT(client.appState(), QStringLiteral("home"), 15000);
+
+        QList<QUrl> opened;
+        client.setUrlOpener([&opened](const QUrl& url) {
+            opened.append(url);
+            return true;
+        });
+
+        QVERIFY(client.openTopUp());
+        QCOMPARE(opened.size(), 1);
+        QCOMPARE(opened.at(0).toString(), QStringLiteral("https://sevenhills.damra.co/topup"));
+
+        // Signed in, with a credential in memory and on disk, and the address carries none of it: no
+        // query, no fragment, no identity, no token.
+        QVERIFY(opened.at(0).query().isEmpty());
+        QVERIFY(opened.at(0).fragment().isEmpty());
+        const QString text = opened.at(0).toString();
+        QVERIFY2(!text.contains(QStringLiteral("opaque-access-token")), qPrintable(text));
+        QVERIFY2(!text.contains(QStringLiteral("lina")), qPrintable(text));
+        QVERIFY2(!text.contains(QStringLiteral("6f1c6f5e")), qPrintable(text));
+
+        // It is the same address `websiteUrl("topup")` gives, so the two cannot drift apart.
+        QCOMPARE(opened.at(0).toString(), client.websiteUrl(QStringLiteral("topup")));
+
+        // A browser that could not be started reports it, and nothing else happens.
+        client.setUrlOpener([](const QUrl&) { return false; });
+        QVERIFY(!client.openTopUp());
+    }
+
+    void signedInIsTrueFromConfirmationToSignOutAndSaysSoWhenItChanges()
+    {
+        // The shell puts the header on a view only while this holds, so it has to follow every way a
+        // customer becomes signed in (a confirmed restore, an offline restore) and signed out.
+        SeatHubClient client;
+        isolateStore(client);
+        armControlPlane(client);
+        m_fake->answerMe(200, accountBody());
+        m_fake->answerWallet(200, walletBody(90));
+        client.credentialStore()->storeToken(TokenStore::accessTokenName(),
+                                             QStringLiteral("opaque-access-token"));
+
+        QVERIFY(!client.signedIn());
+        QSignalSpy changes(&client, &SeatHubClient::signedInChanged);
+
+        client.restoreSession();
+        QTRY_COMPARE_WITH_TIMEOUT(client.appState(), QStringLiteral("home"), 15000);
+        QVERIFY(client.signedIn());
+        QCOMPARE(changes.count(), 1);
+
+        client.signOut();
+        QVERIFY(!client.signedIn());
+        QCOMPARE(changes.count(), 2);
+        QCOMPARE(client.appState(), QStringLiteral("signed_out"));
+    }
+
+    void anOfflineRestoreIsStillSignedInSoTheHeaderShowsItsLastKnownBalance()
+    {
+        SeatHubClient client;
+        isolateStore(client);
+        armControlPlane(client);
+        m_fake->answerMe(0, QByteArray());
+        m_fake->answerWallet(0, QByteArray());
+        client.credentialStore()->storeToken(TokenStore::accessTokenName(),
+                                             QStringLiteral("opaque-access-token"));
+
+        client.restoreSession();
+        QTRY_COMPARE_WITH_TIMEOUT(client.appState(), QStringLiteral("home"), 15000);
+        QVERIFY(client.signedIn());
+        // The wallet read failed and none ever succeeded: the header's word is `Unavailable`.
+        QTRY_VERIFY_WITH_TIMEOUT(client.balanceStale(), 15000);
+        QCOMPARE(client.balanceMinutes(), qint64(-1));
+    }
+
+    void aRefusedCredentialIsNeverSignedIn()
+    {
+        SeatHubClient client;
+        isolateStore(client);
+        armControlPlane(client);
+        m_fake->answerMe(401, refusedBody());
+        client.credentialStore()->storeToken(TokenStore::accessTokenName(),
+                                             QStringLiteral("opaque-access-token"));
+
+        client.restoreSession();
+        QTRY_COMPARE_WITH_TIMEOUT(client.appState(), QStringLiteral("signed_out"), 15000);
+        QVERIFY(!client.signedIn());
+    }
+
     void theFacadeHandsTheScreenTheBundledCountriesAndARegionThatIsOneOfThem()
     {
         SeatHubClient client;

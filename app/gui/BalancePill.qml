@@ -34,7 +34,7 @@ Rectangle {
     readonly property real minutes: client && client.balanceMinutes !== undefined
                                     ? Number(client.balanceMinutes) : -1
     readonly property bool known: root.minutes >= 0
-    readonly property bool stale: client && client.balanceStale === true
+    readonly property bool stale: client ? client.balanceStale === true : false
 
     // `screens.md` section 25: warn at 10 minutes and under, danger at 2 minutes and under. Only
     // meaningful for a value that is current.

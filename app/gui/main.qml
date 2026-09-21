@@ -61,9 +61,40 @@ ApplicationWindow {
         return signInComponent
     }
 
+    // Whether a view carries the header, and the balance in it (CUST-06, D-19): every signed-in view -
+    // Home, Settings (a view inside home), Connecting and the error view - and neither sign-in nor the
+    // restore splash, because there is no balance before sign-in. Anything this does not name has no
+    // header, so a new state cannot grow one by accident.
+    function showsHeader(state, signedIn) {
+        if (!signedIn)
+            return false
+        switch (state) {
+        case "home":
+        case "connecting":
+        case "streaming":
+        case "error":
+            return true
+        }
+        return false
+    }
+
+    // One header for every signed-in view, not one per screen: four copies would be four places to
+    // drift. It sits under the forced-update modal, which still covers everything.
+    AppHeader {
+        id: appHeader
+        anchors.top: parent.top
+        anchors.left: parent.left
+        anchors.right: parent.right
+        visible: window.showsHeader(seatHub.appState, seatHub.signedIn)
+        client: seatHub
+    }
+
     Loader {
         id: viewLoader
-        anchors.fill: parent
+        anchors.top: appHeader.visible ? appHeader.bottom : parent.top
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.bottom: parent.bottom
         sourceComponent: window.componentForState(seatHub.appState)
 
         onLoaded: if (item && item.forceActiveFocus) item.forceActiveFocus()

@@ -153,6 +153,11 @@ class SeatHubClient : public QObject
     /// without its transition (`screens.md` §22). True everywhere else.
     Q_PROPERTY(bool animationEffects READ animationEffects CONSTANT)
 
+    /// True from a confirmed sign-in (or an offline restore, where the stored credential is kept and
+    /// trusted) until sign-out. The shell puts the header, and the balance in it, on a view only
+    /// while this holds: there is no balance before sign-in (CUST-06, `screens.md` Common shell).
+    Q_PROPERTY(bool signedIn READ signedIn NOTIFY signedInChanged)
+
 public:
     explicit SeatHubClient(QObject* parent = nullptr);
     /// Stops the control-plane thread and joins it before anything that could still be running
@@ -184,6 +189,7 @@ public:
     QVariantList countries() const { return m_countries; }
     QString defaultCountryCode() const { return m_defaultCountryCode; }
     bool animationEffects() const { return m_animationEffects; }
+    bool signedIn() const { return m_signedIn; }
 
     /// The Qt window the visibility sequence hides and restores. Called once by main.qml.
     Q_INVOKABLE void setHostWindow(QWindow* window);
@@ -224,6 +230,11 @@ public:
     /// Opens `websiteUrl(target)` in the customer's browser. False (and nothing opened) for an
     /// unknown target.
     Q_INVOKABLE bool openWebsite(const QString& target);
+
+    /// Opens the website's top-up page (`/topup`) in the customer's browser: the menu's `Top up` and
+    /// Home's quiet top-up control (CUST-07). A named call so no view has to spell a target, and no
+    /// view ever holds an address; the page carries nothing about the customer (D-07, D-08).
+    Q_INVOKABLE bool openTopUp();
 
     /// Replaces what opens an address (the default is the desktop's browser). A test uses this so
     /// it can see what would have been opened without launching one.
@@ -301,6 +312,7 @@ signals:
     void homeStatusChanged();
     void endReasonTextChanged();
     void balanceChanged();
+    void signedInChanged();
 
     /// Step 1 succeeded - the view should show the code field.
     void otpRequested(const QString& phoneE164);
@@ -364,6 +376,8 @@ private:
     void raiseFailure(const SeatHubFailure& failure);
     void clearFailure();
     void setInSettings(bool inSettings);
+    /// The one writer of `m_signedIn`, so `signedInChanged()` can never be missed.
+    void setSignedIn(bool signedIn);
     /// Applies the answer to the launch-time `GET /api/me` (see `restoreSession()`).
     void applyRestoreResult(const ControlPlaneResult& result);
     /// Applies an answer to `GET /api/wallet`. `epoch` is the credential generation the read was
