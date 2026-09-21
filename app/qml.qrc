@@ -10,6 +10,7 @@
         <file>gui/SeatHubMenu.qml</file>
         <file>gui/BalancePill.qml</file>
         <file>gui/RestoreSplash.qml</file>
+        <file>gui/ConnectingScreen.qml</file>
         <file>gui/ErrorScreen.qml</file>
         <file>gui/SeatHubOTPField.qml</file>
         <file>gui/SeatHubIdentifierField.qml</file>

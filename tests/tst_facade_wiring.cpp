@@ -1292,11 +1292,12 @@ private slots:
         QSignalSpy liveChanges(&client, &SeatHubClient::liveSessionChanged);
 
         // A session is attached (Play's allocation returned it). The rig has no answer in this test,
-        // so pairing fails and the customer lands on the error view with the session still attached.
+        // so pairing fails and connecting stops where it was, with the session still attached.
         client.beginSession(QStringLiteral("session-live"));
         QVERIFY(client.liveSession());
         QCOMPARE(liveChanges.count(), 1);
-        QTRY_COMPARE_WITH_TIMEOUT(client.appState(), QStringLiteral("error"), 15000);
+        QTRY_VERIFY_WITH_TIMEOUT(client.connectFailed(), 15000);
+        QCOMPARE(client.appState(), QStringLiteral("connecting"));
         QVERIFY2(client.liveSession(), "a failed step does not end the session on the server");
 
         // Back on Home the session is still live: Play reads Resume session (the screen binds to this
@@ -1317,7 +1318,7 @@ private slots:
         QCOMPARE(m_fake->requestPaths().count(QStringLiteral("/api/sessions")), 0);
 
         // Sign-out forgets it: the next customer on this PC is never offered this one's session.
-        QTRY_COMPARE_WITH_TIMEOUT(client.appState(), QStringLiteral("error"), 15000);
+        QTRY_VERIFY_WITH_TIMEOUT(client.connectFailed(), 15000);
         client.signOut();
         QVERIFY(!client.liveSession());
     }
@@ -1329,7 +1330,7 @@ private slots:
         QVERIFY(!QTest::currentTestFailed());
 
         client.beginSession(QStringLiteral("session-live"));
-        QTRY_COMPARE_WITH_TIMEOUT(client.appState(), QStringLiteral("error"), 15000);
+        QTRY_VERIFY_WITH_TIMEOUT(client.connectFailed(), 15000);
         client.dismissError();
         QVERIFY(client.liveSession());
 
@@ -1616,6 +1617,357 @@ private slots:
         client.beginSession(QStringLiteral("s-stages"));
         QCOMPARE(client.connectStage(), 0);
         QVERIFY(client.stageText().isEmpty());
+    }
+
+    // --- a stall names its step and says what the server decided (CUST-13) --------------------------------
+
+    /// What the customer must never read anywhere on a stalled connect: an internal state, an end-reason
+    /// key, or a stage string of the engine's.
+    static void verifyNoInternalNameIsShown(const SeatHubClient& client)
+    {
+        const QStringList shown = {client.stalledStepText(), client.stalledReasonText(),
+                                   client.failure().value(QStringLiteral("error")).toString(),
+                                   client.stageText()};
+        const QStringList internal = {
+            QStringLiteral("READINESS_TIMEOUT"), QStringLiteral("CONNECT_TIMEOUT"),
+            QStringLiteral("MODE_BOOT_TIMEOUT"),  QStringLiteral("BALANCE_EXHAUSTED"),
+            QStringLiteral("HOST_LOST"),          QStringLiteral("CLIENT_SILENT"),
+            QStringLiteral("SESSION_LOST"),       QStringLiteral("SOMETHING_NEW"),
+            QStringLiteral("PREPARING"),          QStringLiteral("ALLOCATED"),
+            QStringLiteral("EXPIRED"),            QStringLiteral("FAILED"),
+            QStringLiteral("RTSP"),               QStringLiteral("STAGE_")};
+        for (const QString& text : shown) {
+            for (const QString& name : internal) {
+                QVERIFY2(!text.contains(name), qPrintable(QStringLiteral("'%1' shows '%2'").arg(text, name)));
+            }
+        }
+    }
+
+    void aStalledConnectNamesItsStepAndSaysWhatTheServerDecided_data()
+    {
+        QTest::addColumn<QString>("reachedState");
+        QTest::addColumn<QString>("state");
+        QTest::addColumn<QString>("endReason");
+        QTest::addColumn<int>("minutes");
+        QTest::addColumn<QString>("step");
+        QTest::addColumn<QString>("plain");
+        QTest::addColumn<QString>("styled");
+
+        const QString rig = QStringLiteral("Stopped at: Preparing the rig");
+        const QString stream = QStringLiteral("Stopped at: Preparing the stream");
+        const QString mono = QStringLiteral("<font face=\"Geist Mono\">%1</font>");
+
+        QTest::newRow("the rig did not come back (no charge)")
+            << "PREPARING" << "FAILED" << "READINESS_TIMEOUT" << 0 << rig
+            << "This rig didn't come back in time. You were not charged."
+            << "This rig didn't come back in time. You were not charged.";
+        QTest::newRow("a mode boot that ran out (no charge)")
+            << "PREPARING" << "FAILED" << "MODE_BOOT_TIMEOUT" << 0 << rig
+            << "This rig didn't come back in time. You were not charged."
+            << "This rig didn't come back in time. You were not charged.";
+        QTest::newRow("the customer never started streaming (no charge)")
+            << "READY" << "EXPIRED" << "CONNECT_TIMEOUT" << 0 << stream
+            << "You didn't start streaming in time, so the session was released. You were not charged."
+            << "You didn't start streaming in time, so the session was released. You were not charged.";
+        QTest::newRow("the rig was lost, with minutes charged")
+            << "READY" << "FAILED" << "HOST_LOST" << 3 << stream
+            << "We lost contact with this rig, so the session ended. You were charged for 3 minutes."
+            << QStringLiteral("We lost contact with this rig, so the session ended. You were charged "
+                              "for %1 minutes.").arg(mono.arg(3));
+        QTest::newRow("support ended it")
+            << "ALLOCATED" << "CANCELLED" << "OPERATOR_FORCED" << 0 << rig
+            << "Support ended this session. You were charged for 0 minutes."
+            << QStringLiteral("Support ended this session. You were charged for %1 minutes.")
+                   .arg(mono.arg(0));
+        QTest::newRow("the balance ran out")
+            << "READY" << "COMPLETED" << "BALANCE_EXHAUSTED" << 12 << stream
+            << "Your balance ran out, so the session ended."
+            << "Your balance ran out, so the session ended.";
+    }
+
+    void aStalledConnectNamesItsStepAndSaysWhatTheServerDecided()
+    {
+        QFETCH(QString, reachedState);
+        QFETCH(QString, state);
+        QFETCH(QString, endReason);
+        QFETCH(int, minutes);
+        QFETCH(QString, step);
+        QFETCH(QString, plain);
+        QFETCH(QString, styled);
+
+        SeatHubClient client;
+        beginStagedSession(client);
+        QVERIFY(!QTest::currentTestFailed());
+        report(client, sessionIn(reachedState));
+        const int reached = client.connectStage();
+        QSignalSpy stalls(&client, &SeatHubClient::connectFailedChanged);
+        QVERIFY(!client.connectFailed());
+
+        SessionInfo over = sessionIn(state);
+        over.endReason = endReason;
+        over.minutesBilled = minutes;
+        report(client, over);
+
+        // Still the connecting view: the stage that was active is what failed, and it says so.
+        QCOMPARE(client.appState(), QStringLiteral("connecting"));
+        QVERIFY(client.connectFailed());
+        QCOMPARE(stalls.count(), 1);
+        QCOMPARE(client.stalledStepText(), step);
+        QCOMPARE(client.stalledReasonText(), styled);
+        QCOMPARE(client.failure().value(QStringLiteral("error")).toString(), plain);
+        // The stepper is frozen where it stopped; a later answer does not move it.
+        QCOMPARE(client.connectStage(), reached);
+        report(client, sessionIn(QStringLiteral("ACTIVE")));
+        QCOMPARE(client.connectStage(), reached);
+        // The server ended it, so it is not a session Home offers to resume.
+        QVERIFY(!client.liveSession());
+        // A second failure while this one is showing does not rewrite what the customer read.
+        emit client.pairing()->pairingFailed(SeatHubFailure::local(QStringLiteral("Something else.")));
+        QCOMPARE(client.stalledReasonText(), styled);
+        QCOMPARE(stalls.count(), 1);
+
+        verifyNoInternalNameIsShown(client);
+        QVERIFY(client.reference().isEmpty());
+
+        // The pairing poll stopped with the session: nothing keeps asking for a pairing that cannot
+        // happen.
+        QTest::qWait(400);
+        const int polls = m_fake->requestPaths().count(QStringLiteral("/api/sessions/s-stages/pairing"));
+        QTest::qWait(600);
+        QCOMPARE(m_fake->requestPaths().count(QStringLiteral("/api/sessions/s-stages/pairing")), polls);
+    }
+
+    void aFailureTheServerGaveNoReasonForStillNamesTheStepAndFallsBackToTheGenericSentence_data()
+    {
+        QTest::addColumn<QString>("state");
+        QTest::addColumn<QString>("endReason");
+
+        QTest::newRow("no reason at all") << "FAILED" << QString();
+        // Reasons the deck has no line for fall back the same way, and are never shown as a bare key.
+        QTest::newRow("a reason the deck has no line for") << "FAILED" << "SESSION_LOST";
+        QTest::newRow("a reason this client has never heard of") << "EXPIRED" << "SOMETHING_NEW";
+    }
+
+    void aFailureTheServerGaveNoReasonForStillNamesTheStepAndFallsBackToTheGenericSentence()
+    {
+        QFETCH(QString, state);
+        QFETCH(QString, endReason);
+
+        SeatHubClient client;
+        beginStagedSession(client);
+        QVERIFY(!QTest::currentTestFailed());
+        report(client, sessionIn(QStringLiteral("PREPARING")));
+
+        SessionInfo over = sessionIn(state);
+        over.endReason = endReason;
+        report(client, over);
+
+        QVERIFY(client.connectFailed());
+        QCOMPARE(client.stalledStepText(), QStringLiteral("Stopped at: Preparing the rig"));
+        // The generic sentence, never blank and never a bare code. It has no reference: the client
+        // does not make one up (ADR-0008), and the server named none for this.
+        QCOMPARE(client.stalledReasonText(), QStringLiteral("Something went wrong on our side."));
+        QCOMPARE(client.failure().value(QStringLiteral("error")).toString(),
+                 QStringLiteral("Something went wrong on our side."));
+        QVERIFY(client.reference().isEmpty());
+        verifyNoInternalNameIsShown(client);
+    }
+
+    void theClientsOwnPairingDeadlineIsAStallToo()
+    {
+        SeatHubClient client;
+        reachHome(client, 90);
+        QVERIFY(!QTest::currentTestFailed());
+        m_fake->answerPairing(409, playRefusalBody(QStringLiteral("The rig is not ready yet."),
+                                                   QStringLiteral("SH-2K2XQ1")));
+
+        // The deadline is measured by the pairing controller, on its own thread: shorten it there, then
+        // let a real pairing wait for a rig that never becomes ready.
+        PairingController* pairing = client.pairing();
+        QMetaObject::invokeMethod(
+            pairing, [pairing]() { pairing->setDeadlineMs(400); }, Qt::BlockingQueuedConnection);
+        client.beginSession(QStringLiteral("s-stages"));
+
+        QTRY_VERIFY_WITH_TIMEOUT(client.connectFailed(), 15000);
+        QCOMPARE(client.appState(), QStringLiteral("connecting"));
+        // Nothing was read about the session, so it stopped at the stage every session begins at.
+        QCOMPARE(client.stalledStepText(), QStringLiteral("Stopped at: Preparing the rig"));
+        // The client's own sentence, from the copy it already had; no reference, because none exists.
+        QCOMPARE(client.stalledReasonText(), QStringLiteral("The rig didn't finish connecting. Try again."));
+        QVERIFY(client.reference().isEmpty());
+        // The session is still the server's to end: Try again picks it up rather than asking for another.
+        QVERIFY(client.liveSession());
+        verifyNoInternalNameIsShown(client);
+    }
+
+    void aRefusalOfTheConnectReadIsTheServersOwnSentenceWithItsReference()
+    {
+        SeatHubClient client;
+        reachHome(client, 90);
+        QVERIFY(!QTest::currentTestFailed());
+        // The default answer for a session's pairing read: "no rig is assigned", with a reference.
+        client.beginSession(QStringLiteral("session-refused"));
+
+        QTRY_VERIFY_WITH_TIMEOUT(client.connectFailed(), 15000);
+        QCOMPARE(client.stalledReasonText(), QStringLiteral("no rig is assigned"));
+        QCOMPARE(client.reference(), QStringLiteral("SH-9K2XQ1"));
+        QCOMPARE(client.failure().value(QStringLiteral("error")).toString(), QStringLiteral("no rig is assigned"));
+    }
+
+    void anEngineFailureBeforeTheStreamStartsIsAStallAtTheSecondStage()
+    {
+        auto* engine = new FakeEngineSession;
+        {
+            SeatHubClient client;
+            client.session()->attachSession(engine);
+            beginStagedSession(client);
+            QVERIFY(!QTest::currentTestFailed());
+
+            emit engine->stageStarting(QStringLiteral("RTSP handshake"));
+            QCOMPARE(client.connectStage(), 2);
+            emit engine->stageFailed(QStringLiteral("RTSP handshake"), -1, QString());
+
+            QCOMPARE(client.appState(), QStringLiteral("connecting"));
+            QVERIFY(client.connectFailed());
+            QCOMPARE(client.stalledStepText(), QStringLiteral("Stopped at: Preparing the stream"));
+            // The engine's own words are diagnostic only.
+            QCOMPARE(client.stalledReasonText(), QStringLiteral("Something went wrong on our side."));
+            verifyNoInternalNameIsShown(client);
+
+            client.session()->attachSession(nullptr);
+        }
+        delete engine;
+    }
+
+    void aStallOffersTryAgainAndBackToHomeAndNeitherIsAnotherRig()
+    {
+        SeatHubClient client;
+        beginStagedSession(client);
+        QVERIFY(!QTest::currentTestFailed());
+        report(client, sessionIn(QStringLiteral("PREPARING")));
+        SessionInfo over = sessionIn(QStringLiteral("FAILED"));
+        over.endReason = QStringLiteral("READINESS_TIMEOUT");
+        report(client, over);
+        QVERIFY(client.connectFailed());
+        QVERIFY(!client.liveSession());
+
+        // Try again asks the server for a session, exactly as Play does: the server chooses the rig
+        // (CUST-03). The client names none and offers none.
+        m_fake->answerPlay(402, playRefusalBody(QStringLiteral("Not enough credit."),
+                                            QStringLiteral("SH-3K2XQ1")));
+        client.retry();
+        QVERIFY(!client.connectFailed());
+        QTRY_COMPARE_WITH_TIMEOUT(client.homeStatus(), QStringLiteral("refused"), 15000);
+        QCOMPARE(m_fake->requestPaths().count(QStringLiteral("/api/sessions")), 1);
+        const QByteArray sent = m_fake->bodyFor(QStringLiteral("/api/sessions"));
+        QVERIFY2(!sent.contains("host"), "the request names no rig");
+    }
+
+    void backToHomeLeavesTheStalledViewAndForgetsIt()
+    {
+        SeatHubClient client;
+        beginStagedSession(client);
+        QVERIFY(!QTest::currentTestFailed());
+        report(client, sessionIn(QStringLiteral("READY")));
+        SessionInfo over = sessionIn(QStringLiteral("EXPIRED"));
+        over.endReason = QStringLiteral("CONNECT_TIMEOUT");
+        report(client, over);
+        QVERIFY(client.connectFailed());
+        QSignalSpy stalls(&client, &SeatHubClient::connectFailedChanged);
+
+        client.dismissError();
+
+        QCOMPARE(client.appState(), QStringLiteral("home"));
+        QVERIFY(!client.connectFailed());
+        QVERIFY(client.stalledStepText().isEmpty());
+        QVERIFY(client.stalledReasonText().isEmpty());
+        QVERIFY(client.failure().isEmpty());
+        QCOMPARE(stalls.count(), 1);
+    }
+
+    // --- the end reason on Home comes from the session itself (CUST-15, D-21) -----------------------------
+
+    void aFinishedSessionTellsHomeWhyItEndedFromTheSessionReadAfterTeardown_data()
+    {
+        QTest::addColumn<QString>("endReason");
+        QTest::addColumn<int>("minutes");
+        QTest::addColumn<QString>("expected");
+
+        const QString mono = QStringLiteral("<font face=\"Geist Mono\">%1</font>");
+        // The one CUST-15 asks for.
+        QTest::newRow("the balance ran out")
+            << "BALANCE_EXHAUSTED" << 42 << "Your balance ran out, so the session ended.";
+        QTest::newRow("the customer ended it")
+            << "CUSTOMER_ENDED" << 15
+            << "You ended the session. Unused minutes stay in your account.";
+        // A sentence with a number in it takes the session's own billed minutes, in mono.
+        QTest::newRow("the rig was lost, with a number")
+            << "HOST_LOST" << 23
+            << QStringLiteral("We lost contact with this rig, so the session ended. You were charged "
+                              "for %1 minutes.").arg(mono.arg(23));
+        // No reason: Home says nothing rather than something invented.
+        QTest::newRow("no reason at all") << QString() << 5 << QString();
+    }
+
+    void aFinishedSessionTellsHomeWhyItEndedFromTheSessionReadAfterTeardown()
+    {
+        QFETCH(QString, endReason);
+        QFETCH(int, minutes);
+        QFETCH(QString, expected);
+
+        auto* engine = new FakeEngineSession;
+        {
+            SeatHubClient client;
+            client.session()->attachSession(engine);
+            beginStagedSession(client);
+            QVERIFY(!QTest::currentTestFailed());
+            client.teardown()->setVerifyIntervalMs(1);
+
+            // The stream ran: the pairing poll is over, so what happens next is the session's end and
+            // the read teardown makes.
+            PairingController* pairing = client.pairing();
+            QMetaObject::invokeMethod(
+                pairing, [pairing]() { pairing->cancel(); }, Qt::BlockingQueuedConnection);
+            QSignalSpy channelDropped(client.sessionChannel(), &SessionWebSocket::dropped);
+            emit engine->connectionStarted();
+            QCOMPARE(client.appState(), QStringLiteral("streaming"));
+            QVERIFY(client.endReasonText().isEmpty());
+
+            m_fake->answerSession(QStringLiteral("s-stages"), QStringLiteral("COMPLETED"), endReason,
+                                  minutes);
+            QSignalSpy completed(client.teardown(), &TeardownController::teardownCompleted);
+            emit engine->sessionFinished(0);
+            emit engine->readyForDeletion();
+            QTRY_COMPARE_WITH_TIMEOUT(completed.count(), 1, 15000);
+
+            QTRY_COMPARE_WITH_TIMEOUT(client.appState(), QStringLiteral("home"), 15000);
+            QCOMPARE(client.endReasonText(), expected);
+            // Fed by the session read, not by a socket: none was ever opened (ending a session closes
+            // the channel, which is not opening it).
+            QVERIFY(!client.sessionChannel()->isOpen());
+            QCOMPARE(client.sessionChannel()->reconnectAttempts(), 0);
+            QCOMPARE(channelDropped.count(), 0);
+            QVERIFY(client.sessionChannel()->state() != QLatin1String("connecting"));
+
+            // The next Play forgets it.
+            client.session()->attachSession(nullptr);
+        }
+        delete engine;
+    }
+
+    void theEndReasonIsForgottenWhenTheNextSessionBegins()
+    {
+        SeatHubClient client;
+        beginStagedSession(client);
+        QVERIFY(!QTest::currentTestFailed());
+        SessionInfo over = sessionIn(QStringLiteral("FAILED"));
+        over.endReason = QStringLiteral("READINESS_TIMEOUT");
+        report(client, over);
+        QVERIFY(!client.endReasonText().isEmpty());
+
+        client.beginSession(QStringLiteral("s-stages"));
+        QVERIFY(client.endReasonText().isEmpty());
+        QVERIFY(!client.connectFailed());
     }
 
     void theFacadeHandsTheScreenTheBundledCountriesAndARegionThatIsOneOfThem()

@@ -240,6 +240,35 @@ private slots:
         QCOMPARE(controller.stage(), TeardownStage::Done);
     }
 
+    void teardownCompletion_carriesTheSessionsOwnEndReasonAndBilledMinutes()
+    {
+        // Home says why a session ended, and that comes from the terminal read teardown ends on - the
+        // session itself, not a socket (CUST-15, ADR-0055).
+        TeardownController controller;
+        auto* client = new ControlPlaneClient(&controller);
+        auto* fake = new FakeNetworkAccessManager;
+        client->setNetworkAccessManager(fake);
+        controller.setControlPlane(client);
+
+        QJsonObject terminal = QJsonDocument::fromJson(sessionBody(QStringLiteral("COMPLETED"))).object();
+        terminal.insert(QStringLiteral("end_reason"), QStringLiteral("BALANCE_EXHAUSTED"));
+        terminal.insert(QStringLiteral("minutes_billed"), 42);
+
+        fake->statuses = { 202, 200 };
+        fake->bodies = { sessionBody(QStringLiteral("ENDING")),
+                         QJsonDocument(terminal).toJson(QJsonDocument::Compact) };
+        controller.setVerifyIntervalMs(1);
+
+        QSignalSpy completed(&controller, &TeardownController::teardownCompleted);
+        controller.teardown(QString::fromLatin1(kSessionId), QString::fromLatin1(kClientUuid));
+        QTRY_COMPARE(completed.count(), 1);
+
+        const SessionInfo finalSession = completed.at(0).at(0).value<SessionInfo>();
+        QCOMPARE(finalSession.state, QStringLiteral("COMPLETED"));
+        QCOMPARE(finalSession.endReason, QStringLiteral("BALANCE_EXHAUSTED"));
+        QCOMPARE(finalSession.minutesBilled, 42);
+    }
+
     void teardown_isIdempotentOnTheEndRequest()
     {
         // `POST /end` is documented idempotent, so a second End press is not an error.

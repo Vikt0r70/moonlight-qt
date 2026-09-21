@@ -53,6 +53,9 @@ Added by each plan (Plan 03-02 onward) in the same commit that makes the change.
 | `app/qml.qrc` | packaging | Registers two new `app/gui/` QML files: `SeatHubIdentifierField.qml` (the one sign-in field for an email or a phone number, with its country tag) and `SeatHubCountryPicker.qml` (the picker behind the tag). Additions only. | 05-06 |
 | `app/qml.qrc` | packaging | Registers two new `app/gui/` QML files: `AppHeader.qml` (the signed-in header that carries the balance element and the menu on every signed-in view, CUST-06) and `SeatHubMenu.qml` (the header's small menu: top up, and settings). Additions only. | 05-07 |
 | `app/gui/main.qml` | UI | One `AppHeader` above the view loader, shown by `showsHeader(state, signedIn)` for every signed-in view (home, which holds settings, connecting, streaming, error) and for neither sign-in nor the restore splash; the loader is anchored below it instead of filling the window. The header is declared before the forced-update modal, so the modal still covers everything. | 05-07 |
+| `app/qml.qrc` | packaging | Registers one new `app/gui/` QML file: `ConnectingScreen.qml` (the connecting view: the three-stage stepper and, when connecting stops, where it stopped and the two ways on). Addition only. | 05-08 |
+| `app/gui/main.qml` | UI | The connecting view is now `ConnectingScreen { client: seatHub }`, in place of the inline column that held the five-stage stepper and its one button. It moved to its own file so a test can load it: `main.qml` cannot be instantiated without the real facade type. No routing changed. | 05-08 |
+| `app/app.pro` | packaging | One header added to `HEADERS`: `seathub/stream_window_name.h`, the neutral name the engine's computer record is given so the stream window is titled `Playing - SeatHub` and never carries a rig's name (CUST-01, owner answer OD-13). Addition only. | 05-08 |
 
 Nothing under `app/streaming/audio/`, `app/streaming/input/` or `app/streaming/video/` (other than
 the overlay compositor exception, which Plan 03-05 is the first and so far only plan to exercise —
@@ -135,6 +138,8 @@ CI diff gate's exception list (the gate only checks files that exist in the upst
 | `SBOM.md` | compliance — every third-party dependency with the version present in the shipped artifact, its license and its source, stating how each was verified and which facts the artifacts do not record. | 03-06 |
 | `tests/fixtures/seathub-client-cert.pem` | test fixture — a self-signed certificate for the transport tests, so no test reaches a real host. Not part of the shipped client. | 03-03 |
 | `FORK-CHANGES.md` | documentation — this file, which does not exist upstream. The CI diff gate reads it to check that an exception-listed engine file is accounted for. | 03-01, 03-06 |
+| `app/gui/ConnectingScreen.qml` | UI - the connecting view: `SeatHubStepper` (three stages, each a real transition, and a failed appearance for the stage that was active), and under it either `Cancel` or, when connecting stopped, `Stopped at: {stage}`, the deck's sentence for what the server decided (or the client's own pairing deadline) and `Try again` / `Back to home`. No offer of another rig (CUST-03). | 05-08 |
+| `app/seathub/stream_window_name.h` | bridge - the fixed word (`Playing`) the client sets on the engine's computer record before the engine builds the stream window's title from it, so the taskbar and the alt-tab switcher never show a rig's name (CUST-01). Header-only and engine-free so a test can prove the assignment against any record. `session.cpp` is not edited again; the ADR-0046 exception is not widened. | 05-08 |
 
 ## Upstream files that must never be modified
 

@@ -71,6 +71,10 @@ struct SeatHubFailure
     /// the customer a code support cannot resolve.
     static SeatHubFailure generic();
 
+    /// The deck's offline sentence (`docs/spec/copy.md` §Support & errors, in full): what a request
+    /// that never reached the control plane says. No reference exists for it and none is made up.
+    static QString offlineSentence();
+
     /// Keys the customer-facing fields for QML. The `diagnostic` field is deliberately
     /// omitted - it must never cross into the view layer (D-51).
     QVariantMap toVariantMap() const;

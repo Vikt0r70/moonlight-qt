@@ -98,8 +98,10 @@ public:
 
 signals:
     void stateChanged();
-    /// The session reached a terminal state and nothing local remains.
-    void teardownCompleted();
+    /// The session reached a terminal state and nothing local remains. `finalSession` is the terminal
+    /// read the teardown ended on: the session's own `end_reason` and `minutes_billed`, which is where
+    /// Home's end-reason line comes from (CUST-15) now that no socket carries them.
+    void teardownCompleted(const SessionInfo& finalSession);
     /// Teardown failed. Always a SeatHub failure; a rig-side timeout carries
     /// `failure = "TEARDOWN_TIMEOUT"` so support can tell it apart from a transport failure.
     void teardownFailed(const SeatHubFailure& failure);

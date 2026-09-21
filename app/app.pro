@@ -283,6 +283,7 @@ HEADERS += \
     seathub/engine_session.h \
     seathub/teardown_guard.h \
     seathub/moonlight_engine_session.h \
+    seathub/stream_window_name.h \
     seathub/stub_engine_session.h \
     streaming/video/decoder.h \
     streaming/streamutils.h \

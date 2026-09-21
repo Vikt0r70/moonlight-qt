@@ -194,6 +194,30 @@ private slots:
         QCOMPARE(result.statusCode, 0);
     }
 
+    void aRequestThatNeverArrivedSaysTheDecksOfflineSentenceInFullAndHasNoReference()
+    {
+        // copy.md Support & errors, "Offline". The same sentence Home shows; the client invents no
+        // reference for a request the control plane never saw (ADR-0008).
+        const ControlPlaneResult result = ControlPlaneClient::classify(0, QByteArray());
+        const SeatHubFailure failure = result.toFailure();
+        QCOMPARE(failure.kind, FailureKind::Network);
+        QCOMPARE(failure.error,
+                 QStringLiteral("Can't reach SevenHills right now. Showing the last known balance."));
+        QCOMPARE(failure.error, SeatHubFailure::offlineSentence());
+        QVERIFY(failure.reference.isEmpty());
+    }
+
+    void aServerRefusalKeepsTheServersOwnSentenceAndItsReference()
+    {
+        const ControlPlaneResult result = ControlPlaneClient::classify(
+            409, refusedBody(QStringLiteral("You already have a session."),
+                             QStringLiteral("SH-3K2XQ1")));
+        const SeatHubFailure failure = result.toFailure();
+        QCOMPARE(failure.kind, FailureKind::Api);
+        QCOMPARE(failure.error, QStringLiteral("You already have a session."));
+        QCOMPARE(failure.reference, QStringLiteral("SH-3K2XQ1"));
+    }
+
     void classify_401_mapsToAuthFailure()
     {
         const ControlPlaneResult result = ControlPlaneClient::classify(

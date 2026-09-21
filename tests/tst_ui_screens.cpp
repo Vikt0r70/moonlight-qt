@@ -192,8 +192,35 @@ class FakeShellClient : public QObject
     Q_PROPERTY(bool animationEffects READ animationEffects CONSTANT)
     Q_PROPERTY(bool liveSession READ liveSession NOTIFY liveSessionChanged)
     Q_PROPERTY(int connectStage READ connectStage NOTIFY connectStageChanged)
+    Q_PROPERTY(bool connectFailed READ connectFailed NOTIFY connectFailedChanged)
+    Q_PROPERTY(QString stalledStepText READ stalledStepText NOTIFY connectFailedChanged)
+    Q_PROPERTY(QString stalledReasonText READ stalledReasonText NOTIFY connectFailedChanged)
 
 public:
+    bool connectFailed() const { return m_connectFailed; }
+    QString stalledStepText() const { return m_stalledStepText; }
+    QString stalledReasonText() const { return m_stalledReasonText; }
+    /// A connect that stopped, as the facade reports it: where, and why in the deck's words.
+    void setStalled(const QString& step, const QString& reasonStyled, const QString& reference)
+    {
+        m_connectFailed = true;
+        m_stalledStepText = step;
+        m_stalledReasonText = reasonStyled;
+        m_reference = reference;
+        emit failureChanged();
+        emit connectFailedChanged();
+    }
+    void clearStalled()
+    {
+        m_connectFailed = false;
+        m_stalledStepText.clear();
+        m_stalledReasonText.clear();
+        m_reference.clear();
+        emit failureChanged();
+        emit connectFailedChanged();
+    }
+    Q_INVOKABLE void interrupt() { ++m_interrupts; }
+    int interrupts() const { return m_interrupts; }
     int connectStage() const { return m_connectStage; }
     void setConnectStage(int stage)
     {
@@ -330,6 +357,7 @@ public:
 signals:
     void balanceChanged();
     void connectStageChanged();
+    void connectFailedChanged();
     void liveSessionChanged();
     void homeStatusChanged();
     void endReasonTextChanged();
@@ -357,6 +385,10 @@ private:
     QString m_lastCode;
     bool m_liveSession = false;
     int m_connectStage = 0;
+    bool m_connectFailed = false;
+    QString m_stalledStepText;
+    QString m_stalledReasonText;
+    int m_interrupts = 0;
     int m_topUps = 0;
     int m_settingsOpens = 0;
     int m_starts = 0;
@@ -489,6 +521,11 @@ private slots:
     void theWindowSequenceRestoresOnlyAfterTheEngineIsDone();
     void theStepperDrawsThreeStagesFromTheFacadesStageAndNothingElse();
     void theStepperMarksTheStageThatWasActiveFailedWithAMarkOfItsOwn();
+    void connectingShowsCancelWhileItGoesAndTheNamedStallWhenItStops();
+    void aStalledConnectOffersTryAgainAndBackToHomeAndNoOtherRig();
+    void aStalledConnectWrapsTheLongestSentenceAndNeverBreaksAReference();
+    void theErrorViewShowsThreeKindsOfSentenceAsTheyAreAndDrawsNoBareReferenceLabel();
+    void noScreenRendersAnInternalStateOrEndReasonKey();
 };
 
 void TstUiScreens::initTestCase()
@@ -557,6 +594,7 @@ void TstUiScreens::everyShellScreenLoads()
                               QStringLiteral("AppHeader.qml"),
                               QStringLiteral("SeatHubMenu.qml"),
                               QStringLiteral("RestoreSplash.qml"),
+                              QStringLiteral("ConnectingScreen.qml"),
                               QStringLiteral("SeatHubIdentifierField.qml"),
                               QStringLiteral("SeatHubCountryPicker.qml"),
     };
@@ -2614,6 +2652,251 @@ void TstUiScreens::theStepperMarksTheStageThatWasActiveFailedWithAMarkOfItsOwn()
     stepper->setProperty("failed", false);
     QCOMPARE(stepperLooks(stepper.data()),
              (QStringList{QStringLiteral("active"), QStringLiteral("pending"), QStringLiteral("pending")}));
+}
+
+namespace {
+
+// `Text.Wrap` and `Text.NoWrap` as QML's `wrapMode` property reports them (QQuickText::WrapMode).
+const int QQuickText_NoWrap = 0;
+
+// A connecting screen on a 960x640 window, with a stand-in facade attached.
+QObject* connectingScreen(QQmlEngine* engine, FakeShellClient* client, QString* error)
+{
+    QObject* screen = instantiate(engine, QStringLiteral("ConnectingScreen.qml"), error);
+    if (screen) {
+        screen->setProperty("client", QVariant::fromValue(static_cast<QObject*>(client)));
+        screen->setProperty("width", 960);
+        screen->setProperty("height", 640);
+    }
+    return screen;
+}
+
+QObject* buttonNamed(QObject* screen, const QString& name)
+{
+    return itemNamed(screen, name);
+}
+
+} // namespace
+
+void TstUiScreens::connectingShowsCancelWhileItGoesAndTheNamedStallWhenItStops()
+{
+    QQuickStyle::setStyle(QStringLiteral("Basic"));
+    QQmlEngine engine;
+    registerTokenSingletons(&engine);
+    FakeShellClient client;
+
+    QString error;
+    QScopedPointer<QObject> screen(connectingScreen(&engine, &client, &error));
+    QVERIFY2(screen, qPrintable(error));
+
+    // Going: the stepper and the one way out of a wait. Nothing about a stall is drawn.
+    client.setConnectStage(2);
+    QVERIFY(effectivelyVisible(buttonNamed(screen.data(), QStringLiteral("cancelButton"))));
+    QVERIFY(!effectivelyVisible(buttonNamed(screen.data(), QStringLiteral("tryAgainButton"))));
+    QVERIFY(!effectivelyVisible(buttonNamed(screen.data(), QStringLiteral("backButton"))));
+    QVERIFY(!effectivelyVisible(itemNamed(screen.data(), QStringLiteral("stalled"))));
+    QObject* stepper = itemNamed(screen.data(), QStringLiteral("stepper"));
+    QVERIFY(stepper);
+    QCOMPARE(stepperLooks(stepper),
+             (QStringList{QStringLiteral("done"), QStringLiteral("active"), QStringLiteral("pending")}));
+
+    // Stopped: the stage that was active is failed, where it stopped and what the server decided are
+    // printed under the stepper, in the deck's words, and the wait's own control is gone.
+    client.setStalled(QStringLiteral("Stopped at: Preparing the stream"),
+                      QStringLiteral("You didn't start streaming in time, so the session was released. "
+                                     "You were not charged."),
+                      QString());
+    QVERIFY(effectivelyVisible(itemNamed(screen.data(), QStringLiteral("stalled"))));
+    QCOMPARE(itemNamed(screen.data(), QStringLiteral("stalledStep"))->property("text").toString(),
+             QStringLiteral("Stopped at: Preparing the stream"));
+    QCOMPARE(itemNamed(screen.data(), QStringLiteral("stalledReason"))->property("text").toString(),
+             QStringLiteral("You didn't start streaming in time, so the session was released. "
+                            "You were not charged."));
+    QCOMPARE(stepperLooks(stepper),
+             (QStringList{QStringLiteral("done"), QStringLiteral("failed"), QStringLiteral("pending")}));
+    QVERIFY(!effectivelyVisible(buttonNamed(screen.data(), QStringLiteral("cancelButton"))));
+
+    // The sentence is drawn as styled text (a minute count is mono) - and the stalled step is not.
+    QCOMPARE(itemNamed(screen.data(), QStringLiteral("stalledReason"))->property("textFormat").toInt(),
+             4); // Text.StyledText
+    QVERIFY(itemNamed(screen.data(), QStringLiteral("stalledStep"))->property("textFormat").toInt() != 4);
+    // A failure with no reference draws no reference row: never a label with nothing after it.
+    QVERIFY(!effectivelyVisible(itemNamed(screen.data(), QStringLiteral("stalledReferenceRow"))));
+
+    // With a reference the row shows it, mono and unbroken.
+    client.setStalled(QStringLiteral("Stopped at: Preparing the rig"), QStringLiteral("no rig is assigned"),
+                      QStringLiteral("SH-9K2XQ1"));
+    QVERIFY(effectivelyVisible(itemNamed(screen.data(), QStringLiteral("stalledReferenceRow"))));
+    QObject* reference = itemNamed(screen.data(), QStringLiteral("stalledReference"));
+    QCOMPARE(reference->property("text").toString(), QStringLiteral("SH-9K2XQ1"));
+    QCOMPARE(reference->property("font").value<QFont>().family(), QString::fromLatin1(kMonoFamily));
+    QCOMPARE(reference->property("wrapMode").toInt(), int(QQuickText_NoWrap));
+
+    // Leaving the stall draws the wait again.
+    client.clearStalled();
+    QVERIFY(effectivelyVisible(buttonNamed(screen.data(), QStringLiteral("cancelButton"))));
+    QVERIFY(!effectivelyVisible(itemNamed(screen.data(), QStringLiteral("stalled"))));
+}
+
+void TstUiScreens::aStalledConnectOffersTryAgainAndBackToHomeAndNoOtherRig()
+{
+    QQuickStyle::setStyle(QStringLiteral("Basic"));
+    QQmlEngine engine;
+    registerTokenSingletons(&engine);
+    FakeShellClient client;
+
+    QString error;
+    QScopedPointer<QObject> screen(connectingScreen(&engine, &client, &error));
+    QVERIFY2(screen, qPrintable(error));
+    client.setConnectStage(1);
+    client.setStalled(QStringLiteral("Stopped at: Preparing the rig"),
+                      QStringLiteral("This rig didn't come back in time. You were not charged."), QString());
+
+    // Exactly two ways on, in the deck's words, and the retry is the primary one.
+    QObject* tryAgain = buttonNamed(screen.data(), QStringLiteral("tryAgainButton"));
+    QObject* back = buttonNamed(screen.data(), QStringLiteral("backButton"));
+    QVERIFY(effectivelyVisible(tryAgain));
+    QVERIFY(effectivelyVisible(back));
+    QCOMPARE(tryAgain->property("text").toString(), QStringLiteral("Try again"));
+    QCOMPARE(back->property("text").toString(), QStringLiteral("Back to home"));
+    QCOMPARE(visibleButtons(screen.data()).size(), 2);
+
+    // They reach the facade's own retry and dismissal, nothing else.
+    QMetaObject::invokeMethod(tryAgain, "clicked");
+    QCOMPARE(client.retries(), 1);
+    QMetaObject::invokeMethod(back, "clicked");
+    QCOMPARE(client.dismissals(), 1);
+    QCOMPARE(client.interrupts(), 0);
+
+    // No offer of a different rig, a list of rigs or a retry against a named machine (CUST-03): the
+    // words on the screen say none of it.
+    QStringList everything;
+    collectTexts(qobject_cast<QQuickItem*>(screen.data()), &everything);
+    const QString joined = everything.join(QLatin1Char('\n')).toLower();
+    for (const QString& word : {QStringLiteral("another rig"), QStringLiteral("different rig"),
+                                QStringLiteral("other rig"), QStringLiteral("choose"),
+                                QStringLiteral("pick a rig"), QStringLiteral("try another"),
+                                QStringLiteral("rig list"), QStringLiteral("notify")}) {
+        QVERIFY2(!joined.contains(word), qPrintable(QStringLiteral("the screen says '%1'").arg(word)));
+    }
+}
+
+void TstUiScreens::aStalledConnectWrapsTheLongestSentenceAndNeverBreaksAReference()
+{
+    QQuickStyle::setStyle(QStringLiteral("Basic"));
+    QQmlEngine engine;
+    registerTokenSingletons(&engine);
+    FakeShellClient client;
+
+    QString error;
+    QScopedPointer<QObject> screen(connectingScreen(&engine, &client, &error));
+    QVERIFY2(screen, qPrintable(error));
+
+    // The longest end-reason sentence, with its minute count in the mono family, under the longest
+    // stalled-step line.
+    client.setConnectStage(2);
+    client.setStalled(
+        QStringLiteral("Stopped at: Preparing the stream"),
+        QStringLiteral("Something went wrong ending this session, so we closed it. You were charged for "
+                       "the minutes you used, which was <font face=\"Geist Mono\">1234</font> minutes."),
+        QStringLiteral("SH-9K2XQ1"));
+
+    QObject* reason = itemNamed(screen.data(), QStringLiteral("stalledReason"));
+    QObject* step = itemNamed(screen.data(), QStringLiteral("stalledStep"));
+    QVERIFY(reason && step);
+    // Wrapped, not clipped: the text wraps at the column's width and nothing is elided.
+    QVERIFY(reason->property("wrapMode").toInt() != QQuickText_NoWrap);
+    QVERIFY(step->property("wrapMode").toInt() != QQuickText_NoWrap);
+    QVERIFY(reason->property("width").toDouble() <= 420.0);
+    QVERIFY2(reason->property("contentWidth").toDouble() <= reason->property("width").toDouble() + 0.5,
+             "the sentence is laid out inside its column");
+    QVERIFY2(!reason->property("truncated").toBool(), "the sentence is not clipped");
+    QVERIFY(reason->property("lineCount").toInt() >= 2);
+    QCOMPARE(itemNamed(screen.data(), QStringLiteral("stalledReference"))->property("lineCount").toInt(), 1);
+}
+
+void TstUiScreens::theErrorViewShowsThreeKindsOfSentenceAsTheyAreAndDrawsNoBareReferenceLabel()
+{
+    QQuickStyle::setStyle(QStringLiteral("Basic"));
+    QQmlEngine engine;
+    registerTokenSingletons(&engine);
+    FakeShellClient client;
+
+    QString error;
+    QScopedPointer<QObject> screen(instantiate(&engine, QStringLiteral("ErrorScreen.qml"), &error));
+    QVERIFY2(screen, qPrintable(error));
+    screen->setProperty("client", QVariant::fromValue(static_cast<QObject*>(&client)));
+
+    struct Case
+    {
+        QString sentence;
+        QString reference;
+    };
+    const QList<Case> cases = {
+        // The server's own sentence, verbatim, with the reference it named.
+        {QStringLiteral("The server's own sentence, exactly as written."), QStringLiteral("SH-4F7KQ2")},
+        // The deck's offline sentence in full: the request never arrived, so no reference exists.
+        {QStringLiteral("Can't reach SevenHills right now. Showing the last known balance."), QString()},
+        // The deck's generic sentence for something that began on this machine: no reference either.
+        {QStringLiteral("Something went wrong on our side."), QString()},
+    };
+
+    for (const Case& c : cases) {
+        client.setFailure(c.sentence, c.reference);
+        QCOMPARE(screen->property("errorText").toString(), c.sentence);
+        QVERIFY2(renderedTexts(screen.data()).contains(c.sentence), qPrintable(c.sentence));
+
+        QObject* row = itemNamed(screen.data(), QStringLiteral("referenceRow"));
+        QVERIFY(row);
+        QCOMPARE(effectivelyVisible(row), !c.reference.isEmpty());
+        if (!c.reference.isEmpty()) {
+            QVERIFY(renderedTexts(screen.data()).contains(c.reference));
+        }
+        else {
+            // Nothing that looks like a code, and no label waiting for one.
+            for (QObject* item : textItems(screen.data())) {
+                if (effectivelyVisible(item)) {
+                    QVERIFY2(item->property("text").toString() != QStringLiteral("Reference"),
+                             "a reference label with nothing after it");
+                }
+            }
+        }
+    }
+
+    // The two ways on, and no other.
+    QCOMPARE(visibleButtons(screen.data()).size(), 2);
+    QStringList labels;
+    for (QObject* button : visibleButtons(screen.data())) {
+        labels.append(button->property("text").toString());
+    }
+    labels.sort();
+    QCOMPARE(labels, (QStringList{QStringLiteral("Back to home"), QStringLiteral("Try again")}));
+}
+
+void TstUiScreens::noScreenRendersAnInternalStateOrEndReasonKey()
+{
+    // An internal state name, an end-reason key or an engine stage string is developer vocabulary
+    // (`copy.md` Support & errors: "customer-facing never do"). The customer's sentences are the deck's
+    // and the server's own, chosen in C++; no QML file may spell a key to print it, or quote one.
+    const QStringList keys = {
+        QStringLiteral("READINESS_TIMEOUT"), QStringLiteral("CONNECT_TIMEOUT"),
+        QStringLiteral("MODE_BOOT_TIMEOUT"), QStringLiteral("BALANCE_EXHAUSTED"),
+        QStringLiteral("HOST_LOST"),         QStringLiteral("CLIENT_SILENT"),
+        QStringLiteral("GRACE_EXPIRED"),     QStringLiteral("OPERATOR_FORCED"),
+        QStringLiteral("TEARDOWN_TIMEOUT"),  QStringLiteral("CUSTOMER_ENDED"),
+        QStringLiteral("PREPARING"),         QStringLiteral("ALLOCATED"),
+        QStringLiteral("STAGE_")};
+
+    const QDir gui(guiDir());
+    const QStringList files = gui.entryList({QStringLiteral("*.qml")}, QDir::Files);
+    QVERIFY(files.size() > 10);
+    for (const QString& file : files) {
+        const QString source = readSource(gui.filePath(file));
+        for (const QString& key : keys) {
+            QVERIFY2(!source.contains(key),
+                     qPrintable(QStringLiteral("%1 spells the internal name %2").arg(file, key)));
+        }
+    }
 }
 
 #include "tst_ui_screens.moc"

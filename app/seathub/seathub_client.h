@@ -107,6 +107,22 @@ class SeatHubClient : public QObject
     /// timer moves it.
     Q_PROPERTY(int connectStage READ connectStage NOTIFY connectStageChanged)
 
+    /// True when connecting stopped and the view is showing where. The stage that was active stays
+    /// the highest one reached (it is what the view marks failed); `failure` and `reference` hold
+    /// what the server or the client said, and `stalledStepText` and `stalledReasonText` are what
+    /// the view prints (CUST-13). The app state stays "connecting" throughout: `Try again` (`retry()`)
+    /// and `Back to home` (`dismissError()`) are the two ways out, and neither offers another rig.
+    Q_PROPERTY(bool connectFailed READ connectFailed NOTIFY connectFailedChanged)
+
+    /// `Stopped at: {stage}` (`copy.md` §Play flow, C5), naming the stage that was active. Empty
+    /// unless `connectFailed`.
+    Q_PROPERTY(QString stalledStepText READ stalledStepText NOTIFY connectFailedChanged)
+
+    /// The sentence that goes with it, as styled text: the copy deck's end-reason sentence for what the
+    /// server decided (its minute count in the mono family), or - when the server gave no reason - the
+    /// failure's own sentence, escaped. Empty unless `connectFailed`.
+    Q_PROPERTY(QString stalledReasonText READ stalledReasonText NOTIFY connectFailedChanged)
+
     /// The mapped failure, or an empty map. `diagnostic` is never present here (D-51).
     Q_PROPERTY(QVariantMap failure READ failure NOTIFY failureChanged)
 
@@ -196,6 +212,9 @@ public:
     bool inSettings() const { return m_inSettings; }
     QString stageText() const { return m_stageText; }
     int connectStage() const { return m_connectStage; }
+    bool connectFailed() const { return m_connectFailed; }
+    QString stalledStepText() const { return m_stalledStepText; }
+    QString stalledReasonText() const { return m_stalledReasonText; }
     QVariantMap failure() const { return m_failure; }
     QString reference() const;
     QString identity() const { return m_identity; }
@@ -327,6 +346,7 @@ signals:
     void appStateChanged();
     void stageTextChanged();
     void connectStageChanged();
+    void connectFailedChanged();
     void failureChanged();
     void identityChanged();
     void inSettingsChanged();
@@ -375,7 +395,8 @@ private slots:
     // D-33: the only locally enforced end. Liveness failure is not one (see `onLivenessWarning`).
     void handleHorizonReached();
     void onLivenessWarning();
-    void handleTeardownCompleted();
+    /// `finalSession` is the terminal read teardown ended on: the source of the end reason Home shows.
+    void handleTeardownCompleted(const SessionInfo& finalSession);
     void handleTeardownFailed(const SeatHubFailure& failure);
     void handlePairingCompleted(const QString& clientUuid);
     void handlePairingFailed(const SeatHubFailure& failure);
@@ -396,12 +417,24 @@ private:
     void setAppState(const QString& state);
     void setStageText(const QString& text);
     /// Moves the highest connecting stage forward to `stage` (1 to 3). A stage at or below the one
-    /// already reached changes nothing and says nothing:
+    /// already reached, or any move once connecting has stopped, changes nothing and says nothing:
     /// a late reply carrying an earlier state must not move the stepper back, and two states seen in
     /// one tick land on the later stage without the earlier one being shown twice.
     void advanceConnectStage(int stage);
     /// Forgets the stages: a session is starting.
     void resetConnecting();
+    /// Forgets a stall (the customer left the stalled view, or a session is starting). Says so only
+    /// when there was one.
+    void clearStall();
+    /// Connecting stopped. Keeps the app state, keeps the stage that was active as the one to mark
+    /// failed, and fills the two texts the view prints. `endReason` is the server's, when it gave one;
+    /// `minutesBilled` is the server's own count for it. A failure the server gave no reason for
+    /// falls back to `failure`'s own sentence, and to the generic one when that is empty too.
+    void raiseConnectFailure(const SeatHubFailure& failure, const QString& endReason = QString(),
+                             int minutesBilled = 0);
+    /// True while the customer is looking at the connecting view for a control-plane session: the
+    /// only time a failure becomes a stall rather than the error view.
+    bool connectingSession() const;
     void setHomeStatus(const QString& status);
     void setEndReasonText(const QString& text);
     void raiseFailure(const SeatHubFailure& failure);
@@ -457,6 +490,9 @@ private:
     QString m_appState;
     QString m_stageText;
     int m_connectStage = 0;
+    bool m_connectFailed = false;
+    QString m_stalledStepText;
+    QString m_stalledReasonText;
     QString m_homeStatus;
     QString m_endReasonText;
     QVariantMap m_failure;

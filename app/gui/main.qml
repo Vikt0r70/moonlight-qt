@@ -180,34 +180,13 @@ ApplicationWindow {
     }
 
     // Connecting: visible only until the engine reports connectionStarted, at which point
-    // SessionSegue hides this whole window (D-01).
+    // SessionSegue hides this whole window (D-01). Its own file (`ConnectingScreen.qml`) so a test
+    // can load it: the stepper, the named stall and its two ways on live there.
     Component {
         id: connectingComponent
 
-        Item {
-            Column {
-                anchors.centerIn: parent
-                spacing: Metrics.s6
-                width: Math.min(parent.width - Metrics.s16, 420)
-
-                // The connect phase is the deck's three stages, each a real transition, not a
-                // spinner that resets (ui.md §6, audit F8, CUST-12).
-                SeatHubStepper {
-                    id: stepper
-                    width: parent.width
-                    client: seatHub
-                }
-
-                // A real control, not a Text + MouseArea (audit F3).
-                SeatHubButton {
-                    id: cancelButton
-                    width: parent.width
-                    variant: "ghost"
-                    text: qsTr("Cancel")
-
-                    onClicked: seatHub.interrupt()
-                }
-            }
+        ConnectingScreen {
+            client: seatHub
         }
     }
 

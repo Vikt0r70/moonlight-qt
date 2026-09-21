@@ -293,7 +293,7 @@ void TeardownController::handleVerifyResult(const ControlPlaneResult& result)
     }
 
     qCInfo(seathubTeardown) << "teardown complete for session" << m_sessionId;
-    emit teardownCompleted();
+    emit teardownCompleted(info);
 }
 
 void TeardownController::fail(const SeatHubFailure& failure, const QString& failureCode)

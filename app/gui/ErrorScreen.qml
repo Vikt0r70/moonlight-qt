@@ -5,10 +5,14 @@ import SeatHub.Tokens 1.0
 // Every failure the customer ever sees, in one screen (D-51, `docs/spec/screens.md` error
 // state): an inline reason, a retry action, and the ADR-0008 support reference.
 //
-// The reference is always present and always mono - `docs/spec/copy.md` §5 microcopy rules
-// put `SH-4F7KQ2` in mono and never translate it. The engine's own words never reach this
-// screen: `failure.error` is SeatHub copy, and the raw engine text is kept out of the map
-// the C++ facade hands over.
+// The reference is always mono - `docs/spec/copy.md` §5 microcopy rules put `SH-4F7KQ2` in mono and
+// never translate it - and is shown whenever the control plane gave one. A failure that never reached
+// it (offline) or that began on this machine has none, and the row is then not drawn at all: a label
+// with nothing after it would be a blank, and a code the client made up would resolve to nothing
+// (ADR-0008). The engine's own words never reach this screen: `failure.error` is SeatHub copy, and the
+// raw engine text is kept out of the map the C++ facade hands over. Three kinds of sentence arrive
+// here and each is shown as it is: the server's own with its reference, the deck's offline sentence in
+// full, and the deck's generic sentence for anything that began on this machine.
 Item {
     id: root
 
@@ -43,9 +47,11 @@ Item {
             font.pixelSize: Metrics.fontBody
         }
 
-        // The support reference (ADR-0008). Always mono, never translated.
+        // The support reference (ADR-0008). Always mono, never translated, and one unbroken line.
         Row {
+            objectName: "referenceRow"
             spacing: Metrics.s2
+            visible: root.reference.length > 0
 
             Text {
                 text: qsTr("Reference")
@@ -58,6 +64,7 @@ Item {
             Text {
                 id: referenceText
                 text: root.reference
+                wrapMode: Text.NoWrap
                 visible: text.length > 0
                 color: Tokens.foregroundDefault
                 font.family: Tokens.fontMonoDefault

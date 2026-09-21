@@ -147,7 +147,7 @@ QString monoMinutes(int minutesBilled)
 // string for a reason the deck has no line for: `SESSION_LOST`, `LEASE_GUARD_LOST` and
 // `RECONNECT_LIMIT` are documented to "fall back to the client's generic ended-session string",
 // which copy.md never spells out - showing nothing is honest, inventing the sentence is not.
-QString endReasonSentence(const QString& endReason, int minutesBilled)
+QString endReasonSentence(const QString& endReason, int minutesBilled, bool styled = true)
 {
     struct ReasonLine {
         const char* reason;
@@ -172,13 +172,16 @@ QString endReasonSentence(const QString& endReason, int minutesBilled)
         if (endReason == QLatin1String(line.reason)) {
             QString sentence = QString::fromUtf8(line.sentence);
             if (sentence.contains(QLatin1String("%1"))) {
-                sentence = sentence.arg(monoMinutes(minutesBilled));
+                sentence = sentence.arg(styled ? monoMinutes(minutesBilled)
+                                               : QString::number(minutesBilled));
             }
             return sentence;
         }
     }
 
-    qCWarning(seathubClient) << "no copy.md sentence for end reason" << endReason;
+    if (!endReason.isEmpty()) {
+        qCWarning(seathubClient) << "no copy.md sentence for end reason" << endReason;
+    }
     return QString();
 }
 
@@ -579,14 +582,78 @@ void SeatHubClient::setStageText(const QString& text)
 void SeatHubClient::advanceConnectStage(int stage)
 {
     // Forward only, and silent when nothing changed: a late reply that reports an earlier state, or a
-    // tick that reports the same one again, leaves the stepper exactly as it was.
-    if (stage <= m_connectStage || stage > kStageStreamingNow) {
+    // tick that reports the same one again, leaves the stepper exactly as it was. Once connecting has
+    // stopped the stepper is frozen where it stopped.
+    if (m_connectFailed || stage <= m_connectStage || stage > kStageStreamingNow) {
         return;
     }
     qCInfo(seathubClient) << "connecting stage" << m_connectStage << "->" << stage;
     m_connectStage = stage;
     setStageText(stageLine(stage));
     emit connectStageChanged();
+}
+
+bool SeatHubClient::connectingSession() const
+{
+    return m_appState == QLatin1String(kStateConnecting) && inControlPlaneSession();
+}
+
+void SeatHubClient::clearStall()
+{
+    if (!m_connectFailed && m_stalledStepText.isEmpty() && m_stalledReasonText.isEmpty()) {
+        return;
+    }
+    m_connectFailed = false;
+    m_stalledStepText.clear();
+    m_stalledReasonText.clear();
+    emit connectFailedChanged();
+}
+
+void SeatHubClient::raiseConnectFailure(const SeatHubFailure& failure, const QString& endReason,
+                                        int minutesBilled)
+{
+    // The first thing that stopped connecting is what the customer reads; whatever else fails while
+    // it is still showing is logged and not allowed to rewrite it.
+    if (m_connectFailed) {
+        qCInfo(seathubClient) << "connecting already stopped; not replacing what the customer reads";
+        return;
+    }
+
+    // The engine's own text and the stage detail are logged for support and never shown (D-51).
+    if (!failure.diagnostic.isEmpty()) {
+        qWarning("SeatHub connect diagnostic (not shown to the customer, reference %s): %s",
+                 qPrintable(failure.reference), qPrintable(failure.diagnostic));
+    }
+
+    // What the customer reads under the stage: the deck's sentence for what the server decided when
+    // it named a reason the deck has a line for; otherwise the failure's own sentence (the server's,
+    // verbatim, or the client's local one); and the generic sentence when there is none at all. The
+    // sentence is drawn as styled text (the minute count is mono), so anything else is escaped.
+    SeatHubFailure shown = failure;
+    QString reasonText;
+    const QString deckSentence = endReasonSentence(endReason, minutesBilled, true);
+    if (!deckSentence.isEmpty()) {
+        shown.error = endReasonSentence(endReason, minutesBilled, false);
+        reasonText = deckSentence;
+    }
+    else {
+        if (shown.error.isEmpty()) {
+            shown.error = SeatHubFailure::generic().error;
+        }
+        reasonText = shown.error.toHtmlEscaped();
+    }
+
+    m_failure = shown.toVariantMap();
+    // Stopped at the stage that was active. Before anything was read that is the first one: it is
+    // where a session that exists begins.
+    m_stalledStepText = QStringLiteral("Stopped at: %1").arg(stageLine(qMax(m_connectStage, kStageRig)));
+    m_stalledReasonText = reasonText;
+    m_connectFailed = true;
+    qCInfo(seathubClient) << "connecting stopped at stage" << m_connectStage;
+
+    m_sessionChannel->close();
+    emit failureChanged();
+    emit connectFailedChanged();
 }
 
 void SeatHubClient::resetConnecting()
@@ -622,6 +689,8 @@ void SeatHubClient::setEndReasonText(const QString& text)
 
 void SeatHubClient::raiseFailure(const SeatHubFailure& failure)
 {
+    // The error view replaces whatever connecting was showing, so a stall is over.
+    clearStall();
     m_failure = failure.toVariantMap();
     // The raw engine text stays out of the view layer entirely: it is logged here for
     // support and dropped (D-51, T-03-05).
@@ -635,6 +704,7 @@ void SeatHubClient::raiseFailure(const SeatHubFailure& failure)
 
 void SeatHubClient::clearFailure()
 {
+    clearStall();
     if (m_failure.isEmpty()) {
         return;
     }
@@ -1051,6 +1121,7 @@ void SeatHubClient::signOut()
     emit identityChanged();
     resetBalance();
     clearFailure();
+    resetConnecting();
     setInSettings(false);
     setHomeStatus(QString::fromLatin1(kHomeReady));
     setEndReasonText(QString());
@@ -1246,6 +1317,12 @@ void SeatHubClient::handleStageFailed(const QString& stage, int errorCode, const
         raiseFailure(mapLaunchError(stage));
         return;
     }
+    // Before the stream started the customer is on the connecting view: it stopped there, at the stage
+    // the engine was in, and says so in the deck's words rather than sending them to the error view.
+    if (connectingSession()) {
+        raiseConnectFailure(mapStageFailure(stage, errorCode, failingPorts));
+        return;
+    }
     raiseFailure(mapStageFailure(stage, errorCode, failingPorts));
 }
 
@@ -1277,6 +1354,10 @@ void SeatHubClient::handleConnectionStarted()
 void SeatHubClient::handleDisplayLaunchError(const QString& text)
 {
     // Never shown verbatim (T-03-05). `mapLaunchError` keeps `text` as diagnostic only.
+    if (connectingSession()) {
+        raiseConnectFailure(mapLaunchError(text));
+        return;
+    }
     raiseFailure(mapLaunchError(text));
 }
 
@@ -1397,9 +1478,16 @@ void SeatHubClient::handleSessionState(const SessionInfo& session)
             setAttachedSessionEnded(true);
         }
         m_liveness->stop();
-        if (m_appState == QLatin1String(kStateStreaming)
-                || m_appState == QLatin1String(kStateConnecting)) {
+        if (m_session->active() || m_appState == QLatin1String(kStateStreaming)) {
+            // The engine is running: it stops it, and its own end path carries the customer home.
             m_session->interrupt();
+        }
+        else if (connectingSession()) {
+            // No engine has started, so there is nothing to interrupt and the customer would sit on a
+            // stepper that looks alive for a session that is over. Connecting stops here, at the stage
+            // it had reached, in the server's own words for why.
+            onClientThread(m_pairing, [this]() { m_pairing->cancel(); });
+            raiseConnectFailure(SeatHubFailure::generic(), session.endReason, session.minutesBilled);
         }
     }
 
@@ -1407,9 +1495,7 @@ void SeatHubClient::handleSessionState(const SessionInfo& session)
         // The session's own outcome, in the deck's words, ready for the home screen the customer
         // lands on once teardown finishes (audit E10). The minute count is the server's own
         // `minutes_billed`, never arithmetic done here.
-        setEndReasonText(endReasonSentence(
-            session.endReason,
-            m_billing.value(QStringLiteral("minutes_billed")).toInt()));
+        setEndReasonText(endReasonSentence(session.endReason, session.minutesBilled));
     }
 }
 
@@ -1481,6 +1567,10 @@ void SeatHubClient::handlePairingCompleted(const QString& clientUuid)
     // needs it to verify the removal.
     m_clientUuid = clientUuid;
 
+    // A pairing only completes against a rig the session has made ready, so the second stage is under
+    // way whether or not a poll happened to read READY first.
+    advanceConnectStage(kStageStream);
+
     // Pairing is done, so the stream may start. The engine session was attached by
     // `handleHostResolved()`, which the seam emitted ahead of this; when it could not be built -
     // a host that is not a paired record, or an application list that names no single application
@@ -1540,6 +1630,12 @@ void SeatHubClient::handlePairingFailed(const SeatHubFailure& failure)
     // Fail closed with a SeatHub error the error screen can render - a reason, a retry and an
     // `SH-` reference - never a Moonlight dialog (ADR-0008, D-51, STREAM-03).
     m_sessionChannel->close();
+    if (connectingSession()) {
+        // The client's own pairing deadline, or the control plane refusing the pairing read: the stage
+        // that was active stays on screen, marked failed, with the sentence that came with it.
+        raiseConnectFailure(failure);
+        return;
+    }
     raiseFailure(failure);
 }
 
@@ -1557,8 +1653,16 @@ void SeatHubClient::handleAuthorizationGranted(const QString& qualityProfile)
     m_settings->applySessionOverride(qualityProfile);
 }
 
-void SeatHubClient::handleTeardownCompleted()
+void SeatHubClient::handleTeardownCompleted(const SessionInfo& finalSession)
 {
+    // Home says why the session ended, read from the session itself now that teardown has confirmed it
+    // is over (CUST-15, D-21). The minute count is the server's own `minutes_billed`. A session the
+    // server gave no reason for leaves the line empty: showing nothing is honest, inventing a sentence
+    // is not.
+    if (!finalSession.endReason.isEmpty()) {
+        setEndReasonText(endReasonSentence(finalSession.endReason, finalSession.minutesBilled));
+    }
+
     m_liveness->stop();
     m_horizon->disarm();
     m_sessionChannel->close();
@@ -1574,9 +1678,9 @@ void SeatHubClient::handleTeardownCompleted()
     emit billingChanged();
     emit sessionWarningChanged();
 
-    // Only leave the error view if the customer is not looking at one; a teardown that succeeded
-    // says nothing about an unrelated failure the error screen is already showing.
-    if (m_appState != QLatin1String(kStateError)) {
+    // Only leave the view if the customer is not looking at a failure: a teardown that succeeded says
+    // nothing about the failure the error screen - or a stalled connecting view - is already showing.
+    if (m_appState != QLatin1String(kStateError) && !m_connectFailed) {
         setAppState(!m_signedIn ? QString::fromLatin1(kStateSignedOut)
                                 : QString::fromLatin1(kStateHome));
     }

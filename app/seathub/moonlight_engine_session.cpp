@@ -10,12 +10,18 @@
 #include "backend/nvhttp.h"
 #include "backend/nvpairingmanager.h"
 #include "streaming/session.h"
+#include "stream_window_name.h"
 
 Q_LOGGING_CATEGORY(seathubEngine, "seathub.engine")
 
 MoonlightPairedHost::MoonlightPairedHost(NvHTTP& http, const QString& serverInfo)
     : m_computer(new NvComputer(http, serverInfo))
 {
+    // The engine titles its stream window with this record's name, and the record was just built from
+    // what the rig says about itself. A customer must never read a rig's name, and the window title
+    // shows in the taskbar and the alt-tab switcher, so the name is replaced here - in this file, not
+    // in the engine's - before the engine can see it (CUST-01, OD-13; `stream_window_name.h`).
+    SeatHubStreamWindow::applyNeutralName(m_computer);
 }
 
 MoonlightPairedHost::~MoonlightPairedHost()
@@ -113,8 +119,9 @@ MoonlightEngineSession* MoonlightEngineSession::create(const PairedHostPtr& host
         return nullptr;
     }
 
-    qCInfo(seathubEngine) << "engine session for" << paired->computer()->name
-                          << "application" << app.name;
+    // The computer's name is the neutral word by now, so it says nothing worth logging; the
+    // application is what the rig served.
+    qCInfo(seathubEngine) << "engine session for application" << app.name;
     return new MoonlightEngineSession(host, app, parent);
 }
 

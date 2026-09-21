@@ -168,10 +168,10 @@ SeatHubFailure ControlPlaneResult::toFailure() const
 {
     if (statusCode == 0) {
         // We never reached the control plane, so there is no control-plane sentence and no
-        // control-plane reference. The reason is the sanctioned generic sentence (copy.md
-        // has no control-plane-unreachable string and none is invented here); `kind`
-        // carries the layer, which is what the UI picks its copy from.
-        SeatHubFailure f = SeatHubFailure::network(SeatHubFailure::generic().error);
+        // control-plane reference. The reason is the deck's own offline sentence, in full
+        // (copy.md §Support & errors); `kind` carries the layer, which is what the UI picks its
+        // copy from.
+        SeatHubFailure f = SeatHubFailure::network(SeatHubFailure::offlineSentence());
         f.diagnostic = error;
         return f;
     }

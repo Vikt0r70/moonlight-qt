@@ -11,6 +11,8 @@ namespace {
 // reference row only when there is something to render (audit F9; the three client-invented codes
 // this file used to carry were removed rather than re-shaped).
 const char* kGenericSentence = "Something went wrong on our side.";
+// copy.md §Support & errors, "Offline", in full. Home shows the same sentence; the two must not drift.
+const char* kOfflineSentence = "Can't reach SevenHills right now. Showing the last known balance.";
 
 } // namespace
 
@@ -72,6 +74,11 @@ SeatHubFailure SeatHubFailure::generic()
     // not this incident's, and no locally generated failure has a resolvable code (ADR-0008).
     f.error = QString::fromLatin1(kGenericSentence);
     return f;
+}
+
+QString SeatHubFailure::offlineSentence()
+{
+    return QString::fromLatin1(kOfflineSentence);
 }
 
 QVariantMap SeatHubFailure::toVariantMap() const

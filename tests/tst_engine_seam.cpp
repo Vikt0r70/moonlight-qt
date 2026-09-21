@@ -24,6 +24,7 @@
 #include "seathub/engine_session.h"
 #include "seathub/pairing_seam.h"
 #include "seathub/session_lifecycle.h"
+#include "seathub/stream_window_name.h"
 
 namespace {
 
@@ -171,6 +172,79 @@ class TstEngineSeam : public QObject
     Q_OBJECT
 
 private slots:
+    void theNeutralNameReachesTheComputerWhateverTheHostReports_data()
+    {
+        QTest::addColumn<QString>("reported");
+
+        // Whatever the rig calls itself, including the shapes a customer must never read.
+        QTest::newRow("a machine name") << QStringLiteral("DESKTOP-7QK2M4L");
+        QTest::newRow("an owner's chosen name") << QStringLiteral("Viktor's gaming PC");
+        QTest::newRow("a rig nickname") << QStringLiteral("Rig 07 - Amman");
+        QTest::newRow("a name with the engine's own suffix") << QStringLiteral("HOST - SeatHub");
+        QTest::newRow("Arabic") << QString::fromUtf8("\xd8\xac\xd9\x87\xd8\xa7\xd8\xb2 \xd8\xa7\xd9\x84\xd8\xb9\xd9\x8a\xd9\x86");
+        QTest::newRow("nothing at all") << QString();
+        QTest::newRow("the neutral word already") << QStringLiteral("Playing");
+    }
+
+    void theNeutralNameReachesTheComputerWhateverTheHostReports()
+    {
+        QFETCH(QString, reported);
+
+        // The engine's computer record reduced to the one field its window title is built from
+        // (`m_Computer->name + " - SeatHub"`, ADR-0046). No suite links the backend, so the record is
+        // a stand-in: the assignment the bridge makes is what is under test, and it is generic on
+        // purpose.
+        struct FakeComputer
+        {
+            QString name;
+        };
+        FakeComputer computer;
+        computer.name = reported;
+
+        SeatHubStreamWindow::applyNeutralName(&computer);
+
+        QCOMPARE(computer.name, QStringLiteral("Playing"));
+        // What the engine then builds: the neutral word and its own suffix, nothing of the rig.
+        QCOMPARE(computer.name + QStringLiteral(" - SeatHub"), QStringLiteral("Playing - SeatHub"));
+    }
+
+    void theBridgeAppliesTheNeutralNameWhereTheEnginesComputerIsBuilt()
+    {
+        // The seam is only as good as its call site, and the call site is in a file this binary cannot
+        // build (it drags the engine in). So the file is read: the record is made in
+        // `MoonlightPairedHost`'s constructor, and the neutral name is applied to it there, before
+        // anything else can hand it to the engine. The engine's own title code is not edited -
+        // `git diff v6.1.0..HEAD -- app/streaming` is the gate for that, and it names only the two
+        // files ADR-0046 and ADR-0055 allow.
+        QDir dir(QCoreApplication::applicationDirPath());
+        QString source;
+        for (int depth = 0; depth < 8 && source.isEmpty(); ++depth) {
+            QFile file(dir.filePath(QStringLiteral("app/seathub/moonlight_engine_session.cpp")));
+            if (file.open(QIODevice::ReadOnly | QIODevice::Text)) {
+                source = QString::fromUtf8(file.readAll());
+            }
+            else if (!dir.cdUp()) {
+                break;
+            }
+        }
+        QVERIFY2(!source.isEmpty(), "moonlight_engine_session.cpp could not be located");
+
+        const int constructor = source.indexOf(QStringLiteral("MoonlightPairedHost::MoonlightPairedHost("));
+        QVERIFY(constructor >= 0);
+        const int bodyEnd = source.indexOf(QStringLiteral("MoonlightPairedHost::~MoonlightPairedHost"));
+        QVERIFY(bodyEnd > constructor);
+        const QString constructorBody = source.mid(constructor, bodyEnd - constructor);
+        QVERIFY2(constructorBody.contains(QStringLiteral("new NvComputer(http, serverInfo)")),
+                 "the computer record is built here");
+        QVERIFY2(constructorBody.contains(QStringLiteral("SeatHubStreamWindow::applyNeutralName(m_computer)")),
+                 "and the neutral name is applied to it before anything else sees it");
+        QVERIFY2(source.contains(QStringLiteral("stream_window_name.h")), "the seam's header is the source");
+
+        // No line of the file hands the rig's own name to anything a customer could read.
+        QVERIFY2(!source.contains(QStringLiteral("computer()->name")),
+                 "nothing may read the rig's name back out of the record");
+    }
+
     void initTestCase()
     {
         qRegisterMetaType<PairedHostPtr>("PairedHostPtr");
