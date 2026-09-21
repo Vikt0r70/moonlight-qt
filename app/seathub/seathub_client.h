@@ -67,9 +67,10 @@ class SeatHubClient : public QObject
     /// never a property and never crosses into a view (D-35).
     Q_PROPERTY(ControlPlaneClient* controlPlane READ controlPlane CONSTANT)
 
-    /// The control plane's live session channel, `/ws/session/{session_id}` (D-29). The UI
-    /// reads billing and warning state from here via the signals below, never by parsing a
-    /// frame itself.
+    /// The control plane's live session channel, `/ws/session/{session_id}` (D-29). The server
+    /// serves no such route, so this client no longer opens it (`ADR-0055`): the class stays
+    /// declared, and the handlers below still accept what it would deliver, but the session is read
+    /// on the pairing poll instead (`handleSessionState`).
     Q_PROPERTY(SessionWebSocket* sessionChannel READ sessionChannel CONSTANT)
 
     /// Silent pairing (D-21, D-22, STREAM-03). Exposed so the connecting view can report
@@ -94,9 +95,17 @@ class SeatHubClient : public QObject
     /// still be the right view when it does.
     Q_PROPERTY(bool inSettings READ inSettings NOTIFY inSettingsChanged)
 
-    /// Customer-facing connecting line from `docs/spec/copy.md` §Play flow. Never the
-    /// engine's own stage name.
+    /// Customer-facing connecting line from `docs/spec/copy.md` §Play flow: the line of the highest
+    /// stage reached, or empty before anything has been read. Never the engine's own stage name.
     Q_PROPERTY(QString stageText READ stageText NOTIFY stageTextChanged)
+
+    /// The highest connecting stage reached, 0 to 3 (`screens.md` §24): 1 `Preparing the rig`, 2
+    /// `Preparing the stream`, 3 `Streaming`. 0 until the first answer about the session has come
+    /// back, and then no stage is done (the first is simply where a session that exists begins).
+    /// Every step is a real transition: the session's own state as the control plane reports it, the
+    /// engine's own stages (inside stage 2) and the stream starting. It only ever moves forward; no
+    /// timer moves it.
+    Q_PROPERTY(int connectStage READ connectStage NOTIFY connectStageChanged)
 
     /// The mapped failure, or an empty map. `diagnostic` is never present here (D-51).
     Q_PROPERTY(QVariantMap failure READ failure NOTIFY failureChanged)
@@ -186,6 +195,7 @@ public:
     QString sessionWarning() const { return m_sessionWarning; }
     bool inSettings() const { return m_inSettings; }
     QString stageText() const { return m_stageText; }
+    int connectStage() const { return m_connectStage; }
     QVariantMap failure() const { return m_failure; }
     QString reference() const;
     QString identity() const { return m_identity; }
@@ -316,6 +326,7 @@ public:
 signals:
     void appStateChanged();
     void stageTextChanged();
+    void connectStageChanged();
     void failureChanged();
     void identityChanged();
     void inSettingsChanged();
@@ -384,6 +395,13 @@ private slots:
 private:
     void setAppState(const QString& state);
     void setStageText(const QString& text);
+    /// Moves the highest connecting stage forward to `stage` (1 to 3). A stage at or below the one
+    /// already reached changes nothing and says nothing:
+    /// a late reply carrying an earlier state must not move the stepper back, and two states seen in
+    /// one tick land on the later stage without the earlier one being shown twice.
+    void advanceConnectStage(int stage);
+    /// Forgets the stages: a session is starting.
+    void resetConnecting();
     void setHomeStatus(const QString& status);
     void setEndReasonText(const QString& text);
     void raiseFailure(const SeatHubFailure& failure);
@@ -438,6 +456,7 @@ private:
 
     QString m_appState;
     QString m_stageText;
+    int m_connectStage = 0;
     QString m_homeStatus;
     QString m_endReasonText;
     QVariantMap m_failure;

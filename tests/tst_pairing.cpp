@@ -86,6 +86,43 @@ protected:
     }
 };
 
+// Answers by path, so the session read that rides every poll tick can be told apart from the
+// authorization poll it rides with. `/pairing` is always the documented 409 (no target yet).
+class PathNetworkAccessManager : public QNetworkAccessManager
+{
+    Q_OBJECT
+
+public:
+    int sessionStatus = 200;
+    QString sessionState = QStringLiteral("PREPARING");
+    QString sessionId = QLatin1String(kSessionId);
+    int sessionReads = 0;
+    int pairingPolls = 0;
+
+protected:
+    QNetworkReply* createRequest(Operation, const QNetworkRequest& request, QIODevice*) override
+    {
+        const QString path = request.url().path();
+        if (path.endsWith(QLatin1String("/pairing"))) {
+            ++pairingPolls;
+            QJsonObject object;
+            object.insert(QStringLiteral("status_code"), 409);
+            object.insert(QStringLiteral("status"), false);
+            object.insert(QStringLiteral("error"), QStringLiteral("The session isn't ready yet."));
+            object.insert(QStringLiteral("reference"), QStringLiteral("SH-3K2XQ1"));
+            return new FakeReply(409, QJsonDocument(object).toJson(QJsonDocument::Compact), this);
+        }
+        ++sessionReads;
+        QJsonObject session;
+        session.insert(QStringLiteral("id"), sessionId);
+        session.insert(QStringLiteral("state"), sessionState);
+        session.insert(QStringLiteral("quality_profile"), QStringLiteral("1080p60"));
+        session.insert(QStringLiteral("minutes_billed"), 0);
+        session.insert(QStringLiteral("reconnect_count"), 0);
+        return new FakeReply(sessionStatus, QJsonDocument(session).toJson(QJsonDocument::Compact), this);
+    }
+};
+
 // The 409 the contract documents for "this session has no pairing target yet".
 QByteArray conflictBody()
 {
@@ -145,7 +182,7 @@ public:
 // Instantiates the client the controller drives, points it at the fake transport, and hands it
 // over. `ControlPlaneClient::setNetworkAccessManager` is the production injection seam, so the
 // test exercises the real request path with no server anywhere.
-ControlPlaneClient* wire(PairingController& controller, FakeNetworkAccessManager* fake)
+ControlPlaneClient* wire(PairingController& controller, QNetworkAccessManager* fake)
 {
     auto* client = new ControlPlaneClient(&controller);
     client->setNetworkAccessManager(fake);
@@ -493,6 +530,57 @@ private slots:
 
         QTRY_COMPARE(failed.count(), 1);
         QCOMPARE(completed.count(), 0);
+    }
+
+    void theSessionIsReadOnEveryPollTickAndReportedAsTheServerSaidIt()
+    {
+        // CUST-12 / ADR-0055: the connecting stages come from the session's own state, read on the
+        // tick this controller already runs - the same interval, no timer of its own.
+        PairingController controller;
+        auto* fake = new PathNetworkAccessManager;
+        wire(controller, fake);
+        controller.setPollIntervalMs(1);
+
+        QSignalSpy reads(&controller, &PairingController::sessionRead);
+        QSignalSpy failed(&controller, &PairingController::pairingFailed);
+
+        controller.start(QString::fromLatin1(kSessionId));
+        QTRY_VERIFY(reads.count() >= 2);
+        QCOMPARE(reads.at(0).at(0).value<SessionInfo>().state, QStringLiteral("PREPARING"));
+        QCOMPARE(reads.at(0).at(0).value<SessionInfo>().id, QString::fromLatin1(kSessionId));
+
+        // The answer moves on as the session does.
+        fake->sessionState = QStringLiteral("READY");
+        QTRY_COMPARE(reads.last().at(0).value<SessionInfo>().state, QStringLiteral("READY"));
+
+        // One read per authorization poll at most: it rides the tick, it does not add ticks.
+        QVERIFY(fake->sessionReads <= fake->pairingPolls);
+        QCOMPARE(failed.count(), 0);
+
+        // And it stops with the poll.
+        controller.cancel();
+        const int readsAtCancel = fake->sessionReads;
+        QTest::qWait(30);
+        QCOMPARE(fake->sessionReads, readsAtCancel);
+    }
+
+    void aSessionReadThatFailedIsDroppedAndDoesNotFailPairing()
+    {
+        PairingController controller;
+        auto* fake = new PathNetworkAccessManager;
+        wire(controller, fake);
+        controller.setPollIntervalMs(1);
+        QSignalSpy reads(&controller, &PairingController::sessionRead);
+        QSignalSpy failed(&controller, &PairingController::pairingFailed);
+
+        // A read that failed says nothing about the session, and does not fail pairing.
+        fake->sessionStatus = 500;
+        controller.start(QString::fromLatin1(kSessionId));
+        QTRY_VERIFY(fake->sessionReads >= 3);
+        QCOMPARE(reads.count(), 0);
+        QCOMPARE(failed.count(), 0);
+
+        controller.cancel();
     }
 
     void cancel_stopsEverything()

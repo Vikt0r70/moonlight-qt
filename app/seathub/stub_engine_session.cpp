@@ -67,21 +67,22 @@ void StubEngineSession::run(QWindow* window)
 
 void StubEngineSession::runStage(int step)
 {
-    // Stages mirror `docs/spec/copy.md` §Play flow, in order. Each one is emitted from the event
-    // loop rather than in a loop, so the QML window actually repaints between them.
+    // Stages are named the way the engine names its own (`LiGetStageName()`), in order; the facade
+    // reads only that one began, and never shows the name. Each one is emitted from the event loop
+    // rather than in a loop, so the QML window actually repaints between them.
     switch (step) {
     case 0:
-        emit stageStarting(QStringLiteral("Waiting for a free rig"));
+        emit stageStarting(QStringLiteral("Platform initialization"));
         m_step = 1;
         m_timer->start(kStageStepMs);
         break;
     case 1:
-        emit stageStarting(QStringLiteral("Preparing the rig"));
+        emit stageStarting(QStringLiteral("Name resolution"));
         m_step = 2;
         m_timer->start(kStageStepMs);
         break;
     case 2:
-        emit stageStarting(QStringLiteral("Preparing the stream"));
+        emit stageStarting(QStringLiteral("RTSP handshake"));
         m_step = 3;
         m_timer->start(kStageStepMs);
         break;

@@ -66,53 +66,50 @@ const char* kHomeRefused = "refused";
 // value and the one the control plane uses in its own examples.
 const char* kDefaultQualityProfile = "1080p60";
 
-// `docs/spec/copy.md` §Play flow, the four customer-visible stage lines. The engine's own
-// stage names (`LiGetStageName()`, e.g. "RTSP handshake") are internal and are never shown
-// - each one is mapped onto one of these four sentences.
-const char* kStageWaitingForRig = "Waiting for a free rig";
+// `docs/spec/copy.md` §Play flow: the three customer-visible stage lines (`screens.md` §24). The
+// engine's own stage names (`LiGetStageName()`, e.g. "RTSP handshake") are internal and are never
+// shown: the engine reaching any of its stages only says that the second stage is under way.
 const char* kStagePreparingRig = "Preparing the rig";
 const char* kStagePreparingStream = "Preparing the stream";
-const char* kStageReady = "Ready";
+const char* kStageStreaming = "Streaming";
 
-const char* const kCopyDeckStageLines[] = {
-    kStageWaitingForRig,
-    kStagePreparingRig,
-    kStagePreparingStream,
-    kStageReady,
-};
+const int kStageRig = 1;
+const int kStageStream = 2;
+const int kStageStreamingNow = 3;
 
-bool isCopyDeckStageLine(const QString& stage)
+// The line of connecting stage `stage` (1 to 3), or empty for anything else.
+QString stageLine(int stage)
 {
-    for (const char* line : kCopyDeckStageLines) {
-        if (stage == QLatin1String(line)) {
-            return true;
-        }
+    switch (stage) {
+    case kStageRig:
+        return QString::fromLatin1(kStagePreparingRig);
+    case kStageStream:
+        return QString::fromLatin1(kStagePreparingStream);
+    case kStageStreamingNow:
+        return QString::fromLatin1(kStageStreaming);
+    default:
+        return QString();
     }
-    return false;
 }
 
-// Maps an engine stage name onto a `copy.md` §Play flow line. Anything unrecognised gets
-// the middle line rather than the engine's own words.
-QString stageLineFor(const QString& engineStage)
+// The connecting stage a session state belongs to, from the states `docs/spec/state-machines.md`
+// lists: the rig is being found and prepared (stage 1), the rig is ready and this client pairs and
+// starts the engine (stage 2), or the stream is running (stage 3). Every other state - a session that
+// is ending or over, or a value this client does not know - belongs to no stage, so it moves nothing:
+// what the customer reads is never a guess.
+int connectStageForState(const QString& state)
 {
-    if (isCopyDeckStageLine(engineStage)) {
-        // Already a SeatHub line (the tracer's stubbed sequence emits these directly).
-        return engineStage;
+    if (state == QLatin1String("REQUESTED") || state == QLatin1String("ALLOCATED")
+            || state == QLatin1String("PREPARING")) {
+        return kStageRig;
     }
-
-    const QString s = engineStage.toLower();
-    if (s.contains(QLatin1String("rtsp")) || s.contains(QLatin1String("handshake"))
-            || s.contains(QLatin1String("control")) || s.contains(QLatin1String("video"))
-            || s.contains(QLatin1String("audio")) || s.contains(QLatin1String("input"))) {
-        return QString::fromLatin1(kStagePreparingStream);
+    if (state == QLatin1String("READY")) {
+        return kStageStream;
     }
-    if (s.contains(QLatin1String("platform")) || s.contains(QLatin1String("name"))) {
-        return QString::fromLatin1(kStagePreparingRig);
+    if (state == QLatin1String("ACTIVE")) {
+        return kStageStreamingNow;
     }
-    if (s.contains(QLatin1String("start"))) {
-        return QString::fromLatin1(kStageReady);
-    }
-    return QString::fromLatin1(kStagePreparingStream);
+    return 0;
 }
 
 // `docs/spec/copy.md` §Session end reasons, verbatim. The left column of the table is the
@@ -260,6 +257,7 @@ SeatHubClient::SeatHubClient(QObject* parent)
       m_horizon(new AuthorizedThroughTimer(nullptr))
 {
     // The sign-in field's data: read from the binary, never fetched (Phase 5 D-02).
+    qRegisterMetaType<SessionInfo>("SessionInfo");
     m_countries = SeatHubCountries::all();
     m_defaultCountryCode = SeatHubRegion::initialCountryCode();
     m_animationEffects = SeatHubSystem::animationEffectsEnabled();
@@ -305,6 +303,12 @@ SeatHubClient::SeatHubClient(QObject* parent)
     connect(m_sessionChannel, &SessionWebSocket::dropped, this, [this](int, int) {
         m_hud.setReconnecting(true);
     });
+
+    // The session as the control plane reports it, read on the pairing poll's own tick (ADR-0055):
+    // the connecting stages come from here. The session channel above is never opened, so this is the
+    // only thing that feeds `handleSessionState` while a session is connecting.
+    connect(m_pairing, &PairingController::sessionRead,
+            this, &SeatHubClient::handleSessionState);
 
     connect(m_pairing, &PairingController::pairingCompleted,
             this, &SeatHubClient::handlePairingCompleted);
@@ -463,17 +467,16 @@ void SeatHubClient::beginSession(const QString& sessionId)
     setHomeStatus(QString::fromLatin1(kHomeReady));
 
     clearFailure();
-    setStageText(QString::fromLatin1(kStageWaitingForRig));
+    resetConnecting();
     setAppState(QString::fromLatin1(kStateConnecting));
 
     startNetworkThreads();
 
-    // The channel and pairing start with the session; pairing runs while the customer watches
-    // the connecting view and never asks them for anything (STREAM-03). The engine is started
-    // from `handlePairingCompleted()` - pairing first, stream second, which is the order the
-    // protocol requires.
-    m_sessionChannel->setBaseUrl(m_controlPlane->baseUrl());
-    m_sessionChannel->open(sessionId);
+    // Pairing starts with the session and runs while the customer watches the connecting view; it
+    // never asks them for anything (STREAM-03). The engine is started from `handlePairingCompleted()`
+    // - pairing first, stream second, which is the order the protocol requires. The session's own
+    // channel is NOT opened: the control plane serves no such route, so the client reads the session
+    // on this same poll instead (ADR-0055).
     // Marshalled, not called: the controller and its poll timer now live on the network thread,
     // and its authorization callbacks come back there too.
     onClientThread(m_pairing, [this, sessionId]() { m_pairing->start(sessionId); });
@@ -573,6 +576,29 @@ void SeatHubClient::setStageText(const QString& text)
     emit stageTextChanged();
 }
 
+void SeatHubClient::advanceConnectStage(int stage)
+{
+    // Forward only, and silent when nothing changed: a late reply that reports an earlier state, or a
+    // tick that reports the same one again, leaves the stepper exactly as it was.
+    if (stage <= m_connectStage || stage > kStageStreamingNow) {
+        return;
+    }
+    qCInfo(seathubClient) << "connecting stage" << m_connectStage << "->" << stage;
+    m_connectStage = stage;
+    setStageText(stageLine(stage));
+    emit connectStageChanged();
+}
+
+void SeatHubClient::resetConnecting()
+{
+    if (m_connectStage == 0 && m_stageText.isEmpty()) {
+        return;
+    }
+    m_connectStage = 0;
+    setStageText(QString());
+    emit connectStageChanged();
+}
+
 void SeatHubClient::setHomeStatus(const QString& status)
 {
     if (m_homeStatus == status) {
@@ -650,7 +676,7 @@ void SeatHubClient::beginLocalAttempt()
     clearFailure();
     setEndReasonText(QString());
     setHomeStatus(QString::fromLatin1(kHomeReady));
-    setStageText(QString::fromLatin1(kStageWaitingForRig));
+    resetConnecting();
     setAppState(QString::fromLatin1(kStateConnecting));
 
     if (!m_session->start(m_hostWindow)) {
@@ -666,7 +692,6 @@ void SeatHubClient::beginPlayRequest()
     // plane answers: the customer sees the named loading line, not a connection screen for a
     // session that may never exist (`screens.md` §23, audit F1).
     setHomeStatus(QString::fromLatin1(kHomeChecking));
-    setStageText(QString::fromLatin1(kStageWaitingForRig));
 
     startNetworkThreads();
 
@@ -1206,7 +1231,11 @@ void SeatHubClient::dismissError()
 
 void SeatHubClient::handleStageStarting(const QString& stage)
 {
-    setStageText(stageLineFor(stage));
+    // The engine only starts its own stages once the rig is ready and paired, so reaching any of them
+    // means the second stage is under way. Its own name for the stage is internal and is not shown
+    // (D-51), so nothing of it is read beyond the fact that it began.
+    Q_UNUSED(stage);
+    advanceConnectStage(kStageStream);
 }
 
 void SeatHubClient::handleStageFailed(const QString& stage, int errorCode, const QString& failingPorts)
@@ -1225,7 +1254,7 @@ void SeatHubClient::handleConnectionStarted()
     // D-14: from here on the settings page can report what the session actually settled on,
     // rather than what was asked for.
     m_settings->noteConnectionStarted();
-    setStageText(QString::fromLatin1(kStageReady));
+    advanceConnectStage(kStageStreamingNow);
     setAppState(QString::fromLatin1(kStateStreaming));
 
     // D-31/D-34: liveness starts with the stream and reports every 10 s, including `state` and
@@ -1342,6 +1371,17 @@ void SeatHubClient::closeSettings()
 
 void SeatHubClient::handleSessionState(const SessionInfo& session)
 {
+    // An answer about another session (one that arrives late, after a new Play) or one that arrives
+    // with no session attached is not this session's to speak for.
+    if (m_sessionId.isEmpty() || (!session.id.isEmpty() && session.id != m_sessionId)) {
+        return;
+    }
+
+    // The connecting stages are the session's own state, as the control plane reports it.
+    if (m_appState == QLatin1String(kStateConnecting)) {
+        advanceConnectStage(connectStageForState(session.state));
+    }
+
     // D-33: `authorized_through` is the control plane's horizon, and it moves forward when the
     // lease is renewed. Arming from here is the extension path; nothing in this client invents a
     // deadline of its own.

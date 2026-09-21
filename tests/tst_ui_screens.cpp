@@ -191,8 +191,15 @@ class FakeShellClient : public QObject
     Q_PROPERTY(QString defaultCountryCode READ defaultCountryCode CONSTANT)
     Q_PROPERTY(bool animationEffects READ animationEffects CONSTANT)
     Q_PROPERTY(bool liveSession READ liveSession NOTIFY liveSessionChanged)
+    Q_PROPERTY(int connectStage READ connectStage NOTIFY connectStageChanged)
 
 public:
+    int connectStage() const { return m_connectStage; }
+    void setConnectStage(int stage)
+    {
+        m_connectStage = stage;
+        emit connectStageChanged();
+    }
     bool liveSession() const { return m_liveSession; }
     void setLiveSession(bool live)
     {
@@ -322,6 +329,7 @@ public:
 
 signals:
     void balanceChanged();
+    void connectStageChanged();
     void liveSessionChanged();
     void homeStatusChanged();
     void endReasonTextChanged();
@@ -348,6 +356,7 @@ private:
     QString m_lastPhone;
     QString m_lastCode;
     bool m_liveSession = false;
+    int m_connectStage = 0;
     int m_topUps = 0;
     int m_settingsOpens = 0;
     int m_starts = 0;
@@ -478,6 +487,8 @@ private slots:
     void disabledActionLabelStaysLegible();
     void agentConfigPanelMasksTheTokenAndNeverRendersIt();
     void theWindowSequenceRestoresOnlyAfterTheEngineIsDone();
+    void theStepperDrawsThreeStagesFromTheFacadesStageAndNothingElse();
+    void theStepperMarksTheStageThatWasActiveFailedWithAMarkOfItsOwn();
 };
 
 void TstUiScreens::initTestCase()
@@ -2432,5 +2443,177 @@ void TstUiScreens::theWindowSequenceRestoresOnlyAfterTheEngineIsDone()
 }
 
 QTEST_MAIN(TstUiScreens)
+
+namespace {
+
+// Every item named `name` in `root`'s visual tree. A Repeater's delegates are children of the item
+// they are laid out in, not of the Repeater in the object tree, so `findChildren` cannot see them.
+void collectNamed(QQuickItem* item, const QString& name, QList<QObject*>* out)
+{
+    for (QQuickItem* child : item->childItems()) {
+        if (child->objectName() == name) {
+            out->append(child);
+        }
+        collectNamed(child, name, out);
+    }
+}
+
+QList<QObject*> itemsNamed(QObject* root, const QString& name)
+{
+    QList<QObject*> found;
+    if (auto* item = qobject_cast<QQuickItem*>(root)) {
+        collectNamed(item, name, &found);
+    }
+    return found;
+}
+
+// Every text any item in `root`'s visual tree prints, delegates included.
+void collectTexts(QQuickItem* item, QStringList* out)
+{
+    for (QQuickItem* child : item->childItems()) {
+        if (child->metaObject()->indexOfProperty("text") >= 0
+                && child->metaObject()->indexOfProperty("font") >= 0) {
+            out->append(child->property("text").toString());
+        }
+        collectTexts(child, out);
+    }
+}
+
+QObject* itemNamed(QObject* root, const QString& name)
+{
+    const QList<QObject*> found = itemsNamed(root, name);
+    return found.isEmpty() ? nullptr : found.first();
+}
+
+// What each of the stepper's three stages looks like, in order, read from the stage rows themselves.
+QStringList stepperLooks(QObject* stepper)
+{
+    QStringList looks;
+    for (int index = 0; index < 3; ++index) {
+        QObject* row = itemNamed(stepper, QStringLiteral("stage%1").arg(index));
+        looks.append(row ? row->property("look").toString() : QStringLiteral("<missing>"));
+    }
+    return looks;
+}
+
+// The stage names the stepper prints, in order.
+QStringList stepperNames(QObject* stepper)
+{
+    QStringList names;
+    for (QObject* item : itemsNamed(stepper, QStringLiteral("stageName"))) {
+        names.append(item->property("text").toString());
+    }
+    return names;
+}
+
+} // namespace
+
+void TstUiScreens::theStepperDrawsThreeStagesFromTheFacadesStageAndNothingElse()
+{
+    QQuickStyle::setStyle(QStringLiteral("Basic"));
+    QQmlEngine engine;
+    registerTokenSingletons(&engine);
+    FakeShellClient client;
+
+    QString error;
+    QScopedPointer<QObject> stepper(instantiate(&engine, QStringLiteral("SeatHubStepper.qml"), &error));
+    QVERIFY2(stepper, qPrintable(error));
+    stepper->setProperty("client", QVariant::fromValue(static_cast<QObject*>(&client)));
+
+    // Three stages, in the copy deck's own words: not five, and none of the two the deck retired.
+    QCOMPARE(stepperNames(stepper.data()),
+             (QStringList{QStringLiteral("Preparing the rig"), QStringLiteral("Preparing the stream"),
+                          QStringLiteral("Streaming")}));
+    QStringList everything;
+    collectTexts(qobject_cast<QQuickItem*>(stepper.data()), &everything);
+    QVERIFY2(everything.contains(QStringLiteral("Preparing the stream")),
+             "the walk over the stepper's items must see its delegates");
+    QVERIFY(!everything.contains(QStringLiteral("Waiting for a free rig")));
+    QVERIFY(!everything.contains(QStringLiteral("Ready")));
+    QVERIFY(!everything.contains(QStringLiteral("Open SeatHub and press Play.")));
+
+    // Before the first answer about the session nothing is marked done: the first stage is simply
+    // where a session that exists begins.
+    client.setConnectStage(0);
+    QCOMPARE(stepperLooks(stepper.data()),
+             (QStringList{QStringLiteral("active"), QStringLiteral("pending"), QStringLiteral("pending")}));
+
+    // Each stage the facade reaches makes the earlier ones done and itself the one live signal.
+    client.setConnectStage(1);
+    QCOMPARE(stepperLooks(stepper.data()),
+             (QStringList{QStringLiteral("active"), QStringLiteral("pending"), QStringLiteral("pending")}));
+    client.setConnectStage(2);
+    QCOMPARE(stepperLooks(stepper.data()),
+             (QStringList{QStringLiteral("done"), QStringLiteral("active"), QStringLiteral("pending")}));
+    client.setConnectStage(3);
+    QCOMPARE(stepperLooks(stepper.data()),
+             (QStringList{QStringLiteral("done"), QStringLiteral("done"), QStringLiteral("active")}));
+
+    // Only the active stage carries its sentence, and the stepper never has a stage of its own to
+    // advance: with nothing set on it, it draws whatever the facade says and no more.
+    client.setConnectStage(2);
+    QObject* sentenceOfSecond = itemNamed(itemNamed(stepper.data(), QStringLiteral("stage1")),
+                                          QStringLiteral("stageSentence"));
+    QVERIFY(sentenceOfSecond);
+    QVERIFY(effectivelyVisible(sentenceOfSecond));
+    QCOMPARE(sentenceOfSecond->property("text").toString(),
+             QStringLiteral("Starting Sunshine and pairing your client. Usually under a minute."));
+    QObject* sentenceOfFirst = itemNamed(itemNamed(stepper.data(), QStringLiteral("stage0")),
+                                         QStringLiteral("stageSentence"));
+    QVERIFY(sentenceOfFirst);
+    QVERIFY(!effectivelyVisible(sentenceOfFirst));
+}
+
+void TstUiScreens::theStepperMarksTheStageThatWasActiveFailedWithAMarkOfItsOwn()
+{
+    QQuickStyle::setStyle(QStringLiteral("Basic"));
+    QQmlEngine engine;
+    registerTokenSingletons(&engine);
+    FakeShellClient client;
+
+    QString error;
+    QScopedPointer<QObject> stepper(instantiate(&engine, QStringLiteral("SeatHubStepper.qml"), &error));
+    QVERIFY2(stepper, qPrintable(error));
+    stepper->setProperty("client", QVariant::fromValue(static_cast<QObject*>(&client)));
+
+    // Stopped at the second stage: the first stays done, the second is failed, the third pending.
+    client.setConnectStage(2);
+    stepper->setProperty("failed", true);
+    QCOMPARE(stepperLooks(stepper.data()),
+             (QStringList{QStringLiteral("done"), QStringLiteral("failed"), QStringLiteral("pending")}));
+
+    // The failed stage has a mark that is not a colour alone, in the destructive colour, and its
+    // name is destructive too; nothing is breathing any more.
+    QObject* failedRow = itemNamed(stepper.data(), QStringLiteral("stage1"));
+    QVERIFY(failedRow);
+    QObject* mark = itemNamed(failedRow, QStringLiteral("failedMark"));
+    QVERIFY(mark);
+    QVERIFY(effectivelyVisible(mark));
+    QCOMPARE(mark->property("color").value<QColor>(), QColor(QStringLiteral("#ef4444")));
+    QObject* name = itemNamed(failedRow, QStringLiteral("stageName"));
+    QVERIFY(name);
+    // The colour changes over the page duration (420ms), so it is read once it has settled.
+    QTRY_COMPARE_WITH_TIMEOUT(name->property("color").value<QColor>(),
+                              QColor(QStringLiteral("#ef4444")), 3000);
+    for (int index = 0; index < 3; ++index) {
+        QObject* row = itemNamed(stepper.data(), QStringLiteral("stage%1").arg(index));
+        QVERIFY(row);
+        QObject* dot = itemNamed(row, QStringLiteral("dot"));
+        QVERIFY(dot);
+        QTRY_VERIFY2_WITH_TIMEOUT(
+            dot->property("color").value<QColor>() != QColor(QStringLiteral("#f59e0b")),
+            "no stage is drawn as live once connecting has stopped", 3000);
+    }
+
+    // Stopped at the first stage before anything else was read: it is the one that failed.
+    client.setConnectStage(0);
+    QCOMPARE(stepperLooks(stepper.data()),
+             (QStringList{QStringLiteral("failed"), QStringLiteral("pending"), QStringLiteral("pending")}));
+
+    // Leaving the failed state draws the live stage again.
+    stepper->setProperty("failed", false);
+    QCOMPARE(stepperLooks(stepper.data()),
+             (QStringList{QStringLiteral("active"), QStringLiteral("pending"), QStringLiteral("pending")}));
+}
 
 #include "tst_ui_screens.moc"

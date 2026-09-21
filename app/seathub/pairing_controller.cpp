@@ -126,6 +126,30 @@ void PairingController::pollAuthorization()
     m_client->fetchSessionAuthorization(
         m_sessionId,
         [this](const ControlPlaneResult& result) { handleAuthorization(result); });
+
+    // The session itself, on the same tick (ADR-0055): the state the connecting stages come from.
+    // Fire and forget - it never decides when the next poll is, so a slow or failed read cannot
+    // slow pairing down or spend its deadline.
+    const QString polledSession = m_sessionId;
+    m_client->fetchSession(polledSession, [this, polledSession](const ControlPlaneResult& result) {
+        handleSessionRead(polledSession, result);
+    });
+}
+
+void PairingController::handleSessionRead(const QString& polledSession,
+                                          const ControlPlaneResult& result)
+{
+    // After pairing has finished (or was cancelled) the engine owns what the customer sees, and a
+    // reply for an earlier session must never speak for this one.
+    if (m_finished || polledSession != m_sessionId || !result.ok) {
+        return;
+    }
+
+    SessionInfo info;
+    if (!SessionInfo::parse(result.body, &info)) {
+        return;
+    }
+    emit sessionRead(info);
 }
 
 void PairingController::handleAuthorization(const ControlPlaneResult& result)

@@ -244,6 +244,28 @@ private slots:
         QVERIFY(!socket.isOpen());
     }
 
+    void aChannelThatWasNeverAskedToOpenNeverConnectsOrRetries()
+    {
+        // The customer client no longer opens this channel at all (the control plane does not serve
+        // the route; `ADR-0055` records that it stays declared and the client reads the session by
+        // polling instead). The class stands on its own terms: it does nothing until it is asked, so a
+        // caller that never asks - as the client now never does - sees no socket, no reconnect and no
+        // noise.
+        SessionWebSocket socket;
+        QSignalSpy states(&socket, &SessionWebSocket::stateChanged);
+        QSignalSpy dropped(&socket, &SessionWebSocket::dropped);
+        QSignalSpy reconnecting(&socket, &SessionWebSocket::reconnectingIn);
+
+        QTest::qWait(150);
+
+        QCOMPARE(socket.state(), QStringLiteral("idle"));
+        QVERIFY(!socket.isOpen());
+        QCOMPARE(socket.reconnectAttempts(), 0);
+        QCOMPARE(states.count(), 0);
+        QCOMPARE(dropped.count(), 0);
+        QCOMPARE(reconnecting.count(), 0);
+    }
+
     void close_isDeliberateAndSuppressesReconnect()
     {
         SessionWebSocket socket;

@@ -190,8 +190,8 @@ ApplicationWindow {
                 spacing: Metrics.s6
                 width: Math.min(parent.width - Metrics.s16, 420)
 
-                // The connect phase is the deck's five stages, not a spinner that resets
-                // (ui.md §6, audit F8).
+                // The connect phase is the deck's three stages, each a real transition, not a
+                // spinner that resets (ui.md §6, audit F8, CUST-12).
                 SeatHubStepper {
                     id: stepper
                     width: parent.width

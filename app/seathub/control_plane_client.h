@@ -123,6 +123,9 @@ struct SessionInfo
 
     static bool parse(const QJsonObject& body, SessionInfo* out);
 };
+// Crosses threads as a signal argument (the pairing poll and the teardown read both run on the
+// network thread and hand the session to the facade), so it has to be a registered metatype.
+Q_DECLARE_METATYPE(SessionInfo)
 
 /// `TokenPair` - the bearer credential sign-in returns. ADR-0050 made sessions permanent, so the
 /// control plane sends one non-expiring `access_token` and nothing else; the refresh and expiry

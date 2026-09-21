@@ -128,6 +128,11 @@ signals:
     void pairingCompleted(const QString& clientUuid);
     /// Pairing failed closed. Always a SeatHub failure, never engine text in `error`.
     void pairingFailed(const SeatHubFailure& failure);
+    /// The session exactly as `GET /api/sessions/{id}` reported it on one poll tick. It rides the
+    /// tick this controller already runs - the same interval, no timer of its own - and is what the
+    /// connecting stages are read from (CUST-12, `ADR-0055`). A read that failed, or that arrived
+    /// after pairing finished or for another session, is dropped: a missing answer is not a state.
+    void sessionRead(const SessionInfo& session);
 
 public slots:
     /// One authorization poll. Public so the deadline and the fail-closed rules can be driven
@@ -136,6 +141,7 @@ public slots:
 
 private slots:
     void handleAuthorization(const ControlPlaneResult& result);
+    void handleSessionRead(const QString& polledSession, const ControlPlaneResult& result);
     void handleSeamResult(bool ok, const QString& clientUuid, const QString& engineError);
 
 private:

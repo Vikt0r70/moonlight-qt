@@ -201,6 +201,37 @@ public:
         m_otpRequestStatus = status;
     }
 
+    /// What `GET /api/sessions/{id}/pairing` answers. The default is the documented refusal (no rig is
+    /// assigned), which stops pairing at once; 409 is "the rig is not ready yet", which keeps the poll
+    /// going - and with it the session read that rides every tick.
+    void answerPairing(int status, const QByteArray& body = QByteArray())
+    {
+        QMutexLocker lock(&m_mutex);
+        m_pairingStatus = status;
+        m_pairingBody = body;
+        m_pairingCustom = true;
+    }
+
+    /// What `GET /api/sessions/{id}` answers: the session in `state`, under `id`, with an end reason
+    /// and a billed-minutes count when given. The default is a terminal session under another id,
+    /// which teardown's verification wants and the connecting stages ignore.
+    void answerSession(const QString& id, const QString& state, const QString& endReason = QString(),
+                       int minutesBilled = 0)
+    {
+        QMutexLocker lock(&m_mutex);
+        QJsonObject object;
+        object.insert(QStringLiteral("id"), id);
+        object.insert(QStringLiteral("state"), state);
+        object.insert(QStringLiteral("quality_profile"), QStringLiteral("1080p60"));
+        object.insert(QStringLiteral("minutes_billed"), minutesBilled);
+        object.insert(QStringLiteral("reconnect_count"), 0);
+        object.insert(QStringLiteral("requested_at"), QStringLiteral("2026-09-19T00:00:00Z"));
+        if (!endReason.isEmpty()) {
+            object.insert(QStringLiteral("end_reason"), endReason);
+        }
+        m_sessionBody = QJsonDocument(object).toJson(QJsonDocument::Compact);
+    }
+
     /// The body the last request for `path` carried.
     QByteArray bodyFor(const QString& path) const
     {
@@ -221,7 +252,9 @@ protected:
     {
         const QString path = request.url().path();
         int meStatus, walletStatus, logoutStatus, loginStatus, otpRequestStatus, playStatus;
-        QByteArray meBody, walletBody, loginBody, playBody;
+        int pairingStatus;
+        bool pairingCustom;
+        QByteArray meBody, walletBody, loginBody, playBody, pairingBody, sessionBody;
         {
             QMutexLocker lock(&m_mutex);
             m_paths.append(path);
@@ -239,6 +272,10 @@ protected:
             walletStatus = m_walletStatus;
             walletBody = m_walletBody;
             logoutStatus = m_logoutStatus;
+            pairingStatus = m_pairingStatus;
+            pairingBody = m_pairingBody;
+            pairingCustom = m_pairingCustom;
+            sessionBody = m_sessionBody;
         }
 
         if (path == QLatin1String("/api/me")) {
@@ -265,6 +302,13 @@ protected:
 
         if (path.endsWith(QLatin1String("/end"))) {
             return new FakeReply(200, QByteArrayLiteral("{\"status\":true}"), this);
+        }
+        if (path.endsWith(QLatin1String("/pairing")) && pairingCustom) {
+            return new FakeReply(pairingStatus, pairingBody, this);
+        }
+        if (path.startsWith(QLatin1String("/api/sessions/")) && path.count(QLatin1Char('/')) == 3
+                && !sessionBody.isEmpty()) {
+            return new FakeReply(200, sessionBody, this);
         }
         if (path.endsWith(QLatin1String("/pairing"))) {
             // No host was assigned to this session: the documented refusal, so pairing stops.
@@ -304,6 +348,10 @@ private:
     int m_walletStatus = 200;
     QByteArray m_walletBody;
     int m_logoutStatus = 204;
+    int m_pairingStatus = 404;
+    QByteArray m_pairingBody;
+    bool m_pairingCustom = false;
+    QByteArray m_sessionBody;
 };
 
 /// An `EngineSession` that records what the facade asked it to do. Engine-free by construction:
@@ -1328,6 +1376,246 @@ private slots:
 
         client.session()->attachSession(nullptr);
         delete engine;
+    }
+
+    // --- the connecting stages are the session's own state (CUST-12, ADR-0055) ------------------------
+
+    /// A session as the pairing poll would hand it to the facade.
+    static SessionInfo sessionIn(const QString& state, const QString& id = QStringLiteral("s-stages"))
+    {
+        SessionInfo info;
+        info.id = id;
+        info.state = state;
+        return info;
+    }
+
+    /// Reports `info` the way a poll tick does: a signal of the pairing controller, which the facade
+    /// listens to. Emitted from here it reaches the facade directly, in order, with no timing.
+    static void report(SeatHubClient& client, const SessionInfo& info)
+    {
+        emit client.pairing()->sessionRead(info);
+    }
+
+    /// A facade that has begun `s-stages` and whose rig is never ready: pairing keeps polling (409)
+    /// so the poll's own session read has something to ride on.
+    void beginStagedSession(SeatHubClient& client)
+    {
+        reachHome(client, 90);
+        QVERIFY(!QTest::currentTestFailed());
+        m_fake->answerPairing(409, playRefusalBody(QStringLiteral("The rig is not ready yet."),
+                                                   QStringLiteral("SH-2K2XQ1")));
+        client.beginSession(QStringLiteral("s-stages"));
+        QCOMPARE(client.appState(), QStringLiteral("connecting"));
+    }
+
+    void beginningASessionNeverOpensTheSessionSocket()
+    {
+        SeatHubClient client;
+        beginStagedSession(client);
+        QVERIFY(!QTest::currentTestFailed());
+
+        QSignalSpy channelState(client.sessionChannel(), &SessionWebSocket::stateChanged);
+        QSignalSpy dropped(client.sessionChannel(), &SessionWebSocket::dropped);
+
+        // Long enough for several poll ticks - and for a socket that had been opened to have tried,
+        // failed against the unresolvable base address and scheduled its first reconnect.
+        QTRY_VERIFY_WITH_TIMEOUT(
+            m_fake->requestPaths().count(QStringLiteral("/api/sessions/s-stages/pairing")) >= 3, 15000);
+
+        QVERIFY(!client.sessionChannel()->isOpen());
+        QCOMPARE(client.sessionChannel()->reconnectAttempts(), 0);
+        QCOMPARE(channelState.count(), 0);
+        QCOMPARE(dropped.count(), 0);
+        // The session is read over HTTP instead, on that same tick.
+        QVERIFY(m_fake->requestPaths().contains(QStringLiteral("/api/sessions/s-stages")));
+        QVERIFY(!m_fake->requestPaths().contains(QStringLiteral("/ws/session/s-stages")));
+    }
+
+    void noStageIsDoneBeforeTheFirstAnswerAboutTheSession()
+    {
+        SeatHubClient client;
+        beginStagedSession(client);
+        QVERIFY(!QTest::currentTestFailed());
+
+        // Nothing has been read: no stage reached, no line, nothing marked done.
+        QCOMPARE(client.connectStage(), 0);
+        QVERIFY(client.stageText().isEmpty());
+    }
+
+    void aSessionWalkingTheRealStatesAdvancesTheStepperInOrder()
+    {
+        SeatHubClient client;
+        beginStagedSession(client);
+        QVERIFY(!QTest::currentTestFailed());
+        QSignalSpy stages(&client, &SeatHubClient::connectStageChanged);
+
+        report(client, sessionIn(QStringLiteral("ALLOCATED")));
+        QCOMPARE(client.connectStage(), 1);
+        QCOMPARE(client.stageText(), QStringLiteral("Preparing the rig"));
+
+        report(client, sessionIn(QStringLiteral("PREPARING")));
+        QCOMPARE(client.connectStage(), 1);
+
+        report(client, sessionIn(QStringLiteral("READY")));
+        QCOMPARE(client.connectStage(), 2);
+        QCOMPARE(client.stageText(), QStringLiteral("Preparing the stream"));
+
+        report(client, sessionIn(QStringLiteral("ACTIVE")));
+        QCOMPARE(client.connectStage(), 3);
+        QCOMPARE(client.stageText(), QStringLiteral("Streaming"));
+
+        // Three moves, each announced once, in order.
+        QCOMPARE(stages.count(), 3);
+    }
+
+    void aLateReplyCarryingAnEarlierStateChangesNothing()
+    {
+        SeatHubClient client;
+        beginStagedSession(client);
+        QVERIFY(!QTest::currentTestFailed());
+
+        report(client, sessionIn(QStringLiteral("READY")));
+        QCOMPARE(client.connectStage(), 2);
+        QSignalSpy stages(&client, &SeatHubClient::connectStageChanged);
+        QSignalSpy lines(&client, &SeatHubClient::stageTextChanged);
+
+        // The same tick's slower reply, or last tick's, arriving second.
+        report(client, sessionIn(QStringLiteral("PREPARING")));
+        report(client, sessionIn(QStringLiteral("ALLOCATED")));
+
+        QCOMPARE(client.connectStage(), 2);
+        QCOMPARE(client.stageText(), QStringLiteral("Preparing the stream"));
+        QCOMPARE(stages.count(), 0);
+        QCOMPARE(lines.count(), 0);
+    }
+
+    void twoStatesSeenInOneTickLandOnTheLaterStageWithoutShowingTheEarlierOneTwice()
+    {
+        SeatHubClient client;
+        beginStagedSession(client);
+        QVERIFY(!QTest::currentTestFailed());
+        QSignalSpy stages(&client, &SeatHubClient::connectStageChanged);
+
+        // A tick that brings two answers at once: the rig was preparing and is already ready.
+        report(client, sessionIn(QStringLiteral("PREPARING")));
+        report(client, sessionIn(QStringLiteral("READY")));
+        QCOMPARE(client.connectStage(), 2);
+        QCOMPARE(stages.count(), 2);
+    }
+
+    void aFirstAnswerAlreadyPastTheFirstStageGoesStraightThere()
+    {
+        SeatHubClient client;
+        beginStagedSession(client);
+        QVERIFY(!QTest::currentTestFailed());
+        QSignalSpy stages(&client, &SeatHubClient::connectStageChanged);
+
+        // The earlier stage is never shown as if it had been waited on.
+        report(client, sessionIn(QStringLiteral("READY")));
+        QCOMPARE(client.connectStage(), 2);
+        QCOMPARE(stages.count(), 1);
+    }
+
+    void aTickThatReportsNoChangeLeavesTheStepperExactlyAsItWas()
+    {
+        SeatHubClient client;
+        beginStagedSession(client);
+        QVERIFY(!QTest::currentTestFailed());
+
+        report(client, sessionIn(QStringLiteral("PREPARING")));
+        QSignalSpy stages(&client, &SeatHubClient::connectStageChanged);
+        QSignalSpy lines(&client, &SeatHubClient::stageTextChanged);
+
+        report(client, sessionIn(QStringLiteral("PREPARING")));
+        report(client, sessionIn(QStringLiteral("PREPARING")));
+        // A state that belongs to no stage moves nothing either: a value this client does not know is
+        // never turned into progress.
+        report(client, sessionIn(QStringLiteral("SOMETHING_NEW")));
+        report(client, sessionIn(QString()));
+
+        QCOMPARE(client.connectStage(), 1);
+        QCOMPARE(stages.count(), 0);
+        QCOMPARE(lines.count(), 0);
+    }
+
+    void anAnswerAboutAnotherSessionIsNotThisOnesToSpeakFor()
+    {
+        SeatHubClient client;
+        beginStagedSession(client);
+        QVERIFY(!QTest::currentTestFailed());
+
+        report(client, sessionIn(QStringLiteral("READY"), QStringLiteral("some-other-session")));
+        QCOMPARE(client.connectStage(), 0);
+    }
+
+    void theSessionIsReadOnThePairingPollAndTheStagesFollowIt()
+    {
+        SeatHubClient client;
+        beginStagedSession(client);
+        QVERIFY(!QTest::currentTestFailed());
+        QSignalSpy stages(&client, &SeatHubClient::connectStageChanged);
+
+        // The control plane's answer changes between ticks, as a real session's does.
+        m_fake->answerSession(QStringLiteral("s-stages"), QStringLiteral("PREPARING"));
+        QTRY_COMPARE_WITH_TIMEOUT(client.connectStage(), 1, 15000);
+
+        m_fake->answerSession(QStringLiteral("s-stages"), QStringLiteral("READY"));
+        QTRY_COMPARE_WITH_TIMEOUT(client.connectStage(), 2, 15000);
+
+        // Later ticks that bring the same answer change nothing.
+        QTest::qWait(800);
+        QCOMPARE(client.connectStage(), 2);
+        QCOMPARE(stages.count(), 2);
+
+        // The read rides the poll the pairing controller already runs: for every authorization poll
+        // there is at most one session read, and there is no timer of the facade's own.
+        const int polls =
+            m_fake->requestPaths().count(QStringLiteral("/api/sessions/s-stages/pairing"));
+        const int reads = m_fake->requestPaths().count(QStringLiteral("/api/sessions/s-stages"));
+        QVERIFY2(reads >= 1 && reads <= polls, "one session read per poll tick, at most");
+    }
+
+    void theEnginesOwnStagesStayInsideTheSecondStageAndOnlyTheStreamStartingReachesTheThird()
+    {
+        auto* engine = new FakeEngineSession;
+        {
+            SeatHubClient client;
+            client.session()->attachSession(engine);
+
+            client.start();
+            QCOMPARE(client.appState(), QStringLiteral("connecting"));
+            QCOMPARE(client.connectStage(), 0);
+
+            // Any of the engine's own stages is the second stage under way, and never past it; its own
+            // name for the stage is not what the customer reads.
+            emit engine->stageStarting(QStringLiteral("RTSP handshake"));
+            QCOMPARE(client.connectStage(), 2);
+            QCOMPARE(client.stageText(), QStringLiteral("Preparing the stream"));
+            emit engine->stageStarting(QStringLiteral("Audio stream initialization"));
+            QCOMPARE(client.connectStage(), 2);
+
+            emit engine->connectionStarted();
+            QCOMPARE(client.connectStage(), 3);
+            QCOMPARE(client.stageText(), QStringLiteral("Streaming"));
+
+            emit engine->sessionFinished(0);
+            emit engine->readyForDeletion();
+            QCOMPARE(client.appState(), QStringLiteral("signed_out"));
+        }
+        delete engine;
+    }
+
+    void aNewSessionStartsItsStagesAgainFromNothing()
+    {
+        SeatHubClient client;
+        beginStagedSession(client);
+        QVERIFY(!QTest::currentTestFailed());
+        report(client, sessionIn(QStringLiteral("READY")));
+        QCOMPARE(client.connectStage(), 2);
+
+        client.beginSession(QStringLiteral("s-stages"));
+        QCOMPARE(client.connectStage(), 0);
+        QVERIFY(client.stageText().isEmpty());
     }
 
     void theFacadeHandsTheScreenTheBundledCountriesAndARegionThatIsOneOfThem()
