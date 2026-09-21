@@ -40,6 +40,7 @@
 #include <QBuffer>
 #include <QDir>
 #include <QFile>
+#include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QMutex>
@@ -51,13 +52,16 @@
 #include <QSignalSpy>
 #include <QTemporaryDir>
 #include <QThread>
+#include <QTimeZone>
 #include <QTimer>
+#include <QUrlQuery>
 #include <QWindow>
 
 #include "seathub/control_plane_client.h"
 #include "seathub/countries.h"
 #include "seathub/duration_text.h"
 #include "seathub/engine_session.h"
+#include "seathub/jordan_time.h"
 #include "seathub/moonlight_engine_session.h"
 #include "seathub/pairing_handshake.h"
 #include "seathub/seathub_client.h"
@@ -101,7 +105,7 @@ class FakeReply : public QNetworkReply
     Q_OBJECT
 
 public:
-    FakeReply(int httpStatus, const QByteArray& body, QObject* parent)
+    FakeReply(int httpStatus, const QByteArray& body, QObject* parent, int delayMs = 0)
         : QNetworkReply(parent)
     {
         if (httpStatus == 0) {
@@ -114,7 +118,7 @@ public:
         m_buffer.setData(body);
         m_buffer.open(QIODevice::ReadOnly);
         open(QIODevice::ReadOnly);
-        QTimer::singleShot(0, this, [this]() {
+        QTimer::singleShot(delayMs, this, [this]() {
             setFinished(true);
             emit finished();
         });
@@ -232,6 +236,35 @@ public:
         m_sessionBody = QJsonDocument(object).toJson(QJsonDocument::Compact);
     }
 
+    /// What a profile list route answers for the page at `cursor` (empty for the first page). `path` is
+    /// the route (`/api/sessions`, `/api/wallet/history`, `/api/topup-notices`). Status 0 is a
+    /// transport failure. A page nobody answered for is an empty last page.
+    void answerList(const QString& path, const QString& cursor, int status, const QByteArray& body)
+    {
+        QMutexLocker lock(&m_mutex);
+        m_lists.insert(path + QLatin1Char('|') + cursor, qMakePair(status, body));
+    }
+    /// What `GET /api/usage` answers.
+    void answerUsage(int status, const QByteArray& body)
+    {
+        QMutexLocker lock(&m_mutex);
+        m_usageStatus = status;
+        m_usageBody = body;
+    }
+    /// Every list reply arrives this many milliseconds after it was asked for, so a test can ask a
+    /// second time while the first is still in flight.
+    void delayLists(int milliseconds)
+    {
+        QMutexLocker lock(&m_mutex);
+        m_listDelay = milliseconds;
+    }
+    /// The query of every request `path` has received, in order (`limit=15&cursor=...`).
+    QStringList queriesFor(const QString& path) const
+    {
+        QMutexLocker lock(&m_mutex);
+        return m_queries.value(path);
+    }
+
     /// The body the last request for `path` carried.
     QByteArray bodyFor(const QString& path) const
     {
@@ -247,10 +280,16 @@ public:
     }
 
 protected:
-    QNetworkReply* createRequest(Operation, const QNetworkRequest& request,
+    QNetworkReply* createRequest(Operation operation, const QNetworkRequest& request,
                                  QIODevice* outgoing) override
     {
         const QString path = request.url().path();
+        const bool isGet = operation == QNetworkAccessManager::GetOperation;
+        const bool isList = isGet && (path == QLatin1String("/api/sessions")
+                                      || path == QLatin1String("/api/wallet/history")
+                                      || path == QLatin1String("/api/topup-notices"));
+        const QString cursor = QUrlQuery(request.url()).queryItemValue(
+            QStringLiteral("cursor"), QUrl::FullyDecoded);
         int meStatus, walletStatus, logoutStatus, loginStatus, otpRequestStatus, playStatus;
         int pairingStatus;
         bool pairingCustom;
@@ -258,6 +297,7 @@ protected:
         {
             QMutexLocker lock(&m_mutex);
             m_paths.append(path);
+            m_queries[path].append(request.url().query(QUrl::FullyEncoded));
             m_auth.insert(path, request.rawHeader("Authorization"));
             if (outgoing) {
                 m_bodies.insert(path, outgoing->peek(outgoing->size()));
@@ -278,6 +318,33 @@ protected:
             sessionBody = m_sessionBody;
         }
 
+        if (isList) {
+            QPair<int, QByteArray> answer;
+            int delay;
+            {
+                QMutexLocker lock(&m_mutex);
+                delay = m_listDelay;
+                answer = m_lists.value(path + QLatin1Char('|') + cursor, qMakePair(200, QByteArray()));
+            }
+            if (answer.second.isEmpty()) {
+                const char* member = path.endsWith(QLatin1String("history")) ? "entries"
+                                     : path.endsWith(QLatin1String("notices")) ? "notices"
+                                                                               : "sessions";
+                answer.second = QStringLiteral("{\"%1\":[],\"next_cursor\":null}")
+                                    .arg(QLatin1String(member)).toUtf8();
+            }
+            return new FakeReply(answer.first, answer.second, this, delay);
+        }
+        if (isGet && path == QLatin1String("/api/usage")) {
+            int usageStatus;
+            QByteArray usageBody;
+            {
+                QMutexLocker lock(&m_mutex);
+                usageStatus = m_usageStatus;
+                usageBody = m_usageBody;
+            }
+            return new FakeReply(usageStatus, usageBody, this);
+        }
         if (path == QLatin1String("/api/me")) {
             return new FakeReply(meStatus, meBody, this);
         }
@@ -336,6 +403,11 @@ private:
 
     mutable QMutex m_mutex;
     QStringList m_paths;
+    QHash<QString, QStringList> m_queries;
+    QHash<QString, QPair<int, QByteArray>> m_lists;
+    int m_listDelay = 0;
+    int m_usageStatus = 200;
+    QByteArray m_usageBody = QByteArrayLiteral("{\"minutes_played\":0,\"balance_minutes\":0}");
     QHash<QString, QByteArray> m_auth;
     QHash<QString, QByteArray> m_bodies;
     int m_loginStatus = 200;
@@ -483,6 +555,103 @@ private:
             body.insert(QStringLiteral("failure"), failure);
         }
         return QJsonDocument(body).toJson(QJsonDocument::Compact);
+    }
+
+    // --- Phase 5 plan 09: builders for the profile's pages -----------------------------------------
+
+    static QByteArray pageBody(const char* member, const QJsonArray& rows, const QString& next)
+    {
+        QJsonObject body;
+        body.insert(QLatin1String(member), rows);
+        body.insert(QStringLiteral("next_cursor"),
+                    next.isEmpty() ? QJsonValue(QJsonValue::Null) : QJsonValue(next));
+        return QJsonDocument(body).toJson(QJsonDocument::Compact);
+    }
+
+    /// One finished session as the contract's `CustomerSessionRow` has it. `host_id` and `host_name`
+    /// are NOT part of that row: they are put on the wire here on purpose, to prove a client that
+    /// were handed a rig's identity would still never show it.
+    static QJsonObject sessionRow(const QString& id, int minutes,
+                                  const QString& endReason = QStringLiteral("CUSTOMER_ENDED"),
+                                  const QString& requestedAt = QStringLiteral("2026-09-12T18:40:00Z"))
+    {
+        QJsonObject row;
+        row.insert(QStringLiteral("id"), id);
+        row.insert(QStringLiteral("state"), QStringLiteral("COMPLETED"));
+        row.insert(QStringLiteral("minutes_billed"), minutes);
+        row.insert(QStringLiteral("requested_at"), requestedAt);
+        row.insert(QStringLiteral("end_reason"), endReason);
+        row.insert(QStringLiteral("host_id"), QStringLiteral("rig-7-secret-id"));
+        row.insert(QStringLiteral("host_name"), QStringLiteral("Rig 07 Secret Name"));
+        return row;
+    }
+
+    static QJsonObject ledgerRowJson(const QString& id, const QString& kind, int amount,
+                                     const QString& createdAt = QStringLiteral("2026-09-12T18:40:00Z"))
+    {
+        QJsonObject row;
+        row.insert(QStringLiteral("id"), id);
+        row.insert(QStringLiteral("kind"), kind);
+        row.insert(QStringLiteral("amount_minutes"), amount);
+        row.insert(QStringLiteral("created_at"), createdAt);
+        return row;
+    }
+
+    /// An open notice when `creditedAt` is empty (both credited members null), a closed one otherwise.
+    static QJsonObject noticeRow(const QString& id, const QString& sentAt, const QString& creditedAt,
+                                 int creditedMinutes)
+    {
+        QJsonObject row;
+        row.insert(QStringLiteral("id"), id);
+        row.insert(QStringLiteral("sent_at"), sentAt);
+        row.insert(QStringLiteral("credited_at"),
+                   creditedAt.isEmpty() ? QJsonValue(QJsonValue::Null) : QJsonValue(creditedAt));
+        row.insert(QStringLiteral("credited_minutes"),
+                   creditedAt.isEmpty() ? QJsonValue(QJsonValue::Null) : QJsonValue(creditedMinutes));
+        return row;
+    }
+
+    static QByteArray usageBody(int played, int balance)
+    {
+        return QStringLiteral("{\"minutes_played\":%1,\"balance_minutes\":%2}")
+            .arg(played).arg(balance).toUtf8();
+    }
+
+    static QByteArray errorJson(const QString& sentence, const QString& reference)
+    {
+        return QStringLiteral("{\"error\":\"%1\",\"reference\":\"%2\"}").arg(sentence, reference)
+            .toUtf8();
+    }
+
+    /// A signed-in facade on Home with the profile open and the totals and identity read.
+    void reachProfile(SeatHubClient& client, int minutes = 90)
+    {
+        reachHome(client, minutes);
+        m_fake->answerUsage(200, usageBody(135, minutes));
+        client.openProfile();
+        QVERIFY(client.inProfile());
+        QTRY_COMPARE_WITH_TIMEOUT(client.totalsStatus(), QStringLiteral("ready"), 15000);
+    }
+
+    static QString cell(CustomerListModel* list, int row, int role)
+    {
+        return list->index(row, 0).data(role).toString();
+    }
+
+    /// `app/seathub`, found from the test binary's own directory the way the other suites find it.
+    static QString seathubSourceDir()
+    {
+        QDir dir(QCoreApplication::applicationDirPath());
+        for (int depth = 0; depth < 8; ++depth) {
+            const QString candidate = dir.filePath(QStringLiteral("app/seathub"));
+            if (QFile::exists(candidate + QStringLiteral("/customer_lists.cpp"))) {
+                return candidate;
+            }
+            if (!dir.cdUp()) {
+                break;
+            }
+        }
+        return QString();
     }
 
 private slots:
@@ -2072,6 +2241,826 @@ private slots:
 
         client.session()->attachSession(nullptr);
         delete engine;
+    }
+
+    // --- Phase 5 plan 09: the profile ---------------------------------------------------------------
+
+    void theProfileIsAViewInsideHomeThatReadsTheTotalsAndTheIdentityAndNoListYet()
+    {
+        SeatHubClient client;
+        reachHome(client, 45);
+        m_fake->answerUsage(200, usageBody(135, 45));
+        QSignalSpy changes(&client, &SeatHubClient::inProfileChanged);
+        const int meReadsBefore = m_fake->countOfPathEndingWith(QStringLiteral("/api/me"));
+
+        client.openProfile();
+
+        // A view inside Home, like Settings: it keeps the header and is not a state of its own.
+        QVERIFY(client.inProfile());
+        QCOMPARE(changes.count(), 1);
+        QCOMPARE(client.appState(), QStringLiteral("home"));
+
+        // The two totals are the server's numbers, formatted and nothing more.
+        QTRY_COMPARE_WITH_TIMEOUT(client.totalsStatus(), QStringLiteral("ready"), 15000);
+        QCOMPARE(client.hoursPlayedText(), QStringLiteral("2 h 15 min"));
+        QCOMPARE(client.creditLeftText(), QStringLiteral("45 min"));
+        QCOMPARE(client.accountStatus(), QStringLiteral("ready"));
+
+        // The identity is read afresh on every visit (the in-session sign-ins never fill it).
+        QTRY_COMPARE_WITH_TIMEOUT(m_fake->countOfPathEndingWith(QStringLiteral("/api/me")),
+                                  meReadsBefore + 1, 15000);
+        QCOMPARE(client.account().value(QStringLiteral("username")).toString(), QStringLiteral("lina"));
+
+        // Lazy: the lists are asked for by the view, one at a time as their tab is opened.
+        QCOMPARE(m_fake->queriesFor(QStringLiteral("/api/sessions")).size(), 0);
+        QCOMPARE(m_fake->queriesFor(QStringLiteral("/api/wallet/history")).size(), 0);
+        QCOMPARE(m_fake->queriesFor(QStringLiteral("/api/topup-notices")).size(), 0);
+        QCOMPARE(client.sessionHistory()->status(), QStringLiteral("idle"));
+        QCOMPARE(client.creditHistory()->status(), QStringLiteral("idle"));
+        QCOMPARE(client.topupHistory()->status(), QStringLiteral("idle"));
+
+        client.closeProfile();
+        QVERIFY(!client.inProfile());
+        QCOMPARE(changes.count(), 2);
+        QCOMPARE(client.totalsStatus(), QStringLiteral("idle"));
+        QVERIFY(client.hoursPlayedText().isEmpty());
+    }
+
+    void theProfileOpensOnlyForASignedInCustomerOnHome()
+    {
+        SeatHubClient client;
+        // Constructed in "restoring": nobody is signed in and no view is Home yet.
+        client.openProfile();
+        QVERIFY(!client.inProfile());
+
+        // Signed out.
+        isolateStore(client);
+        client.restoreSession();
+        QCOMPARE(client.appState(), QStringLiteral("signed_out"));
+        client.openProfile();
+        QVERIFY(!client.inProfile());
+
+        // The list calls do nothing either: there is no credential to ask with.
+        client.loadFirstPage(QStringLiteral("sessions"));
+        client.loadNextPage(QStringLiteral("sessions"));
+        client.reloadList(QStringLiteral("sessions"));
+        QCOMPARE(client.sessionHistory()->status(), QStringLiteral("idle"));
+    }
+
+    void anUnknownListNameIsANoOp()
+    {
+        SeatHubClient client;
+        reachProfile(client);
+        client.loadFirstPage(QStringLiteral("rigs"));
+        client.loadNextPage(QStringLiteral("rigs"));
+        client.reloadList(QStringLiteral("rigs"));
+        QTest::qWait(150);
+        QCOMPARE(m_fake->queriesFor(QStringLiteral("/api/sessions")).size(), 0);
+        QCOMPARE(m_fake->queriesFor(QStringLiteral("/api/wallet/history")).size(), 0);
+        QCOMPARE(m_fake->queriesFor(QStringLiteral("/api/topup-notices")).size(), 0);
+    }
+
+    // The six paging behaviours (CUST-14, D-14) ------------------------------------------------------
+
+    void theFirstPageFillsTheListWithRowsThatAreAlreadyDisplayText()
+    {
+        SeatHubClient client;
+        reachProfile(client);
+        m_fake->answerList(QStringLiteral("/api/sessions"), QString(), 200,
+                           pageBody("sessions",
+                                    { sessionRow(QStringLiteral("a"), 135),
+                                      sessionRow(QStringLiteral("b"), 45,
+                                                 QStringLiteral("BALANCE_EXHAUSTED")),
+                                      sessionRow(QStringLiteral("c"), 0, QStringLiteral("CONNECT_TIMEOUT"),
+                                                 QStringLiteral("2026-09-11T10:00:00Z")) },
+                                    QStringLiteral("c1")));
+
+        SessionListModel* list = client.sessionHistory();
+        client.loadFirstPage(QStringLiteral("sessions"));
+        QCOMPARE(list->status(), QStringLiteral("loading"));
+        QTRY_COMPARE_WITH_TIMEOUT(list->status(), QStringLiteral("ready"), 15000);
+
+        QCOMPARE(list->count(), 3);
+        QVERIFY(list->hasMore());
+        QVERIFY(!list->loadingMore());
+        QVERIFY(list->errorText().isEmpty());
+
+        // Date and time in Jordan time, how it ended in the deck's short words, and the length.
+        QCOMPARE(cell(list, 0, CustomerListModel::WhenRole), QStringLiteral("Sat 12 Sep, 21:40"));
+        QCOMPARE(cell(list, 0, CustomerListModel::KindRole), QStringLiteral("You ended it"));
+        QCOMPARE(cell(list, 0, CustomerListModel::AmountRole), QStringLiteral("2 h 15 min"));
+        QCOMPARE(cell(list, 1, CustomerListModel::KindRole), QStringLiteral("Balance ran out"));
+        QCOMPARE(cell(list, 1, CustomerListModel::AmountRole), QStringLiteral("45 min"));
+        QCOMPARE(cell(list, 2, CustomerListModel::WhenRole), QStringLiteral("Fri 11 Sep, 13:00"));
+        QCOMPARE(cell(list, 2, CustomerListModel::KindRole),
+                 QStringLiteral("Not started in time, not charged"));
+        QCOMPARE(cell(list, 2, CustomerListModel::AmountRole), QStringLiteral("0 min"));
+
+        // The first page: a page of fifteen and no cursor at all.
+        QCOMPARE(CustomerListModel::kPageSize, 15);
+        QCOMPARE(m_fake->queriesFor(QStringLiteral("/api/sessions")),
+                 QStringList{ QStringLiteral("limit=15") });
+        QCOMPARE(m_fake->authorizationFor(QStringLiteral("/api/sessions")),
+                 QByteArrayLiteral("Bearer opaque-access-token"));
+    }
+
+    void reachingTheEndWithACursorLoadsTheNextPageAndAppendsItWithoutRefetching()
+    {
+        SeatHubClient client;
+        reachProfile(client);
+        m_fake->answerList(QStringLiteral("/api/sessions"), QString(), 200,
+                           pageBody("sessions",
+                                    { sessionRow(QStringLiteral("a"), 10), sessionRow(QStringLiteral("b"), 20) },
+                                    QStringLiteral("c1")));
+        m_fake->answerList(QStringLiteral("/api/sessions"), QStringLiteral("c1"), 200,
+                           pageBody("sessions",
+                                    { sessionRow(QStringLiteral("c"), 30), sessionRow(QStringLiteral("d"), 40) },
+                                    QString()));
+
+        SessionListModel* list = client.sessionHistory();
+        client.loadFirstPage(QStringLiteral("sessions"));
+        QTRY_COMPARE_WITH_TIMEOUT(list->status(), QStringLiteral("ready"), 15000);
+        QCOMPARE(list->count(), 2);
+        QVERIFY(list->hasMore());
+
+        QSignalSpy inserted(list, &QAbstractItemModel::rowsInserted);
+        client.loadNextPage(QStringLiteral("sessions"));
+        QVERIFY(list->loadingMore());
+        QTRY_COMPARE_WITH_TIMEOUT(list->count(), 4, 15000);
+
+        QVERIFY(!list->loadingMore());
+        QVERIFY(!list->hasMore());
+        // Appended after the two already there, in the order the server gave them.
+        QCOMPARE(cell(list, 0, CustomerListModel::AmountRole), QStringLiteral("10 min"));
+        QCOMPARE(cell(list, 1, CustomerListModel::AmountRole), QStringLiteral("20 min"));
+        QCOMPARE(cell(list, 2, CustomerListModel::AmountRole), QStringLiteral("30 min"));
+        QCOMPARE(cell(list, 3, CustomerListModel::AmountRole), QStringLiteral("40 min"));
+        // Two rows arrived, once: what was on screen was not asked for again.
+        QCOMPARE(inserted.count(), 1);
+        QCOMPARE(m_fake->queriesFor(QStringLiteral("/api/sessions")),
+                 (QStringList{ QStringLiteral("limit=15"), QStringLiteral("limit=15&cursor=c1") }));
+    }
+
+    void reachingTheEndWithNoCursorLeftAsksForNothing()
+    {
+        SeatHubClient client;
+        reachProfile(client);
+        m_fake->answerList(QStringLiteral("/api/sessions"), QString(), 200,
+                           pageBody("sessions", { sessionRow(QStringLiteral("a"), 10) }, QString()));
+
+        SessionListModel* list = client.sessionHistory();
+
+        // Before the first page has been asked for there is nothing to page.
+        client.loadNextPage(QStringLiteral("sessions"));
+        QCOMPARE(list->status(), QStringLiteral("idle"));
+        QCOMPARE(m_fake->queriesFor(QStringLiteral("/api/sessions")).size(), 0);
+
+        client.loadFirstPage(QStringLiteral("sessions"));
+        QTRY_COMPARE_WITH_TIMEOUT(list->status(), QStringLiteral("ready"), 15000);
+        QVERIFY(!list->hasMore());
+
+        // The last page: reaching the end again and again asks for nothing.
+        for (int i = 0; i < 3; ++i) {
+            client.loadNextPage(QStringLiteral("sessions"));
+        }
+        QTest::qWait(200);
+        QCOMPARE(list->count(), 1);
+        QVERIFY(!list->loadingMore());
+        QCOMPARE(m_fake->queriesFor(QStringLiteral("/api/sessions")).size(), 1);
+    }
+
+    void aPageThatFailsKeepsTheRowsAlreadyLoadedAndRecordsWhy()
+    {
+        SeatHubClient client;
+        reachProfile(client);
+        m_fake->answerList(QStringLiteral("/api/sessions"), QString(), 200,
+                           pageBody("sessions",
+                                    { sessionRow(QStringLiteral("a"), 10), sessionRow(QStringLiteral("b"), 20) },
+                                    QStringLiteral("c1")));
+        m_fake->answerList(QStringLiteral("/api/sessions"), QStringLiteral("c1"), 500,
+                           errorJson(QStringLiteral("We couldn't load that page."),
+                                     QStringLiteral("SH-4F7KQ2")));
+
+        SessionListModel* list = client.sessionHistory();
+        client.loadFirstPage(QStringLiteral("sessions"));
+        QTRY_COMPARE_WITH_TIMEOUT(list->status(), QStringLiteral("ready"), 15000);
+
+        client.loadNextPage(QStringLiteral("sessions"));
+        QTRY_VERIFY_WITH_TIMEOUT(list->moreFailed(), 15000);
+
+        // The rows on screen stay; the list is still "ready", not "error" (that is the first page's
+        // state); the server's own sentence and reference are kept for the footer row.
+        QCOMPARE(list->status(), QStringLiteral("ready"));
+        QCOMPARE(list->count(), 2);
+        QVERIFY(!list->loadingMore());
+        QVERIFY2(list->hasMore(), "the cursor is kept so the same page can be asked for again");
+        QCOMPARE(list->errorText(), QStringLiteral("We couldn't load that page."));
+        QCOMPARE(list->errorReference(), QStringLiteral("SH-4F7KQ2"));
+
+        // Try again asks for that same page, and the rows arrive after the two that were kept.
+        m_fake->answerList(QStringLiteral("/api/sessions"), QStringLiteral("c1"), 200,
+                           pageBody("sessions", { sessionRow(QStringLiteral("c"), 30) }, QString()));
+        client.loadNextPage(QStringLiteral("sessions"));
+        QTRY_COMPARE_WITH_TIMEOUT(list->count(), 3, 15000);
+        QVERIFY(!list->moreFailed());
+        QVERIFY(list->errorText().isEmpty());
+        QCOMPARE(cell(list, 2, CustomerListModel::AmountRole), QStringLiteral("30 min"));
+    }
+
+    void aPageThatNeverArrivedSaysTheDecksOfflineSentenceAndKeepsTheRows()
+    {
+        SeatHubClient client;
+        reachProfile(client);
+        m_fake->answerList(QStringLiteral("/api/sessions"), QString(), 200,
+                           pageBody("sessions", { sessionRow(QStringLiteral("a"), 10) },
+                                    QStringLiteral("c1")));
+        m_fake->answerList(QStringLiteral("/api/sessions"), QStringLiteral("c1"), 0, QByteArray());
+
+        SessionListModel* list = client.sessionHistory();
+        client.loadFirstPage(QStringLiteral("sessions"));
+        QTRY_COMPARE_WITH_TIMEOUT(list->status(), QStringLiteral("ready"), 15000);
+        client.loadNextPage(QStringLiteral("sessions"));
+        QTRY_VERIFY_WITH_TIMEOUT(list->moreFailed(), 15000);
+
+        QCOMPARE(list->errorText(), SeatHubFailure::offlineSentence());
+        QVERIFY2(list->errorReference().isEmpty(), "a request that never arrived has no reference");
+        QCOMPARE(list->count(), 1);
+    }
+
+    void aSecondRequestWhileOneIsInFlightIsIgnored()
+    {
+        SeatHubClient client;
+        reachProfile(client);
+        m_fake->answerList(QStringLiteral("/api/sessions"), QString(), 200,
+                           pageBody("sessions",
+                                    { sessionRow(QStringLiteral("a"), 10), sessionRow(QStringLiteral("b"), 20) },
+                                    QStringLiteral("c1")));
+        m_fake->answerList(QStringLiteral("/api/sessions"), QStringLiteral("c1"), 200,
+                           pageBody("sessions", { sessionRow(QStringLiteral("c"), 30) }, QString()));
+        m_fake->delayLists(400);
+
+        SessionListModel* list = client.sessionHistory();
+
+        // The first page, asked for three times while the first is still out: one request.
+        client.loadFirstPage(QStringLiteral("sessions"));
+        client.loadFirstPage(QStringLiteral("sessions"));
+        client.loadNextPage(QStringLiteral("sessions"));
+        QTRY_COMPARE_WITH_TIMEOUT(list->status(), QStringLiteral("ready"), 15000);
+        QCOMPARE(m_fake->queriesFor(QStringLiteral("/api/sessions")).size(), 1);
+        QCOMPARE(list->count(), 2);
+
+        // The next page, asked for four times while the first is still out: one request, one append.
+        for (int i = 0; i < 4; ++i) {
+            client.loadNextPage(QStringLiteral("sessions"));
+        }
+        QVERIFY(list->loadingMore());
+        QTRY_COMPARE_WITH_TIMEOUT(list->count(), 3, 15000);
+        QTest::qWait(700);
+        QCOMPARE(list->count(), 3);
+        QCOMPARE(m_fake->queriesFor(QStringLiteral("/api/sessions")).size(), 2);
+    }
+
+    void eachListAndTheTotalsFailOnTheirOwn()
+    {
+        SeatHubClient client;
+        reachProfile(client);
+        // Sessions fails; credit history and top-ups answer; the totals are already in.
+        m_fake->answerList(QStringLiteral("/api/sessions"), QString(), 500,
+                           errorJson(QStringLiteral("We couldn't load your sessions."),
+                                     QStringLiteral("SH-4F7KQ2")));
+        m_fake->answerList(QStringLiteral("/api/wallet/history"), QString(), 200,
+                           pageBody("entries",
+                                    { ledgerRowJson(QStringLiteral("l1"), QStringLiteral("topup_credit"), 300) },
+                                    QString()));
+        m_fake->answerList(QStringLiteral("/api/topup-notices"), QString(), 200,
+                           pageBody("notices",
+                                    { noticeRow(QStringLiteral("n1"), QStringLiteral("2026-09-13T09:00:00Z"),
+                                                QString(), 0) },
+                                    QString()));
+
+        client.loadFirstPage(QStringLiteral("sessions"));
+        client.loadFirstPage(QStringLiteral("credit"));
+        client.loadFirstPage(QStringLiteral("topups"));
+
+        QTRY_COMPARE_WITH_TIMEOUT(client.sessionHistory()->status(), QStringLiteral("error"), 15000);
+        QTRY_COMPARE_WITH_TIMEOUT(client.creditHistory()->status(), QStringLiteral("ready"), 15000);
+        QTRY_COMPARE_WITH_TIMEOUT(client.topupHistory()->status(), QStringLiteral("ready"), 15000);
+
+        // The failed list says why, in the server's words, and has no rows; the others and the totals
+        // and the identity rows are intact.
+        QCOMPARE(client.sessionHistory()->errorText(), QStringLiteral("We couldn't load your sessions."));
+        QCOMPARE(client.sessionHistory()->errorReference(), QStringLiteral("SH-4F7KQ2"));
+        QCOMPARE(client.sessionHistory()->count(), 0);
+        QCOMPARE(client.creditHistory()->count(), 1);
+        QVERIFY(client.creditHistory()->errorText().isEmpty());
+        QCOMPARE(client.topupHistory()->count(), 1);
+        QCOMPARE(client.totalsStatus(), QStringLiteral("ready"));
+        QCOMPARE(client.accountStatus(), QStringLiteral("ready"));
+
+        // Loading a failed list again neither refetches the others nor needs them.
+        client.loadFirstPage(QStringLiteral("sessions"));
+        QTest::qWait(150);
+        QCOMPARE(m_fake->queriesFor(QStringLiteral("/api/sessions")).size(), 1);
+
+        m_fake->answerList(QStringLiteral("/api/sessions"), QString(), 200,
+                           pageBody("sessions", { sessionRow(QStringLiteral("a"), 10) }, QString()));
+        client.reloadList(QStringLiteral("sessions"));
+        QCOMPARE(client.sessionHistory()->status(), QStringLiteral("loading"));
+        QTRY_COMPARE_WITH_TIMEOUT(client.sessionHistory()->status(), QStringLiteral("ready"), 15000);
+        QCOMPARE(client.sessionHistory()->count(), 1);
+        QVERIFY(client.sessionHistory()->errorText().isEmpty());
+        QCOMPARE(m_fake->queriesFor(QStringLiteral("/api/wallet/history")).size(), 1);
+        QCOMPARE(m_fake->queriesFor(QStringLiteral("/api/topup-notices")).size(), 1);
+    }
+
+    void aReloadStartsAgainFromTheTopAndDropsTheRowsAndAnyReplyStillOnItsWay()
+    {
+        SeatHubClient client;
+        reachProfile(client);
+        m_fake->answerList(QStringLiteral("/api/sessions"), QString(), 200,
+                           pageBody("sessions",
+                                    { sessionRow(QStringLiteral("a"), 10), sessionRow(QStringLiteral("b"), 20) },
+                                    QStringLiteral("c1")));
+        m_fake->answerList(QStringLiteral("/api/sessions"), QStringLiteral("c1"), 200,
+                           pageBody("sessions", { sessionRow(QStringLiteral("c"), 30) }, QString()));
+
+        SessionListModel* list = client.sessionHistory();
+        client.loadFirstPage(QStringLiteral("sessions"));
+        QTRY_COMPARE_WITH_TIMEOUT(list->status(), QStringLiteral("ready"), 15000);
+
+        // A next page is on its way when the customer reloads: the reply belongs to the list that was
+        // reset, so it must never be appended to the new one.
+        m_fake->delayLists(300);
+        client.loadNextPage(QStringLiteral("sessions"));
+        QVERIFY(list->loadingMore());
+        client.reloadList(QStringLiteral("sessions"));
+        QCOMPARE(list->count(), 0);
+        QCOMPARE(list->status(), QStringLiteral("loading"));
+        QVERIFY(!list->loadingMore());
+
+        QTRY_COMPARE_WITH_TIMEOUT(list->status(), QStringLiteral("ready"), 15000);
+        QTest::qWait(600);
+        QCOMPARE(list->count(), 2);
+        QCOMPARE(cell(list, 0, CustomerListModel::AmountRole), QStringLiteral("10 min"));
+        QCOMPARE(cell(list, 1, CustomerListModel::AmountRole), QStringLiteral("20 min"));
+    }
+
+    // The other two lists' rows (D-15) -----------------------------------------------------------------
+
+    void creditHistoryRowsSayThePlainKindAndTheSignedAmount()
+    {
+        SeatHubClient client;
+        reachProfile(client);
+        m_fake->answerList(
+            QStringLiteral("/api/wallet/history"), QString(), 200,
+            pageBody("entries",
+                     { ledgerRowJson(QStringLiteral("l1"), QStringLiteral("topup_credit"), 300),
+                       ledgerRowJson(QStringLiteral("l2"), QStringLiteral("first_bonus"), 60),
+                       ledgerRowJson(QStringLiteral("l3"), QStringLiteral("session_debit"), -1),
+                       ledgerRowJson(QStringLiteral("l4"), QStringLiteral("refund"), 45),
+                       ledgerRowJson(QStringLiteral("l5"), QStringLiteral("adjustment"), -90),
+                       ledgerRowJson(QStringLiteral("l6"), QStringLiteral("shortfall"), -5) },
+                     QString()));
+
+        CreditHistoryModel* list = client.creditHistory();
+        client.loadFirstPage(QStringLiteral("credit"));
+        QTRY_COMPARE_WITH_TIMEOUT(list->status(), QStringLiteral("ready"), 15000);
+        QCOMPARE(list->count(), 6);
+
+        const QStringList kinds = { QStringLiteral("Top-up"), QStringLiteral("First top-up bonus"),
+                                    QStringLiteral("Played"), QStringLiteral("Refund"),
+                                    QStringLiteral("Adjustment by support"),
+                                    QStringLiteral("Unpaid minutes") };
+        const QStringList amounts = { QStringLiteral("+5 h 00 min"), QStringLiteral("+1 h 00 min"),
+                                      QStringLiteral("-1 min"), QStringLiteral("+45 min"),
+                                      QStringLiteral("-1 h 30 min"), QStringLiteral("-5 min") };
+        for (int row = 0; row < 6; ++row) {
+            QCOMPARE(cell(list, row, CustomerListModel::WhenRole), QStringLiteral("Sat 12 Sep, 21:40"));
+            QCOMPARE(cell(list, row, CustomerListModel::KindRole), kinds.at(row));
+            QCOMPARE(cell(list, row, CustomerListModel::AmountRole), amounts.at(row));
+            QVERIFY(cell(list, row, CustomerListModel::ToneRole).isEmpty());
+        }
+    }
+
+    void topupRowsSayWaitingOrCreditedAndShowMinutesOnlyOnceCredited()
+    {
+        SeatHubClient client;
+        reachProfile(client);
+        m_fake->answerList(
+            QStringLiteral("/api/topup-notices"), QString(), 200,
+            pageBody("notices",
+                     { noticeRow(QStringLiteral("n1"), QStringLiteral("2026-09-13T09:00:00Z"), QString(), 0),
+                       noticeRow(QStringLiteral("n2"), QStringLiteral("2026-09-10T09:00:00Z"),
+                                 QStringLiteral("2026-09-10T09:30:00Z"), 300) },
+                     QString()));
+
+        TopupListModel* list = client.topupHistory();
+        client.loadFirstPage(QStringLiteral("topups"));
+        QTRY_COMPARE_WITH_TIMEOUT(list->status(), QStringLiteral("ready"), 15000);
+        QCOMPARE(list->count(), 2);
+
+        QCOMPARE(cell(list, 0, CustomerListModel::WhenRole), QStringLiteral("Sun 13 Sep, 12:00"));
+        QCOMPARE(cell(list, 0, CustomerListModel::KindRole), QStringLiteral("Waiting"));
+        QCOMPARE(cell(list, 0, CustomerListModel::ToneRole), QStringLiteral("waiting"));
+        QVERIFY2(cell(list, 0, CustomerListModel::AmountRole).isEmpty(),
+                 "no minutes are shown while the notice is open");
+
+        QCOMPARE(cell(list, 1, CustomerListModel::KindRole), QStringLiteral("Credited"));
+        QCOMPARE(cell(list, 1, CustomerListModel::ToneRole), QStringLiteral("credited"));
+        QCOMPARE(cell(list, 1, CustomerListModel::AmountRole), QStringLiteral("+5 h 00 min"));
+    }
+
+    void noRowNamesARigEvenWhenTheBodyHandsOneOver()
+    {
+        // The rows above carry `host_id` and `host_name` on the wire (see `sessionRow`). Nothing the
+        // model exposes - through any role of any row - holds them (CUST-01, T-05-37).
+        SeatHubClient client;
+        reachProfile(client);
+        m_fake->answerList(QStringLiteral("/api/sessions"), QString(), 200,
+                           pageBody("sessions",
+                                    { sessionRow(QStringLiteral("a"), 10), sessionRow(QStringLiteral("b"), 20) },
+                                    QString()));
+        SessionListModel* list = client.sessionHistory();
+        client.loadFirstPage(QStringLiteral("sessions"));
+        QTRY_COMPARE_WITH_TIMEOUT(list->status(), QStringLiteral("ready"), 15000);
+
+        QCOMPARE(list->count(), 2);
+        const QHash<int, QByteArray> roles = list->roleNames();
+        QCOMPARE(roles.size(), 4);
+        for (int row = 0; row < list->count(); ++row) {
+            for (auto it = roles.constBegin(); it != roles.constEnd(); ++it) {
+                const QString text = cell(list, row, it.key());
+                QVERIFY2(!text.contains(QStringLiteral("rig-7")), qPrintable(text));
+                QVERIFY2(!text.contains(QStringLiteral("Rig 07")), qPrintable(text));
+                QVERIFY2(!text.contains(QStringLiteral("Secret")), qPrintable(text));
+            }
+        }
+
+        // And the source that turns a page into rows never names one.
+        const QString dir = seathubSourceDir();
+        QVERIFY2(!dir.isEmpty(), "app/seathub could not be located from the test binary");
+        QFile file(dir + QStringLiteral("/customer_lists.cpp"));
+        QVERIFY(file.open(QIODevice::ReadOnly));
+        const QString source = QString::fromUtf8(file.readAll());
+        for (const QString& forbidden : { QStringLiteral("host_id"), QStringLiteral("hostName"),
+                                          QStringLiteral("host_name") }) {
+            QVERIFY2(!source.contains(forbidden), qPrintable(forbidden));
+        }
+    }
+
+    void theListModelsDoNoArithmeticOnAMinuteTheServerSent()
+    {
+        // T-05-39: every number a row shows is the server's, printed as it came. There is no adding
+        // up, counting or inferring in the code that builds a row.
+        const QString dir = seathubSourceDir();
+        QVERIFY2(!dir.isEmpty(), "app/seathub could not be located from the test binary");
+        QFile file(dir + QStringLiteral("/customer_lists.cpp"));
+        QVERIFY(file.open(QIODevice::ReadOnly));
+        const QString source = QString::fromUtf8(file.readAll());
+        for (const QString& forbidden :
+             { QStringLiteral("+="), QStringLiteral("-="), QStringLiteral("accumulate"),
+               QStringLiteral("std::reduce"), QStringLiteral("qSum"), QStringLiteral("minutesBilled +"),
+               QStringLiteral("amountMinutes +"), QStringLiteral("creditedMinutes +") }) {
+            QVERIFY2(!source.contains(forbidden), qPrintable(forbidden));
+        }
+    }
+
+    // The totals (CUST-14, D-13) -----------------------------------------------------------------------
+
+    void theTotalsAreTheServersOwnNumbersAndAFailureIsNeverAZero()
+    {
+        SeatHubClient client;
+        reachHome(client, 90);
+        m_fake->answerUsage(500, errorJson(QStringLiteral("We couldn't total that."),
+                                           QStringLiteral("SH-4F7KQ2")));
+        client.openProfile();
+        QCOMPARE(client.totalsStatus(), QStringLiteral("loading"));
+        QTRY_COMPARE_WITH_TIMEOUT(client.totalsStatus(), QStringLiteral("error"), 15000);
+
+        QCOMPARE(client.totalsError(), QStringLiteral("We couldn't total that."));
+        QCOMPARE(client.totalsErrorReference(), QStringLiteral("SH-4F7KQ2"));
+        QVERIFY2(client.hoursPlayedText().isEmpty() && client.creditLeftText().isEmpty(),
+                 "a failed read shows no total, and certainly not zero");
+
+        // A 2xx that is not the totals is the deck's generic sentence and no reference, still no zero.
+        m_fake->answerUsage(200, QByteArrayLiteral("{}"));
+        client.reloadTotals();
+        QTRY_COMPARE_WITH_TIMEOUT(client.totalsError(), SeatHubFailure::generic().error, 15000);
+        QCOMPARE(client.totalsStatus(), QStringLiteral("error"));
+        QVERIFY(client.totalsErrorReference().isEmpty());
+        QVERIFY(client.hoursPlayedText().isEmpty());
+
+        // Zero really played is a real answer, and reads as zero.
+        m_fake->answerUsage(200, usageBody(0, 0));
+        client.reloadTotals();
+        QTRY_COMPARE_WITH_TIMEOUT(client.totalsStatus(), QStringLiteral("ready"), 15000);
+        QCOMPARE(client.hoursPlayedText(), QStringLiteral("0 min"));
+        QCOMPARE(client.creditLeftText(), QStringLiteral("0 min"));
+        QVERIFY(client.totalsError().isEmpty());
+
+        // The lists never noticed any of it.
+        QCOMPARE(client.sessionHistory()->status(), QStringLiteral("idle"));
+    }
+
+    void aFailedTotalsReadLeavesTheListsAndTheIdentityAlone()
+    {
+        SeatHubClient client;
+        reachHome(client, 90);
+        m_fake->answerUsage(500, errorJson(QStringLiteral("We couldn't total that."),
+                                           QStringLiteral("SH-4F7KQ2")));
+        m_fake->answerList(QStringLiteral("/api/sessions"), QString(), 200,
+                           pageBody("sessions", { sessionRow(QStringLiteral("a"), 10) }, QString()));
+        client.openProfile();
+        client.loadFirstPage(QStringLiteral("sessions"));
+
+        QTRY_COMPARE_WITH_TIMEOUT(client.totalsStatus(), QStringLiteral("error"), 15000);
+        QTRY_COMPARE_WITH_TIMEOUT(client.sessionHistory()->status(), QStringLiteral("ready"), 15000);
+        QCOMPARE(client.sessionHistory()->count(), 1);
+        QCOMPARE(client.accountStatus(), QStringLiteral("ready"));
+    }
+
+    // The identity rows (CUST-08) -----------------------------------------------------------------------
+
+    void theIdentityRowsHaveTheirOwnLoadingAndErrorStatesAndAFailedRefreshNeverBlanksThem()
+    {
+        // An offline restore keeps the customer signed in and reads no account, so the profile has
+        // nothing to draw until its own read succeeds.
+        SeatHubClient client;
+        isolateStore(client);
+        client.controlPlane()->setBaseUrl(QStringLiteral("https://control.invalid"));
+        armControlPlane(client);
+        m_fake->answerMe(0, QByteArray());
+        m_fake->answerWallet(200, walletBody(90));
+        QVERIFY(client.credentialStore()->storeToken(TokenStore::accessTokenName(),
+                                                     QString::fromLatin1(kAccessToken)));
+        client.restoreSession();
+        QTRY_COMPARE_WITH_TIMEOUT(client.appState(), QStringLiteral("home"), 15000);
+        QVERIFY(client.account().isEmpty());
+
+        client.openProfile();
+        QCOMPARE(client.accountStatus(), QStringLiteral("loading"));
+        QTRY_COMPARE_WITH_TIMEOUT(client.accountStatus(), QStringLiteral("error"), 15000);
+        QCOMPARE(client.accountError(), SeatHubFailure::offlineSentence());
+        QVERIFY(client.accountErrorReference().isEmpty());
+
+        // Try again reads it again on its own and the rows fill in.
+        m_fake->answerMe(200, accountBody());
+        client.reloadAccount();
+        QTRY_COMPARE_WITH_TIMEOUT(client.accountStatus(), QStringLiteral("ready"), 15000);
+        QVERIFY(client.accountError().isEmpty());
+        const QVariantMap account = client.account();
+        QCOMPARE(account.value(QStringLiteral("username")).toString(), QStringLiteral("lina"));
+        QCOMPARE(account.value(QStringLiteral("email")).toString(), QStringLiteral("lina@example.com"));
+        QCOMPARE(account.value(QStringLiteral("phone")).toString(), QStringLiteral("+962790000000"));
+        QVERIFY(account.value(QStringLiteral("email_verified")).toBool());
+
+        // A later refresh that fails never blanks what was already read.
+        const int reads = m_fake->countOfPathEndingWith(QStringLiteral("/api/me"));
+        m_fake->answerMe(500, errorJson(QStringLiteral("Try again."), QStringLiteral("SH-4F7KQ2")));
+        client.reloadAccount();
+        QTRY_COMPARE_WITH_TIMEOUT(m_fake->countOfPathEndingWith(QStringLiteral("/api/me")), reads + 1,
+                                  15000);
+        QTest::qWait(200);
+        QCOMPARE(client.accountStatus(), QStringLiteral("ready"));
+        QCOMPARE(client.account().value(QStringLiteral("username")).toString(), QStringLiteral("lina"));
+    }
+
+    // A rejected credential anywhere, and sign-out (CUST-08) ---------------------------------------------
+
+    void aRejectedCredentialOnAListClearsItAndLandsOnSignIn()
+    {
+        SeatHubClient client;
+        reachProfile(client);
+        m_fake->answerList(QStringLiteral("/api/sessions"), QString(), 401,
+                           errorJson(QStringLiteral("Please sign in again."), QStringLiteral("SH-3K2XQ1")));
+
+        client.loadFirstPage(QStringLiteral("sessions"));
+        QTRY_COMPARE_WITH_TIMEOUT(client.appState(), QStringLiteral("signed_out"), 15000);
+
+        QVERIFY(!client.signedIn());
+        QVERIFY(!client.inProfile());
+        QVERIFY2(client.credentialStore()->retrieveToken(TokenStore::accessTokenName()).isEmpty(),
+                 "a refused credential is removed from this machine");
+        QCOMPARE(client.sessionHistory()->status(), QStringLiteral("idle"));
+        QCOMPARE(client.sessionHistory()->count(), 0);
+        QCOMPARE(client.totalsStatus(), QStringLiteral("idle"));
+        QTRY_VERIFY_WITH_TIMEOUT(!client.controlPlane()->hasAccessToken(), 15000);
+    }
+
+    void aRejectedCredentialOnTheTotalsOrTheIdentityDoesTheSame()
+    {
+        {
+            SeatHubClient client;
+            reachHome(client, 90);
+            m_fake->answerUsage(401, errorJson(QStringLiteral("Please sign in again."),
+                                               QStringLiteral("SH-3K2XQ1")));
+            client.openProfile();
+            QTRY_COMPARE_WITH_TIMEOUT(client.appState(), QStringLiteral("signed_out"), 15000);
+            QVERIFY(client.credentialStore()->retrieveToken(TokenStore::accessTokenName()).isEmpty());
+        }
+        m_fake = nullptr;
+        {
+            SeatHubClient client;
+            reachHome(client, 90);
+            m_fake->answerMe(401, errorJson(QStringLiteral("Please sign in again."),
+                                            QStringLiteral("SH-3K2XQ1")));
+            client.openProfile();
+            QTRY_COMPARE_WITH_TIMEOUT(client.appState(), QStringLiteral("signed_out"), 15000);
+            QVERIFY(client.credentialStore()->retrieveToken(TokenStore::accessTokenName()).isEmpty());
+        }
+    }
+
+    void aFailureOtherThanARejectionNeverSignsAnybodyOut()
+    {
+        SeatHubClient client;
+        reachProfile(client);
+        m_fake->answerList(QStringLiteral("/api/sessions"), QString(), 503,
+                           errorJson(QStringLiteral("Try again later."), QStringLiteral("SH-4F7KQ2")));
+        m_fake->answerList(QStringLiteral("/api/wallet/history"), QString(), 0, QByteArray());
+        client.loadFirstPage(QStringLiteral("sessions"));
+        client.loadFirstPage(QStringLiteral("credit"));
+        QTRY_COMPARE_WITH_TIMEOUT(client.sessionHistory()->status(), QStringLiteral("error"), 15000);
+        QTRY_COMPARE_WITH_TIMEOUT(client.creditHistory()->status(), QStringLiteral("error"), 15000);
+        QVERIFY(client.signedIn());
+        QCOMPARE(client.appState(), QStringLiteral("home"));
+        QVERIFY(!client.credentialStore()->retrieveToken(TokenStore::accessTokenName()).isEmpty());
+    }
+
+    void signingOutForgetsTheHistoryTheTotalsAndAnyReplyStillOnItsWay()
+    {
+        SeatHubClient client;
+        reachProfile(client);
+        m_fake->answerList(QStringLiteral("/api/sessions"), QString(), 200,
+                           pageBody("sessions", { sessionRow(QStringLiteral("a"), 10) }, QString()));
+        client.loadFirstPage(QStringLiteral("sessions"));
+        QTRY_COMPARE_WITH_TIMEOUT(client.sessionHistory()->status(), QStringLiteral("ready"), 15000);
+        QCOMPARE(client.sessionHistory()->count(), 1);
+
+        // Another list is still out when the customer signs out: its reply is nobody's to show.
+        m_fake->answerList(QStringLiteral("/api/wallet/history"), QString(), 200,
+                           pageBody("entries",
+                                    { ledgerRowJson(QStringLiteral("l1"), QStringLiteral("topup_credit"), 300) },
+                                    QString()));
+        m_fake->delayLists(300);
+        client.loadFirstPage(QStringLiteral("credit"));
+        client.signOut();
+
+        QCOMPARE(client.appState(), QStringLiteral("signed_out"));
+        QVERIFY(!client.inProfile());
+        QCOMPARE(client.sessionHistory()->status(), QStringLiteral("idle"));
+        QCOMPARE(client.sessionHistory()->count(), 0);
+        QCOMPARE(client.creditHistory()->status(), QStringLiteral("idle"));
+        QCOMPARE(client.totalsStatus(), QStringLiteral("idle"));
+        QVERIFY(client.hoursPlayedText().isEmpty());
+        QVERIFY(client.creditLeftText().isEmpty());
+
+        QTest::qWait(700);
+        QCOMPARE(client.creditHistory()->status(), QStringLiteral("idle"));
+        QCOMPARE(client.creditHistory()->count(), 0);
+    }
+
+    void aVisitStartsCleanNothingFromTheLastOneIsShownAsCurrent()
+    {
+        SeatHubClient client;
+        reachProfile(client);
+        m_fake->answerList(QStringLiteral("/api/sessions"), QString(), 200,
+                           pageBody("sessions", { sessionRow(QStringLiteral("a"), 10) }, QString()));
+        client.loadFirstPage(QStringLiteral("sessions"));
+        QTRY_COMPARE_WITH_TIMEOUT(client.sessionHistory()->status(), QStringLiteral("ready"), 15000);
+
+        client.closeProfile();
+        QCOMPARE(client.sessionHistory()->status(), QStringLiteral("idle"));
+        QCOMPARE(client.sessionHistory()->count(), 0);
+
+        // The next visit asks for the first page again, and it is the new answer that shows.
+        m_fake->answerList(QStringLiteral("/api/sessions"), QString(), 200,
+                           pageBody("sessions",
+                                    { sessionRow(QStringLiteral("z"), 99), sessionRow(QStringLiteral("a"), 10) },
+                                    QString()));
+        m_fake->answerUsage(200, usageBody(200, 30));
+        client.openProfile();
+        client.loadFirstPage(QStringLiteral("sessions"));
+        QTRY_COMPARE_WITH_TIMEOUT(client.sessionHistory()->count(), 2, 15000);
+        QCOMPARE(cell(client.sessionHistory(), 0, CustomerListModel::AmountRole),
+                 QStringLiteral("1 h 39 min"));
+        QTRY_COMPARE_WITH_TIMEOUT(client.hoursPlayedText(), QStringLiteral("3 h 20 min"), 15000);
+    }
+
+    // The words and the dates (D-15) ----------------------------------------------------------------------
+
+    void endReasonShortText_data()
+    {
+        QTest::addColumn<QString>("key");
+        QTest::addColumn<QString>("text");
+
+        QTest::newRow("CUSTOMER_ENDED") << "CUSTOMER_ENDED" << "You ended it";
+        QTest::newRow("BALANCE_EXHAUSTED") << "BALANCE_EXHAUSTED" << "Balance ran out";
+        QTest::newRow("HOST_LOST") << "HOST_LOST" << "Lost contact with the rig";
+        QTest::newRow("CLIENT_SILENT") << "CLIENT_SILENT" << "Lost contact with your device";
+        QTest::newRow("CONNECT_TIMEOUT") << "CONNECT_TIMEOUT" << "Not started in time, not charged";
+        QTest::newRow("READINESS_TIMEOUT") << "READINESS_TIMEOUT" << "Rig didn't come back, not charged";
+        QTest::newRow("MODE_BOOT_TIMEOUT") << "MODE_BOOT_TIMEOUT" << "Rig didn't come back, not charged";
+        QTest::newRow("GRACE_EXPIRED") << "GRACE_EXPIRED" << "Couldn't reconnect";
+        QTest::newRow("OWNER_RESERVATION") << "OWNER_RESERVATION" << "Owner reserved the rig";
+        QTest::newRow("TEARDOWN_TIMEOUT") << "TEARDOWN_TIMEOUT" << "Closed after a problem";
+        QTest::newRow("OPERATOR_FORCED") << "OPERATOR_FORCED" << "Ended by support";
+        QTest::newRow("a reason the deck has no form for") << "RECONNECT_LIMIT" << "Ended";
+        QTest::newRow("no reason at all") << "" << "Ended";
+    }
+
+    void endReasonShortText()
+    {
+        QFETCH(QString, key);
+        QFETCH(QString, text);
+        QCOMPARE(::endReasonShortText(key), text);
+        // The key itself is never what a customer reads.
+        QVERIFY(key.isEmpty() || ::endReasonShortText(key) != key);
+    }
+
+    void ledgerKindText_data()
+    {
+        QTest::addColumn<QString>("key");
+        QTest::addColumn<QString>("text");
+
+        QTest::newRow("topup_credit") << "topup_credit" << "Top-up";
+        QTest::newRow("first_bonus") << "first_bonus" << "First top-up bonus";
+        QTest::newRow("session_debit") << "session_debit" << "Played";
+        QTest::newRow("refund") << "refund" << "Refund";
+        QTest::newRow("adjustment") << "adjustment" << "Adjustment by support";
+        QTest::newRow("shortfall") << "shortfall" << "Unpaid minutes";
+        // The deck has no word for a kind it does not list, and a guess would be an invented string.
+        QTest::newRow("a kind the deck does not list") << "chargeback" << "";
+    }
+
+    void ledgerKindText()
+    {
+        QFETCH(QString, key);
+        QFETCH(QString, text);
+        QCOMPARE(::ledgerKindText(key), text);
+    }
+
+    void jordanTimeReadsAnInstantInJordanTimeInEnglishWhateverTheMachineIs_data()
+    {
+        QTest::addColumn<QString>("instant");
+        QTest::addColumn<QString>("text");
+
+        // Jordan has been on UTC+3 all year since 28 October 2022.
+        QTest::newRow("a summer evening") << "2026-09-12T18:40:00Z" << "Sat 12 Sep, 21:40";
+        QTest::newRow("a winter noon") << "2026-01-15T10:00:00Z" << "Thu 15 Jan, 13:00";
+        QTest::newRow("across midnight") << "2026-09-12T21:30:00Z" << "Sun 13 Sep, 00:30";
+        QTest::newRow("no leading zero on the day") << "2026-03-05T05:07:00Z" << "Thu 5 Mar, 08:07";
+        QTest::newRow("fractional seconds") << "2026-09-12T18:40:00.123456Z" << "Sat 12 Sep, 21:40";
+        // The same instant, said with another offset, reads the same.
+        QTest::newRow("an offset of +00:00") << "2026-09-12T18:40:00+00:00" << "Sat 12 Sep, 21:40";
+        QTest::newRow("already Jordan's own offset") << "2026-09-12T21:40:00+03:00" << "Sat 12 Sep, 21:40";
+        QTest::newRow("another zone's offset") << "2026-09-12T14:40:00-04:00" << "Sat 12 Sep, 21:40";
+        // A timestamp with no zone at all is read as UTC, which is what every stored instant is.
+        QTest::newRow("no zone at all") << "2026-09-12T18:40:00" << "Sat 12 Sep, 21:40";
+        QTest::newRow("empty") << "" << "";
+        QTest::newRow("not a time") << "yesterday" << "";
+    }
+
+    void jordanTimeReadsAnInstantInJordanTimeInEnglishWhateverTheMachineIs()
+    {
+        QFETCH(QString, instant);
+        QFETCH(QString, text);
+        QCOMPARE(jordanDateTimeText(instant), text);
+    }
+
+    void jordanTimeUsesTheJordanZoneItselfWhereTheMachineHasIt()
+    {
+        // Not a check of the fallback: on a machine whose zone data has Jordan in it, the answer is the
+        // zone's own. A winter before Jordan gave up daylight saving was UTC+2.
+        const QTimeZone amman(QByteArrayLiteral("Asia/Amman"));
+        if (!amman.isValid()) {
+            QSKIP("this machine has no Asia/Amman zone data; the fixed +03:00 fallback answers instead");
+        }
+        QCOMPARE(jordanDateTimeText(QStringLiteral("2020-01-15T10:00:00Z")),
+                 QStringLiteral("Wed 15 Jan, 12:00"));
+        QCOMPARE(jordanDateTimeText(QStringLiteral("2020-07-15T10:00:00Z")),
+                 QStringLiteral("Wed 15 Jul, 13:00"));
+    }
+
+    void theProfilesWebsiteLinkOpensTheOriginItselfAndNothingElse()
+    {
+        SeatHubClient client;
+        reachHome(client, 10);
+
+        QCOMPARE(client.websiteUrl(QStringLiteral("home")), QStringLiteral("https://sevenhills.damra.co"));
+
+        QList<QUrl> opened;
+        client.setUrlOpener([&opened](const QUrl& url) {
+            opened.append(url);
+            return true;
+        });
+        QVERIFY(client.openWebsite(QStringLiteral("home")));
+        QCOMPARE(opened.size(), 1);
+        QCOMPARE(opened.at(0).toString(), QStringLiteral("https://sevenhills.damra.co"));
+        QVERIFY(opened.at(0).path().isEmpty());
+        QVERIFY(opened.at(0).query().isEmpty());
+        const QString text = opened.at(0).toString();
+        QVERIFY2(!text.contains(QStringLiteral("opaque-access-token")), qPrintable(text));
+        QVERIFY2(!text.contains(QStringLiteral("lina")), qPrintable(text));
     }
 
     // --- the one hours-and-minutes formatter (OD-01) ---------------------------------------------

@@ -22,6 +22,14 @@ inline constexpr const char* kTopUpPath = "/topup";
 inline constexpr const char* kSignUpPath = "/login?mode=signup";
 inline constexpr const char* kResetPasswordPath = "/forgot-password";
 
+/// The website's own front door: the origin itself and nothing after it. The profile's `Open the
+/// website` link opens this (owner answer OD-11, `client.md` § Website links); it promises nothing,
+/// because the website has no page for changing account details yet.
+inline QUrl homeUrl()
+{
+    return QUrl(QString::fromLatin1(kOrigin));
+}
+
 /// The full address for one of the three paths above. An unknown path yields an empty URL, so a
 /// typo cannot send a customer somewhere unintended.
 inline QUrl url(const char* path)

@@ -211,6 +211,8 @@ SOURCES += \
     seathub/hud_overlay.cpp \
     seathub/control_plane_client.cpp \
     seathub/duration_text.cpp \
+    seathub/jordan_time.cpp \
+    seathub/customer_lists.cpp \
     seathub/countries.cpp \
     seathub/region.cpp \
     seathub/token_store.cpp \
@@ -269,6 +271,8 @@ HEADERS += \
     seathub/hud_overlay.h \
     seathub/control_plane_client.h \
     seathub/duration_text.h \
+    seathub/jordan_time.h \
+    seathub/customer_lists.h \
     seathub/countries.h \
     seathub/region.h \
     seathub/web_origin.h \

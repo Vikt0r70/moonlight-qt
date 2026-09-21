@@ -56,6 +56,7 @@ Added by each plan (Plan 03-02 onward) in the same commit that makes the change.
 | `app/qml.qrc` | packaging | Registers one new `app/gui/` QML file: `ConnectingScreen.qml` (the connecting view: the three-stage stepper and, when connecting stops, where it stopped and the two ways on). Addition only. | 05-08 |
 | `app/gui/main.qml` | UI | The connecting view is now `ConnectingScreen { client: seatHub }`, in place of the inline column that held the five-stage stepper and its one button. It moved to its own file so a test can load it: `main.qml` cannot be instantiated without the real facade type. No routing changed. | 05-08 |
 | `app/app.pro` | packaging | One header added to `HEADERS`: `seathub/stream_window_name.h`, the neutral name the engine's computer record is given so the stream window is titled `Playing - SeatHub` and never carries a rig's name (CUST-01, owner answer OD-13). Addition only. | 05-08 |
+| `app/app.pro` | packaging | Four SeatHub translation units added to `SOURCES`/`HEADERS`, additions only and no upstream entry removed or reordered: `seathub/customer_lists.*` (the profile's three list models and their paging, CUST-14) and `seathub/jordan_time.*` (the one place an instant becomes a Jordan-time date, ADR-0029). | 05-09 |
 
 Nothing under `app/streaming/audio/`, `app/streaming/input/` or `app/streaming/video/` (other than
 the overlay compositor exception, which Plan 03-05 is the first and so far only plan to exercise —
@@ -140,6 +141,8 @@ CI diff gate's exception list (the gate only checks files that exist in the upst
 | `FORK-CHANGES.md` | documentation — this file, which does not exist upstream. The CI diff gate reads it to check that an exception-listed engine file is accounted for. | 03-01, 03-06 |
 | `app/gui/ConnectingScreen.qml` | UI - the connecting view: `SeatHubStepper` (three stages, each a real transition, and a failed appearance for the stage that was active), and under it either `Cancel` or, when connecting stopped, `Stopped at: {stage}`, the deck's sentence for what the server decided (or the client's own pairing deadline) and `Try again` / `Back to home`. No offer of another rig (CUST-03). | 05-08 |
 | `app/seathub/stream_window_name.h` | bridge - the fixed word (`Playing`) the client sets on the engine's computer record before the engine builds the stream window's title from it, so the taskbar and the alt-tab switcher never show a rig's name (CUST-01). Header-only and engine-free so a test can prove the assignment against any record. `session.cpp` is not edited again; the ADR-0046 exception is not widened. | 05-08 |
+| `app/seathub/customer_lists.h`, `app/seathub/customer_lists.cpp` | bridge - the profile's three histories as list models (sessions, credit history, top-ups): rows already display text, real cursor paging that appends and never refetches, a second request while one is in flight ignored, each list failing on its own. Nothing here reads a rig member or does arithmetic on a minute (CUST-01, CUST-14). | 05-09 |
+| `app/seathub/jordan_time.h`, `app/seathub/jordan_time.cpp` | bridge - the one function that turns an instant into `Thu 12 Sep, 21:40` in Jordan time, English day and month names whatever the machine's language (`copy.md` section 5, ADR-0029). | 05-09 |
 
 ## Upstream files that must never be modified
 

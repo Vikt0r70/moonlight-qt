@@ -266,6 +266,19 @@ SeatHubClient::SeatHubClient(QObject* parent)
     m_animationEffects = SeatHubSystem::animationEffectsEnabled();
     m_urlOpener = [](const QUrl& url) { return QDesktopServices::openUrl(url); };
 
+    // The profile's three histories. They live on this thread and ask the control-plane client for
+    // their pages; that client marshals onto its own thread once a stream has begun, and each model
+    // marshals the reply back. A 401 on any of them is a rejected credential (`screens.md` §27).
+    m_sessionHistory = new SessionListModel(m_controlPlane, this);
+    m_creditHistory = new CreditHistoryModel(m_controlPlane, this);
+    m_topupHistory = new TopupListModel(m_controlPlane, this);
+    for (CustomerListModel* list : { static_cast<CustomerListModel*>(m_sessionHistory),
+                                     static_cast<CustomerListModel*>(m_creditHistory),
+                                     static_cast<CustomerListModel*>(m_topupHistory) }) {
+        connect(list, &CustomerListModel::credentialRefused,
+                this, &SeatHubClient::handleCredentialRefused);
+    }
+
     connect(m_session, &SessionLifecycle::stageStarting, this, &SeatHubClient::handleStageStarting);
     connect(m_session, &SessionLifecycle::stageFailed, this, &SeatHubClient::handleStageFailed);
     connect(m_session, &SessionLifecycle::connectionStarted, this, &SeatHubClient::handleConnectionStarted);
@@ -569,6 +582,15 @@ void SeatHubClient::setInSettings(bool inSettings)
     emit inSettingsChanged();
 }
 
+void SeatHubClient::setInProfile(bool inProfile)
+{
+    if (m_inProfile == inProfile) {
+        return;
+    }
+    m_inProfile = inProfile;
+    emit inProfileChanged();
+}
+
 void SeatHubClient::setStageText(const QString& text)
 {
     if (m_stageText == text) {
@@ -832,6 +854,7 @@ void SeatHubClient::retry()
     // screen comes back.
     clearFailure();
     setInSettings(false);
+    setInProfile(false);
 
     if (!m_signedIn) {
         setHomeStatus(QString::fromLatin1(kHomeReady));
@@ -1031,6 +1054,11 @@ void SeatHubClient::signInWithPassword(const QString& identifier, const QString&
 
 QString SeatHubClient::websiteUrl(const QString& target) const
 {
+    // The profile's `Open the website` link: the origin itself, not one of the three paths (OD-11).
+    if (target == QLatin1String("home")) {
+        return SeatHubWeb::homeUrl().toString();
+    }
+
     const char* path = nullptr;
     if (target == QLatin1String("signup")) {
         path = SeatHubWeb::kSignUpPath;
@@ -1123,6 +1151,9 @@ void SeatHubClient::signOut()
     clearFailure();
     resetConnecting();
     setInSettings(false);
+    // Nothing of this customer's history, totals or identity rows is left for the next one.
+    setInProfile(false);
+    resetProfileData();
     setHomeStatus(QString::fromLatin1(kHomeReady));
     setEndReasonText(QString());
     setAppState(QString::fromLatin1(kStateSignedOut));
@@ -1291,6 +1322,7 @@ void SeatHubClient::dismissError()
 {
     clearFailure();
     setInSettings(false);
+    setInProfile(false);
     setHomeStatus(QString::fromLatin1(kHomeReady));
     setAppState(!m_signedIn ? QString::fromLatin1(kStateSignedOut)
                             : QString::fromLatin1(kStateHome));
@@ -1444,6 +1476,233 @@ void SeatHubClient::openSettings()
 void SeatHubClient::closeSettings()
 {
     setInSettings(false);
+}
+
+// ---------------------------------------------------------------------------
+// The profile (CUST-08, CUST-14)
+// ---------------------------------------------------------------------------
+
+QString SeatHubClient::accountStatus() const
+{
+    // Whether there is anything to draw: an account we have read is "ready" whatever a later read
+    // does, so a refresh that fails never blanks the customer's own details.
+    if (!m_account.isEmpty()) {
+        return QStringLiteral("ready");
+    }
+    return m_accountFailed ? QStringLiteral("error") : QStringLiteral("loading");
+}
+
+CustomerListModel* SeatHubClient::listNamed(const QString& list) const
+{
+    if (list == QLatin1String("sessions")) {
+        return m_sessionHistory;
+    }
+    if (list == QLatin1String("credit")) {
+        return m_creditHistory;
+    }
+    if (list == QLatin1String("topups")) {
+        return m_topupHistory;
+    }
+    return nullptr;
+}
+
+void SeatHubClient::openProfile()
+{
+    // Only from Home: the menu is also on the connecting and error views, and a customer who is
+    // connecting is not looking at their history.
+    if (!m_signedIn || m_appState != QLatin1String(kStateHome)) {
+        return;
+    }
+
+    // Each visit starts clean: nothing from an earlier one is shown as current, and a reply still on
+    // its way from that visit is dropped.
+    resetProfileData();
+    setInProfile(true);
+
+    // The balance in the header and the `Credit left` tile are two reads of the same number; asking
+    // for the header's again keeps them from disagreeing for the length of a visit.
+    refreshBalance();
+    readTotals();
+    readAccount();
+}
+
+void SeatHubClient::closeProfile()
+{
+    setInProfile(false);
+    resetProfileData();
+}
+
+void SeatHubClient::loadFirstPage(const QString& list)
+{
+    CustomerListModel* model = listNamed(list);
+    if (model == nullptr || !m_signedIn || !m_controlPlane->hasAccessToken()) {
+        return;
+    }
+    startNetworkThreads();
+    model->loadFirstPage();
+}
+
+void SeatHubClient::loadNextPage(const QString& list)
+{
+    CustomerListModel* model = listNamed(list);
+    if (model == nullptr || !m_signedIn || !m_controlPlane->hasAccessToken()) {
+        return;
+    }
+    startNetworkThreads();
+    model->loadNextPage();
+}
+
+void SeatHubClient::reloadList(const QString& list)
+{
+    CustomerListModel* model = listNamed(list);
+    if (model == nullptr || !m_signedIn || !m_controlPlane->hasAccessToken()) {
+        return;
+    }
+    startNetworkThreads();
+    model->reload();
+}
+
+void SeatHubClient::reloadTotals()
+{
+    readTotals();
+}
+
+void SeatHubClient::reloadAccount()
+{
+    readAccount();
+}
+
+void SeatHubClient::resetProfileData()
+{
+    m_sessionHistory->reset();
+    m_creditHistory->reset();
+    m_topupHistory->reset();
+
+    // Replies asked for before this point belong to a visit that is over.
+    ++m_totalsRead;
+    ++m_accountRead;
+
+    m_totalsStatus = QStringLiteral("idle");
+    m_hoursPlayedText.clear();
+    m_creditLeftText.clear();
+    m_totalsError.clear();
+    m_totalsErrorReference.clear();
+    emit totalsChanged();
+
+    m_accountFailed = false;
+    m_accountError.clear();
+    m_accountErrorReference.clear();
+    emit accountStatusChanged();
+}
+
+void SeatHubClient::readTotals()
+{
+    if (!m_signedIn || !m_controlPlane->hasAccessToken()) {
+        return;
+    }
+    startNetworkThreads();
+
+    const quint64 epoch = m_authEpoch;
+    const quint64 read = ++m_totalsRead;
+
+    m_totalsStatus = QStringLiteral("loading");
+    m_totalsError.clear();
+    m_totalsErrorReference.clear();
+    emit totalsChanged();
+
+    m_controlPlane->fetchUsage([this, epoch, read](const ControlPlaneResult& result) {
+        onClientThread(this, [this, epoch, read, result]() {
+            // Signed out or in as someone else since, or asked again since: not this read's to show.
+            if (epoch != m_authEpoch || read != m_totalsRead || !m_signedIn) {
+                return;
+            }
+
+            UsageInfo usage;
+            if (result.ok && UsageInfo::parse(result.body, &usage)) {
+                // Both are the server's numbers, printed as they came.
+                m_hoursPlayedText = durationText(usage.minutesPlayed);
+                m_creditLeftText = durationText(usage.balanceMinutes);
+                m_totalsStatus = QStringLiteral("ready");
+                m_totalsError.clear();
+                m_totalsErrorReference.clear();
+                emit totalsChanged();
+                return;
+            }
+
+            if (!result.ok && result.statusCode == 401) {
+                handleCredentialRefused();
+                return;
+            }
+
+            // A 2xx that is not the totals is a contract violation: the deck's generic sentence and
+            // no reference, never a zero that says "you have played nothing".
+            const SeatHubFailure failure = result.ok ? SeatHubFailure::generic() : result.toFailure();
+            m_hoursPlayedText.clear();
+            m_creditLeftText.clear();
+            m_totalsStatus = QStringLiteral("error");
+            m_totalsError = failure.error;
+            m_totalsErrorReference = failure.reference;
+            emit totalsChanged();
+        });
+    });
+}
+
+void SeatHubClient::readAccount()
+{
+    if (!m_signedIn || !m_controlPlane->hasAccessToken()) {
+        return;
+    }
+    startNetworkThreads();
+
+    const quint64 epoch = m_authEpoch;
+    const quint64 read = ++m_accountRead;
+
+    if (m_accountFailed) {
+        m_accountFailed = false;
+        m_accountError.clear();
+        m_accountErrorReference.clear();
+        emit accountStatusChanged();
+    }
+
+    m_controlPlane->fetchMe([this, epoch, read](const ControlPlaneResult& result) {
+        onClientThread(this, [this, epoch, read, result]() {
+            if (epoch != m_authEpoch || read != m_accountRead || !m_signedIn) {
+                return;
+            }
+
+            AccountInfo account;
+            if (result.ok && AccountInfo::parse(result.body, &account)) {
+                m_accountFailed = false;
+                m_accountError.clear();
+                m_accountErrorReference.clear();
+                setAccount(account);
+                emit accountStatusChanged();
+                return;
+            }
+
+            if (!result.ok && result.statusCode == 401) {
+                handleCredentialRefused();
+                return;
+            }
+
+            // Whatever was read before stays (the status is derived from it); only an identity that
+            // was never read shows the error.
+            const SeatHubFailure failure = result.ok ? SeatHubFailure::generic() : result.toFailure();
+            m_accountFailed = true;
+            m_accountError = failure.error;
+            m_accountErrorReference = failure.reference;
+            emit accountStatusChanged();
+        });
+    });
+}
+
+void SeatHubClient::handleCredentialRefused()
+{
+    // The same end as a sign-out: the local credential is swept whatever the network says, the
+    // server-side revoke is asked for (it will simply refuse a credential it already refused), and
+    // the customer lands on sign-in.
+    qCInfo(seathubClient) << "a profile read was refused (401); signing out";
+    signOut();
 }
 
 // ---------------------------------------------------------------------------

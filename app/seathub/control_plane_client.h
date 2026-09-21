@@ -19,6 +19,10 @@
 //   POST /api/auth/logout                      revoke the credential     -> 204
 //   GET  /api/me                               who the credential is     -> Account
 //   GET  /api/wallet                           the balance in minutes    -> Wallet
+//   GET  /api/sessions                         finished sessions, paged  -> CustomerSessionPage
+//   GET  /api/wallet/history                   the ledger, paged         -> LedgerPage
+//   GET  /api/topup-notices                    the top-up notices, paged -> TopupNoticePage
+//   GET  /api/usage                            hours played + balance    -> Usage
 //   POST /api/sessions                         Play (D-35)               -> Session
 //   GET  /api/sessions/{session_id}            state + billing facts     -> Session
 //   GET  /api/sessions/{session_id}/pairing    the session authorization -> SessionAuthorization
@@ -42,6 +46,7 @@
 // accessors below are safe to call from any thread.
 
 #include <QJsonObject>
+#include <QList>
 #include <QObject>
 #include <QString>
 #include <functional>
@@ -168,6 +173,97 @@ struct WalletInfo
     static bool parse(const QJsonObject& body, WalletInfo* out);
 };
 
+// --- the profile's three lists and its usage totals (Phase 5 plan 09, contract 1.8.0) -------------
+//
+// Each list page is a small array plus the server's own opaque cursor. The cursor is carried
+// unchanged and sent back unchanged: the client never builds one, reads one or does arithmetic on one
+// (T-05-38). Every parse is tolerant in the way `AccountInfo::parse` is - members the client does not
+// draw are ignored - but a row that has no `id`, or a page that has no array at all, is a contract
+// violation and fails the whole page, so a row is never silently dropped from a history.
+//
+// None of these structs has a rig member of any kind. The contract's `CustomerSessionRow` carries
+// none (CUST-01), and this client would not read one if it did.
+
+/// One row of `GET /api/sessions` (`CustomerSessionRow`): a finished session as the customer sees it.
+struct CustomerSessionRow
+{
+    QString id;
+    QString state;
+    /// The server's own billed-minutes count for the session.
+    int minutesBilled = 0;
+    /// RFC 3339 UTC; the position the list is ordered by.
+    QString requestedAt;
+    /// `EndReason`, or empty when the server gave none.
+    QString endReason;
+
+    static bool parse(const QJsonObject& body, CustomerSessionRow* out);
+};
+
+/// `CustomerSessionPage`.
+struct CustomerSessionPage
+{
+    QList<CustomerSessionRow> rows;
+    /// Empty on the last page (`next_cursor` is null there).
+    QString nextCursor;
+
+    static bool parse(const QJsonObject& body, CustomerSessionPage* out);
+};
+
+/// One row of `GET /api/wallet/history` (`LedgerEntry`).
+struct LedgerRow
+{
+    QString id;
+    /// `LedgerKind`: topup_credit, first_bonus, session_debit, refund, adjustment, shortfall.
+    QString kind;
+    /// Positive for a credit, negative for a debit; the server's own signed number.
+    qint64 amountMinutes = 0;
+    QString createdAt;
+
+    static bool parse(const QJsonObject& body, LedgerRow* out);
+};
+
+/// `LedgerPage`.
+struct LedgerPage
+{
+    QList<LedgerRow> rows;
+    QString nextCursor;
+
+    static bool parse(const QJsonObject& body, LedgerPage* out);
+};
+
+/// One row of `GET /api/topup-notices` (`TopupNotice`): a statement that a transfer was sent.
+struct TopupNoticeRow
+{
+    QString id;
+    QString sentAt;
+    /// Empty while the notice is open (waiting).
+    QString creditedAt;
+    /// The whole minutes the operator's credit added, or -1 while the notice is open.
+    qint64 creditedMinutes = -1;
+
+    static bool parse(const QJsonObject& body, TopupNoticeRow* out);
+};
+
+/// `TopupNoticePage`.
+struct TopupNoticePage
+{
+    QList<TopupNoticeRow> rows;
+    QString nextCursor;
+
+    static bool parse(const QJsonObject& body, TopupNoticePage* out);
+};
+
+/// `GET /api/usage` (`Usage`): the two totals the profile shows. Both are the server's numbers; the
+/// client formats them and adds nothing to them.
+struct UsageInfo
+{
+    /// The sum of the customer's session-debit ledger minutes (OD-09: a refund is not played).
+    qint64 minutesPlayed = 0;
+    qint64 balanceMinutes = 0;
+
+    static bool parse(const QJsonObject& body, UsageInfo* out);
+};
+
 class ControlPlaneClient : public QObject
 {
     Q_OBJECT
@@ -205,6 +301,11 @@ public:
     /// Percent-encodes one path segment (a session id) so it cannot add structure to the route it
     /// is interpolated into.
     static QString encodedPathSegment(const QString& segment);
+
+    /// `path` with the page size and, when there is one, the server's cursor as its query. The cursor
+    /// is opaque: it is percent-encoded so nothing in it can add structure to the query, and is
+    /// otherwise passed through exactly as the server gave it.
+    static QString listPath(const QString& path, int limit, const QString& cursor);
 
     // --- response classification (Pitfall 4). Static so the rule is testable without a server.
 
@@ -300,6 +401,19 @@ public:
 
     /// `GET /api/wallet`. Authenticated. `Wallet`.
     void fetchWallet(Callback callback);
+
+    /// The profile's reads (contract 1.8.0, `ADR-0055`). Each is authenticated, takes the page size and
+    /// the server's cursor of the page wanted (empty for the first) and answers the page shape named
+    /// beside it; `fetchUsage` takes neither.
+    ///
+    /// `GET /api/sessions` - `CustomerSessionPage`, the customer's own finished sessions.
+    void fetchSessionList(const QString& cursor, int limit, Callback callback);
+    /// `GET /api/wallet/history` - `LedgerPage`.
+    void fetchWalletHistory(const QString& cursor, int limit, Callback callback);
+    /// `GET /api/topup-notices` - `TopupNoticePage`.
+    void fetchTopupNotices(const QString& cursor, int limit, Callback callback);
+    /// `GET /api/usage` - `Usage`.
+    void fetchUsage(Callback callback);
 
     void requestSession(const QString& qualityProfile, Callback callback);
     void fetchSession(const QString& sessionId, Callback callback);

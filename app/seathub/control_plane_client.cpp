@@ -1,5 +1,6 @@
 #include "control_plane_client.h"
 
+#include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonParseError>
 #include <QNetworkAccessManager>
@@ -164,6 +165,178 @@ bool WalletInfo::parse(const QJsonObject& body, WalletInfo* out)
     return true;
 }
 
+// ---- the profile's lists and totals (Phase 5 plan 09). None of these reads a rig member: the
+// ---- contract's session row has none, and a row here is only ever what the customer is shown.
+
+namespace {
+
+// `next_cursor` is a string, or null on the last page. Whatever it is, it is carried as the server
+// wrote it; a null is the empty string.
+QString nextCursorOf(const QJsonObject& body)
+{
+    return body.value(QStringLiteral("next_cursor")).toString();
+}
+
+// A page's array member. A body that has no array there is not a page, and is not an empty one.
+bool arrayOf(const QJsonObject& body, const char* member, QJsonArray* out)
+{
+    const QJsonValue value = body.value(QLatin1String(member));
+    if (!value.isArray()) {
+        return false;
+    }
+    *out = value.toArray();
+    return true;
+}
+
+// A whole-minute member the schema requires: present and a number. Anything else is a body that
+// cannot be trusted with a customer's minutes, so it is not read as zero.
+bool minutesOf(const QJsonObject& body, const char* member, qint64* out)
+{
+    const QJsonValue value = body.value(QLatin1String(member));
+    if (!value.isDouble()) {
+        return false;
+    }
+    *out = static_cast<qint64>(value.toDouble());
+    return true;
+}
+
+} // namespace
+
+bool CustomerSessionRow::parse(const QJsonObject& body, CustomerSessionRow* out)
+{
+    const QString id = body.value(QStringLiteral("id")).toString();
+    if (!out || id.isEmpty()) {
+        return false;
+    }
+
+    CustomerSessionRow row;
+    row.id = id;
+    row.state = body.value(QStringLiteral("state")).toString();
+    row.minutesBilled = body.value(QStringLiteral("minutes_billed")).toInt();
+    row.requestedAt = body.value(QStringLiteral("requested_at")).toString();
+    row.endReason = body.value(QStringLiteral("end_reason")).toString();
+
+    *out = row;
+    return true;
+}
+
+bool CustomerSessionPage::parse(const QJsonObject& body, CustomerSessionPage* out)
+{
+    QJsonArray array;
+    if (!out || !arrayOf(body, "sessions", &array)) {
+        return false;
+    }
+
+    CustomerSessionPage page;
+    for (const QJsonValue& value : array) {
+        CustomerSessionRow row;
+        if (!CustomerSessionRow::parse(value.toObject(), &row)) {
+            return false;
+        }
+        page.rows.append(row);
+    }
+    page.nextCursor = nextCursorOf(body);
+
+    *out = page;
+    return true;
+}
+
+bool LedgerRow::parse(const QJsonObject& body, LedgerRow* out)
+{
+    const QString id = body.value(QStringLiteral("id")).toString();
+    qint64 amount = 0;
+    if (!out || id.isEmpty() || !minutesOf(body, "amount_minutes", &amount)) {
+        return false;
+    }
+
+    LedgerRow row;
+    row.id = id;
+    row.kind = body.value(QStringLiteral("kind")).toString();
+    row.amountMinutes = amount;
+    row.createdAt = body.value(QStringLiteral("created_at")).toString();
+
+    *out = row;
+    return true;
+}
+
+bool LedgerPage::parse(const QJsonObject& body, LedgerPage* out)
+{
+    QJsonArray array;
+    if (!out || !arrayOf(body, "entries", &array)) {
+        return false;
+    }
+
+    LedgerPage page;
+    for (const QJsonValue& value : array) {
+        LedgerRow row;
+        if (!LedgerRow::parse(value.toObject(), &row)) {
+            return false;
+        }
+        page.rows.append(row);
+    }
+    page.nextCursor = nextCursorOf(body);
+
+    *out = page;
+    return true;
+}
+
+bool TopupNoticeRow::parse(const QJsonObject& body, TopupNoticeRow* out)
+{
+    const QString id = body.value(QStringLiteral("id")).toString();
+    if (!out || id.isEmpty()) {
+        return false;
+    }
+
+    TopupNoticeRow row;
+    row.id = id;
+    row.sentAt = body.value(QStringLiteral("sent_at")).toString();
+    row.creditedAt = body.value(QStringLiteral("credited_at")).toString();
+    // `credited_minutes` is null while the notice is open; only a number is a count.
+    const QJsonValue minutes = body.value(QStringLiteral("credited_minutes"));
+    row.creditedMinutes = minutes.isDouble() ? static_cast<qint64>(minutes.toDouble()) : -1;
+
+    *out = row;
+    return true;
+}
+
+bool TopupNoticePage::parse(const QJsonObject& body, TopupNoticePage* out)
+{
+    QJsonArray array;
+    if (!out || !arrayOf(body, "notices", &array)) {
+        return false;
+    }
+
+    TopupNoticePage page;
+    for (const QJsonValue& value : array) {
+        TopupNoticeRow row;
+        if (!TopupNoticeRow::parse(value.toObject(), &row)) {
+            return false;
+        }
+        page.rows.append(row);
+    }
+    page.nextCursor = nextCursorOf(body);
+
+    *out = page;
+    return true;
+}
+
+bool UsageInfo::parse(const QJsonObject& body, UsageInfo* out)
+{
+    qint64 played = 0;
+    qint64 balance = 0;
+    if (!out || !minutesOf(body, "minutes_played", &played)
+            || !minutesOf(body, "balance_minutes", &balance) || played < 0 || balance < 0) {
+        return false;
+    }
+
+    UsageInfo usage;
+    usage.minutesPlayed = played;
+    usage.balanceMinutes = balance;
+
+    *out = usage;
+    return true;
+}
+
 SeatHubFailure ControlPlaneResult::toFailure() const
 {
     if (statusCode == 0) {
@@ -291,6 +464,19 @@ QString ControlPlaneClient::encodedPathSegment(const QString& segment)
     // it was pasted into. `toPercentEncoding` escapes exactly those (and everything else outside
     // the unreserved set) while leaving the contract's UUIDs, and the `-_.~` set, untouched.
     return QString::fromLatin1(QUrl::toPercentEncoding(segment));
+}
+
+QString ControlPlaneClient::listPath(const QString& path, int limit, const QString& cursor)
+{
+    // The cursor is the server's, opaque to this client and sent back exactly as it came (T-05-38).
+    // It is percent-encoded so a cursor can never add structure to the query; that is the only thing
+    // done to it. The server scopes every list to the credential, so a cursor reaches nothing that
+    // is not the caller's own.
+    QString result = path + QStringLiteral("?limit=") + QString::number(limit);
+    if (!cursor.isEmpty()) {
+        result += QStringLiteral("&cursor=") + QString::fromLatin1(QUrl::toPercentEncoding(cursor));
+    }
+    return result;
 }
 
 // ---------------------------------------------------------------- response classification
@@ -610,6 +796,29 @@ void ControlPlaneClient::fetchMe(Callback callback)
 void ControlPlaneClient::fetchWallet(Callback callback)
 {
     send(QStringLiteral("GET"), QStringLiteral("/api/wallet"), QByteArray(), true, callback);
+}
+
+void ControlPlaneClient::fetchSessionList(const QString& cursor, int limit, Callback callback)
+{
+    send(QStringLiteral("GET"), listPath(QStringLiteral("/api/sessions"), limit, cursor),
+         QByteArray(), true, callback);
+}
+
+void ControlPlaneClient::fetchWalletHistory(const QString& cursor, int limit, Callback callback)
+{
+    send(QStringLiteral("GET"), listPath(QStringLiteral("/api/wallet/history"), limit, cursor),
+         QByteArray(), true, callback);
+}
+
+void ControlPlaneClient::fetchTopupNotices(const QString& cursor, int limit, Callback callback)
+{
+    send(QStringLiteral("GET"), listPath(QStringLiteral("/api/topup-notices"), limit, cursor),
+         QByteArray(), true, callback);
+}
+
+void ControlPlaneClient::fetchUsage(Callback callback)
+{
+    send(QStringLiteral("GET"), QStringLiteral("/api/usage"), QByteArray(), true, callback);
 }
 
 void ControlPlaneClient::requestSession(const QString& qualityProfile, Callback callback)

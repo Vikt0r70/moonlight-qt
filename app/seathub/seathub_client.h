@@ -25,6 +25,7 @@
 
 #include "authorized_through_timer.h"
 #include "control_plane_client.h"
+#include "customer_lists.h"
 #include "engine_session.h"
 #include "error_map.h"
 #include "hud_overlay.h"
@@ -143,8 +144,9 @@ class SeatHubClient : public QObject
     /// True while a control-plane session is attached and the server has not reported it over: Home
     /// then reads `Resume session` in place of `Play`, and `start()` resumes that session instead of
     /// asking for a new one. It is derived from what this client itself knows (an attached session
-    /// that has not ended), not from a server read: nothing discovers a live session at launch yet,
-    /// so after a restart it is false until Plan 08's session reads set it.
+    /// that has not ended), not from a server read: nothing discovers a live session at launch, so
+    /// after a restart it is false until a session is attached again (`.planning/WINDOWS.md`, the
+    /// resume-after-restart row). The connecting reads of `handleSessionState` do not set it.
     Q_PROPERTY(bool liveSession READ liveSession NOTIFY liveSessionChanged)
 
     /// The last session's end reason as the sentence `docs/spec/copy.md` §Session end reasons
@@ -192,6 +194,37 @@ class SeatHubClient : public QObject
     /// while this holds: there is no balance before sign-in (CUST-06, `screens.md` Common shell).
     Q_PROPERTY(bool signedIn READ signedIn NOTIFY signedInChanged)
 
+    /// True while the profile is showing. Like Settings it is a view inside the home state, not an
+    /// appState of its own, so it keeps the signed-in header and a session that ends while it is open
+    /// still lands on the right view (`screens.md` §27).
+    Q_PROPERTY(bool inProfile READ inProfile NOTIFY inProfileChanged)
+
+    /// The profile's three lists (CUST-14, D-14). Constant objects the view binds to; each is
+    /// independent of the others and of the totals and the identity rows. QML never sees raw data:
+    /// every row is already the text the screen draws.
+    Q_PROPERTY(SessionListModel* sessionHistory READ sessionHistory CONSTANT)
+    Q_PROPERTY(CreditHistoryModel* creditHistory READ creditHistory CONSTANT)
+    Q_PROPERTY(TopupListModel* topupHistory READ topupHistory CONSTANT)
+
+    /// The profile's two totals, both the server's own numbers (`GET /api/usage`) in the hours-and-
+    /// minutes format (`duration_text.h`): `Hours played` (the sum of session-debit minutes, OD-09)
+    /// and `Credit left`. Empty until the read has succeeded. `totalsStatus` is "idle" | "loading" |
+    /// "ready" | "error"; on "error" `totalsError` is the server's sentence (or the deck's offline or
+    /// generic one) and `totalsErrorReference` its ADR-0008 code, when it gave one.
+    Q_PROPERTY(QString hoursPlayedText READ hoursPlayedText NOTIFY totalsChanged)
+    Q_PROPERTY(QString creditLeftText READ creditLeftText NOTIFY totalsChanged)
+    Q_PROPERTY(QString totalsStatus READ totalsStatus NOTIFY totalsChanged)
+    Q_PROPERTY(QString totalsError READ totalsError NOTIFY totalsChanged)
+    Q_PROPERTY(QString totalsErrorReference READ totalsErrorReference NOTIFY totalsChanged)
+
+    /// Whether the identity rows (`account`) can be drawn: "ready" once `GET /api/me` has said who
+    /// the customer is, "loading" while it has not (and no failure is recorded), "error" when the
+    /// read failed and there is nothing to show. `accountError` and `accountErrorReference` are the
+    /// sentence and code for that failure.
+    Q_PROPERTY(QString accountStatus READ accountStatus NOTIFY accountStatusChanged)
+    Q_PROPERTY(QString accountError READ accountError NOTIFY accountStatusChanged)
+    Q_PROPERTY(QString accountErrorReference READ accountErrorReference NOTIFY accountStatusChanged)
+
 public:
     explicit SeatHubClient(QObject* parent = nullptr);
     /// Stops the control-plane thread and joins it before anything that could still be running
@@ -229,6 +262,18 @@ public:
     bool animationEffects() const { return m_animationEffects; }
     bool signedIn() const { return m_signedIn; }
     bool liveSession() const { return m_liveSession; }
+    bool inProfile() const { return m_inProfile; }
+    SessionListModel* sessionHistory() const { return m_sessionHistory; }
+    CreditHistoryModel* creditHistory() const { return m_creditHistory; }
+    TopupListModel* topupHistory() const { return m_topupHistory; }
+    QString hoursPlayedText() const { return m_hoursPlayedText; }
+    QString creditLeftText() const { return m_creditLeftText; }
+    QString totalsStatus() const { return m_totalsStatus; }
+    QString totalsError() const { return m_totalsError; }
+    QString totalsErrorReference() const { return m_totalsErrorReference; }
+    QString accountStatus() const;
+    QString accountError() const { return m_accountError; }
+    QString accountErrorReference() const { return m_accountErrorReference; }
 
     /// The Qt window the visibility sequence hides and restores. Called once by main.qml.
     Q_INVOKABLE void setHostWindow(QWindow* window);
@@ -263,8 +308,8 @@ public:
     /// request: it is not stored, not kept by this object and not logged.
     Q_INVOKABLE void signInWithPassword(const QString& identifier, const QString& password);
 
-    /// The website address for `target` (`signup`, `reset` or `topup`), or an empty string for
-    /// anything else. QML never builds an address itself; these come from `web_origin.h`, carry no
+    /// The website address for `target` (`signup`, `reset`, `topup` or `home`, the origin itself that
+    /// the profile's `Open the website` link opens), or an empty string for anything else. QML never builds an address itself; these come from `web_origin.h`, carry no
     /// parameters and so can never carry a credential.
     Q_INVOKABLE QString websiteUrl(const QString& target) const;
 
@@ -319,6 +364,34 @@ public:
     /// Returns to the home view.
     Q_INVOKABLE void closeSettings();
 
+    /// Shows the profile (a view inside the home state, like Settings). Reads the identity and the two
+    /// totals afresh and forgets whatever the three lists held, so each opens on its first page and
+    /// nothing from an earlier visit is shown as current. The lists themselves are not asked for here:
+    /// the view asks for the one it shows and the others wait until their tab is opened.
+    Q_INVOKABLE void openProfile();
+
+    /// Returns to the home view, and forgets the lists (they are the customer's own history and are
+    /// not kept while nobody is looking at it).
+    Q_INVOKABLE void closeProfile();
+
+    /// `list` is "sessions", "credit" or "topups". Each of the four calls below is a no-op for any
+    /// other name.
+    ///
+    /// Asks for the list's first page, once: a list already asked for, loading, loaded or failed is
+    /// left as it is (`reloadList` is how a failed one starts again).
+    Q_INVOKABLE void loadFirstPage(const QString& list);
+
+    /// Asks for the list's next page when the server said there is one and no request is in flight;
+    /// otherwise does nothing (the view calls this every time it reaches the end of the list).
+    Q_INVOKABLE void loadNextPage(const QString& list);
+
+    /// Forgets the list and asks for its first page again: the list's `Try again`.
+    Q_INVOKABLE void reloadList(const QString& list);
+
+    /// `Try again` on the totals and on the identity rows: each is read again on its own.
+    Q_INVOKABLE void reloadTotals();
+    Q_INVOKABLE void reloadAccount();
+
     /// Attach a control-plane session to this client: the real path, as opposed to the tracer's
     /// stubbed stage sequence. Starts the session channel, runs silent pairing, and hands the
     /// session authorization's `quality_profile` to the settings bridge as an in-memory override
@@ -357,6 +430,9 @@ signals:
     void balanceChanged();
     void signedInChanged();
     void liveSessionChanged();
+    void inProfileChanged();
+    void totalsChanged();
+    void accountStatusChanged();
 
     /// Step 1 succeeded - the view should show the code field.
     void otpRequested(const QString& phoneE164);
@@ -413,6 +489,11 @@ private slots:
     /// tree that belongs to the facade's thread.
     void handleHostResolved(const PairedHostPtr& host);
 
+    /// One of the profile's reads was answered 401: the credential is no longer valid. Cleared, and
+    /// the customer lands on sign-in (`screens.md` §27), exactly as a sign-out that could not reach
+    /// the server does.
+    void handleCredentialRefused();
+
 private:
     void setAppState(const QString& state);
     void setStageText(const QString& text);
@@ -440,6 +521,14 @@ private:
     void raiseFailure(const SeatHubFailure& failure);
     void clearFailure();
     void setInSettings(bool inSettings);
+    void setInProfile(bool inProfile);
+    /// The list named `list` ("sessions", "credit", "topups"), or null for any other name.
+    CustomerListModel* listNamed(const QString& list) const;
+    /// Forgets the three lists and the totals. The account itself stays: it is the signed-in
+    /// customer's identity, and only sign-out clears it.
+    void resetProfileData();
+    void readTotals();
+    void readAccount();
     /// The one writer of `m_signedIn`, so `signedInChanged()` can never be missed.
     void setSignedIn(bool signedIn);
     /// The one writer of `m_sessionId`, and of whether that session has ended, so `liveSession` can
@@ -498,6 +587,25 @@ private:
     QVariantMap m_failure;
     QString m_identity;
     QVariantMap m_account;
+
+    // The profile (Phase 5 plan 09). The three lists and the totals are each independent: one failing
+    // never blanks another, and none is computed here - every number is the server's own answer.
+    bool m_inProfile = false;
+    SessionListModel* m_sessionHistory = nullptr;
+    CreditHistoryModel* m_creditHistory = nullptr;
+    TopupListModel* m_topupHistory = nullptr;
+    QString m_totalsStatus = QStringLiteral("idle");
+    QString m_hoursPlayedText;
+    QString m_creditLeftText;
+    QString m_totalsError;
+    QString m_totalsErrorReference;
+    bool m_accountFailed = false;
+    QString m_accountError;
+    QString m_accountErrorReference;
+    /// Bumped by every totals or identity read, and by every reset, so a reply that was asked for
+    /// before the profile was left, reloaded or signed out of is dropped.
+    quint64 m_totalsRead = 0;
+    quint64 m_accountRead = 0;
 
     QVariantList m_countries;
     QString m_defaultCountryCode;

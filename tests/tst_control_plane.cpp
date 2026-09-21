@@ -18,6 +18,7 @@
 #include <QBuffer>
 #include <QDir>
 #include <QFile>
+#include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QNetworkAccessManager>
@@ -86,6 +87,8 @@ public:
     int status = 200;
     QByteArray body;
     QString lastPath;
+    /// The query the last request carried, as it went on the wire (percent-encoded).
+    QString lastQuery;
     QByteArray lastMethod;
     QNetworkRequest lastRequest;
     /// Every path asked for, in order - for the assertion that a route was never built.
@@ -97,6 +100,7 @@ protected:
     {
         Q_UNUSED(op);
         lastPath = request.url().path(QUrl::FullyEncoded);
+        lastQuery = request.url().query(QUrl::FullyEncoded);
         paths.append(lastPath);
         lastRequest = request;
         lastMethod = outgoingData ? QByteArrayLiteral("POST") : QByteArrayLiteral("GET");
@@ -472,6 +476,10 @@ private slots:
                  QStringLiteral("https://sevenhills.damra.co/forgot-password"));
         // A path the spec does not record yields no address at all.
         QVERIFY(SeatHubWeb::url("/somewhere-else").isEmpty());
+        // The profile's `Open the website` link is the origin itself (OD-11), nothing after it.
+        QCOMPARE(SeatHubWeb::homeUrl().toString(), QStringLiteral("https://sevenhills.damra.co"));
+        QVERIFY(SeatHubWeb::homeUrl().path().isEmpty());
+        QVERIFY(SeatHubWeb::homeUrl().query().isEmpty());
     }
 
     // --- ME-04: ids cannot add structure to the route they are pasted into -------------------
@@ -1082,7 +1090,11 @@ private slots:
         client.fetchSessionAuthorization(QStringLiteral("s"), done);
         client.postLiveness(QStringLiteral("s"), QStringLiteral("streaming"), QString(), done);
         client.endSession(QStringLiteral("s"), done);
-        QTRY_COMPARE(completed, 11);
+        client.fetchSessionList(QString(), 15, done);
+        client.fetchWalletHistory(QString(), 15, done);
+        client.fetchTopupNotices(QString(), 15, done);
+        client.fetchUsage(done);
+        QTRY_COMPARE(completed, 15);
 
         for (const QString& path : fake->paths) {
             QVERIFY2(!path.contains(QStringLiteral("refresh")),
@@ -1103,6 +1115,294 @@ private slots:
         QCOMPARE(pair.accessToken, QStringLiteral("a"));
         QCOMPARE(pair.refreshToken, QStringLiteral("r"));
         QVERIFY(pair.accessExpiresAt.startsWith(QStringLiteral("2026-09-19")));
+    }
+
+    // --- Phase 5 plan 09: the profile's three lists and its totals ----------------------------------
+
+    void listPath_data()
+    {
+        QTest::addColumn<QString>("cursor");
+        QTest::addColumn<QString>("expected");
+
+        QTest::newRow("first page") << QString()
+                                    << QStringLiteral("/api/sessions?limit=15");
+        QTest::newRow("a plain cursor") << QStringLiteral("abc123")
+                                        << QStringLiteral("/api/sessions?limit=15&cursor=abc123");
+        // The cursor is the server's and opaque: whatever it holds, nothing in it can add structure to
+        // the query, and nothing else is done to it.
+        QTest::newRow("base64 characters")
+            << QStringLiteral("ab+/=cd")
+            << QStringLiteral("/api/sessions?limit=15&cursor=ab%2B%2F%3Dcd");
+        QTest::newRow("a cursor that tries to add a parameter")
+            << QStringLiteral("x&limit=100")
+            << QStringLiteral("/api/sessions?limit=15&cursor=x%26limit%3D100");
+        QTest::newRow("a cursor that tries to end the query")
+            << QStringLiteral("x#y") << QStringLiteral("/api/sessions?limit=15&cursor=x%23y");
+    }
+
+    void listPath()
+    {
+        QFETCH(QString, cursor);
+        QFETCH(QString, expected);
+
+        QCOMPARE(ControlPlaneClient::listPath(QStringLiteral("/api/sessions"), 15, cursor), expected);
+    }
+
+    void listRoutes_data()
+    {
+        QTest::addColumn<int>("which");
+        QTest::addColumn<QString>("path");
+
+        QTest::newRow("sessions") << 0 << QStringLiteral("/api/sessions");
+        QTest::newRow("credit history") << 1 << QStringLiteral("/api/wallet/history");
+        QTest::newRow("top-up notices") << 2 << QStringLiteral("/api/topup-notices");
+    }
+
+    void listRoutes()
+    {
+        QFETCH(int, which);
+        QFETCH(QString, path);
+
+        ControlPlaneClient client;
+        auto* fake = new FakeNetworkAccessManager;
+        client.setNetworkAccessManager(fake);
+        client.setAccessToken(QStringLiteral("opaque-access-token"));
+        fake->status = 200;
+        fake->body = QByteArrayLiteral("{}");
+
+        int completed = 0;
+        const ControlPlaneClient::Callback done = [&](const ControlPlaneResult&) { ++completed; };
+        auto ask = [&](const QString& cursor) {
+            switch (which) {
+            case 0:
+                client.fetchSessionList(cursor, 15, done);
+                break;
+            case 1:
+                client.fetchWalletHistory(cursor, 15, done);
+                break;
+            default:
+                client.fetchTopupNotices(cursor, 15, done);
+                break;
+            }
+        };
+
+        // The first page: the documented route, a page of fifteen and no cursor at all.
+        ask(QString());
+        QTRY_COMPARE(completed, 1);
+        QCOMPARE(fake->lastPath, path);
+        QCOMPARE(fake->lastMethod, QByteArrayLiteral("GET"));
+        QCOMPARE(fake->lastQuery, QStringLiteral("limit=15"));
+        QCOMPARE(fake->lastRequest.rawHeader("Authorization"),
+                 QByteArrayLiteral("Bearer opaque-access-token"));
+
+        // The next page: the server's cursor, sent back as it came.
+        ask(QStringLiteral("opaque+cursor/=="));
+        QTRY_COMPARE(completed, 2);
+        QCOMPARE(fake->lastPath, path);
+        QCOMPARE(fake->lastQuery, QStringLiteral("limit=15&cursor=opaque%2Bcursor%2F%3D%3D"));
+        QCOMPARE(fake->lastRequest.rawHeader("Authorization"),
+                 QByteArrayLiteral("Bearer opaque-access-token"));
+    }
+
+    void usageRoute_getsTheDocumentedRouteWithTheCredentialAndNothingElse()
+    {
+        ControlPlaneClient client;
+        auto* fake = new FakeNetworkAccessManager;
+        client.setNetworkAccessManager(fake);
+        client.setAccessToken(QStringLiteral("opaque-access-token"));
+        fake->status = 200;
+        fake->body = QByteArrayLiteral("{\"minutes_played\":135,\"balance_minutes\":45}");
+
+        ControlPlaneResult captured;
+        bool called = false;
+        client.fetchUsage([&](const ControlPlaneResult& result) {
+            captured = result;
+            called = true;
+        });
+        QTRY_VERIFY(called);
+
+        QCOMPARE(fake->lastPath, QStringLiteral("/api/usage"));
+        QCOMPARE(fake->lastMethod, QByteArrayLiteral("GET"));
+        QVERIFY(fake->lastQuery.isEmpty());
+        QCOMPARE(fake->lastRequest.rawHeader("Authorization"),
+                 QByteArrayLiteral("Bearer opaque-access-token"));
+
+        UsageInfo usage;
+        QVERIFY(captured.ok);
+        QVERIFY(UsageInfo::parse(captured.body, &usage));
+        QCOMPARE(usage.minutesPlayed, qint64(135));
+        QCOMPARE(usage.balanceMinutes, qint64(45));
+    }
+
+    void aListReadWithoutACredentialIsRefusedAndAttachesNoHeader()
+    {
+        ControlPlaneClient client;
+        auto* fake = new FakeNetworkAccessManager;
+        client.setNetworkAccessManager(fake);
+        fake->status = 401;
+        fake->body = QByteArrayLiteral("{\"error\":\"Please sign in.\",\"reference\":\"SH-3K2XQ1\"}");
+
+        ControlPlaneResult captured;
+        bool called = false;
+        client.fetchSessionList(QString(), 15, [&](const ControlPlaneResult& result) {
+            captured = result;
+            called = true;
+        });
+        QTRY_VERIFY(called);
+
+        QVERIFY(fake->lastRequest.rawHeader("Authorization").isEmpty());
+        QVERIFY(!captured.ok);
+        QCOMPARE(captured.statusCode, 401);
+        QCOMPARE(captured.toFailure().kind, FailureKind::Auth);
+    }
+
+    void sessionPage_parsesTheRowsAndTheCursorAndDrawsNothingAboutARig()
+    {
+        // The wire may carry members this client does not draw. Even a rig's name and id, which the
+        // contract's session row does not have, are not read into anything.
+        const QByteArray text = QByteArrayLiteral(
+            "{\"sessions\":["
+            "{\"id\":\"a\",\"state\":\"COMPLETED\",\"minutes_billed\":135,"
+            "\"requested_at\":\"2026-09-12T18:40:00Z\",\"started_at\":\"2026-09-12T18:41:00Z\","
+            "\"ended_at\":\"2026-09-12T20:56:00Z\",\"end_reason\":\"CUSTOMER_ENDED\","
+            "\"host_id\":\"rig-7\",\"host_name\":\"Rig 07\"},"
+            "{\"id\":\"b\",\"state\":\"EXPIRED\",\"minutes_billed\":0,"
+            "\"requested_at\":\"2026-09-11T10:00:00Z\",\"started_at\":null,\"ended_at\":null,"
+            "\"end_reason\":null}"
+            "],\"next_cursor\":\"opaque-1\"}");
+        const QJsonObject body = QJsonDocument::fromJson(text).object();
+
+        CustomerSessionPage page;
+        QVERIFY(CustomerSessionPage::parse(body, &page));
+        QCOMPARE(page.rows.size(), 2);
+        QCOMPARE(page.nextCursor, QStringLiteral("opaque-1"));
+
+        QCOMPARE(page.rows.at(0).id, QStringLiteral("a"));
+        QCOMPARE(page.rows.at(0).state, QStringLiteral("COMPLETED"));
+        QCOMPARE(page.rows.at(0).minutesBilled, 135);
+        QCOMPARE(page.rows.at(0).requestedAt, QStringLiteral("2026-09-12T18:40:00Z"));
+        QCOMPARE(page.rows.at(0).endReason, QStringLiteral("CUSTOMER_ENDED"));
+
+        // A null end reason is no reason, not the word "null".
+        QCOMPARE(page.rows.at(1).endReason, QString());
+        QCOMPARE(page.rows.at(1).minutesBilled, 0);
+
+        // The last page has a null cursor, and that is the empty string.
+        QJsonObject last = body;
+        last.insert(QStringLiteral("next_cursor"), QJsonValue::Null);
+        QVERIFY(CustomerSessionPage::parse(last, &page));
+        QVERIFY(page.nextCursor.isEmpty());
+
+        // An empty page is a page.
+        QJsonObject empty;
+        empty.insert(QStringLiteral("sessions"), QJsonArray());
+        empty.insert(QStringLiteral("next_cursor"), QJsonValue::Null);
+        QVERIFY(CustomerSessionPage::parse(empty, &page));
+        QVERIFY(page.rows.isEmpty());
+    }
+
+    void ledgerPage_parsesTheSignedMinutesAsTheServerSentThem()
+    {
+        const QByteArray text = QByteArrayLiteral(
+            "{\"entries\":["
+            "{\"id\":\"l1\",\"kind\":\"topup_credit\",\"amount_minutes\":300,\"session_id\":null,"
+            "\"minute_index\":null,\"created_at\":\"2026-09-12T18:40:00Z\"},"
+            "{\"id\":\"l2\",\"kind\":\"session_debit\",\"amount_minutes\":-1,"
+            "\"session_id\":\"a\",\"minute_index\":4,\"created_at\":\"2026-09-12T18:45:00Z\"}"
+            "],\"next_cursor\":null}");
+
+        LedgerPage page;
+        QVERIFY(LedgerPage::parse(QJsonDocument::fromJson(text).object(), &page));
+        QCOMPARE(page.rows.size(), 2);
+        QCOMPARE(page.rows.at(0).kind, QStringLiteral("topup_credit"));
+        QCOMPARE(page.rows.at(0).amountMinutes, qint64(300));
+        QCOMPARE(page.rows.at(1).kind, QStringLiteral("session_debit"));
+        QCOMPARE(page.rows.at(1).amountMinutes, qint64(-1));
+        QVERIFY(page.nextCursor.isEmpty());
+    }
+
+    void noticePage_anOpenNoticeHasNoMinutesAndAClosedOneHasTheOperatorsOwn()
+    {
+        const QByteArray text = QByteArrayLiteral(
+            "{\"notices\":["
+            "{\"id\":\"n1\",\"sent_at\":\"2026-09-13T09:00:00Z\",\"credited_at\":null,"
+            "\"credited_minutes\":null},"
+            "{\"id\":\"n2\",\"sent_at\":\"2026-09-10T09:00:00Z\","
+            "\"credited_at\":\"2026-09-10T09:30:00Z\",\"credited_minutes\":300}"
+            "],\"next_cursor\":\"opaque-2\"}");
+
+        TopupNoticePage page;
+        QVERIFY(TopupNoticePage::parse(QJsonDocument::fromJson(text).object(), &page));
+        QCOMPARE(page.rows.size(), 2);
+        QCOMPARE(page.nextCursor, QStringLiteral("opaque-2"));
+
+        QCOMPARE(page.rows.at(0).creditedAt, QString());
+        QCOMPARE(page.rows.at(0).creditedMinutes, qint64(-1));
+        QCOMPARE(page.rows.at(1).creditedAt, QStringLiteral("2026-09-10T09:30:00Z"));
+        QCOMPARE(page.rows.at(1).creditedMinutes, qint64(300));
+    }
+
+    void aPageThatIsNotAPageIsNotAnEmptyOne()
+    {
+        // A body with no array where the list belongs, and a row with no id, are contract violations:
+        // reading either as "nothing to show" would tell a customer their history is empty.
+        CustomerSessionPage sessions;
+        LedgerPage ledger;
+        TopupNoticePage notices;
+
+        QVERIFY(!CustomerSessionPage::parse(QJsonObject(), &sessions));
+        QVERIFY(!LedgerPage::parse(QJsonObject(), &ledger));
+        QVERIFY(!TopupNoticePage::parse(QJsonObject(), &notices));
+
+        QJsonObject notAnArray;
+        notAnArray.insert(QStringLiteral("sessions"), QStringLiteral("none"));
+        QVERIFY(!CustomerSessionPage::parse(notAnArray, &sessions));
+
+        QJsonObject rowWithoutAnId;
+        QJsonArray rows;
+        QJsonObject row;
+        row.insert(QStringLiteral("minutes_billed"), 5);
+        rows.append(row);
+        rowWithoutAnId.insert(QStringLiteral("sessions"), rows);
+        QVERIFY(!CustomerSessionPage::parse(rowWithoutAnId, &sessions));
+
+        // A ledger row whose amount is not a number is not an amount of zero.
+        QJsonObject ledgerRow;
+        ledgerRow.insert(QStringLiteral("id"), QStringLiteral("l"));
+        ledgerRow.insert(QStringLiteral("kind"), QStringLiteral("refund"));
+        ledgerRow.insert(QStringLiteral("amount_minutes"), QStringLiteral("30"));
+        QJsonArray ledgerRows;
+        ledgerRows.append(ledgerRow);
+        QJsonObject ledgerBody;
+        ledgerBody.insert(QStringLiteral("entries"), ledgerRows);
+        QVERIFY(!LedgerPage::parse(ledgerBody, &ledger));
+    }
+
+    void usageParse_neverInventsATotal()
+    {
+        UsageInfo usage;
+
+        // Zero played and zero left are real answers.
+        QJsonObject zero;
+        zero.insert(QStringLiteral("minutes_played"), 0);
+        zero.insert(QStringLiteral("balance_minutes"), 0);
+        QVERIFY(UsageInfo::parse(zero, &usage));
+        QCOMPARE(usage.minutesPlayed, qint64(0));
+        QCOMPARE(usage.balanceMinutes, qint64(0));
+
+        // A body missing either total, carrying text, or negative is not a total.
+        QVERIFY(!UsageInfo::parse(QJsonObject(), &usage));
+        QJsonObject onlyOne;
+        onlyOne.insert(QStringLiteral("minutes_played"), 30);
+        QVERIFY(!UsageInfo::parse(onlyOne, &usage));
+        QJsonObject text;
+        text.insert(QStringLiteral("minutes_played"), QStringLiteral("30"));
+        text.insert(QStringLiteral("balance_minutes"), 10);
+        QVERIFY(!UsageInfo::parse(text, &usage));
+        QJsonObject negative;
+        negative.insert(QStringLiteral("minutes_played"), -3);
+        negative.insert(QStringLiteral("balance_minutes"), 10);
+        QVERIFY(!UsageInfo::parse(negative, &usage));
     }
 
     void baseUrl_isTheSameHostTheReleaseFeedUses()

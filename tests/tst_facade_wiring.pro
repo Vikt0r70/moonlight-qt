@@ -41,6 +41,8 @@ SOURCES += \
     ../app/seathub/countries.cpp \
     ../app/seathub/region.cpp \
     ../app/seathub/duration_text.cpp \
+    ../app/seathub/jordan_time.cpp \
+    ../app/seathub/customer_lists.cpp \
     ../app/seathub/token_store.cpp \
     ../app/seathub/session_websocket.cpp \
     ../app/seathub/pairing_controller.cpp \
@@ -67,6 +69,8 @@ HEADERS += \
     ../app/seathub/region.h \
     ../app/seathub/web_origin.h \
     ../app/seathub/duration_text.h \
+    ../app/seathub/jordan_time.h \
+    ../app/seathub/customer_lists.h \
     ../app/seathub/token_store.h \
     ../app/seathub/session_websocket.h \
     ../app/seathub/pairing_controller.h \
