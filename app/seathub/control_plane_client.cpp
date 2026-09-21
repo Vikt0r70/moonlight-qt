@@ -122,6 +122,48 @@ bool AuthTokenPair::parse(const QJsonObject& body, AuthTokenPair* out)
     return true;
 }
 
+bool AccountInfo::parse(const QJsonObject& body, AccountInfo* out)
+{
+    // Tolerant on purpose: `id` is the only member a signed-in client cannot do without, and the
+    // account schema grows new members over time. A missing username, email or phone is a normal
+    // account (phone-only sign-up has no email), not a malformed body.
+    if (!out || body.value(QStringLiteral("id")).toString().isEmpty()) {
+        return false;
+    }
+
+    AccountInfo account;
+    account.id = body.value(QStringLiteral("id")).toString();
+    account.displayName = body.value(QStringLiteral("display_name")).toString();
+    account.username = body.value(QStringLiteral("username")).toString();
+    account.email = body.value(QStringLiteral("email")).toString();
+    account.phoneE164 = body.value(QStringLiteral("phone_e164")).toString();
+    account.emailVerified = body.value(QStringLiteral("email_verified")).toBool(false);
+
+    *out = account;
+    return true;
+}
+
+bool WalletInfo::parse(const QJsonObject& body, WalletInfo* out)
+{
+    // `balance_minutes` is required by the `Wallet` schema and is an integer. A body without one is
+    // not a balance of zero: reporting zero for "we could not read it" would tell a customer with
+    // credit that they have none.
+    const QJsonValue balance = body.value(QStringLiteral("balance_minutes"));
+    if (!out || !balance.isDouble()) {
+        return false;
+    }
+
+    WalletInfo wallet;
+    wallet.balanceMinutes = static_cast<qint64>(balance.toDouble());
+    if (wallet.balanceMinutes < 0) {
+        return false;
+    }
+    wallet.updatedAt = body.value(QStringLiteral("updated_at")).toString();
+
+    *out = wallet;
+    return true;
+}
+
 SeatHubFailure ControlPlaneResult::toFailure() const
 {
     if (statusCode == 0) {
@@ -235,6 +277,14 @@ ControlPlaneResult ControlPlaneClient::classify(int httpStatus, const QByteArray
     const QJsonDocument doc = QJsonDocument::fromJson(body, &parseError);
     const QJsonObject object = doc.isObject() ? doc.object() : QJsonObject();
 
+    // 204 No Content is the one 2xx that legitimately has no body (`POST /api/auth/logout`).
+    // Absence of a body is the documented success there, so it is not held to the "evidence of
+    // success" rule below - which is about a 200 that should have carried a JSON object.
+    if (httpStatus == 204) {
+        result.ok = true;
+        return result;
+    }
+
     if (httpStatus >= 200 && httpStatus < 300) {
         // Pitfall 4, and the single most important rule in this file. The control plane's
         // `Error` and `AllocationRefused` schemas both ship `status: false` underneath an
@@ -298,10 +348,11 @@ QByteArray ControlPlaneClient::buildOtpVerify(const QString& phoneE164, const QS
     return QJsonDocument(object).toJson(QJsonDocument::Compact);
 }
 
-QByteArray ControlPlaneClient::buildRefreshRequest(const QString& refreshToken)
+QByteArray ControlPlaneClient::buildLogin(const QString& identifier, const QString& password)
 {
     QJsonObject object;
-    object.insert(QStringLiteral("refresh_token"), refreshToken);
+    object.insert(QStringLiteral("identifier"), identifier);
+    object.insert(QStringLiteral("password"), password);
     return QJsonDocument(object).toJson(QJsonDocument::Compact);
 }
 
@@ -512,10 +563,26 @@ void ControlPlaneClient::verifyOtp(const QString& phoneE164, const QString& code
          buildOtpVerify(phoneE164, code), false, callback);
 }
 
-void ControlPlaneClient::refresh(const QString& refreshToken, Callback callback)
+void ControlPlaneClient::login(const QString& identifier, const QString& password,
+                               Callback callback)
 {
-    send(QStringLiteral("POST"), QStringLiteral("/api/auth/refresh"),
-         buildRefreshRequest(refreshToken), false, callback);
+    send(QStringLiteral("POST"), QStringLiteral("/api/auth/login"),
+         buildLogin(identifier, password), false, callback);
+}
+
+void ControlPlaneClient::logout(Callback callback)
+{
+    send(QStringLiteral("POST"), QStringLiteral("/api/auth/logout"), QByteArray(), true, callback);
+}
+
+void ControlPlaneClient::fetchMe(Callback callback)
+{
+    send(QStringLiteral("GET"), QStringLiteral("/api/me"), QByteArray(), true, callback);
+}
+
+void ControlPlaneClient::fetchWallet(Callback callback)
+{
+    send(QStringLiteral("GET"), QStringLiteral("/api/wallet"), QByteArray(), true, callback);
 }
 
 void ControlPlaneClient::requestSession(const QString& qualityProfile, Callback callback)

@@ -39,10 +39,17 @@ ApplicationWindow {
         // D-41: the feed is checked on launch. `SeatHubClient` refuses the check while a stream
         // is running (Pitfall 8), and re-checks when one ends.
         seatHub.updates.checkForUpdates()
+
+        // CUST-08: the stored sign-in is read and confirmed once, here. Until it resolves the
+        // client is in the "restoring" state and shows the splash - never the sign-in form.
+        seatHub.restoreSession()
     }
 
     function componentForState(state) {
         switch (state) {
+        // Routed explicitly: an unrecognised state falls through to the sign-in form below, which is
+        // exactly the flash the restore splash exists to prevent.
+        case "restoring":  return restoreComponent
         case "signed_out": return signInComponent
         // Settings is a view inside the home state, not a state of its own: a session can end
         // while the page is open, and the page must still be the right view when it does.
@@ -108,6 +115,13 @@ ApplicationWindow {
         sequence: "Ctrl+Alt+Shift+Q"
         context: Qt.ApplicationShortcut
         onActivated: seatHub.interrupt()
+    }
+
+    Component {
+        id: restoreComponent
+
+        RestoreSplash {
+        }
     }
 
     Component {

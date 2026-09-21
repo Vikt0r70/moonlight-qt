@@ -55,6 +55,7 @@
 #include <QWindow>
 
 #include "seathub/control_plane_client.h"
+#include "seathub/duration_text.h"
 #include "seathub/engine_session.h"
 #include "seathub/moonlight_engine_session.h"
 #include "seathub/pairing_handshake.h"
@@ -101,7 +102,13 @@ public:
     FakeReply(int httpStatus, const QByteArray& body, QObject* parent)
         : QNetworkReply(parent)
     {
-        setAttribute(QNetworkRequest::HttpStatusCodeAttribute, QVariant(httpStatus));
+        if (httpStatus == 0) {
+            // The transport never produced a response: an unreachable control plane.
+            setError(QNetworkReply::HostNotFoundError, QStringLiteral("no route to control plane"));
+        }
+        else {
+            setAttribute(QNetworkRequest::HttpStatusCodeAttribute, QVariant(httpStatus));
+        }
         m_buffer.setData(body);
         m_buffer.open(QIODevice::ReadOnly);
         open(QIODevice::ReadOnly);
@@ -151,13 +158,61 @@ public:
         return count;
     }
 
+    // What `GET /api/me`, `GET /api/wallet`, `POST /api/auth/logout` and `POST
+    // /api/auth/otp/verify` answer. Status 0 is a transport failure.
+    void answerMe(int status, const QByteArray& body)
+    {
+        QMutexLocker lock(&m_mutex);
+        m_meStatus = status;
+        m_meBody = body;
+    }
+    void answerWallet(int status, const QByteArray& body)
+    {
+        QMutexLocker lock(&m_mutex);
+        m_walletStatus = status;
+        m_walletBody = body;
+    }
+    void answerLogout(int status)
+    {
+        QMutexLocker lock(&m_mutex);
+        m_logoutStatus = status;
+    }
+
+    /// The `Authorization` header the last request for `path` carried.
+    QByteArray authorizationFor(const QString& path) const
+    {
+        QMutexLocker lock(&m_mutex);
+        return m_auth.value(path);
+    }
+
 protected:
     QNetworkReply* createRequest(Operation, const QNetworkRequest& request, QIODevice*) override
     {
         const QString path = request.url().path();
+        int meStatus, walletStatus, logoutStatus;
+        QByteArray meBody, walletBody;
         {
             QMutexLocker lock(&m_mutex);
             m_paths.append(path);
+            m_auth.insert(path, request.rawHeader("Authorization"));
+            meStatus = m_meStatus;
+            meBody = m_meBody;
+            walletStatus = m_walletStatus;
+            walletBody = m_walletBody;
+            logoutStatus = m_logoutStatus;
+        }
+
+        if (path == QLatin1String("/api/me")) {
+            return new FakeReply(meStatus, meBody, this);
+        }
+        if (path == QLatin1String("/api/wallet")) {
+            return new FakeReply(walletStatus, walletBody, this);
+        }
+        if (path == QLatin1String("/api/auth/logout")) {
+            return new FakeReply(logoutStatus, QByteArray(), this);
+        }
+        if (path == QLatin1String("/api/auth/otp/verify")) {
+            return new FakeReply(200, QByteArrayLiteral("{\"access_token\":\"sb_at_from_otp\"}"), this);
         }
 
         if (path.endsWith(QLatin1String("/end"))) {
@@ -189,6 +244,12 @@ private:
 
     mutable QMutex m_mutex;
     QStringList m_paths;
+    QHash<QString, QByteArray> m_auth;
+    int m_meStatus = 200;
+    QByteArray m_meBody;
+    int m_walletStatus = 200;
+    QByteArray m_walletBody;
+    int m_logoutStatus = 204;
 };
 
 /// An `EngineSession` that records what the facade asked it to do. Engine-free by construction:
@@ -237,18 +298,44 @@ private:
             Qt::BlockingQueuedConnection);
     }
 
-    /// A real stored credential, so "leaves nothing behind" is a statement about the disk and not
-    /// about a flag. The value is a marker, never a credential.
+    /// A real stored credential, so "teardown leaves the sign-in alone" is a statement about the
+    /// disk and not about a flag. The value is a marker, never a credential.
     bool storeACredential(SeatHubClient& client, QString* pathOut)
     {
         TokenStore* store = client.credentialStore();
         store->setDirectory(m_dir->path());
-        if (!store->storeToken(TokenStore::refreshTokenName(),
+        if (!store->storeToken(TokenStore::accessTokenName(),
                                QString::fromLatin1(kPlaintextMarker))) {
             return false;
         }
-        *pathOut = store->pathFor(TokenStore::refreshTokenName());
+        *pathOut = store->pathFor(TokenStore::accessTokenName());
         return QFile::exists(*pathOut);
+    }
+
+    /// Points a fresh facade's store at the scratch directory without storing anything.
+    void isolateStore(SeatHubClient& client)
+    {
+        client.credentialStore()->setDirectory(m_dir->path());
+    }
+
+    /// The account and wallet the control plane answers for a signed-in customer.
+    static QByteArray accountBody()
+    {
+        return QByteArrayLiteral(
+            "{\"id\":\"6f1c6f5e-3a1e-4b1e-9f2e-0f1a2b3c4d5e\",\"display_name\":\"Lina\","
+            "\"username\":\"lina\",\"email\":\"lina@example.com\",\"phone_e164\":\"+962790000000\","
+            "\"role\":\"customer\",\"signup_stage\":\"complete\",\"email_verified\":true,"
+            "\"phone_verified\":true,\"created_at\":\"2026-09-01T00:00:00Z\"}");
+    }
+    static QByteArray walletBody(int minutes)
+    {
+        return QStringLiteral("{\"balance_minutes\":%1,\"updated_at\":\"2026-09-21T10:00:00Z\"}")
+            .arg(minutes).toUtf8();
+    }
+    static QByteArray refusedBody()
+    {
+        return QByteArrayLiteral(
+            "{\"error\":\"Please sign in again.\",\"reference\":\"SH-3K2XQ1\"}");
     }
 
     static QList<int> stagesSeen(const QSignalSpy& spy)
@@ -282,11 +369,17 @@ private slots:
 
     // --- the facade compiles, links and starts in the right state ------------------------------
 
-    void theFacadeLinksAndConstructsInItsSignedOutState()
+    void theFacadeLinksAndConstructsInTheRestoreState()
     {
         SeatHubClient client;
 
-        QCOMPARE(client.appState(), QStringLiteral("signed_out"));
+        // Constructed in "restoring", not "signed_out": the sign-in form must never be shown while
+        // the stored credential is being checked (CUST-08). `restoreSession()` resolves it.
+        QCOMPARE(client.appState(), QStringLiteral("restoring"));
+        QCOMPARE(client.balanceMinutes(), qint64(-1));
+        QVERIFY(client.balanceText().isEmpty());
+        QVERIFY(!client.balanceStale());
+        QVERIFY(client.identity().isEmpty());
         QCOMPARE(client.homeStatus(), QStringLiteral("ready"));
         QVERIFY(client.session() != nullptr);
         QVERIFY(client.teardown() != nullptr);
@@ -380,9 +473,11 @@ private slots:
         QVERIFY(seen.contains(static_cast<int>(TeardownStage::Done)));
         QCOMPARE(client.teardown()->stage(), TeardownStage::Done);
 
-        // STREAM-10, on the disk.
-        QVERIFY2(!QFile::exists(tokenPath), "teardown must remove the stored credential");
-        QCOMPARE(QDir(m_dir->path()).entryList(QDir::Files).size(), 0);
+        // On the disk: teardown does not sign the customer out (CUST-08). The client stores no rig,
+        // address or pairing (STREAM-10), so the credential is the only thing there, and it stays.
+        QVERIFY2(QFile::exists(tokenPath), "teardown must not remove the sign-in credential");
+        QCOMPARE(client.credentialStore()->retrieveToken(TokenStore::accessTokenName()),
+                 QString::fromLatin1(kPlaintextMarker));
 
         // The whole composite ran: the engine's signal, through the lifecycle, through the facade,
         // into the teardown controller - not just the controller on its own (tst_teardown) and not
@@ -424,7 +519,7 @@ private slots:
         QTRY_COMPARE_WITH_TIMEOUT(completed.count(), 1, 15000);
         QCOMPARE(failed.count(), 0);
         QCOMPARE(client.teardown()->stage(), TeardownStage::Done);
-        QVERIFY(!QFile::exists(firstTokenPath));
+        QVERIFY(QFile::exists(firstTokenPath));
 
         // Session two. A fresh credential on disk, and a fresh engine: the lifecycle detached the
         // first one when its session ended (the W1 fix clears `active` and disconnects there), and
@@ -456,13 +551,323 @@ private slots:
         QCOMPARE(seen.count(static_cast<int>(TeardownStage::Clear)), 2);
         QCOMPARE(seen.count(static_cast<int>(TeardownStage::Done)), 2);
 
-        QVERIFY2(!QFile::exists(secondTokenPath),
-                 "the second session must leave no credential behind either");
-        QCOMPARE(QDir(m_dir->path()).entryList(QDir::Files).size(), 0);
+        QVERIFY2(QFile::exists(secondTokenPath),
+                 "the second session must not sign the customer out either");
+        QCOMPARE(client.credentialStore()->retrieveToken(TokenStore::accessTokenName()),
+                 QString::fromLatin1(kPlaintextMarker));
 
         client.session()->attachSession(nullptr);
         delete secondEngine;
         delete engine;
+    }
+
+    // --- Phase 5 plan 02: launch, real balance, real sign-out -----------------------------------
+    //
+    // The phase tracer, driven end to end at the facade with a stubbed control plane: a stored
+    // credential is read, confirmed with GET /api/me, Home opens, the wallet is read and drawn in
+    // the hours-and-minutes format, and sign-out revokes it on the server.
+
+    void aStoredCredentialOpensHomeWithTheIdentityAndTheRealBalance()
+    {
+        SeatHubClient client;
+        QString tokenPath;
+        QVERIFY(storeACredential(client, &tokenPath));
+        // A credential of a shape a real one has, replacing the marker: the header must carry it.
+        QVERIFY(client.credentialStore()->storeToken(TokenStore::accessTokenName(),
+                                                     QStringLiteral("opaque-access-token")));
+        armControlPlane(client);
+        m_fake->answerMe(200, accountBody());
+        m_fake->answerWallet(200, walletBody(135));
+
+        QCOMPARE(client.appState(), QStringLiteral("restoring"));
+        client.restoreSession();
+
+        QTRY_COMPARE_WITH_TIMEOUT(client.appState(), QStringLiteral("home"), 15000);
+        QTRY_COMPARE_WITH_TIMEOUT(client.balanceText(), QStringLiteral("2 h 15 min"), 15000);
+
+        // Confirmed against the control plane, with the credential, before Home opened.
+        QVERIFY(m_fake->requestPaths().contains(QStringLiteral("/api/me")));
+        QCOMPARE(m_fake->authorizationFor(QStringLiteral("/api/me")),
+                 QByteArrayLiteral("Bearer opaque-access-token"));
+
+        // The identity comes from the account, and the balance is the server's number, formatted
+        // - never computed here.
+        QCOMPARE(client.identity(), QStringLiteral("+962790000000"));
+        QCOMPARE(client.account().value(QStringLiteral("display_name")).toString(),
+                 QStringLiteral("Lina"));
+        QCOMPARE(client.account().value(QStringLiteral("email")).toString(),
+                 QStringLiteral("lina@example.com"));
+        QCOMPARE(client.balanceMinutes(), qint64(135));
+        QVERIFY(!client.balanceStale());
+        QVERIFY(m_fake->requestPaths().contains(QStringLiteral("/api/wallet")));
+        QCOMPARE(m_fake->authorizationFor(QStringLiteral("/api/wallet")),
+                 QByteArrayLiteral("Bearer opaque-access-token"));
+
+        // Still stored: launching signs nobody out.
+        QVERIFY(client.credentialStore()->hasToken(TokenStore::accessTokenName()));
+    }
+
+    void restoreDoesNotShowTheSignInFormWhileTheCredentialIsBeingChecked()
+    {
+        SeatHubClient client;
+        QString tokenPath;
+        QVERIFY(storeACredential(client, &tokenPath));
+        armControlPlane(client);
+        m_fake->answerMe(200, accountBody());
+        m_fake->answerWallet(200, walletBody(5));
+
+        QStringList states;
+        QObject::connect(&client, &SeatHubClient::appStateChanged,
+                         [&client, &states]() { states.append(client.appState()); });
+
+        client.restoreSession();
+        QTRY_COMPARE_WITH_TIMEOUT(client.appState(), QStringLiteral("home"), 15000);
+
+        // restoring -> home, and never through signed_out on the way.
+        QVERIFY2(!states.contains(QStringLiteral("signed_out")),
+                 qPrintable(QStringLiteral("states seen: %1").arg(states.join(QLatin1Char(',')))));
+        QCOMPARE(states.first(), QStringLiteral("home"));
+    }
+
+    void aRefusedCredentialClearsTheStoreAndLandsOnSignIn()
+    {
+        SeatHubClient client;
+        QString tokenPath;
+        QVERIFY(storeACredential(client, &tokenPath));
+        armControlPlane(client);
+        m_fake->answerMe(401, refusedBody());
+
+        client.restoreSession();
+        QTRY_COMPARE_WITH_TIMEOUT(client.appState(), QStringLiteral("signed_out"), 15000);
+
+        QVERIFY2(!QFile::exists(tokenPath), "a credential the server refused is not kept");
+        QCOMPARE(QDir(m_dir->path()).entryList(QDir::Files).size(), 0);
+        QVERIFY(!client.controlPlane()->hasAccessToken());
+        QVERIFY(client.identity().isEmpty());
+        // Nothing to read a balance for.
+        QVERIFY(!m_fake->requestPaths().contains(QStringLiteral("/api/wallet")));
+    }
+
+    void noStoredCredentialLandsOnSignInWithoutAskingTheNetwork()
+    {
+        SeatHubClient client;
+        isolateStore(client);
+        armControlPlane(client);
+
+        client.restoreSession();
+        QCOMPARE(client.appState(), QStringLiteral("signed_out"));
+        QVERIFY(m_fake->requestPaths().isEmpty());
+    }
+
+    void anUnreachableControlPlaneKeepsTheCustomerSignedInAndOffline()
+    {
+        SeatHubClient client;
+        QString tokenPath;
+        QVERIFY(storeACredential(client, &tokenPath));
+        armControlPlane(client);
+        m_fake->answerMe(0, QByteArray());
+        m_fake->answerWallet(0, QByteArray());
+
+        client.restoreSession();
+        QTRY_COMPARE_WITH_TIMEOUT(client.appState(), QStringLiteral("home"), 15000);
+
+        // Signed in, and Home says the control plane cannot be reached rather than signing out.
+        QCOMPARE(client.homeStatus(), QStringLiteral("offline"));
+        QVERIFY2(QFile::exists(tokenPath), "a lost network must never delete the credential");
+        QVERIFY(client.controlPlane()->hasAccessToken());
+
+        // The wallet could not be read either, and no read has ever succeeded: nothing to show.
+        QTRY_VERIFY_WITH_TIMEOUT(client.balanceStale(), 15000);
+        QCOMPARE(client.balanceMinutes(), qint64(-1));
+        QVERIFY(client.balanceText().isEmpty());
+    }
+
+    void aFailedWalletReadKeepsTheLastKnownBalanceAndSignsNobodyOut()
+    {
+        SeatHubClient client;
+        QString tokenPath;
+        QVERIFY(storeACredential(client, &tokenPath));
+        armControlPlane(client);
+        m_fake->answerMe(200, accountBody());
+        m_fake->answerWallet(200, walletBody(45));
+
+        client.restoreSession();
+        QTRY_COMPARE_WITH_TIMEOUT(client.balanceText(), QStringLiteral("45 min"), 15000);
+
+        // The next read fails - a transport failure, then a 401, then a 500. None of them may blank
+        // the balance, and none of them may sign the customer out.
+        for (int status : { 0, 401, 500 }) {
+            m_fake->answerWallet(status, status == 401 ? refusedBody() : QByteArray());
+            client.refreshBalance();
+            QTRY_VERIFY_WITH_TIMEOUT(client.balanceStale(), 15000);
+
+            QCOMPARE(client.balanceText(), QStringLiteral("45 min"));
+            QCOMPARE(client.balanceMinutes(), qint64(45));
+            QCOMPARE(client.appState(), QStringLiteral("home"));
+            QVERIFY(QFile::exists(tokenPath));
+
+            // And a later good read clears the label and takes the new number.
+            m_fake->answerWallet(200, walletBody(45));
+            client.refreshBalance();
+            QTRY_VERIFY_WITH_TIMEOUT(!client.balanceStale(), 15000);
+        }
+
+        m_fake->answerWallet(200, walletBody(60));
+        client.refreshBalance();
+        QTRY_COMPARE_WITH_TIMEOUT(client.balanceText(), QStringLiteral("1 h 00 min"), 15000);
+    }
+
+    void signInByCodeStoresTheCredentialInTheAccessSlotAndReadsTheBalance()
+    {
+        SeatHubClient client;
+        isolateStore(client);
+        armControlPlane(client);
+        m_fake->answerWallet(200, walletBody(90));
+
+        client.verifyOtp(QStringLiteral("+962790000000"), QStringLiteral("123456"));
+        QTRY_COMPARE_WITH_TIMEOUT(client.appState(), QStringLiteral("home"), 15000);
+
+        QCOMPARE(client.credentialStore()->retrieveToken(TokenStore::accessTokenName()),
+                 QStringLiteral("sb_at_from_otp"));
+        QVERIFY(!client.credentialStore()->hasToken(TokenStore::refreshTokenName()));
+        QTRY_COMPARE_WITH_TIMEOUT(client.balanceText(), QStringLiteral("1 h 30 min"), 15000);
+        QCOMPARE(m_fake->authorizationFor(QStringLiteral("/api/wallet")),
+                 QByteArrayLiteral("Bearer sb_at_from_otp"));
+    }
+
+    void signOutRevokesOnTheServerThenClearsTheStore()
+    {
+        SeatHubClient client;
+        QString tokenPath;
+        QVERIFY(storeACredential(client, &tokenPath));
+        QVERIFY(client.credentialStore()->storeToken(TokenStore::accessTokenName(),
+                                                     QStringLiteral("opaque-access-token")));
+        armControlPlane(client);
+        m_fake->answerMe(200, accountBody());
+        m_fake->answerWallet(200, walletBody(135));
+
+        client.restoreSession();
+        QTRY_COMPARE_WITH_TIMEOUT(client.balanceText(), QStringLiteral("2 h 15 min"), 15000);
+
+        client.signOut();
+
+        // The revoke was attempted, with the credential, on the documented route.
+        QTRY_VERIFY_WITH_TIMEOUT(m_fake->requestPaths().contains(QStringLiteral("/api/auth/logout")),
+                                 15000);
+        QCOMPARE(m_fake->authorizationFor(QStringLiteral("/api/auth/logout")),
+                 QByteArrayLiteral("Bearer opaque-access-token"));
+
+        // And nothing usable is left anywhere.
+        QCOMPARE(client.appState(), QStringLiteral("signed_out"));
+        QVERIFY(client.identity().isEmpty());
+        QVERIFY(client.account().isEmpty());
+        QCOMPARE(client.balanceMinutes(), qint64(-1));
+        QVERIFY(client.balanceText().isEmpty());
+        QVERIFY(!QFile::exists(tokenPath));
+        QCOMPARE(QDir(m_dir->path()).entryList(QDir::Files).size(), 0);
+        QTRY_VERIFY_WITH_TIMEOUT(!client.controlPlane()->hasAccessToken(), 15000);
+    }
+
+    void signOutStillClearsEverythingWhenTheServerCannotBeReached()
+    {
+        SeatHubClient client;
+        QString tokenPath;
+        QVERIFY(storeACredential(client, &tokenPath));
+        armControlPlane(client);
+        m_fake->answerMe(200, accountBody());
+        m_fake->answerWallet(200, walletBody(20));
+        m_fake->answerLogout(0);
+
+        client.restoreSession();
+        QTRY_COMPARE_WITH_TIMEOUT(client.balanceText(), QStringLiteral("20 min"), 15000);
+
+        client.signOut();
+
+        QTRY_VERIFY_WITH_TIMEOUT(m_fake->requestPaths().contains(QStringLiteral("/api/auth/logout")),
+                                 15000);
+        QCOMPARE(client.appState(), QStringLiteral("signed_out"));
+        QVERIFY2(!QFile::exists(tokenPath),
+                 "an offline sign-out still removes the credential from this machine");
+        QCOMPARE(QDir(m_dir->path()).entryList(QDir::Files).size(), 0);
+        // The reply failed and the in-memory copy is still dropped once it arrives.
+        QTRY_VERIFY_WITH_TIMEOUT(!client.controlPlane()->hasAccessToken(), 15000);
+
+        // A wallet answer that lands after sign-out is not the next customer's to see.
+        QVERIFY(client.balanceText().isEmpty());
+    }
+
+    void aSessionThatEndsHandsTheSignedInCustomerBackToHomeAndRereadsTheBalance()
+    {
+        // The return to Home after a stream reads the wallet again (CUST-06), and the credential
+        // is still stored - so the next launch opens on Home too (CUST-08).
+        SeatHubClient client;
+        QString tokenPath;
+        QVERIFY(storeACredential(client, &tokenPath));
+        auto* engine = new FakeEngineSession;
+        client.session()->attachSession(engine);
+        armControlPlane(client);
+        m_fake->answerMe(200, accountBody());
+        m_fake->answerWallet(200, walletBody(40));
+
+        client.restoreSession();
+        QTRY_COMPARE_WITH_TIMEOUT(client.balanceText(), QStringLiteral("40 min"), 15000);
+
+        // The stream ran and used fifteen minutes; only the server knows that.
+        m_fake->answerWallet(200, walletBody(25));
+        QVERIFY(client.session()->start(nullptr));
+        emit engine->connectionStarted();
+        QCOMPARE(client.appState(), QStringLiteral("streaming"));
+        emit engine->sessionFinished(0);
+        emit engine->readyForDeletion();
+
+        QCOMPARE(client.appState(), QStringLiteral("home"));
+        QTRY_COMPARE_WITH_TIMEOUT(client.balanceText(), QStringLiteral("25 min"), 15000);
+        QVERIFY2(QFile::exists(tokenPath), "playing once must not sign the customer out");
+
+        client.session()->attachSession(nullptr);
+        delete engine;
+    }
+
+    // --- the one hours-and-minutes formatter (OD-01) ---------------------------------------------
+
+    void durationText_isHoursAndMinutesAndNeverARawMinuteCount_data()
+    {
+        QTest::addColumn<qint64>("minutes");
+        QTest::addColumn<QString>("plain");
+        QTest::addColumn<QString>("signedText");
+
+        QTest::newRow("zero") << qint64(0) << QStringLiteral("0 min") << QStringLiteral("0 min");
+        QTest::newRow("under an hour") << qint64(45) << QStringLiteral("45 min")
+                                       << QStringLiteral("+45 min");
+        QTest::newRow("one minute") << qint64(1) << QStringLiteral("1 min")
+                                    << QStringLiteral("+1 min");
+        QTest::newRow("59 minutes") << qint64(59) << QStringLiteral("59 min")
+                                    << QStringLiteral("+59 min");
+        QTest::newRow("a whole hour keeps its minutes") << qint64(60) << QStringLiteral("1 h 00 min")
+                                                        << QStringLiteral("+1 h 00 min");
+        QTest::newRow("three whole hours") << qint64(180) << QStringLiteral("3 h 00 min")
+                                           << QStringLiteral("+3 h 00 min");
+        QTest::newRow("two and a quarter") << qint64(135) << QStringLiteral("2 h 15 min")
+                                           << QStringLiteral("+2 h 15 min");
+        QTest::newRow("minutes are two digits from one hour up") << qint64(65)
+                                                                 << QStringLiteral("1 h 05 min")
+                                                                 << QStringLiteral("+1 h 05 min");
+        QTest::newRow("a long balance") << qint64(6000) << QStringLiteral("100 h 00 min")
+                                        << QStringLiteral("+100 h 00 min");
+        QTest::newRow("a debit") << qint64(-45) << QStringLiteral("-45 min")
+                                 << QStringLiteral("-45 min");
+        QTest::newRow("a debit over an hour") << qint64(-65) << QStringLiteral("-1 h 05 min")
+                                              << QStringLiteral("-1 h 05 min");
+    }
+
+    void durationText_isHoursAndMinutesAndNeverARawMinuteCount()
+    {
+        QFETCH(qint64, minutes);
+        QFETCH(QString, plain);
+        QFETCH(QString, signedText);
+
+        QCOMPARE(durationText(minutes), plain);
+        QCOMPARE(signedDurationText(minutes), signedText);
     }
 };
 

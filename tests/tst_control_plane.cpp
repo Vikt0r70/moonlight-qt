@@ -16,6 +16,8 @@
 
 #include <QtTest>
 #include <QBuffer>
+#include <QDir>
+#include <QFile>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QNetworkAccessManager>
@@ -83,6 +85,8 @@ public:
     QString lastPath;
     QByteArray lastMethod;
     QNetworkRequest lastRequest;
+    /// Every path asked for, in order - for the assertion that a route was never built.
+    QStringList paths;
 
 protected:
     QNetworkReply* createRequest(Operation op, const QNetworkRequest& request,
@@ -90,6 +94,7 @@ protected:
     {
         Q_UNUSED(op);
         lastPath = request.url().path(QUrl::FullyEncoded);
+        paths.append(lastPath);
         lastRequest = request;
         lastMethod = outgoingData ? QByteArrayLiteral("POST") : QByteArrayLiteral("GET");
         if (outgoingData) {
@@ -611,9 +616,321 @@ private slots:
         QCOMPARE(create.value(QStringLiteral("quality_profile")).toString(),
                  QStringLiteral("1080p120"));
 
-        const QJsonObject refresh = QJsonDocument::fromJson(
-            ControlPlaneClient::buildRefreshRequest(QStringLiteral("r"))).object();
-        QCOMPARE(refresh.value(QStringLiteral("refresh_token")).toString(), QStringLiteral("r"));
+        const QJsonObject login = QJsonDocument::fromJson(
+            ControlPlaneClient::buildLogin(QStringLiteral("someone@example.com"),
+                                           QStringLiteral("a password"))).object();
+        QCOMPARE(login.value(QStringLiteral("identifier")).toString(),
+                 QStringLiteral("someone@example.com"));
+        QCOMPARE(login.value(QStringLiteral("password")).toString(), QStringLiteral("a password"));
+        QCOMPARE(login.size(), 2);
+    }
+
+    // --- Phase 5 plan 02: the launch, balance, sign-out and password routes ------------------
+
+    void fetchMe_getsTheDocumentedRouteWithTheCredentialAndParsesTheAccount()
+    {
+        ControlPlaneClient client;
+        auto* fake = new FakeNetworkAccessManager;
+        client.setNetworkAccessManager(fake);
+        client.setAccessToken(QStringLiteral("opaque-access-token"));
+        fake->status = 200;
+        fake->body = QByteArrayLiteral(
+            "{\"id\":\"6f1c6f5e-3a1e-4b1e-9f2e-0f1a2b3c4d5e\",\"display_name\":\"Lina\","
+            "\"username\":\"lina\",\"email\":\"lina@example.com\",\"phone_e164\":\"+962790000000\","
+            "\"role\":\"customer\",\"signup_stage\":\"complete\",\"email_verified\":true,"
+            "\"phone_verified\":true,\"created_at\":\"2026-09-01T00:00:00Z\"}");
+
+        ControlPlaneResult captured;
+        bool called = false;
+        client.fetchMe([&](const ControlPlaneResult& result) {
+            captured = result;
+            called = true;
+        });
+        QTRY_VERIFY(called);
+
+        QCOMPARE(fake->lastPath, QStringLiteral("/api/me"));
+        QCOMPARE(fake->lastMethod, QByteArrayLiteral("GET"));
+        QCOMPARE(fake->lastRequest.rawHeader("Authorization"),
+                 QByteArrayLiteral("Bearer opaque-access-token"));
+
+        QVERIFY(captured.ok);
+        AccountInfo account;
+        QVERIFY(AccountInfo::parse(captured.body, &account));
+        QCOMPARE(account.id, QStringLiteral("6f1c6f5e-3a1e-4b1e-9f2e-0f1a2b3c4d5e"));
+        QCOMPARE(account.displayName, QStringLiteral("Lina"));
+        QCOMPARE(account.username, QStringLiteral("lina"));
+        QCOMPARE(account.email, QStringLiteral("lina@example.com"));
+        QCOMPARE(account.phoneE164, QStringLiteral("+962790000000"));
+        QVERIFY(account.emailVerified);
+    }
+
+    void accountParse_needsOnlyAnId()
+    {
+        // A phone-only account has no username and no email; that is a normal account.
+        QJsonObject minimal;
+        minimal.insert(QStringLiteral("id"), QStringLiteral("abc"));
+        AccountInfo account;
+        QVERIFY(AccountInfo::parse(minimal, &account));
+        QCOMPARE(account.id, QStringLiteral("abc"));
+        QVERIFY(account.email.isEmpty());
+        QVERIFY(account.username.isEmpty());
+        QVERIFY(!account.emailVerified);
+
+        // Null members (the schema's nullable username/email/phone) read as empty, not as text.
+        QJsonObject nulls = minimal;
+        nulls.insert(QStringLiteral("username"), QJsonValue::Null);
+        nulls.insert(QStringLiteral("email"), QJsonValue::Null);
+        QVERIFY(AccountInfo::parse(nulls, &account));
+        QVERIFY(account.username.isEmpty());
+
+        // Without an id there is no account.
+        QVERIFY(!AccountInfo::parse(QJsonObject(), &account));
+        QJsonObject emptyId;
+        emptyId.insert(QStringLiteral("id"), QString());
+        QVERIFY(!AccountInfo::parse(emptyId, &account));
+    }
+
+    void fetchMe_withoutACredential_attachesNoAuthorizationHeader()
+    {
+        ControlPlaneClient client;
+        auto* fake = new FakeNetworkAccessManager;
+        client.setNetworkAccessManager(fake);
+        fake->status = 401;
+        fake->body = refusedBody(QStringLiteral("Please sign in again."), QStringLiteral("SH-3K2XQ1"));
+
+        ControlPlaneResult captured;
+        bool called = false;
+        client.fetchMe([&](const ControlPlaneResult& result) {
+            captured = result;
+            called = true;
+        });
+        QTRY_VERIFY(called);
+
+        QVERIFY2(fake->lastRequest.rawHeader("Authorization").isEmpty(),
+                 "no credential means no Authorization header, never an empty Bearer");
+        QVERIFY(!captured.ok);
+        QCOMPARE(captured.statusCode, 401);
+        QCOMPARE(captured.toFailure().kind, FailureKind::Auth);
+    }
+
+    void fetchWallet_getsTheDocumentedRouteWithTheCredentialAndParsesTheBalance()
+    {
+        ControlPlaneClient client;
+        auto* fake = new FakeNetworkAccessManager;
+        client.setNetworkAccessManager(fake);
+        client.setAccessToken(QStringLiteral("opaque-access-token"));
+        fake->status = 200;
+        fake->body = QByteArrayLiteral(
+            "{\"balance_minutes\":135,\"updated_at\":\"2026-09-21T10:00:00Z\"}");
+
+        ControlPlaneResult captured;
+        bool called = false;
+        client.fetchWallet([&](const ControlPlaneResult& result) {
+            captured = result;
+            called = true;
+        });
+        QTRY_VERIFY(called);
+
+        QCOMPARE(fake->lastPath, QStringLiteral("/api/wallet"));
+        QCOMPARE(fake->lastMethod, QByteArrayLiteral("GET"));
+        QCOMPARE(fake->lastRequest.rawHeader("Authorization"),
+                 QByteArrayLiteral("Bearer opaque-access-token"));
+
+        QVERIFY(captured.ok);
+        WalletInfo wallet;
+        QVERIFY(WalletInfo::parse(captured.body, &wallet));
+        QCOMPARE(wallet.balanceMinutes, qint64(135));
+        QCOMPARE(wallet.updatedAt, QStringLiteral("2026-09-21T10:00:00Z"));
+    }
+
+    void walletParse_neverInventsABalance()
+    {
+        WalletInfo wallet;
+
+        // Zero is a real balance and parses as zero...
+        QJsonObject zero;
+        zero.insert(QStringLiteral("balance_minutes"), 0);
+        QVERIFY(WalletInfo::parse(zero, &wallet));
+        QCOMPARE(wallet.balanceMinutes, qint64(0));
+
+        // ...but a body that has no balance is not zero, and neither is one that is not a number.
+        QVERIFY(!WalletInfo::parse(QJsonObject(), &wallet));
+        QJsonObject text;
+        text.insert(QStringLiteral("balance_minutes"), QStringLiteral("135"));
+        QVERIFY(!WalletInfo::parse(text, &wallet));
+        QJsonObject nul;
+        nul.insert(QStringLiteral("balance_minutes"), QJsonValue::Null);
+        QVERIFY(!WalletInfo::parse(nul, &wallet));
+        // The schema says `ge: 0`; a negative one is a broken body, not a debt to display.
+        QJsonObject negative;
+        negative.insert(QStringLiteral("balance_minutes"), -5);
+        QVERIFY(!WalletInfo::parse(negative, &wallet));
+    }
+
+    void logout_postsWithTheCredentialAndA204IsSuccess()
+    {
+        ControlPlaneClient client;
+        auto* fake = new FakeNetworkAccessManager;
+        client.setNetworkAccessManager(fake);
+        client.setAccessToken(QStringLiteral("opaque-access-token"));
+        fake->status = 204;
+        fake->body = QByteArray();
+
+        ControlPlaneResult captured;
+        bool called = false;
+        client.logout([&](const ControlPlaneResult& result) {
+            captured = result;
+            called = true;
+        });
+        QTRY_VERIFY(called);
+
+        QCOMPARE(fake->lastPath, QStringLiteral("/api/auth/logout"));
+        QCOMPARE(fake->lastMethod, QByteArrayLiteral("POST"));
+        QCOMPARE(fake->lastRequest.rawHeader("Authorization"),
+                 QByteArrayLiteral("Bearer opaque-access-token"));
+        QVERIFY2(captured.ok, "204 No Content is the documented success for logout");
+        QCOMPARE(captured.statusCode, 204);
+    }
+
+    void logout_aRefusalOrAnUnreachableServerIsAFailureTheCallerCanIgnore()
+    {
+        ControlPlaneClient client;
+        auto* fake = new FakeNetworkAccessManager;
+        client.setNetworkAccessManager(fake);
+        client.setAccessToken(QStringLiteral("opaque-access-token"));
+
+        for (int status : { 401, 500, 0 }) {
+            fake->status = status;
+            fake->body = QByteArray();
+            ControlPlaneResult captured;
+            bool called = false;
+            client.logout([&](const ControlPlaneResult& result) {
+                captured = result;
+                called = true;
+            });
+            QTRY_VERIFY(called);
+            QVERIFY2(!captured.ok, qPrintable(QString::number(status)));
+            QCOMPARE(captured.statusCode, status);
+        }
+    }
+
+    void classify_only204MayCarryNoBody()
+    {
+        QVERIFY(ControlPlaneClient::classify(204, QByteArray()).ok);
+        // The HR-02 rule stands for every other 2xx: no body is no evidence of success.
+        QVERIFY(!ControlPlaneClient::classify(200, QByteArray()).ok);
+        QVERIFY(!ControlPlaneClient::classify(202, QByteArray()).ok);
+    }
+
+    void login_postsUnauthenticatedAndParsesABodyWithOnlyAnAccessToken()
+    {
+        ControlPlaneClient client;
+        auto* fake = new FakeNetworkAccessManager;
+        client.setNetworkAccessManager(fake);
+        // A credential is present on the client - login must not send it (it is how you get one).
+        client.setAccessToken(QStringLiteral("a-stale-credential"));
+        fake->status = 200;
+        fake->body = QByteArrayLiteral("{\"access_token\":\"sb_at_permanent\"}");
+
+        ControlPlaneResult captured;
+        bool called = false;
+        client.login(QStringLiteral("lina@example.com"), QStringLiteral("hunter2"),
+                     [&](const ControlPlaneResult& result) {
+                         captured = result;
+                         called = true;
+                     });
+        QTRY_VERIFY(called);
+
+        QCOMPARE(fake->lastPath, QStringLiteral("/api/auth/login"));
+        QCOMPARE(fake->lastMethod, QByteArrayLiteral("POST"));
+        QVERIFY2(fake->lastRequest.rawHeader("Authorization").isEmpty(),
+                 "login is unauthenticated: no credential may be attached");
+
+        QVERIFY(captured.ok);
+        AuthTokenPair pair;
+        QVERIFY2(AuthTokenPair::parse(captured.body, &pair),
+                 "ADR-0050: the body carries one access token and nothing else");
+        QCOMPARE(pair.accessToken, QStringLiteral("sb_at_permanent"));
+        QVERIFY(pair.refreshToken.isEmpty());
+    }
+
+    void login_aRefusalKeepsTheServersOwnSentence()
+    {
+        ControlPlaneClient client;
+        auto* fake = new FakeNetworkAccessManager;
+        client.setNetworkAccessManager(fake);
+        fake->status = 401;
+        fake->body = refusedBody(QStringLiteral("That password isn't right."),
+                                 QStringLiteral("SH-4F7KQ2"));
+
+        ControlPlaneResult captured;
+        bool called = false;
+        client.login(QStringLiteral("lina@example.com"), QStringLiteral("wrong"),
+                     [&](const ControlPlaneResult& result) {
+                         captured = result;
+                         called = true;
+                     });
+        QTRY_VERIFY(called);
+
+        QVERIFY(!captured.ok);
+        QCOMPARE(captured.error, QStringLiteral("That password isn't right."));
+        QCOMPARE(captured.reference, QStringLiteral("SH-4F7KQ2"));
+    }
+
+    void theRetiredRefreshRouteIsNeverBuilt()
+    {
+        // ADR-0050 made sessions permanent: there is no refresh token and no refresh request. The
+        // route is gone from the client, and this proves it two ways - the sources do not name it,
+        // and no public call the client makes ever reaches it.
+        QDir dir(QCoreApplication::applicationDirPath());
+        QString sourceDir;
+        for (int depth = 0; depth < 8 && sourceDir.isEmpty(); ++depth) {
+            const QString candidate = dir.filePath(QStringLiteral("app/seathub"));
+            if (QFile::exists(candidate + QStringLiteral("/control_plane_client.h"))) {
+                sourceDir = candidate;
+            }
+            else if (!dir.cdUp()) {
+                break;
+            }
+        }
+        QVERIFY2(!sourceDir.isEmpty(), "app/seathub could not be located from the test binary");
+        for (const QString& name : { QStringLiteral("control_plane_client.h"),
+                                     QStringLiteral("control_plane_client.cpp") }) {
+            QFile file(sourceDir + QLatin1Char('/') + name);
+            QVERIFY2(file.open(QIODevice::ReadOnly), qPrintable(name));
+            const QString text = QString::fromUtf8(file.readAll());
+            QVERIFY2(!text.contains(QStringLiteral("auth/refresh")),
+                     qPrintable(name + QStringLiteral(" still names the refresh route")));
+            QVERIFY2(!text.contains(QStringLiteral("buildRefreshRequest")),
+                     qPrintable(name + QStringLiteral(" still has the refresh request builder")));
+        }
+
+        ControlPlaneClient client;
+        auto* fake = new FakeNetworkAccessManager;
+        client.setNetworkAccessManager(fake);
+        client.setAccessToken(QStringLiteral("opaque-access-token"));
+        fake->status = 200;
+        fake->body = okBody();
+
+        int completed = 0;
+        const ControlPlaneClient::Callback done = [&](const ControlPlaneResult&) { ++completed; };
+        client.requestOtp(QStringLiteral("+962790000000"), done);
+        client.verifyOtp(QStringLiteral("+962790000000"), QStringLiteral("123456"), done);
+        client.login(QStringLiteral("a@b.co"), QStringLiteral("pw"), done);
+        client.logout(done);
+        client.fetchMe(done);
+        client.fetchWallet(done);
+        client.requestSession(QStringLiteral("1080p60"), done);
+        client.fetchSession(QStringLiteral("s"), done);
+        client.fetchSessionAuthorization(QStringLiteral("s"), done);
+        client.postLiveness(QStringLiteral("s"), QStringLiteral("streaming"), QString(), done);
+        client.endSession(QStringLiteral("s"), done);
+        QTRY_COMPARE(completed, 11);
+
+        for (const QString& path : fake->paths) {
+            QVERIFY2(!path.contains(QStringLiteral("refresh")),
+                     qPrintable(QStringLiteral("a request was built for %1").arg(path)));
+        }
     }
 
     void tokenPair_parsesTheSignInResponse()

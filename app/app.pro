@@ -210,6 +210,7 @@ SOURCES += \
     seathub/agent_config.cpp \
     seathub/hud_overlay.cpp \
     seathub/control_plane_client.cpp \
+    seathub/duration_text.cpp \
     seathub/token_store.cpp \
     seathub/session_websocket.cpp \
     seathub/pairing_controller.cpp \
@@ -265,6 +266,7 @@ HEADERS += \
     seathub/agent_config.h \
     seathub/hud_overlay.h \
     seathub/control_plane_client.h \
+    seathub/duration_text.h \
     seathub/token_store.h \
     seathub/session_websocket.h \
     seathub/pairing_controller.h \

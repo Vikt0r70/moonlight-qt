@@ -6,9 +6,13 @@
  *   1. The order. Disable, then remove, then verify - never removal first, because removing the
  *      record does not stop a live stream (Pitfall 5). The controller encodes the order as a
  *      stage enum it advances through, so the property is enforced rather than commented.
- *   2. Nothing is left behind. STREAM-10 ends with "the client keeps no stored rig, address or
- *      pairing of its own", and the DPAPI store is where such a thing would survive - so the
- *      test stores a real token, runs teardown, and checks the file is gone.
+ *   2. Teardown does not sign the customer out. STREAM-10 ends with "the client keeps no stored
+ *      rig, address or pairing of its own", which holds because the client stores none of the
+ *      three; the one thing the DPAPI store does hold is the sign-in credential, and CUST-08 (a
+ *      customer who plays once is still signed in at the next launch) makes teardown leave it
+ *      alone. The test stores a real token, runs teardown, and checks it is intact. (Until Phase 5
+ *      plan 02 this case asserted the opposite - teardown deleted the credential - which signed
+ *      every customer out after their first session.)
  *****************************************************************************/
 
 #include <QtTest>
@@ -27,6 +31,7 @@
 
 #include "seathub/teardown_controller.h"
 #include "seathub/teardown_guard.h"
+#include "seathub/token_store.h"
 
 namespace {
 
@@ -182,14 +187,13 @@ private slots:
         client->setNetworkAccessManager(fake);
         controller.setControlPlane(client);
 
+        // The customer's stored sign-in credential. Teardown must leave it alone (CUST-08): a
+        // customer who plays once is still signed in at the next launch.
         TokenStore store;
         store.setDirectory(m_dir->path());
-        controller.setTokenStore(&store);
-
-        // A real stored credential, so "leaves nothing behind" is a statement about the disk.
-        QVERIFY(store.storeToken(TokenStore::refreshTokenName(),
-                                 QStringLiteral("sb_rt_PLAINTEXT-MARKER-4F7K")));
-        const QString tokenPath = store.pathFor(TokenStore::refreshTokenName());
+        QVERIFY(store.storeToken(TokenStore::accessTokenName(),
+                                 QStringLiteral("sb_at_SIGN-IN-MUST-SURVIVE")));
+        const QString tokenPath = store.pathFor(TokenStore::accessTokenName());
         QVERIFY(QFile::exists(tokenPath));
 
         // POST /end, then the verification polls: still ENDING once, then terminal.
@@ -228,9 +232,11 @@ private slots:
         QVERIFY(seen.contains(static_cast<int>(TeardownStage::Clear)));
         QVERIFY(seen.contains(static_cast<int>(TeardownStage::Done)));
 
-        // STREAM-10, on the disk: nothing of this client survives.
-        QVERIFY2(!QFile::exists(tokenPath), "teardown must remove the stored credential");
-        QCOMPARE(QDir(m_dir->path()).entryList(QDir::Files).size(), 0);
+        // On the disk: teardown removes no rig, address or pairing (this client stores none), and it
+        // does not sign the customer out. The credential is exactly as it was.
+        QVERIFY2(QFile::exists(tokenPath), "teardown must not remove the sign-in credential");
+        QCOMPARE(store.retrieveToken(TokenStore::accessTokenName()),
+                 QStringLiteral("sb_at_SIGN-IN-MUST-SURVIVE"));
         QCOMPARE(controller.stage(), TeardownStage::Done);
     }
 
@@ -387,7 +393,6 @@ private slots:
 
         TokenStore store;
         store.setDirectory(m_dir->path());
-        controller.setTokenStore(&store);
 
         controller.setVerifyIntervalMs(1);
 
@@ -395,9 +400,9 @@ private slots:
             QString(QStringLiteral("/api/sessions/%1/end").arg(QLatin1String(kSessionId)));
 
         // --- session one, driven to its end
-        QVERIFY(store.storeToken(TokenStore::refreshTokenName(),
-                                 QStringLiteral("sb_rt_SESSION-ONE")));
-        const QString tokenPath = store.pathFor(TokenStore::refreshTokenName());
+        QVERIFY(store.storeToken(TokenStore::accessTokenName(),
+                                 QStringLiteral("sb_at_SESSION-ONE")));
+        const QString tokenPath = store.pathFor(TokenStore::accessTokenName());
         QVERIFY(QFile::exists(tokenPath));
 
         fake->statuses = { 202, 200 };
@@ -413,7 +418,7 @@ private slots:
         QTRY_COMPARE(firstCompleted.count(), 1);
 
         QCOMPARE(fake->paths.count(endPath), 1);
-        QVERIFY2(!QFile::exists(tokenPath), "session one must leave nothing behind");
+        QVERIFY2(QFile::exists(tokenPath), "session one must not sign the customer out");
 
         // The sticky state the old guard read. Asserting it is the point: it is the fact that made
         // a stage-based guard wrong, and nothing between two sessions resets it.
@@ -424,19 +429,20 @@ private slots:
         QVERIFY2(guard.markStarted(),
                  "the second session must be allowed to tear down even though the stage is Done");
 
-        QVERIFY(store.storeToken(TokenStore::refreshTokenName(),
-                                 QStringLiteral("sb_rt_SESSION-TWO")));
-        QVERIFY(QFile::exists(tokenPath));
+        // The credential is still there for session two - and it is the one a sign-in would have
+        // left, not a stale one.
+        QCOMPARE(store.retrieveToken(TokenStore::accessTokenName()),
+                 QStringLiteral("sb_at_SESSION-ONE"));
 
         QSignalSpy secondCompleted(&controller, &TeardownController::teardownCompleted);
         controller.teardown(QString::fromLatin1(kSessionId), QString::fromLatin1(kClientUuid));
         QTRY_COMPARE(secondCompleted.count(), 1);
 
         // The authorisation is not decoration on a path that then refuses: the request went out,
-        // and the store was cleared a second time.
+        // and the second teardown ran to its end too.
         QCOMPARE(fake->paths.count(endPath), 2);
-        QVERIFY2(!QFile::exists(tokenPath),
-                 "STREAM-10: the second session must clear the store too");
+        QVERIFY2(QFile::exists(tokenPath),
+                 "the second teardown must not sign the customer out either");
 
         // And the flag is claimed exactly once, so a duplicate cannot re-run a teardown.
         QVERIFY2(!guard.markStarted(), "a session's teardown is claimed exactly once");

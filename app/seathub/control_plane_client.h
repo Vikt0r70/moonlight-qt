@@ -11,11 +11,14 @@
 // on the control-plane contract at all. `COVERAGE.md` is explicit: "The client (fork)
 // itself never calls any of these endpoints directly - all seven are Node Agent-only."
 //
-// The routes this client does own (`docs/spec/openapi.yaml`, version 1.6.0):
+// The routes this client does own (`docs/spec/openapi.yaml`, version 1.8.0):
 //
 //   POST /api/auth/otp/request                 sign-in step 1
 //   POST /api/auth/otp/verify                  sign-in step 2            -> TokenPair
-//   POST /api/auth/refresh                     rotate a refresh token    -> TokenPair
+//   POST /api/auth/login                       email/phone + password    -> TokenPair
+//   POST /api/auth/logout                      revoke the credential     -> 204
+//   GET  /api/me                               who the credential is     -> Account
+//   GET  /api/wallet                           the balance in minutes    -> Wallet
 //   POST /api/sessions                         Play (D-35)               -> Session
 //   GET  /api/sessions/{session_id}            state + billing facts     -> Session
 //   GET  /api/sessions/{session_id}/pairing    the session authorization -> SessionAuthorization
@@ -121,7 +124,9 @@ struct SessionInfo
     static bool parse(const QJsonObject& body, SessionInfo* out);
 };
 
-/// `TokenPair` - the bearer credentials sign-in and refresh return (ADR-0014).
+/// `TokenPair` - the bearer credential sign-in returns. ADR-0050 made sessions permanent, so the
+/// control plane sends one non-expiring `access_token` and nothing else; the refresh and expiry
+/// members below stay optional only so a body from an older server still parses.
 struct AuthTokenPair
 {
     QString accessToken;
@@ -130,6 +135,34 @@ struct AuthTokenPair
     QString refreshExpiresAt;
 
     static bool parse(const QJsonObject& body, AuthTokenPair* out);
+};
+
+/// `GET /api/me` (`Account`) - who the stored credential belongs to. Read at launch to confirm
+/// the credential is still valid and to fill the signed-in identity. Only `id` is required; every
+/// other member is carried when present and empty when not (an account may have no username, no
+/// email or no phone).
+struct AccountInfo
+{
+    QString id;
+    QString displayName;
+    QString username;
+    QString email;
+    QString phoneE164;
+    bool emailVerified = false;
+
+    static bool parse(const QJsonObject& body, AccountInfo* out);
+};
+
+/// `GET /api/wallet` (`Wallet`) - the customer's balance. The number is the server's; the client
+/// formats it (`duration_text.h`) and does no arithmetic on it (`docs/spec/client.md` §Wallet
+/// authority).
+struct WalletInfo
+{
+    /// Whole minutes, never negative on the wire.
+    qint64 balanceMinutes = 0;
+    QString updatedAt;
+
+    static bool parse(const QJsonObject& body, WalletInfo* out);
 };
 
 class ControlPlaneClient : public QObject
@@ -178,7 +211,9 @@ public:
 
     static QByteArray buildOtpRequest(const QString& phoneE164);
     static QByteArray buildOtpVerify(const QString& phoneE164, const QString& code);
-    static QByteArray buildRefreshRequest(const QString& refreshToken);
+    /// `LoginRequest`: `{identifier, password}`. The identifier is what the customer typed (an
+    /// email or an E.164 phone number); the control plane decides which it is.
+    static QByteArray buildLogin(const QString& identifier, const QString& password);
     static QByteArray buildSessionCreate(const QString& qualityProfile);
     /// The liveness body is optional and additive (ADR-0041, D-34). An empty `state` and an
     /// empty `error_code` produce the pre-1.6.0 empty body, which is still a valid report.
@@ -243,7 +278,22 @@ public:
 
     void requestOtp(const QString& phoneE164, Callback callback);
     void verifyOtp(const QString& phoneE164, const QString& code, Callback callback);
-    void refresh(const QString& refreshToken, Callback callback);
+
+    /// `POST /api/auth/login`. Unauthenticated: no credential is attached. Returns `TokenPair`.
+    /// Called by the sign-in screen's password step; wired and tested here so that screen has a
+    /// real method to call.
+    void login(const QString& identifier, const QString& password, Callback callback);
+
+    /// `POST /api/auth/logout`. Authenticated, empty body; the server revokes the presented
+    /// credential and answers 204, which is success (it has no body to classify).
+    void logout(Callback callback);
+
+    /// `GET /api/me`. Authenticated. `Account`.
+    void fetchMe(Callback callback);
+
+    /// `GET /api/wallet`. Authenticated. `Wallet`.
+    void fetchWallet(Callback callback);
+
     void requestSession(const QString& qualityProfile, Callback callback);
     void fetchSession(const QString& sessionId, Callback callback);
     void fetchSessionAuthorization(const QString& sessionId, Callback callback);

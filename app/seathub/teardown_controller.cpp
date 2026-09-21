@@ -33,7 +33,6 @@ const char* kStateFailed = "failed";
 const char* kTeardownTimeout = "TEARDOWN_TIMEOUT";
 const char* kTeardownTimeoutSentence = "The rig didn't finish closing the session. Support can see it.";
 const char* kTeardownFailedSentence = "We couldn't close the session cleanly. Support can see it.";
-const char* kStillStoredSentence = "Something was left behind on this PC. Support can see it.";
 
 QString stateForStage(TeardownStage stage)
 {
@@ -78,11 +77,6 @@ bool TeardownController::onOwnThread() const
     // which case there is no queue left to hand work to and running here is the only option.
     QThread* owner = thread();
     return owner == nullptr || owner == QThread::currentThread();
-}
-
-void TeardownController::setTokenStore(TokenStore* store)
-{
-    m_store = store;
 }
 
 void TeardownController::setTeardownGraceMs(int milliseconds)
@@ -276,17 +270,18 @@ void TeardownController::handleVerifyResult(const ControlPlaneResult& result)
     }
 
     // Step 4: leave nothing behind. STREAM-10 - "the client keeps no stored rig, address or
-    // pairing of its own" - so every credential this client holds is removed, and teardown does
-    // not report success while anything survives.
+    // pairing of its own" - is what this stage stands for, and it holds by construction: the
+    // client's only stored data is the customer's sign-in credential (`TokenStore`), the rig, its
+    // address and the pairing live in the engine's session and are dropped with it, and nothing of
+    // them is ever written to disk here.
+    //
+    // This stage used to sweep the token store as well ("every credential this client holds is
+    // removed"). That was written before ADR-0050 made sessions permanent, and it means a customer
+    // who plays once is signed out at the next launch - the opposite of CUST-08. The credential is
+    // the customer's sign-in, not a session artifact, so it is deliberately NOT touched here: only
+    // sign-out (`SeatHubClient::signOut()`) removes it (Phase 5 plan 02, D-06).
     if (!advanceTo(TeardownStage::Clear)) {
         return;
-    }
-
-    if (m_store != nullptr) {
-        if (!m_store->clearAll()) {
-            fail(SeatHubFailure::local(QString::fromLatin1(kStillStoredSentence)));
-            return;
-        }
     }
 
     m_cleared = true;

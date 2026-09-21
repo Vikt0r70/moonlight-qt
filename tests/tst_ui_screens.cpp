@@ -163,8 +163,24 @@ class FakeShellClient : public QObject
     Q_PROPERTY(QString identity READ identity NOTIFY identityChanged)
     Q_PROPERTY(QString reference READ reference NOTIFY failureChanged)
     Q_PROPERTY(QVariantMap failure READ failure NOTIFY failureChanged)
+    Q_PROPERTY(qint64 balanceMinutes READ balanceMinutes NOTIFY balanceChanged)
+    Q_PROPERTY(QString balanceText READ balanceText NOTIFY balanceChanged)
+    Q_PROPERTY(bool balanceStale READ balanceStale NOTIFY balanceChanged)
 
 public:
+    qint64 balanceMinutes() const { return m_balanceMinutes; }
+    QString balanceText() const { return m_balanceText; }
+    bool balanceStale() const { return m_balanceStale; }
+    /// What `SeatHubClient` exposes: minutes (-1 = never read), the C++-formatted text, and
+    /// whether the last read failed. The screens only display these.
+    void setBalance(qint64 minutes, const QString& text, bool stale)
+    {
+        m_balanceMinutes = minutes;
+        m_balanceText = text;
+        m_balanceStale = stale;
+        emit balanceChanged();
+    }
+
     QString homeStatus() const { return m_homeStatus; }
     QString endReasonText() const { return m_endReasonText; }
     QString identity() const { return m_identity; }
@@ -215,6 +231,7 @@ public:
     void deliverOtpAccepted() { emit otpAccepted(); }
 
 signals:
+    void balanceChanged();
     void homeStatusChanged();
     void endReasonTextChanged();
     void identityChanged();
@@ -224,6 +241,9 @@ signals:
     void otpAccepted();
 
 private:
+    qint64 m_balanceMinutes = -1;
+    QString m_balanceText;
+    bool m_balanceStale = false;
     QString m_homeStatus = QStringLiteral("ready");
     QString m_endReasonText;
     QString m_identity = QStringLiteral("+962 7 0001 0002");
@@ -323,6 +343,10 @@ private slots:
     void everyShellScreenLoads();
     void homeScreenRendersEachHomeState();
     void homeScreenRendersTheSessionEndReason();
+    void homeHostsTheBalanceElement();
+    void balancePillDrawsEachOfItsStates();
+    void restoreSplashShowsItsLineAndNeverTheSignInForm();
+    void theShellRoutesTheRestoreStateToTheSplashNotToSignIn();
     void signInScreenReachesThePhoneStepError();
     void signInScreenCountsDownToResend();
     void forcedUpdateModalKeepsUpdateTabbableAndUndismissable();
@@ -394,6 +418,8 @@ void TstUiScreens::everyShellScreenLoads()
         QStringLiteral("SeatHubSelect.qml"), QStringLiteral("SeatHubNumberField.qml"),
                               QStringLiteral("SeatHubReadOnlyRow.qml"),
                               QStringLiteral("AgentConfigPanel.qml"),
+                              QStringLiteral("BalancePill.qml"),
+                              QStringLiteral("RestoreSplash.qml"),
     };
 
     QQuickStyle::setStyle(QStringLiteral("Basic"));
@@ -520,6 +546,154 @@ void TstUiScreens::homeScreenRendersTheSessionEndReason()
     client.setEndReasonText(QString());
     QVERIFY2(!findVisibleTextItem(screen.data(), ended),
              "a cleared end reason must not stay on screen");
+}
+
+void TstUiScreens::homeHostsTheBalanceElement()
+{
+    QQuickStyle::setStyle(QStringLiteral("Basic"));
+    QQmlEngine engine;
+    registerTokenSingletons(&engine);
+
+    FakeShellClient client;
+    client.setBalance(135, QStringLiteral("2 h 15 min"), false);
+
+    QString error;
+    QScopedPointer<QObject> screen(instantiate(&engine, QStringLiteral("HomeScreen.qml"), &error));
+    QVERIFY2(screen, qPrintable(error));
+    QVERIFY(screen->setProperty("client", QVariant::fromValue(static_cast<QObject*>(&client))));
+
+    // Home carries the balance element (CUST-06), and it shows the facade's own text - the client
+    // draws it and does no arithmetic.
+    QObject* pill = screen->findChild<QObject*>(QStringLiteral("balancePill"));
+    QVERIFY2(pill, "Home must host the balance element");
+    QVERIFY2(findVisibleTextItem(pill, QStringLiteral("2 h 15 min")),
+             "the balance element must show the formatted balance");
+
+    // And it follows the facade: a new balance is drawn without a reload.
+    client.setBalance(45, QStringLiteral("45 min"), false);
+    QVERIFY(findVisibleTextItem(pill, QStringLiteral("45 min")));
+    QVERIFY(!findVisibleTextItem(pill, QStringLiteral("2 h 15 min")));
+}
+
+void TstUiScreens::balancePillDrawsEachOfItsStates()
+{
+    QQuickStyle::setStyle(QStringLiteral("Basic"));
+    QQmlEngine engine;
+    registerTokenSingletons(&engine);
+
+    FakeShellClient client;
+    QString error;
+    QScopedPointer<QObject> pill(instantiate(&engine, QStringLiteral("BalancePill.qml"), &error));
+    QVERIFY2(pill, qPrintable(error));
+    QVERIFY(pill->setProperty("client", QVariant::fromValue(static_cast<QObject*>(&client))));
+
+    // populated: the value in the mono family, `--foreground`, tabular.
+    client.setBalance(135, QStringLiteral("2 h 15 min"), false);
+    QObject* value = findVisibleTextItem(pill.data(), QStringLiteral("2 h 15 min"));
+    QVERIFY2(value, "the populated balance must render");
+    QCOMPARE(value->property("font").value<QFont>().family(), QString::fromLatin1(kMonoFamily));
+    QCOMPARE(value->property("color").value<QColor>(), QColor(QStringLiteral("#fafafa")));
+    QVERIFY(!findVisibleTextItem(pill.data(), QStringLiteral("last known")));
+    QVERIFY(!findVisibleTextItem(pill.data(), QStringLiteral("Unavailable")));
+
+    // low (10 minutes or fewer): warn colour, and a glyph so colour is not the only signal.
+    client.setBalance(8, QStringLiteral("8 min"), false);
+    value = findVisibleTextItem(pill.data(), QStringLiteral("8 min"));
+    QVERIFY(value);
+    QCOMPARE(value->property("color").value<QColor>(), QColor(QStringLiteral("#f59e0b")));
+    QVERIFY2(findVisibleTextItem(pill.data(), QStringLiteral("▲")),
+             "a low balance must carry a glyph besides the colour");
+
+    // critical (2 minutes or fewer): destructive colour, and a different glyph.
+    client.setBalance(2, QStringLiteral("2 min"), false);
+    value = findVisibleTextItem(pill.data(), QStringLiteral("2 min"));
+    QVERIFY(value);
+    QCOMPARE(value->property("color").value<QColor>(), QColor(QStringLiteral("#ef4444")));
+    QVERIFY(findVisibleTextItem(pill.data(), QStringLiteral("◆")));
+
+    // last known: the read failed but an earlier one succeeded. The value stays, muted, and says so.
+    client.setBalance(8, QStringLiteral("8 min"), true);
+    value = findVisibleTextItem(pill.data(), QStringLiteral("8 min"));
+    QVERIFY2(value, "a failed read must not blank the balance");
+    QCOMPARE(value->property("color").value<QColor>(), QColor(QStringLiteral("#a3a3a3")));
+    QVERIFY2(findVisibleTextItem(pill.data(), QStringLiteral("last known")),
+             "a stale balance must be labelled");
+
+    // unavailable: no read has ever succeeded and the last one failed.
+    client.setBalance(-1, QString(), true);
+    QVERIFY(findVisibleTextItem(pill.data(), QStringLiteral("Unavailable")));
+    QVERIFY(!findVisibleTextItem(pill.data(), QStringLiteral("last known")));
+
+    // Never a raw minute count, and never a second formatter: the element draws what the facade
+    // gives it, and `duration_text` is the one place minutes become words.
+    QFile source(guiDir() + QStringLiteral("/BalancePill.qml"));
+    QVERIFY(source.open(QIODevice::ReadOnly));
+    const QString text = QString::fromUtf8(source.readAll());
+    QVERIFY2(!text.contains(QStringLiteral(" min\"")) && !text.contains(QStringLiteral(" h \"")),
+             "the balance element must not format a duration itself");
+}
+
+void TstUiScreens::restoreSplashShowsItsLineAndNeverTheSignInForm()
+{
+    QQuickStyle::setStyle(QStringLiteral("Basic"));
+    QQmlEngine engine;
+    registerTokenSingletons(&engine);
+
+    QString error;
+    QScopedPointer<QObject> splash(instantiate(&engine, QStringLiteral("RestoreSplash.qml"), &error));
+    QVERIFY2(splash, qPrintable(error));
+
+    // copy.md C2, verbatim.
+    QVERIFY2(findVisibleTextItem(splash.data(), QStringLiteral("Signing you in…")),
+             "the restore splash must show copy.md's line");
+
+    // No form, no field, no button, and no balance element (there is no balance before sign-in).
+    for (QObject* item : splash->findChildren<QObject*>()) {
+        QVERIFY2(!item->inherits("QQuickButton"), "the splash has no action");
+        QVERIFY2(!item->inherits("QQuickTextInput"), "the splash has no field");
+    }
+    QVERIFY(!splash->findChild<QObject*>(QStringLiteral("balancePill")));
+    for (const QString& formText : { QStringLiteral("Enter your phone number"),
+                                     QStringLiteral("Continue"), QStringLiteral("Sign in") }) {
+        QVERIFY2(!findTextItem(splash.data(), formText),
+                 qPrintable(QStringLiteral("the splash must not carry sign-in copy: ") + formText));
+    }
+}
+
+void TstUiScreens::theShellRoutesTheRestoreStateToTheSplashNotToSignIn()
+{
+    // `main.qml` instantiates the real SeatHubClient, which only the application registers, so it
+    // is read as source - the same technique the window-sequence test uses. The invariant: the
+    // state the facade is constructed in ("restoring") has its own route to the splash, because
+    // `componentForState()` falls through to the sign-in form for any state it does not name, and
+    // that fall-through is exactly the flash the splash exists to prevent.
+    QFile file(guiDir() + QStringLiteral("/main.qml"));
+    QVERIFY2(file.open(QIODevice::ReadOnly), "main.qml must be readable");
+    const QString source = QString::fromUtf8(file.readAll());
+
+    QVERIFY2(source.contains(QRegularExpression(
+                 QStringLiteral("case\\s+\"restoring\"\\s*:\\s*return\\s+restoreComponent"))),
+             "the restoring state must route to the restore splash");
+
+    // The splash component is the splash and nothing else.
+    const QRegularExpression component(
+        QStringLiteral("id:\\s*restoreComponent\\s*(.*?)\\n    \\}"),
+        QRegularExpression::DotMatchesEverythingOption);
+    const QRegularExpressionMatch match = component.match(source);
+    QVERIFY2(match.hasMatch(), "restoreComponent must exist in main.qml");
+    QVERIFY(match.captured(1).contains(QStringLiteral("RestoreSplash")));
+    QVERIFY2(!match.captured(1).contains(QStringLiteral("SignInScreen")),
+             "the restore route must never instantiate the sign-in form");
+
+    // The facade leaves that state, and main.qml starts the restore exactly once.
+    QCOMPARE(source.count(QStringLiteral("seatHub.restoreSession()")), 1);
+
+    // The splash and the pill are compiled in.
+    QFile qrc(guiDir() + QStringLiteral("/../qml.qrc"));
+    QVERIFY(qrc.open(QIODevice::ReadOnly));
+    const QString qrcText = QString::fromUtf8(qrc.readAll());
+    QVERIFY(qrcText.contains(QStringLiteral("gui/RestoreSplash.qml")));
+    QVERIFY(qrcText.contains(QStringLiteral("gui/BalancePill.qml")));
 }
 
 void TstUiScreens::signInScreenReachesThePhoneStepError()

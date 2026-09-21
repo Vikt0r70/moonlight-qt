@@ -38,6 +38,7 @@ SOURCES += \
     ../app/seathub/session_lifecycle.cpp \
     ../app/seathub/engine_session.cpp \
     ../app/seathub/control_plane_client.cpp \
+    ../app/seathub/duration_text.cpp \
     ../app/seathub/token_store.cpp \
     ../app/seathub/session_websocket.cpp \
     ../app/seathub/pairing_controller.cpp \
@@ -60,6 +61,7 @@ HEADERS += \
     ../app/seathub/session_lifecycle.h \
     ../app/seathub/engine_session.h \
     ../app/seathub/control_plane_client.h \
+    ../app/seathub/duration_text.h \
     ../app/seathub/token_store.h \
     ../app/seathub/session_websocket.h \
     ../app/seathub/pairing_controller.h \

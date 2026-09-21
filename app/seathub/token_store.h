@@ -26,9 +26,11 @@
 // actually returns. Reconciling the documents with the code (or the code with the documents) is an
 // ADR decision; changing the path silently would move existing customers' credentials.
 //
-// Its other job is teardown: STREAM-10 requires that the client keeps no stored rig, address
-// or pairing of its own. `clearAll()` is what makes that true, and teardown refuses to report
-// success while anything is left behind.
+// The store holds one thing: the customer's sign-in credential (the access slot). STREAM-10
+// requires that the client keeps no stored rig, address or pairing of its own, and that holds
+// because none of the three is ever written here. Teardown therefore does NOT clear this store -
+// a customer who plays once stays signed in (CUST-08) - and only sign-out (`clearAll()`) removes
+// the credential.
 
 #include <QByteArray>
 #include <QObject>
@@ -41,8 +43,13 @@ class TokenStore : public QObject
     Q_OBJECT
 
 public:
-    /// The pair of credentials sign-in issues (ADR-0014): `access` and `refresh`.
+    /// The slot the credential lives in: ADR-0050 made sessions permanent, so the one non-expiring
+    /// access token is the whole credential and this is where every sign-in writes it.
     static QString accessTokenName();
+    /// The slot 0.1.x wrote the same credential under, back when sign-in stored a refresh token
+    /// (its OTP path stored the access token there once refresh tokens stopped existing). Nothing
+    /// writes it any more; it survives as a name because an installed 0.1.4 that updates to this
+    /// build has its credential there.
     static QString refreshTokenName();
 
     explicit TokenStore(QObject* parent = nullptr);

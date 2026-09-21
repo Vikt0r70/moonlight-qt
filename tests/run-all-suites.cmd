@@ -107,7 +107,10 @@ if errorlevel 1 (
     goto :eof
 )
 
-"%~1.exe" -o "%~1-out.txt,txt" >nul 2>&1
+rem Path-explicit (".\"): the bare name is resolved through PATH/App Paths, and a
+rem non-interactive shell answers 9009 (command not found) for it even though the file is
+rem right here after pushd. See .planning/debug/resolved/client-inapp-update-hangs.md.
+".\%~1.exe" -o "%~1-out.txt,txt" >nul 2>&1
 set "RC=!ERRORLEVEL!"
 
 findstr /r /c:"^Totals:.*, 0 failed" "%~1-out.txt" >nul 2>&1

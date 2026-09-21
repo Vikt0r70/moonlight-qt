@@ -7,6 +7,7 @@
 #include <SDL.h>
 
 #include "agent_config.h"
+#include "duration_text.h"
 #include "session_lifecycle.h"
 #include "settings_bridge.h"
 #include "update_feed_client.h"
@@ -28,6 +29,7 @@ namespace {
 
 // appState values (D-35). QML switches views on these; they are part of the facade's
 // contract, not an implementation detail.
+const char* kStateRestoring = "restoring";
 const char* kStateSignedOut = "signed_out";
 const char* kStateHome = "home";
 const char* kStateConnecting = "connecting";
@@ -222,7 +224,9 @@ void onClientThread(QObject* owner, Fn fn)
 
 SeatHubClient::SeatHubClient(QObject* parent)
     : QObject(parent),
-      m_appState(QString::fromLatin1(kStateSignedOut)),
+      // Entered before anything else is shown: the sign-in form must never flash while the stored
+      // credential is being checked (`restoreSession()` resolves this to home or signed_out).
+      m_appState(QString::fromLatin1(kStateRestoring)),
       m_homeStatus(QString::fromLatin1(kHomeReady)),
       m_session(new SessionLifecycle(this)),
       m_settings(new SettingsBridge(this)),
@@ -263,7 +267,6 @@ SeatHubClient::SeatHubClient(QObject* parent)
     m_pairing->setSeam(m_pairingSeam);
     m_pairing->setControlPlane(m_controlPlane);
     m_teardown->setControlPlane(m_controlPlane);
-    m_teardown->setTokenStore(m_tokenStore);
     m_liveness->setControlPlane(m_controlPlane);
 
     connect(m_sessionChannel, &SessionWebSocket::sessionStateReceived,
@@ -489,6 +492,12 @@ void SeatHubClient::setAppState(const QString& state)
     }
 
     emit appStateChanged();
+
+    // The balance is read on every arrival at Home: after a restore, after a sign-in, and when a
+    // session or a failure hands the customer back (CUST-06). A no-op unless signed in.
+    if (state == QLatin1String(kStateHome)) {
+        refreshBalance();
+    }
 }
 
 void SeatHubClient::setInSettings(bool inSettings)
@@ -651,7 +660,7 @@ void SeatHubClient::retry()
     clearFailure();
     setInSettings(false);
 
-    if (m_identity.isEmpty()) {
+    if (!m_signedIn) {
         setHomeStatus(QString::fromLatin1(kHomeReady));
         setAppState(QString::fromLatin1(kStateSignedOut));
         return;
@@ -735,21 +744,24 @@ void SeatHubClient::verifyOtp(const QString& phoneE164, const QString& code)
             }
 
             // D-30 / ADR-0050 D-10: the long-lived credential goes to disk only as a DPAPI blob.
-            // Under permanent sessions there is no refresh token; the access token itself is the
-            // durable, non-expiring credential, so it is what persists. (When a refresh token is
-            // present - older servers - keep storing that instead.) `storeToken` writes no
-            // plaintext, and it is the only write path.
-            const QString durableCredential =
-                pair.refreshToken.isEmpty() ? pair.accessToken : pair.refreshToken;
-            if (!m_tokenStore->storeToken(TokenStore::refreshTokenName(), durableCredential)) {
+            // Sessions are permanent, so the access token itself is the durable, non-expiring
+            // credential and it lives in the access slot - the slot the launch-time restore
+            // reads. `storeToken` writes no plaintext, and it is the only write path.
+            if (!m_tokenStore->storeToken(TokenStore::accessTokenName(), pair.accessToken)) {
                 const SeatHubFailure failure = SeatHubFailure::local(
                     QStringLiteral("This PC wouldn't let us save your sign-in."));
                 emit otpRejected(failure.error, failure.reference);
                 return;
             }
+            // Whatever 0.1.x left in its own slot is now stale; two credentials at rest would let
+            // a later launch restore the wrong one.
+            m_tokenStore->clearToken(TokenStore::refreshTokenName());
 
             m_controlPlane->setAccessToken(pair.accessToken);
 
+            ++m_authEpoch;
+            m_signedIn = true;
+            m_account.clear();
             m_identity = phone;
             emit identityChanged();
             emit otpAccepted();
@@ -773,21 +785,51 @@ QVariantMap SeatHubClient::readAgentConfigFile(const QUrl& fileUrl)
 
 void SeatHubClient::signOut()
 {
-    // STREAM-10: signing out leaves no stored pairing and no stored credential. The channel and
-    // both timers stop before the store is swept.
+    // Signing out leaves no stored pairing and no usable credential: not on disk, not in memory
+    // here, and not valid on the server (ADR-0050, D-06). The channel and both timers stop before
+    // the store is swept.
     m_sessionChannel->close();
     m_liveness->stop();
     m_horizon->disarm();
     onClientThread(m_pairing, [this]() { m_pairing->cancel(); });
     m_teardown->cancel();
+
+    // The server's revoke goes out first - it is the only thing that makes "signed out" true for
+    // anyone who has copied the credential. The request reads the credential when it runs, which
+    // may be on the network thread a moment from now, so the in-memory copy is cleared when the
+    // reply arrives (whatever it is) and not before.
+    const quint64 epoch = ++m_authEpoch;
+    if (m_controlPlane->hasAccessToken()) {
+        startNetworkThreads();
+        m_controlPlane->logout([this, epoch](const ControlPlaneResult& result) {
+            onClientThread(this, [this, epoch, result]() {
+                if (!result.ok) {
+                    // Logged for support; the customer is already signed out here. An unreachable
+                    // control plane leaves the server-side credential valid until the next
+                    // reachable revoke - the local sweep below did not wait for it.
+                    qCInfo(seathubClient) << "server revoke did not complete; status"
+                                          << result.statusCode;
+                }
+                // A newer sign-in owns the in-memory credential now; leave it alone.
+                if (m_authEpoch == epoch) {
+                    m_controlPlane->setAccessToken(QString());
+                }
+            });
+        });
+    }
+
+    // Unconditional, and never behind the network: an offline sign-out still removes the credential
+    // from this machine (T-05-07).
     m_tokenStore->clearAll();
 
     m_sessionId.clear();
     m_clientUuid.clear();
-    m_controlPlane->setAccessToken(QString());
 
+    m_signedIn = false;
+    m_account.clear();
     m_identity.clear();
     emit identityChanged();
+    resetBalance();
     clearFailure();
     setInSettings(false);
     setHomeStatus(QString::fromLatin1(kHomeReady));
@@ -795,13 +837,168 @@ void SeatHubClient::signOut()
     setAppState(QString::fromLatin1(kStateSignedOut));
 }
 
+// ---------------------------------------------------------------------------
+// Launch: restore the stored sign-in (CUST-08, D-06)
+// ---------------------------------------------------------------------------
+
+void SeatHubClient::restoreSession()
+{
+    if (m_restoreStarted) {
+        return;
+    }
+    m_restoreStarted = true;
+
+    const QString credential = m_tokenStore->retrieveToken(TokenStore::accessTokenName());
+    if (credential.isEmpty()) {
+        qCInfo(seathubClient) << "no stored credential; showing sign-in";
+        setAppState(QString::fromLatin1(kStateSignedOut));
+        return;
+    }
+
+    // Found - and that is all that is logged about it.
+    qCInfo(seathubClient) << "stored credential found; confirming it with the control plane";
+    m_controlPlane->setAccessToken(credential);
+    startNetworkThreads();
+
+    const quint64 epoch = m_authEpoch;
+    m_controlPlane->fetchMe([this, epoch](const ControlPlaneResult& result) {
+        onClientThread(this, [this, epoch, result]() {
+            if (epoch != m_authEpoch) {
+                return;
+            }
+            applyRestoreResult(result);
+        });
+    });
+}
+
+void SeatHubClient::applyRestoreResult(const ControlPlaneResult& result)
+{
+    if (result.ok) {
+        AccountInfo account;
+        if (AccountInfo::parse(result.body, &account)) {
+            ++m_authEpoch;
+            m_signedIn = true;
+            setAccount(account);
+            setHomeStatus(QString::fromLatin1(kHomeReady));
+            setAppState(QString::fromLatin1(kStateHome));
+            return;
+        }
+        // A 2xx that is not an account is a contract violation, not evidence the credential is
+        // bad. Treated like an unreachable control plane below: keep the customer signed in.
+        qCWarning(seathubClient) << "GET /api/me answered without an account";
+    }
+    else if (result.statusCode == 401) {
+        // The control plane says the credential is no longer valid (revoked, or the account is
+        // gone): the one case where a stored credential is discarded at launch.
+        qCInfo(seathubClient) << "the stored credential was refused; clearing it";
+        ++m_authEpoch;
+        m_tokenStore->clearAll();
+        m_controlPlane->setAccessToken(QString());
+        setAppState(QString::fromLatin1(kStateSignedOut));
+        return;
+    }
+
+    // Could not confirm it: no network, or the control plane had a bad moment. A lost connection
+    // must never sign a customer out, so the credential stays and Home opens in its offline state
+    // (copy.md, Support and errors). The next successful read of the wallet clears that state.
+    qCInfo(seathubClient) << "could not confirm the stored credential (status" << result.statusCode
+                          << "); staying signed in, offline";
+    ++m_authEpoch;
+    m_signedIn = true;
+    setHomeStatus(QString::fromLatin1(kHomeOffline));
+    setAppState(QString::fromLatin1(kStateHome));
+}
+
+void SeatHubClient::setAccount(const AccountInfo& account)
+{
+    m_account.clear();
+    m_account.insert(QStringLiteral("display_name"), account.displayName);
+    m_account.insert(QStringLiteral("username"), account.username);
+    m_account.insert(QStringLiteral("email"), account.email);
+    m_account.insert(QStringLiteral("phone"), account.phoneE164);
+    m_account.insert(QStringLiteral("email_verified"), account.emailVerified);
+
+    // What the customer is shown as: the first of the four the account has.
+    m_identity.clear();
+    const QStringList candidates = { account.phoneE164, account.email, account.username,
+                                     account.displayName };
+    for (const QString& candidate : candidates) {
+        if (!candidate.isEmpty()) {
+            m_identity = candidate;
+            break;
+        }
+    }
+    emit identityChanged();
+}
+
+// ---------------------------------------------------------------------------
+// The balance (CUST-06)
+// ---------------------------------------------------------------------------
+
+void SeatHubClient::refreshBalance()
+{
+    if (!m_signedIn || !m_controlPlane->hasAccessToken()) {
+        return;
+    }
+
+    startNetworkThreads();
+
+    const quint64 epoch = m_authEpoch;
+    m_controlPlane->fetchWallet([this, epoch](const ControlPlaneResult& result) {
+        onClientThread(this, [this, epoch, result]() { applyWalletResult(epoch, result); });
+    });
+}
+
+void SeatHubClient::applyWalletResult(quint64 epoch, const ControlPlaneResult& result)
+{
+    // Signed out, or signed in as someone else, since the read was issued: the answer is not this
+    // session's to show.
+    if (epoch != m_authEpoch || !m_signedIn) {
+        return;
+    }
+
+    WalletInfo wallet;
+    if (!result.ok || !WalletInfo::parse(result.body, &wallet)) {
+        // A failed read changes nothing but the label: the last known value stays on screen, and
+        // it never signs anybody out - not even on a 401, which a wallet read has no business
+        // deciding (the launch-time restore is where a refused credential is handled).
+        if (!m_balanceStale) {
+            m_balanceStale = true;
+            emit balanceChanged();
+        }
+        return;
+    }
+
+    m_balanceMinutes = wallet.balanceMinutes;
+    m_balanceText = durationText(wallet.balanceMinutes);
+    m_balanceStale = false;
+    emit balanceChanged();
+
+    // The control plane is reachable, so an offline label from an unconfirmed restore (or a failed
+    // Play) no longer describes the world.
+    if (m_homeStatus == QLatin1String(kHomeOffline)) {
+        setHomeStatus(QString::fromLatin1(kHomeReady));
+    }
+}
+
+void SeatHubClient::resetBalance()
+{
+    if (m_balanceMinutes == -1 && m_balanceText.isEmpty() && !m_balanceStale) {
+        return;
+    }
+    m_balanceMinutes = -1;
+    m_balanceText.clear();
+    m_balanceStale = false;
+    emit balanceChanged();
+}
+
 void SeatHubClient::dismissError()
 {
     clearFailure();
     setInSettings(false);
     setHomeStatus(QString::fromLatin1(kHomeReady));
-    setAppState(m_identity.isEmpty() ? QString::fromLatin1(kStateSignedOut)
-                                     : QString::fromLatin1(kStateHome));
+    setAppState(!m_signedIn ? QString::fromLatin1(kStateSignedOut)
+                            : QString::fromLatin1(kStateHome));
 }
 
 // ---------------------------------------------------------------------------
@@ -886,8 +1083,8 @@ void SeatHubClient::handleReadyForDeletion()
     // back and the appState may leave "streaming". SessionSegue.qml performs the actual
     // `window.visible = true`.
     if (m_appState == QLatin1String(kStateStreaming)) {
-        setAppState(m_identity.isEmpty() ? QString::fromLatin1(kStateSignedOut)
-                                         : QString::fromLatin1(kStateHome));
+        setAppState(!m_signedIn ? QString::fromLatin1(kStateSignedOut)
+                                : QString::fromLatin1(kStateHome));
     }
 
     // The stream is over, so nothing more is reported to the control plane about it (D-31).
@@ -1138,8 +1335,8 @@ void SeatHubClient::handleTeardownCompleted()
     // Only leave the error view if the customer is not looking at one; a teardown that succeeded
     // says nothing about an unrelated failure the error screen is already showing.
     if (m_appState != QLatin1String(kStateError)) {
-        setAppState(m_identity.isEmpty() ? QString::fromLatin1(kStateSignedOut)
-                                         : QString::fromLatin1(kStateHome));
+        setAppState(!m_signedIn ? QString::fromLatin1(kStateSignedOut)
+                                : QString::fromLatin1(kStateHome));
     }
 }
 

@@ -44,7 +44,10 @@ class SeatHubClient : public QObject
 {
     Q_OBJECT
 
-    /// One of: "signed_out" | "home" | "connecting" | "streaming" | "error" (D-35).
+    /// One of: "restoring" | "signed_out" | "home" | "connecting" | "streaming" | "error" (D-35).
+    /// "restoring" is the state the client is constructed in: the stored credential is being read
+    /// and confirmed (`restoreSession()`), and the view shows the restore splash - never the
+    /// sign-in form - until that resolves to "home" or "signed_out".
     Q_PROPERTY(QString appState READ appState NOTIFY appStateChanged)
 
     /// The engine lifecycle this client drives.
@@ -112,8 +115,28 @@ class SeatHubClient : public QObject
     /// because every number with a unit is mono (copy.md §5). The bare enum never reaches QML.
     Q_PROPERTY(QString endReasonText READ endReasonText NOTIFY endReasonTextChanged)
 
-    /// The signed-in identity (the phone number). Never a credential.
+    /// The signed-in identity: the first of phone, email, username and display name the account
+    /// has. Never a credential.
     Q_PROPERTY(QString identity READ identity NOTIFY identityChanged)
+
+    /// What `GET /api/me` said about the signed-in account, as a map of `display_name`,
+    /// `username`, `email`, `phone` and `email_verified`. Empty until a restore or a sign-in has
+    /// read it. Never a credential.
+    Q_PROPERTY(QVariantMap account READ account NOTIFY identityChanged)
+
+    /// The customer's balance in whole minutes as `GET /api/wallet` last reported it, or -1 when
+    /// no read has ever succeeded. The client does no arithmetic on it (CUST-06,
+    /// `docs/spec/client.md` §Wallet authority); the view compares it to the warning thresholds
+    /// and nothing else.
+    Q_PROPERTY(qint64 balanceMinutes READ balanceMinutes NOTIFY balanceChanged)
+
+    /// `balanceMinutes` in the hours-and-minutes format (`duration_text.h`), or empty when no read
+    /// has ever succeeded.
+    Q_PROPERTY(QString balanceText READ balanceText NOTIFY balanceChanged)
+
+    /// True when the most recent wallet read failed. The value then on screen is the last known
+    /// one, and the view says so; a failed read never blanks it and never signs anybody out.
+    Q_PROPERTY(bool balanceStale READ balanceStale NOTIFY balanceChanged)
 
 public:
     explicit SeatHubClient(QObject* parent = nullptr);
@@ -137,6 +160,10 @@ public:
     QVariantMap failure() const { return m_failure; }
     QString reference() const;
     QString identity() const { return m_identity; }
+    QVariantMap account() const { return m_account; }
+    qint64 balanceMinutes() const { return m_balanceMinutes; }
+    QString balanceText() const { return m_balanceText; }
+    bool balanceStale() const { return m_balanceStale; }
     QString homeStatus() const { return m_homeStatus; }
     QString endReasonText() const { return m_endReasonText; }
 
@@ -157,7 +184,29 @@ public:
     /// Sign-in step 2 (D-55 shell, stubbed in Plan 03-02).
     Q_INVOKABLE void verifyOtp(const QString& phoneE164, const QString& code);
 
-    /// Returns to the signed-out view and forgets the in-memory identity.
+    /// Launch (CUST-08, D-06): reads the stored credential, confirms it with `GET /api/me`, and
+    /// opens on Home. Called once by main.qml; further calls are ignored.
+    ///
+    ///   * no credential on disk               -> signed_out
+    ///   * the control plane says 401          -> the store is cleared, signed_out
+    ///   * the control plane cannot be reached -> the customer stays signed in: Home, in its
+    ///                                            offline state. A lost network never signs anyone
+    ///                                            out.
+    ///   * confirmed                           -> the identity is filled from the account, Home,
+    ///                                            and the balance is read.
+    ///
+    /// Before it reads anything it runs `TokenStore::recoverAtStartup()`, so a credential written by
+    /// 0.1.4 or parked by an update is in the access slot by then (WINDOWS #22). The log records
+    /// that a credential was found, never its bytes.
+    Q_INVOKABLE void restoreSession();
+
+    /// Reads `GET /api/wallet` and updates `balanceMinutes` / `balanceText` / `balanceStale`. Runs
+    /// itself on every return to Home; exposed so a view can refresh it too.
+    Q_INVOKABLE void refreshBalance();
+
+    /// Revokes the credential on the server (`POST /api/auth/logout`), deletes it locally
+    /// whatever that reply is, and returns to the signed-out view. The local deletion never waits
+    /// on the server: an offline sign-out still leaves nothing on this machine.
     Q_INVOKABLE void signOut();
 
     /// Leaves the error state for the home view.
@@ -206,6 +255,7 @@ signals:
     void sessionWarningChanged();
     void homeStatusChanged();
     void endReasonTextChanged();
+    void balanceChanged();
 
     /// Step 1 succeeded - the view should show the code field.
     void otpRequested(const QString& phoneE164);
@@ -261,6 +311,15 @@ private:
     void raiseFailure(const SeatHubFailure& failure);
     void clearFailure();
     void setInSettings(bool inSettings);
+    /// Applies the answer to the launch-time `GET /api/me` (see `restoreSession()`).
+    void applyRestoreResult(const ControlPlaneResult& result);
+    /// Applies an answer to `GET /api/wallet`. `epoch` is the credential generation the read was
+    /// issued under; an answer that arrives after a sign-out (or a different sign-in) is dropped.
+    void applyWalletResult(quint64 epoch, const ControlPlaneResult& result);
+    /// Forgets the balance. Called at sign-out so the next customer never sees this one's.
+    void resetBalance();
+    /// Fills `m_identity` and `m_account` from a confirmed account.
+    void setAccount(const AccountInfo& account);
     /// True once `beginSession()` has attached a real control-plane session.
     bool inControlPlaneSession() const;
     /// Play with no access token: there is nothing to allocate a session with, so the engine
@@ -289,6 +348,22 @@ private:
     QString m_endReasonText;
     QVariantMap m_failure;
     QString m_identity;
+    QVariantMap m_account;
+
+    /// True from a confirmed sign-in (or a restore that could not reach the control plane, where
+    /// the credential is kept and trusted) until sign-out. This - not `m_identity`, which an
+    /// offline restore cannot fill - is what "signed in" means: the screens a session ends on
+    /// (Home or sign-in) follow it.
+    bool m_signedIn = false;
+    bool m_restoreStarted = false;
+    /// Bumped by every sign-in, restore result and sign-out. A reply issued under an older value
+    /// (a wallet read, a sign-out's own revoke) must not touch what a newer one set up.
+    quint64 m_authEpoch = 0;
+
+    qint64 m_balanceMinutes = -1;
+    QString m_balanceText;
+    bool m_balanceStale = false;
+
     QWindow* m_hostWindow = nullptr;
     SessionLifecycle* m_session = nullptr;
     SettingsBridge* m_settings = nullptr;

@@ -17,8 +17,8 @@
 //   CR-02  `LivenessTimer` and `AuthorizedThroughTimer` hand a call from another thread over to
 //          the thread that owns their `QTimer`, so the heartbeat ticks and the billing horizon
 //          fires when they are started or armed from the main thread.
-//   HR-01  `TeardownController`, driven from the network thread, reaches `Done` and clears the
-//          DPAPI store.
+//   HR-01  `TeardownController`, driven from the network thread, reaches `Done` - and leaves the
+//          DPAPI store (the customer's sign-in) alone.
 //
 // Build recipe:
 //   call "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
@@ -315,7 +315,7 @@ private slots:
     void horizonArmedFromAnotherThreadFires();
 
     // HR-01
-    void teardownDrivenFromTheNetworkThreadReachesDoneAndClearsTheStore();
+    void teardownDrivenFromTheNetworkThreadReachesDoneAndKeepsTheSignIn();
 };
 
 void TstThreading::initTestCase()
@@ -503,17 +503,17 @@ void TstThreading::horizonArmedFromAnotherThreadFires()
     QTRY_COMPARE_WITH_TIMEOUT(reached.count(), 2, 2000);
 }
 
-void TstThreading::teardownDrivenFromTheNetworkThreadReachesDoneAndClearsTheStore()
+void TstThreading::teardownDrivenFromTheNetworkThreadReachesDoneAndKeepsTheSignIn()
 {
     QTemporaryDir directory;
     QVERIFY(directory.isValid());
 
     auto* store = new TokenStore(nullptr);
     store->setDirectory(directory.path());
-    if (!store->storeToken(TokenStore::refreshTokenName(), QStringLiteral("a-refresh-token"))) {
+    if (!store->storeToken(TokenStore::accessTokenName(), QStringLiteral("an-access-token"))) {
         QSKIP("DPAPI refused a token on this machine; the store cannot be exercised here");
     }
-    QVERIFY(store->hasToken(TokenStore::refreshTokenName()));
+    QVERIFY(store->hasToken(TokenStore::accessTokenName()));
 
     std::atomic<int> destroyed{0};
     std::atomic<quintptr> destroyedOn{0};
@@ -526,7 +526,6 @@ void TstThreading::teardownDrivenFromTheNetworkThreadReachesDoneAndClearsTheStor
 
     auto* controller = new TeardownController(nullptr);
     controller->setControlPlane(client);
-    controller->setTokenStore(store);
     controller->setVerifyIntervalMs(5);
     controller->setTeardownGraceMs(2000);
     controller->moveToThread(fixture.thread());
@@ -537,16 +536,18 @@ void TstThreading::teardownDrivenFromTheNetworkThreadReachesDoneAndClearsTheStor
     QSignalSpy stages(controller, &TeardownController::stageEntered);
 
     // From the main thread, as `handleReadyForDeletion()` does. Before the HR-01 fix the verify
-    // timer was refused its start, teardown never reached `Clear`, and the DPAPI blob stayed on
-    // disk while `teardownCompleted()` never fired.
+    // timer was refused its start, teardown never reached `Clear`, and `teardownCompleted()` never
+    // fired.
     controller->teardown(QString::fromLatin1(kSessionId), QStringLiteral("client-uuid"));
 
     QTRY_COMPARE_WITH_TIMEOUT(completed.count(), 1, 5000);
     QCOMPARE(failed.count(), 0);
 
-    // STREAM-10's local half: the credential is gone from disk, and the stages were walked in
-    // order.
-    QVERIFY(!store->hasToken(TokenStore::refreshTokenName()));
+    // Teardown ran to its end from the network thread, walked the stages in order, and left the
+    // customer's sign-in credential where it was (CUST-08).
+    QVERIFY(store->hasToken(TokenStore::accessTokenName()));
+    QCOMPARE(store->retrieveToken(TokenStore::accessTokenName()),
+             QStringLiteral("an-access-token"));
     QVERIFY(controller->stage() == TeardownStage::Done);
     QCOMPARE(stageSequence(stages),
              QStringLiteral("Disable,Unpair,Verify,Clear,Done"));

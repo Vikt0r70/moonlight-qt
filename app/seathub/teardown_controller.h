@@ -8,7 +8,6 @@
 
 #include "control_plane_client.h"
 #include "error_map.h"
-#include "token_store.h"
 
 class ControlPlaneClient;
 
@@ -56,10 +55,11 @@ Q_DECLARE_METATYPE(TeardownStage)
 // it there before any session starts, and `teardown()`, `cancel()` and `verifySession()` hand
 // themselves over queued when they are called from anywhere else - a `QTimer` started from a
 // foreign thread is refused by Qt with a warning and nothing else, which is what used to stop
-// teardown before `Clear` so the token store was never cleared.
+// teardown before `Clear` and `teardownCompleted()` was never emitted.
 //
-// `m_store->clearAll()` runs from that thread and touches only the filesystem and DPAPI; it owns
-// no timer, socket or event-loop object, so it is deliberately not moved with this controller.
+// Teardown does not touch the customer's stored sign-in credential: that is removed by sign-out
+// alone (CUST-08, Phase 5 plan 02). STREAM-10's "keeps no stored rig, address or pairing" holds
+// because the client never writes any of the three to disk.
 class TeardownController : public QObject
 {
     Q_OBJECT
@@ -80,7 +80,6 @@ public:
     TeardownStage stage() const { return m_stage; }
 
     void setControlPlane(ControlPlaneClient* client);
-    void setTokenStore(TokenStore* store);
     /// Test seam: the grace window is measured with the same clock either way.
     void setTeardownGraceMs(int milliseconds);
     void setVerifyIntervalMs(int milliseconds);
@@ -127,7 +126,6 @@ private:
     bool onOwnThread() const;
 
     ControlPlaneClient* m_client = nullptr;
-    TokenStore* m_store = nullptr;
 
     QString m_state;
     TeardownStage m_stage = TeardownStage::Idle;
