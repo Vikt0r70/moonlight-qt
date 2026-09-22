@@ -10,19 +10,25 @@ Q_LOGGING_CATEGORY(seathubSettings, "seathub.settings")
 namespace {
 
 // ---------------------------------------------------------------------------------------------
-// The catalogue (D-11, D-47, CUST-05).
+// The catalogue (D-11, D-24, D-25, D-25a, D-47, CUST-17).
 //
 // Every key upstream's `StreamingPreferences::save()` writes is listed exactly once, in the
-// order `settings-audit.md` audits them. `group` is the D-48 SeatHub grouping, which is
-// SeatHub's own arrangement - upstream's launcher has no such split.
+// order `settings-audit.md` audits them. `group` is one of the seven sections upstream's own
+// `SettingsView.qml` renders, in upstream's own order (D-24, superseding Phase 3's D-48
+// SeatHub-invented grouping).
 //
-// A key is one of three things and the table says which:
-//   * its own control           (mergedInto == nullptr, dropReason == nullptr)
-//   * a legacy key folded into another control (mergedInto set - `windowmode` and `fullscreen`
-//     are one "Display mode" dropdown, `startwindowed` and `uidisplaymode` are one launcher
-//     display dropdown, `width`/`height` are one resolution dropdown plus its custom fields)
-//   * deliberately managed by SeatHub with no control at all (dropReason set - D-47's
-//     "intentionally dropped" status, which the Settings page discloses rather than hides)
+// A key is one of four things and the table says which:
+//   * its own control, rendered                (mergedInto == nullptr, forced == false,
+//                                                dropReason == nullptr)
+//   * a legacy key folded into another control  (mergedInto set - `windowmode` and `fullscreen`
+//     are one "Display mode" dropdown, `startwindowed` and `uidisplaymode` are one "GUI display
+//     mode" dropdown, `width`/`height` are the "Resolution" control, `fps` is the "Frame rate"
+//     control)
+//   * corrected to a fixed value on every load, not rendered (forced == true, D-25(b)/(c),
+//     T-05-45)
+//   * not rendered and not corrected - its stored value keeps working exactly as it is, because
+//     it was never on upstream's own page, or (`showperfoverlay`) because SeatHub's page shows
+//     its per-value toggles instead (forced == false, dropReason set)
 // ---------------------------------------------------------------------------------------------
 
 enum Kind {
@@ -30,7 +36,8 @@ enum Kind {
     KindInt,
     KindEnum,
     // Read-only in SeatHub's own vocabulary: the value upstream stores is an internal marker
-    // (an enum index, a version number) that has no honest customer-facing control.
+    // (an enum index, a version number) that has no honest customer-facing control, or a value
+    // D-25 forces to one fixed setting.
     KindFixed,
 };
 
@@ -44,7 +51,15 @@ struct Setting {
     int optionCount;
     // Non-null when another control owns this key.
     const char* mergedInto;
-    // Non-null when SeatHub manages the key itself and shows no control.
+    // True when the displayed/written boolean is the logical NOT of the stored one. Three
+    // upstream checkboxes read this way (`hostaudio`, `abstouchmode`, `multicontroller`) - the
+    // catalogue carries the inversion so no QML row has to know about it.
+    bool inverted;
+    // D-25(b)/(c): corrected back to this fixed value on every load (T-05-45). Never true at the
+    // same time as a non-null `dropReason` being merely informational - a forced key's
+    // `dropReason` explains *why* it is forced.
+    bool forced;
+    // Non-null when the row is not rendered, whether forced or simply not on upstream's page.
     const char* dropReason;
 };
 
@@ -67,86 +82,163 @@ const char* const kLanguages[] = {
 
 #define COUNT_OF(a) int(sizeof(a) / sizeof((a)[0]))
 
+// D-24 order: Basic, Audio, Host, UI (column 1), Input, Gamepad, Advanced (column 2) -
+// upstream's own two-column layout (`SettingsView.qml`, RESEARCH Q4).
 const Setting kSettings[] = {
-    // ---- Video ------------------------------------------------------------------------------
-    { "width", "video", "Resolution", KindInt, nullptr, 0, "resolutionPreset", nullptr },
-    { "height", "video", "Resolution height", KindInt, nullptr, 0, "resolutionPreset", nullptr },
-    { "fps", "video", "Frame rate", KindInt, nullptr, 0, nullptr, nullptr },
-    { "bitrate", "video", "Video bitrate (Kbps)", KindInt, nullptr, 0, nullptr, nullptr },
-    { "unlockbitrate", "video", "Unlock bitrate limit", KindBool, nullptr, 0, nullptr, nullptr },
-    { "fullscreen", "video", "Display mode", KindEnum, kDisplayModes, COUNT_OF(kDisplayModes),
-      "displayMode", nullptr },
-    { "windowmode", "video", "Display mode", KindEnum, kDisplayModes, COUNT_OF(kDisplayModes),
-      "displayMode", nullptr },
-    { "vsync", "video", "V-Sync", KindBool, nullptr, 0, nullptr, nullptr },
-    { "framepacing", "video", "Frame pacing", KindBool, nullptr, 0, nullptr, nullptr },
-    { "hdr", "video", "HDR", KindBool, nullptr, 0, nullptr, nullptr },
-    { "yuv444", "video", "YUV 4:4:4", KindBool, nullptr, 0, nullptr, nullptr },
-    { "videocfg", "video", "Video codec", KindEnum, kVideoCodecs, COUNT_OF(kVideoCodecs),
-      nullptr, nullptr },
-    { "videodec", "video", "Video decoder", KindEnum, kVideoDecoders, COUNT_OF(kVideoDecoders),
-      nullptr, nullptr },
-    { "showperfoverlay", "video", "Show performance stats while streaming", KindBool, nullptr, 0,
-      nullptr, nullptr },
+    // ---- Basic Settings ----------------------------------------------------------------------
+    // Upstream's one row "Resolution and FPS" holds two combo boxes; SeatHub renders them as two
+    // rows with the SeatHub select control, each carrying its own half of upstream's description.
+    { "width", "basic", "Resolution", KindInt, nullptr, 0, "resolutionPreset", false, false,
+      nullptr },
+    { "height", "basic", "Resolution height", KindInt, nullptr, 0, "resolutionPreset", false,
+      false, nullptr },
+    { "fps", "basic", "Frame rate", KindInt, nullptr, 0, "frameRatePreset", false, false,
+      nullptr },
+    { "bitrate", "basic", "Video bitrate", KindInt, nullptr, 0, nullptr, false, false, nullptr },
+    { "fullscreen", "basic", "Display mode", KindEnum, kDisplayModes, COUNT_OF(kDisplayModes),
+      "displayMode", false, false, nullptr },
+    { "windowmode", "basic", "Display mode", KindEnum, kDisplayModes, COUNT_OF(kDisplayModes),
+      "displayMode", false, false, nullptr },
+    { "vsync", "basic", "V-Sync", KindBool, nullptr, 0, nullptr, false, false, nullptr },
+    { "framepacing", "basic", "Frame pacing", KindBool, nullptr, 0, nullptr, false, false,
+      nullptr },
 
-    // ---- Audio ------------------------------------------------------------------------------
+    // ---- Audio Settings -----------------------------------------------------------------------
     { "audiocfg", "audio", "Audio configuration", KindEnum, kAudioConfigs, COUNT_OF(kAudioConfigs),
-      nullptr, nullptr },
-    { "hostaudio", "audio", "Mute host PC speakers while streaming", KindBool, nullptr, 0, nullptr,
-      nullptr },
-    { "muteonfocusloss", "audio", "Mute audio when SeatHub is not the active window", KindBool,
-      nullptr, 0, nullptr, nullptr },
+      nullptr, false, false, nullptr },
+    // D-25a: NOT forced. Stays visible and user-editable at upstream's own default
+    // (`playAudioOnHost=false`), which the checkbox shows as checked (host muted) because the
+    // checkbox is the inverse of the stored key, exactly as upstream renders it.
+    { "hostaudio", "audio", "Mute host PC speakers while streaming", KindBool, nullptr, 0,
+      nullptr, true, false, nullptr },
+    { "muteonfocusloss", "audio", "Mute audio stream when SeatHub is not the active window",
+      KindBool, nullptr, 0, nullptr, false, false, nullptr },
 
-    // ---- Input ------------------------------------------------------------------------------
-    { "gameopts", "input", "Optimize game settings for streaming", KindBool, nullptr, 0, nullptr,
-      nullptr },
-    { "multicontroller", "input", "Force gamepad #1 always connected", KindBool, nullptr, 0,
-      nullptr, nullptr },
-    { "gamepadmouse", "input", "Mouse control with gamepads (hold Start)", KindBool, nullptr, 0,
-      nullptr, nullptr },
-    { "backgroundgamepad", "input", "Process gamepad input in the background", KindBool, nullptr,
-      0, nullptr, nullptr },
-    { "swapfacebuttons", "input", "Swap A/B and X/Y gamepad buttons", KindBool, nullptr, 0,
-      nullptr, nullptr },
-    { "mouseacceleration", "input", "Optimize mouse for remote desktop instead of games",
-      KindBool, nullptr, 0, nullptr, nullptr },
-    { "abstouchmode", "input", "Use touchscreen as a virtual trackpad", KindBool, nullptr, 0,
-      nullptr, nullptr },
-    { "swapmousebuttons", "input", "Swap left and right mouse buttons", KindBool, nullptr, 0,
-      nullptr, nullptr },
-    { "reversescroll", "input", "Reverse mouse scrolling direction", KindBool, nullptr, 0, nullptr,
-      nullptr },
-
-    // ---- Network ----------------------------------------------------------------------------
-    { "packetsize", "network", "Packet size (bytes)", KindInt, nullptr, 0, nullptr, nullptr },
-    { "connwarnings", "network", "Show connection quality warnings", KindBool, nullptr, 0, nullptr,
-      nullptr },
-    { "detectnetblocking", "network", "Automatically detect blocked connections", KindBool,
-      nullptr, 0, nullptr, nullptr },
-    { "mdns", "network", "Find PCs on the local network", KindFixed, nullptr, 0, nullptr,
-      "SeatHub reaches the host through the session the control plane allocated, so local "
-      "discovery is not part of the session path. Left at upstream's setting." },
-
-    // ---- Advanced ---------------------------------------------------------------------------
-    { "startwindowed", "advanced", "Launcher window display mode", KindEnum, kLaunchDisplayModes,
-      COUNT_OF(kLaunchDisplayModes), "launchDisplayMode", nullptr },
-    { "uidisplaymode", "advanced", "Launcher window display mode", KindEnum, kLaunchDisplayModes,
-      COUNT_OF(kLaunchDisplayModes), "launchDisplayMode", nullptr },
-    { "capturesyskeys", "advanced", "Capture system keyboard shortcuts", KindEnum, kCaptureSysKeys,
-      COUNT_OF(kCaptureSysKeys), nullptr, nullptr },
-    { "keepawake", "advanced", "Keep the display awake while streaming", KindBool, nullptr, 0,
-      nullptr, nullptr },
-    { "language", "advanced", "Interface language", KindEnum, kLanguages, COUNT_OF(kLanguages),
-      nullptr, nullptr },
-    { "quitAppAfter", "advanced", "Quit app on host PC after ending stream", KindFixed, nullptr, 0,
-      nullptr,
+    // ---- Host Settings ------------------------------------------------------------------------
+    { "gameopts", "host", "Optimize game settings for streaming", KindBool, nullptr, 0, nullptr,
+      false, false, nullptr },
+    // D-25(c): forced off, which is already upstream's own default - SeatHub owns the one
+    // session per launch and closes the host app as part of its own teardown.
+    { "quitAppAfter", "host", "Quit app on host PC after ending stream", KindFixed, nullptr, 0,
+      nullptr, false, true,
       "SeatHub owns one session per launch and closes the host app as part of that teardown, so "
-      "this is not a customer-facing choice." },
-    { "richpresence", "advanced", "Discord Rich Presence integration", KindFixed, nullptr, 0,
-      nullptr, "SeatHub has no external presence surface; the setting has nothing to act on." },
+      "this is not a customer-facing choice. Forced off on every load (D-25(c))." },
+
+    // ---- UI Settings --------------------------------------------------------------------------
+    // D-25(b): forced English on every load. ADR-0043 also retires every language toggle on
+    // every surface - Arabic wording renders inside the same layout, with no switcher.
+    { "language", "ui", "Language", KindFixed, nullptr, 0, nullptr, false, true,
+      "English-only milestone (ADR-0043). Forced on every load so a value edited by hand in the "
+      "store cannot reach the engine (D-25(b))." },
+    { "startwindowed", "ui", "GUI display mode", KindEnum, kLaunchDisplayModes,
+      COUNT_OF(kLaunchDisplayModes), "launchDisplayMode", false, false, nullptr },
+    { "uidisplaymode", "ui", "GUI display mode", KindEnum, kLaunchDisplayModes,
+      COUNT_OF(kLaunchDisplayModes), "launchDisplayMode", false, false, nullptr },
+    // OD-05: stays visible with upstream's own default (true). SeatHub's overlay re-asserts
+    // itself after the engine writes status text so a low-balance warning is never blanked.
+    { "connwarnings", "ui", "Show connection quality warnings", KindBool, nullptr, 0, nullptr,
+      false, false, nullptr },
+    // D-25(b): forced off. SeatHub has no external presence surface for this to act on.
+    { "richpresence", "ui", "Discord Rich Presence integration", KindFixed, nullptr, 0, nullptr,
+      false, true,
+      "SeatHub has no external presence surface; the setting has nothing to act on. Forced off "
+      "on every load (D-25(b))." },
+    { "keepawake", "ui", "Keep the display awake while streaming", KindBool, nullptr, 0, nullptr,
+      false, false, nullptr },
+
+    // ---- Input Settings -----------------------------------------------------------------------
+    { "mouseacceleration", "input", "Optimize mouse for remote desktop instead of games",
+      KindBool, nullptr, 0, nullptr, false, false, nullptr },
+    // ADR-0042/D-49, kept exactly as Phase 3 decided (D-26): SeatHub's own default (checked,
+    // "In fullscreen") differs from upstream's own default (unchecked/never) - a third
+    // authorized deviation from upstream, alongside the brand substitution and the
+    // tooltip-to-description move, recorded in the re-issued audit.
+    { "capturesyskeys", "input", "Capture system keyboard shortcuts", KindEnum, kCaptureSysKeys,
+      COUNT_OF(kCaptureSysKeys), nullptr, false, false, nullptr },
+    // Upstream's checkbox is the inverse of the stored key (`absoluteTouchMode=true` by default,
+    // so the box ships unchecked).
+    { "abstouchmode", "input", "Use touchscreen as a virtual trackpad", KindBool, nullptr, 0,
+      nullptr, true, false, nullptr },
+    { "swapmousebuttons", "input", "Swap left and right mouse buttons", KindBool, nullptr, 0,
+      nullptr, false, false, nullptr },
+    { "reversescroll", "input", "Reverse mouse scrolling direction", KindBool, nullptr, 0, nullptr,
+      false, false, nullptr },
+
+    // ---- Gamepad Settings ---------------------------------------------------------------------
+    { "swapfacebuttons", "gamepad", "Swap A/B and X/Y gamepad buttons", KindBool, nullptr, 0,
+      nullptr, false, false, nullptr },
+    // Upstream's checkbox is the inverse of the stored key (`multiController=true` by default,
+    // so the box ships unchecked).
+    { "multicontroller", "gamepad", "Force gamepad #1 always connected", KindBool, nullptr, 0,
+      nullptr, true, false, nullptr },
+    { "gamepadmouse", "gamepad", "Enable mouse control with gamepads by holding the 'Start' "
+      "button", KindBool, nullptr, 0, nullptr, false, false, nullptr },
+    { "backgroundgamepad", "gamepad", "Process gamepad input when SeatHub is in the background",
+      KindBool, nullptr, 0, nullptr, false, false, nullptr },
+
+    // ---- Advanced Settings --------------------------------------------------------------------
+    { "videodec", "advanced", "Video decoder", KindEnum, kVideoDecoders, COUNT_OF(kVideoDecoders),
+      nullptr, false, false, nullptr },
+    { "videocfg", "advanced", "Video codec", KindEnum, kVideoCodecs, COUNT_OF(kVideoCodecs),
+      nullptr, false, false, nullptr },
+    { "hdr", "advanced", "Enable HDR (Experimental)", KindBool, nullptr, 0, nullptr, false, false,
+      nullptr },
+    { "yuv444", "advanced", "Enable YUV 4:4:4 (Experimental)", KindBool, nullptr, 0, nullptr,
+      false, false, nullptr },
+    { "unlockbitrate", "advanced", "Unlock bitrate limit (Experimental)", KindBool, nullptr, 0,
+      nullptr, false, false, nullptr },
+    // D-25(b): forced off. SeatHub's session path is the control plane's own allocation, not
+    // local discovery.
+    { "mdns", "advanced", "Automatically find PCs on the local network (Recommended)", KindFixed,
+      nullptr, 0, nullptr, false, true,
+      "SeatHub reaches the host through the session the control plane allocated, so local "
+      "discovery is not part of the session path. Forced off on every load (D-25(b))." },
+    // D-25(c): forced off - it raises the engine's own dialogs, which never reach a customer.
+    { "detectnetblocking", "advanced", "Automatically detect blocked connections (Recommended)",
+      KindFixed, nullptr, 0, nullptr, false, true,
+      "This check raises the engine's own dialogs, which SeatHub never shows a customer. Forced "
+      "off on every load (D-25(c))." },
+    // D-23/CUST-17: not a customer control any more. The eleven `statsToggle*` keys below are
+    // the customer's actual choice; this value is derived from them (recomputeShowPerfOverlay).
+    { "showperfoverlay", "advanced", "Show performance stats while streaming", KindFixed, nullptr,
+      0, nullptr, false, false,
+      "Replaced by the eleven performance-stats toggles below (D-23); its value follows them "
+      "automatically (on when any is on, off when none is) rather than being a customer choice "
+      "of its own." },
+
+    // ---- Not on the engine's own settings page (completeness audit only, D-47) -----------------
+    // OD-06: the owner dropped this row because the engine's own stock page does not show it.
+    // Not forced - the stored value is untouched and keeps working, exactly as OD-06 asks.
+    { "packetsize", "advanced", "Packet size (bytes)", KindInt, nullptr, 0, nullptr, false, false,
+      "Not on the engine's own stock settings page (`moonlight stream` CLI only). The owner "
+      "dropped this row (OD-06); the stored value is untouched and keeps working." },
     { "defaultver", "advanced", "Preference-format version", KindFixed, nullptr, 0, nullptr,
-      "Internal upstream migration marker. SeatHub preserves the migration behavior and never "
-      "presents a version-control setting." },
+      false, false,
+      "Internal upstream migration marker, never on the engine's own settings page. SeatHub "
+      "preserves the migration behavior and never presents a version-control setting." },
+};
+
+// The eleven lines Moonlight 6.1.0's own `stringifyVideoStats()` writes (RESEARCH Q3,
+// `ffmpeg.cpp:700-856`), each labelled with that line's own text minus its numbers (OD-03), in
+// its own output order. `copy.md` § Settings carries the same eleven labels verbatim - this is
+// the one place both this bridge and Plan 12's overlay filter read them from (D-26).
+struct StatsToggle {
+    const char* key;
+    const char* label;
+};
+
+const StatsToggle kStatsToggles[] = {
+    { "statsVideoStream", "Video stream" },
+    { "statsIncomingFrameRate", "Incoming frame rate from network" },
+    { "statsDecodingFrameRate", "Decoding frame rate" },
+    { "statsRenderingFrameRate", "Rendering frame rate" },
+    { "statsHostProcessingLatency", "Host processing latency min/max/average" },
+    { "statsNetworkDroppedFrames", "Frames dropped by your network connection" },
+    { "statsJitterDroppedFrames", "Frames dropped due to network jitter" },
+    { "statsNetworkLatency", "Average network latency" },
+    { "statsDecodingTime", "Average decoding time" },
+    { "statsFrameQueueDelay", "Average frame queue delay" },
+    { "statsRenderingTime", "Average rendering time (including monitor V-sync latency)" },
 };
 
 const Setting* findSetting(const QString& key)
@@ -154,6 +246,16 @@ const Setting* findSetting(const QString& key)
     for (const Setting& s : kSettings) {
         if (key == QLatin1String(s.key)) {
             return &s;
+        }
+    }
+    return nullptr;
+}
+
+const StatsToggle* findStatsToggle(const QString& key)
+{
+    for (const StatsToggle& t : kStatsToggles) {
+        if (key == QLatin1String(t.key)) {
+            return &t;
         }
     }
     return nullptr;
@@ -183,6 +285,12 @@ const ResolutionPreset kResolutionPresets[] = {
     { "1440p", 2560, 1440 },
     { "4K", 3840, 2160 },
 };
+
+// Upstream always offers 30 and 60 FPS plus a per-display detected refresh rate plus Custom
+// (RESEARCH Q4). SeatHub's page offers the two fixed presets every install has, plus Custom for
+// anything else, including a display's own native rate - a proper subset of upstream's option
+// set, never a value upstream would refuse, and recorded as a deviation in the settings audit.
+const int kFrameRatePresets[] = { 30, 60 };
 
 // SeatHub's sentences for a setting the engine could not honour as saved. Composed in
 // `copy.md`'s voice (plain, factual); the engine's own sentence never reaches a screen
@@ -267,15 +375,32 @@ SettingsBridge::SettingsBridge(QObject* parent)
 {
     m_preferences = StreamingPreferences::get();
     applySeatHubDefaults();
+    // T-05-45: a load is a load, including the very first one - a store hand-edited before the
+    // process ever started must not survive past this constructor.
+    applyForcedValues();
+    recomputeShowPerfOverlay();
 }
 
 // ---------------------------------------------------------------------------- catalogue
 
 QStringList SettingsBridge::groups() const
 {
-    // D-48's order, and the order the Settings page renders.
-    return { QStringLiteral("video"), QStringLiteral("audio"), QStringLiteral("input"),
-             QStringLiteral("network"), QStringLiteral("advanced") };
+    // D-24's order: the two upstream columns, read top to bottom then left to right.
+    return { QStringLiteral("basic"), QStringLiteral("audio"), QStringLiteral("host"),
+             QStringLiteral("ui"), QStringLiteral("input"), QStringLiteral("gamepad"),
+             QStringLiteral("advanced") };
+}
+
+QString SettingsBridge::groupTitle(const QString& group) const
+{
+    if (group == QLatin1String("basic")) return QStringLiteral("Basic Settings");
+    if (group == QLatin1String("audio")) return QStringLiteral("Audio Settings");
+    if (group == QLatin1String("host")) return QStringLiteral("Host Settings");
+    if (group == QLatin1String("ui")) return QStringLiteral("UI Settings");
+    if (group == QLatin1String("input")) return QStringLiteral("Input Settings");
+    if (group == QLatin1String("gamepad")) return QStringLiteral("Gamepad Settings");
+    if (group == QLatin1String("advanced")) return QStringLiteral("Advanced Settings");
+    return QString();
 }
 
 QStringList SettingsBridge::keys() const
@@ -363,6 +488,12 @@ QStringList SettingsBridge::droppedKeys() const
     return out;
 }
 
+bool SettingsBridge::isForced(const QString& key) const
+{
+    const Setting* s = findSetting(key);
+    return s && s->forced;
+}
+
 // ------------------------------------------------------------------------ read / write
 
 QVariant SettingsBridge::getSavedValue(const QString& key) const
@@ -403,7 +534,9 @@ QVariant SettingsBridge::getSavedValue(const QString& key) const
         return m_preferences->showPerformanceOverlay;
     }
     if (key == QLatin1String("hostaudio")) {
-        return m_preferences->playAudioOnHost;
+        // Inverted (D-25a): the row shows "Mute host PC speakers", the stored key is
+        // "play audio on host". Default false -> shown checked, exactly like upstream.
+        return !m_preferences->playAudioOnHost;
     }
     if (key == QLatin1String("muteonfocusloss")) {
         return m_preferences->muteOnFocusLoss;
@@ -412,7 +545,8 @@ QVariant SettingsBridge::getSavedValue(const QString& key) const
         return m_preferences->gameOptimizations;
     }
     if (key == QLatin1String("multicontroller")) {
-        return m_preferences->multiController;
+        // Inverted: default true -> shown unchecked, exactly like upstream.
+        return !m_preferences->multiController;
     }
     if (key == QLatin1String("gamepadmouse")) {
         return m_preferences->gamepadMouse;
@@ -427,7 +561,8 @@ QVariant SettingsBridge::getSavedValue(const QString& key) const
         return m_preferences->absoluteMouseMode;
     }
     if (key == QLatin1String("abstouchmode")) {
-        return m_preferences->absoluteTouchMode;
+        // Inverted: default true -> shown unchecked, exactly like upstream.
+        return !m_preferences->absoluteTouchMode;
     }
     if (key == QLatin1String("swapmousebuttons")) {
         return m_preferences->swapMouseButtons;
@@ -520,8 +655,8 @@ bool SettingsBridge::setValue(const QString& key, const QVariant& value)
         qCWarning(seathubSettings) << "unknown settings key:" << key;
         return false;
     }
-    if (s->dropReason != nullptr) {
-        qCWarning(seathubSettings) << "key is managed by SeatHub and not writable:" << key;
+    if (s->forced) {
+        qCWarning(seathubSettings) << "key is forced by SeatHub and not writable:" << key;
         return false;
     }
 
@@ -592,11 +727,9 @@ bool SettingsBridge::writeThrough(const QString& key, const QVariant& value)
     else if (key == QLatin1String("yuv444")) {
         m_preferences->enableYUV444 = value.toBool();
     }
-    else if (key == QLatin1String("showperfoverlay")) {
-        m_preferences->showPerformanceOverlay = value.toBool();
-    }
     else if (key == QLatin1String("hostaudio")) {
-        m_preferences->playAudioOnHost = value.toBool();
+        // Inverted write: the row's "checked" means muted, i.e. `playAudioOnHost = false`.
+        m_preferences->playAudioOnHost = !value.toBool();
     }
     else if (key == QLatin1String("muteonfocusloss")) {
         m_preferences->muteOnFocusLoss = value.toBool();
@@ -605,7 +738,9 @@ bool SettingsBridge::writeThrough(const QString& key, const QVariant& value)
         m_preferences->gameOptimizations = value.toBool();
     }
     else if (key == QLatin1String("multicontroller")) {
-        m_preferences->multiController = value.toBool();
+        // Inverted write: the row's "checked" means "force gamepad #1 always connected", i.e.
+        // `multiController = false`.
+        m_preferences->multiController = !value.toBool();
     }
     else if (key == QLatin1String("gamepadmouse")) {
         m_preferences->gamepadMouse = value.toBool();
@@ -620,7 +755,9 @@ bool SettingsBridge::writeThrough(const QString& key, const QVariant& value)
         m_preferences->absoluteMouseMode = value.toBool();
     }
     else if (key == QLatin1String("abstouchmode")) {
-        m_preferences->absoluteTouchMode = value.toBool();
+        // Inverted write: the row's "checked" means "use as a virtual trackpad", i.e.
+        // `absoluteTouchMode = false`.
+        m_preferences->absoluteTouchMode = !value.toBool();
     }
     else if (key == QLatin1String("swapmousebuttons")) {
         m_preferences->swapMouseButtons = value.toBool();
@@ -630,9 +767,6 @@ bool SettingsBridge::writeThrough(const QString& key, const QVariant& value)
     }
     else if (key == QLatin1String("connwarnings")) {
         m_preferences->connectionWarnings = value.toBool();
-    }
-    else if (key == QLatin1String("detectnetblocking")) {
-        m_preferences->detectNetworkBlocking = value.toBool();
     }
     else if (key == QLatin1String("keepawake")) {
         m_preferences->keepAwake = value.toBool();
@@ -674,13 +808,6 @@ bool SettingsBridge::writeThrough(const QString& key, const QVariant& value)
         }
         m_preferences->captureSysKeysMode = StreamingPreferences::CaptureSysKeysMode(index);
     }
-    else if (key == QLatin1String("language")) {
-        const int index = optionIndex(*findSetting(key), value.toString());
-        if (index < 0) {
-            return false;
-        }
-        m_preferences->language = StreamingPreferences::Language(index);
-    }
     else if (key == QLatin1String("windowmode") || key == QLatin1String("displayMode")
              || key == QLatin1String("fullscreen")) {
         const int index = optionIndex(*findSetting(QStringLiteral("windowmode")),
@@ -714,6 +841,11 @@ bool SettingsBridge::writeThrough(const QString& key, const QVariant& value)
     // A write through one member of a merge is a write to the merged control.
     if (s && s->mergedInto != nullptr) {
         emit valueChanged(QString::fromLatin1(s->mergedInto));
+    }
+    // Widening the bitrate ceiling can leave a saved value that used to be clamped; nothing to
+    // do here beyond notifying, since the QML row re-reads the bound on every refresh.
+    if (key == QLatin1String("unlockbitrate")) {
+        emit valueChanged(QStringLiteral("bitrate"));
     }
 
     return true;
@@ -753,6 +885,36 @@ bool SettingsBridge::setResolutionPreset(const QString& preset)
     // "Custom" is a state of the pair, not a value to store - the width and height fields
     // carry it. Anything else is not a preset this build knows.
     return preset == QLatin1String("Custom") && resolutionPreset() == QLatin1String("Custom");
+}
+
+QStringList SettingsBridge::frameRatePresets() const
+{
+    QStringList out;
+    for (int fps : kFrameRatePresets) {
+        out.append(QString::number(fps) + QStringLiteral(" FPS"));
+    }
+    out.append(QStringLiteral("Custom"));
+    return out;
+}
+
+QString SettingsBridge::frameRatePreset() const
+{
+    for (int fps : kFrameRatePresets) {
+        if (m_preferences->fps == fps) {
+            return QString::number(fps) + QStringLiteral(" FPS");
+        }
+    }
+    return QStringLiteral("Custom");
+}
+
+bool SettingsBridge::setFrameRatePreset(const QString& preset)
+{
+    for (int fps : kFrameRatePresets) {
+        if (preset == QString::number(fps) + QStringLiteral(" FPS")) {
+            return setValue(QStringLiteral("fps"), fps);
+        }
+    }
+    return preset == QLatin1String("Custom") && frameRatePreset() == QLatin1String("Custom");
 }
 
 QStringList SettingsBridge::displayModes() const
@@ -799,6 +961,79 @@ QString SettingsBridge::captureSysKeysMode() const
 bool SettingsBridge::setCaptureSysKeysMode(const QString& mode)
 {
     return setValue(QStringLiteral("capturesyskeys"), mode);
+}
+
+int SettingsBridge::bitrateMaximum() const
+{
+    // Upstream widens the ceiling from 150000 to 500000 Kbps only while unlockbitrate is on
+    // (RESEARCH Q4, `SettingsView.qml`'s bitrate Slider). No new bound is invented here.
+    return m_preferences->unlockBitrate ? 500000 : 150000;
+}
+
+// ------------------------------------------------------------------ performance stats (CUST-17)
+
+QStringList SettingsBridge::statsToggleKeys() const
+{
+    QStringList out;
+    for (const StatsToggle& t : kStatsToggles) {
+        out.append(QString::fromLatin1(t.key));
+    }
+    return out;
+}
+
+QString SettingsBridge::statsToggleLabel(const QString& statsKey) const
+{
+    const StatsToggle* t = findStatsToggle(statsKey);
+    return t ? QString::fromLatin1(t->label) : QString();
+}
+
+bool SettingsBridge::getStatsToggle(const QString& statsKey) const
+{
+    if (!findStatsToggle(statsKey)) {
+        return false;
+    }
+    // Same preference store as everything else (D-12); a SeatHub-only key with no upstream
+    // `[streamsettings]` counterpart, so it is read directly rather than through
+    // `StreamingPreferences`, which upstream owns.
+    return QSettings().value(statsKey, false).toBool();
+}
+
+bool SettingsBridge::setStatsToggle(const QString& statsKey, bool value)
+{
+    if (m_streaming) {
+        qCInfo(seathubSettings) << "refused a stats-toggle write during an active stream:"
+                                << statsKey;
+        return false;
+    }
+    if (!findStatsToggle(statsKey)) {
+        qCWarning(seathubSettings) << "unknown stats toggle key:" << statsKey;
+        return false;
+    }
+
+    QSettings settings;
+    settings.setValue(statsKey, value);
+    settings.sync();
+
+    recomputeShowPerfOverlay();
+    emit valueChanged(statsKey);
+    return true;
+}
+
+void SettingsBridge::recomputeShowPerfOverlay()
+{
+    QSettings settings;
+    bool anyOn = false;
+    for (const StatsToggle& t : kStatsToggles) {
+        if (settings.value(QString::fromLatin1(t.key), false).toBool()) {
+            anyOn = true;
+            break;
+        }
+    }
+    if (m_preferences->showPerformanceOverlay != anyOn) {
+        m_preferences->showPerformanceOverlay = anyOn;
+        m_preferences->save();
+        emit valueChanged(QStringLiteral("showperfoverlay"));
+    }
 }
 
 // ------------------------------------------------------------------ negotiated / D-14
@@ -941,6 +1176,16 @@ void SettingsBridge::setStreamingActive(bool active)
     emit sessionActiveChanged();
 }
 
+void SettingsBridge::prepareForSession()
+{
+    // RESEARCH Q4: forced values are re-applied "after reload() and before each stream start".
+    // `SeatHubClient` calls this at the top of `beginSession()`/`beginLocalAttempt()`, before
+    // `setAppState(kStateConnecting)` and therefore well before the engine constructs anything
+    // that reads `StreamingPreferences` (T-05-45).
+    applyForcedValues();
+    recomputeShowPerfOverlay();
+}
+
 void SettingsBridge::noteConnectionStarted()
 {
     if (m_connectionStarted) {
@@ -999,4 +1244,38 @@ void SettingsBridge::applySeatHubDefaults()
     m_preferences->captureSysKeysMode = StreamingPreferences::CSK_FULLSCREEN;
     m_preferences->save();
     qCInfo(seathubSettings) << "applied SeatHub's capture-system-keys default (ADR-0042)";
+}
+
+void SettingsBridge::applyForcedValues()
+{
+    // D-25(b)/(c), T-05-45: re-applied on every load, not only the first, so a value edited by
+    // hand in the store between sessions is corrected before the engine reads it. `hostaudio` is
+    // deliberately absent (D-25a amendment) - it stays user-editable at upstream's own default.
+    bool changed = false;
+
+    if (m_preferences->language != StreamingPreferences::LANG_EN) {
+        m_preferences->language = StreamingPreferences::LANG_EN;
+        changed = true;
+    }
+    if (m_preferences->richPresence) {
+        m_preferences->richPresence = false;
+        changed = true;
+    }
+    if (m_preferences->enableMdns) {
+        m_preferences->enableMdns = false;
+        changed = true;
+    }
+    if (m_preferences->detectNetworkBlocking) {
+        m_preferences->detectNetworkBlocking = false;
+        changed = true;
+    }
+    if (m_preferences->quitAppAfter) {
+        m_preferences->quitAppAfter = false;
+        changed = true;
+    }
+
+    if (changed) {
+        m_preferences->save();
+        qCInfo(seathubSettings) << "corrected forced settings back to their fixed value (D-25)";
+    }
 }

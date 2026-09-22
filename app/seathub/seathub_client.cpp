@@ -495,6 +495,9 @@ void SeatHubClient::beginSession(const QString& sessionId)
 
     clearFailure();
     resetConnecting();
+    // D-25/T-05-45: correct any forced setting back to its fixed value before the engine reads
+    // preferences for this connection (`settings_bridge.h`, RESEARCH Q4).
+    m_settings->prepareForSession();
     setAppState(QString::fromLatin1(kStateConnecting));
 
     startNetworkThreads();
@@ -780,6 +783,8 @@ void SeatHubClient::beginLocalAttempt()
     setEndReasonText(QString());
     setHomeStatus(QString::fromLatin1(kHomeReady));
     resetConnecting();
+    // D-25/T-05-45: same correction as `beginSession()`, before the local engine starts.
+    m_settings->prepareForSession();
     setAppState(QString::fromLatin1(kStateConnecting));
 
     if (!m_session->start(m_hostWindow)) {

@@ -1,5 +1,6 @@
-// Settings bridge tests (Plan 03-04 Task 1): write-through, the streaming guard, the launch-only
-// override layer, and the two QML artifacts that carry the settings page and its controls.
+// Settings bridge tests (Plan 05-11): the upstream-shaped catalogue (D-24), the forced values
+// re-applied on every load (D-25/D-25a, T-05-45), the write-through and streaming guard carried
+// over from Plan 03-04, and the per-value performance-stats toggles (D-23, CUST-17).
 //
 // The bridge is exercised against the real upstream `StreamingPreferences`, not a stand-in: the
 // whole point of the bridge (D-12, STREAM-02) is that there is exactly one preference store, so a
@@ -9,74 +10,16 @@
 // run never reads or writes the preferences of the machine it runs on (upstream's own `main.cpp`
 // uses an INI file too - `QSettings::setDefaultFormat(QSettings::IniFormat)` - so this changes the
 // location, not the format).
+//
+// The QML page itself (`SettingsPage.qml`) is exercised in `tst_ui_screens.cpp` (Plan 05-11 Task
+// 2) rather than here: this file is the bridge's own contract, checkable without a rebuilt page.
 
 #include <QtTest>
-#include <QDir>
-#include <QFile>
-#include <QFont>
-#include <QQmlComponent>
-#include <QQmlEngine>
-#include <QQuickItem>
-#include <QQuickStyle>
-#include <QRegularExpression>
 #include <QSettings>
 #include <QTemporaryDir>
-#include <QUrl>
 
 #include "seathub/settings_bridge.h"
 #include "settings/streamingpreferences.h"
-
-namespace {
-const char* const kSansFamily = "Inter";
-
-QString guiDir()
-{
-    // The .pro hands the fork's own root over so the test finds `app/gui` wherever it was built.
-#ifdef FORK_ROOT
-    const QString fromRoot =
-        QDir(QString::fromUtf8(FORK_ROOT) + QStringLiteral("/app/gui")).absolutePath();
-    if (QDir(fromRoot).exists()) {
-        return fromRoot;
-    }
-#endif
-    return QDir(QCoreApplication::applicationDirPath() + QStringLiteral("/../app/gui"))
-        .absolutePath();
-}
-
-// Collects every Text item under `root`, the same way the 03-02 error-screen test does.
-QList<QObject*> textItems(QObject* root)
-{
-    QList<QObject*> items;
-    for (QObject* child : root->children()) {
-        if (child->inherits("QQuickText")) {
-            items.append(child);
-        }
-        items.append(textItems(child));
-    }
-    return items;
-}
-}
-
-// A stand-in for `SeatHubClient` for the QML tests: SettingsPage talks to the facade (D-35), and
-// what it uses of it is `settings` plus `closeSettings()`. The bridge behind it is the real one.
-class FakeClient : public QObject
-{
-    Q_OBJECT
-    Q_PROPERTY(SettingsBridge* settings READ settings CONSTANT)
-
-public:
-    explicit FakeClient(SettingsBridge* bridge, QObject* parent = nullptr)
-        : QObject(parent), m_bridge(bridge) {}
-
-    SettingsBridge* settings() const { return m_bridge; }
-
-    Q_INVOKABLE void closeSettings() { ++m_closes; }
-    int closes() const { return m_closes; }
-
-private:
-    SettingsBridge* m_bridge;
-    int m_closes = 0;
-};
 
 class TstSettingsBridge : public QObject
 {
@@ -84,12 +27,17 @@ class TstSettingsBridge : public QObject
 
 private slots:
     void initTestCase();
+    void init();
+
+    void catalogueMatchesUpstreamInventoryRowForRow();
     void bridgeReadsThroughToStreamingPreferences();
     void bridgeWritesThroughAndPersists();
+    void invertedCheckboxesReadAndWriteTheOppositeOfTheStoredKey();
     void captureSystemKeysIsCheckboxPlusDropdownState();
     void writesRefusedDuringStream();
-    void settingsPageRendersFiveGroups();
-    void everyAuditedKeyHasAVisibleControl();
+    void forcedValuesAreCorrectedOnEveryLoadNotOnlyTheFirst();
+    void hostSpeakerRowStaysEditableAtUpstreamsDefault();
+    void statsTogglesDefaultOffAndTheDerivedOptionFollowsInBothDirections();
     void sessionOverridesAreInMemoryOnly();
     void negotiatedResultsAreExposedOnlyAfterConnectionStarted();
 
@@ -107,8 +55,63 @@ void TstSettingsBridge::initTestCase()
     QSettings::setDefaultFormat(QSettings::IniFormat);
     QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, m_settingsDir.path());
     QSettings::setPath(QSettings::IniFormat, QSettings::SystemScope, m_settingsDir.path());
+}
 
+void TstSettingsBridge::init()
+{
+    // A fresh bridge (and a fresh constructor pass over applySeatHubDefaults/applyForcedValues/
+    // recomputeShowPerfOverlay) for every test, so one test's writes cannot leak into another's
+    // "on every load" assertion.
+    delete m_bridge;
     m_bridge = new SettingsBridge(this);
+}
+
+void TstSettingsBridge::catalogueMatchesUpstreamInventoryRowForRow()
+{
+    // D-24: the seven upstream sections, in upstream's own two-column order.
+    const QStringList groups = m_bridge->groups();
+    QCOMPARE(groups, (QStringList{ QStringLiteral("basic"), QStringLiteral("audio"),
+                                   QStringLiteral("host"), QStringLiteral("ui"),
+                                   QStringLiteral("input"), QStringLiteral("gamepad"),
+                                   QStringLiteral("advanced") }));
+    QCOMPARE(m_bridge->groupTitle(QStringLiteral("basic")), QStringLiteral("Basic Settings"));
+    QCOMPARE(m_bridge->groupTitle(QStringLiteral("audio")), QStringLiteral("Audio Settings"));
+    QCOMPARE(m_bridge->groupTitle(QStringLiteral("host")), QStringLiteral("Host Settings"));
+    QCOMPARE(m_bridge->groupTitle(QStringLiteral("ui")), QStringLiteral("UI Settings"));
+    QCOMPARE(m_bridge->groupTitle(QStringLiteral("input")), QStringLiteral("Input Settings"));
+    QCOMPARE(m_bridge->groupTitle(QStringLiteral("gamepad")), QStringLiteral("Gamepad Settings"));
+    QCOMPARE(m_bridge->groupTitle(QStringLiteral("advanced")),
+             QStringLiteral("Advanced Settings"));
+
+    // D-11/D-47: the full 38-key completeness baseline is unchanged by the re-grouping - nothing
+    // was added or removed from the catalogue, only re-sectioned, re-labelled and re-flagged.
+    QCOMPARE(m_bridge->keys().size(), 38);
+
+    // Sampled labels, matching RESEARCH Q4's inventory verbatim (with "Moonlight" read as
+    // "SeatHub" where upstream's own tooltip names it).
+    QCOMPARE(m_bridge->labelOf(QStringLiteral("hostaudio")),
+             QStringLiteral("Mute host PC speakers while streaming"));
+    QCOMPARE(m_bridge->labelOf(QStringLiteral("muteonfocusloss")),
+             QStringLiteral("Mute audio stream when SeatHub is not the active window"));
+    QCOMPARE(m_bridge->labelOf(QStringLiteral("uidisplaymode")),
+             QStringLiteral("GUI display mode"));
+    QCOMPARE(m_bridge->labelOf(QStringLiteral("backgroundgamepad")),
+             QStringLiteral("Process gamepad input when SeatHub is in the background"));
+    QCOMPARE(m_bridge->labelOf(QStringLiteral("hdr")),
+             QStringLiteral("Enable HDR (Experimental)"));
+
+    // Sections moved to match upstream, not Phase 3's own D-48 grouping: capture-system-keys is
+    // Input, keep-awake is UI (RESEARCH Q4).
+    QCOMPARE(m_bridge->groupOf(QStringLiteral("capturesyskeys")), QStringLiteral("input"));
+    QCOMPARE(m_bridge->groupOf(QStringLiteral("keepawake")), QStringLiteral("ui"));
+    QCOMPARE(m_bridge->groupOf(QStringLiteral("hostaudio")), QStringLiteral("audio"));
+    QCOMPARE(m_bridge->groupOf(QStringLiteral("quitAppAfter")), QStringLiteral("host"));
+
+    // Merged controls: the resolution and frame-rate presets, same pattern as the display-mode
+    // and launcher-display-mode merges already covered below.
+    QVERIFY(m_bridge->isMerged(QStringLiteral("fps")));
+    QVERIFY(m_bridge->mergedSources(QStringLiteral("frameRatePreset"))
+                .contains(QStringLiteral("fps")));
 }
 
 void TstSettingsBridge::bridgeReadsThroughToStreamingPreferences()
@@ -154,10 +157,53 @@ void TstSettingsBridge::bridgeWritesThroughAndPersists()
     QCOMPARE(m_bridge->getValue(QStringLiteral("width")).toInt(), 2560);
     QCOMPARE(m_bridge->getValue(QStringLiteral("height")).toInt(), 1440);
 
+    // Same pattern for the new frame-rate preset (D-26: derived from upstream's own two fixed
+    // presets, 30 and 60, plus Custom for anything else).
+    QCOMPARE(m_bridge->frameRatePresets(),
+             (QStringList{ QStringLiteral("30 FPS"), QStringLiteral("60 FPS"),
+                           QStringLiteral("Custom") }));
+    QVERIFY(m_bridge->setFrameRatePreset(QStringLiteral("30 FPS")));
+    QCOMPARE(m_bridge->getValue(QStringLiteral("fps")).toInt(), 30);
+    QCOMPARE(m_bridge->frameRatePreset(), QStringLiteral("30 FPS"));
+    QVERIFY(m_bridge->setValue(QStringLiteral("fps"), 45));
+    QCOMPARE(m_bridge->frameRatePreset(), QStringLiteral("Custom"));
+
+    // Bitrate's ceiling widens only while unlockbitrate is on (D-26; upstream's own Slider
+    // bound), not a new value this bridge invents.
+    QCOMPARE(m_bridge->bitrateMaximum(), 150000);
+    QVERIFY(m_bridge->setValue(QStringLiteral("unlockbitrate"), true));
+    QCOMPARE(m_bridge->bitrateMaximum(), 500000);
+    QVERIFY(m_bridge->setValue(QStringLiteral("unlockbitrate"), false));
+    QCOMPARE(m_bridge->bitrateMaximum(), 150000);
+
     // An unknown key, and a value the setting cannot hold, are both refused rather than stored.
     QVERIFY(!m_bridge->setValue(QStringLiteral("not-a-key"), 1));
     QVERIFY(!m_bridge->setValue(QStringLiteral("fps"), 0));
     QVERIFY(!m_bridge->setValue(QStringLiteral("packetsize"), 512)); // upstream floor is 1024
+}
+
+void TstSettingsBridge::invertedCheckboxesReadAndWriteTheOppositeOfTheStoredKey()
+{
+    // RESEARCH Q4: three upstream checkboxes are the logical NOT of the key they write. The
+    // catalogue carries the inversion (advisor point 4) so no QML row has to know about it.
+    StreamingPreferences* prefs = StreamingPreferences::get();
+
+    prefs->playAudioOnHost = false;
+    QCOMPARE(m_bridge->getValue(QStringLiteral("hostaudio")).toBool(), true); // shown checked
+    QVERIFY(m_bridge->setValue(QStringLiteral("hostaudio"), false));           // unchecked
+    QCOMPARE(prefs->playAudioOnHost, true);
+    QVERIFY(m_bridge->setValue(QStringLiteral("hostaudio"), true));            // back to checked
+    QCOMPARE(prefs->playAudioOnHost, false);
+
+    prefs->absoluteTouchMode = true;
+    QCOMPARE(m_bridge->getValue(QStringLiteral("abstouchmode")).toBool(), false);
+    QVERIFY(m_bridge->setValue(QStringLiteral("abstouchmode"), true));
+    QCOMPARE(prefs->absoluteTouchMode, false);
+
+    prefs->multiController = true;
+    QCOMPARE(m_bridge->getValue(QStringLiteral("multicontroller")).toBool(), false);
+    QVERIFY(m_bridge->setValue(QStringLiteral("multicontroller"), true));
+    QCOMPARE(prefs->multiController, false);
 }
 
 void TstSettingsBridge::captureSystemKeysIsCheckboxPlusDropdownState()
@@ -188,14 +234,11 @@ void TstSettingsBridge::captureSystemKeysIsCheckboxPlusDropdownState()
     QVERIFY(modes.contains(QStringLiteral("fullscreen")));
     QVERIFY(modes.contains(QStringLiteral("always")));
     QVERIFY(!modes.contains(QStringLiteral("never")));
-
-    // Back to the shipped default for the remaining tests.
-    QVERIFY(m_bridge->setCaptureSysKeysMode(QStringLiteral("fullscreen")));
 }
 
 void TstSettingsBridge::writesRefusedDuringStream()
 {
-    QCOMPARE(m_bridge->getSavedValue(QStringLiteral("width")).toInt(), 2560);
+    QVERIFY(m_bridge->setValue(QStringLiteral("width"), 2560));
 
     m_bridge->setStreamingActive(true);
     QVERIFY(!m_bridge->writable());
@@ -208,8 +251,6 @@ void TstSettingsBridge::writesRefusedDuringStream()
     QCOMPARE(StreamingPreferences::get()->width, 2560);
     QVERIFY(!m_bridge->setResolutionPreset(QStringLiteral("720p")));
     QVERIFY(!m_bridge->setCaptureSysKeysMode(QStringLiteral("always")));
-    QCOMPARE(StreamingPreferences::get()->captureSysKeysMode,
-             StreamingPreferences::CSK_FULLSCREEN);
 
     m_bridge->setStreamingActive(false);
     QVERIFY(m_bridge->writable());
@@ -217,138 +258,122 @@ void TstSettingsBridge::writesRefusedDuringStream()
     QCOMPARE(StreamingPreferences::get()->width, 1920);
 }
 
-void TstSettingsBridge::settingsPageRendersFiveGroups()
+void TstSettingsBridge::forcedValuesAreCorrectedOnEveryLoadNotOnlyTheFirst()
 {
-    const QString qmlPath = guiDir() + QStringLiteral("/SettingsPage.qml");
-    QVERIFY2(QFile::exists(qmlPath), qPrintable(QStringLiteral("missing ") + qmlPath));
+    // D-25(b)/(c), T-05-45: exactly these five keys are forced, matching D-25a's amendment that
+    // excludes `hostaudio`.
+    QVERIFY(m_bridge->isForced(QStringLiteral("language")));
+    QVERIFY(m_bridge->isForced(QStringLiteral("richpresence")));
+    QVERIFY(m_bridge->isForced(QStringLiteral("mdns")));
+    QVERIFY(m_bridge->isForced(QStringLiteral("detectnetblocking")));
+    QVERIFY(m_bridge->isForced(QStringLiteral("quitAppAfter")));
+    QVERIFY(!m_bridge->isForced(QStringLiteral("hostaudio")));
+    QVERIFY(!m_bridge->isForced(QStringLiteral("packetsize")));
+    QVERIFY(!m_bridge->isForced(QStringLiteral("defaultver")));
+    QVERIFY(!m_bridge->isForced(QStringLiteral("showperfoverlay")));
 
-    QQuickStyle::setStyle(QStringLiteral("Basic"));
+    // A forced key refuses a direct write, unlike a merely-dropped one.
+    QVERIFY(!m_bridge->setValue(QStringLiteral("language"), QStringLiteral("French")));
 
-    QQmlEngine engine;
-    qmlRegisterSingletonType(QUrl::fromLocalFile(guiDir() + QStringLiteral("/Tokens.qml")),
-                             "SeatHub.Tokens", 1, 0, "Tokens");
-    qmlRegisterSingletonType(QUrl::fromLocalFile(guiDir() + QStringLiteral("/Metrics.qml")),
-                             "SeatHub.Tokens", 1, 0, "Metrics");
+    // The construction pass already forced everything once; edit the store BY HAND, behind the
+    // bridge's back (`StreamingPreferences` directly, the way a stray INI edit or an upstream
+    // code path would), and prove a fresh "load" corrects it - this is the exact scenario T-05-45
+    // names, and the exact call `SeatHubClient` makes before every connect attempt.
+    StreamingPreferences* prefs = StreamingPreferences::get();
+    prefs->language = StreamingPreferences::LANG_AUTO;
+    prefs->richPresence = true;
+    prefs->enableMdns = true;
+    prefs->detectNetworkBlocking = true;
+    prefs->quitAppAfter = true;
+    prefs->save();
 
-    QQmlComponent component(&engine, QUrl::fromLocalFile(qmlPath));
-    QScopedPointer<QObject> root(component.create());
-    if (!root) {
-        QFAIL(qPrintable(component.errorString()));
-    }
+    QCOMPARE(prefs->language, StreamingPreferences::LANG_AUTO);
 
-    FakeClient client(m_bridge);
-    QVERIFY(root->setProperty("client", QVariant::fromValue(static_cast<QObject*>(&client))));
+    m_bridge->prepareForSession();
 
-    // D-48: exactly these five groups, each with a heading set in the H2 size.
-    const QStringList groups = { QStringLiteral("Video"), QStringLiteral("Audio"),
-                                 QStringLiteral("Input"), QStringLiteral("Network"),
-                                 QStringLiteral("Advanced") };
-    const QList<QObject*> items = textItems(root.data());
-    for (const QString& group : groups) {
-        bool headingFound = false;
-        for (QObject* item : items) {
-            if (item->property("text").toString() != group) {
-                continue;
-            }
-            const QFont font = item->property("font").value<QFont>();
-            if (font.pixelSize() == 24) { // Metrics.fontH2
-                headingFound = true;
-                break;
-            }
-        }
-        QVERIFY2(headingFound, qPrintable(QStringLiteral("SettingsPage must render the ")
-                                          + group + QStringLiteral(" section (D-48)")));
-    }
+    QCOMPARE(m_bridge->getValue(QStringLiteral("language")).toString(),
+             QStringLiteral("English"));
+    QCOMPARE(prefs->language, StreamingPreferences::LANG_EN);
+    QCOMPARE(m_bridge->getValue(QStringLiteral("richpresence")).toBool(), false);
+    QCOMPARE(m_bridge->getValue(QStringLiteral("mdns")).toBool(), false);
+    QCOMPARE(m_bridge->getValue(QStringLiteral("detectnetblocking")).toBool(), false);
+    QCOMPARE(m_bridge->getValue(QStringLiteral("quitAppAfter")).toBool(), false);
 
-    // The page is a view inside the home state and can always be left.
-    bool sawBack = false;
-    for (QObject* item : items) {
-        if (item->property("text").toString() == QStringLiteral("Back")) {
-            sawBack = true;
-            break;
-        }
-    }
-    QVERIFY2(sawBack, "the settings page must offer a way back to the home view");
+    // And the correction is actually persisted, not just held in memory - a fresh reload from
+    // disk still reads the fixed value.
+    prefs->reload();
+    QCOMPARE(prefs->language, StreamingPreferences::LANG_EN);
+    QCOMPARE(prefs->richPresence, false);
+    QCOMPARE(prefs->enableMdns, false);
+    QCOMPARE(prefs->detectNetworkBlocking, false);
+    QCOMPARE(prefs->quitAppAfter, false);
 }
 
-void TstSettingsBridge::everyAuditedKeyHasAVisibleControl()
+void TstSettingsBridge::hostSpeakerRowStaysEditableAtUpstreamsDefault()
 {
-    const QString source = [&] {
-        QFile file(guiDir() + QStringLiteral("/SettingsPage.qml"));
-        if (!file.open(QIODevice::ReadOnly)) {
-            return QString();
-        }
-        return QString::fromUtf8(file.readAll());
-    }();
-    QVERIFY(!source.isEmpty());
+    // D-25a: NOT forced, and a hand-edit survives a fresh load exactly because it is not one of
+    // the five corrected keys - the opposite of the previous test, on purpose.
+    StreamingPreferences* prefs = StreamingPreferences::get();
+    prefs->playAudioOnHost = false; // upstream default -> the row shows checked (muted)
+    prefs->save();
 
-    // CUST-05 / D-11: nothing is hidden. Every key the bridge catalogues is named in the page -
-    // the managed ones are shown with the reason they are not a choice, the rest have a control.
-    //
-    // The pinned commit serializes exactly 38 `[streamsettings]` keys
-    // (`app/settings/streamingpreferences.cpp`): the 34 the audit gives controls to plus the four
-    // it marks intentionally dropped (`mdns`, `quitAppAfter`, `richpresence`, `defaultver`), which
-    // SeatHub still renders as rows carrying their reason. A short catalogue is the defect this
-    // catches - a key with no row anywhere on the page.
-    const QStringList keys = m_bridge->keys();
-    QVERIFY2(int(keys.size()) == 38, qPrintable(QStringLiteral("expected the full catalogue, got ")
-                                               + QString::number(keys.size())));
-    // Every key is accounted for on the page: a control binds it (`settingKey: "fps"`), a merged
-    // control names its sources in its own description, and a key SeatHub does not expose has a
-    // read-only row carrying the reason. What must never appear is a catalogued key that the page
-    // neither names nor renders - that is the key the audit would lose track of.
-    //
-    // The rows for the keys SeatHub does not expose are built from the bridge's own list rather
-    // than written out one at a time, so those four are covered by the `droppedKeys()` binding
-    // below instead of a literal in this file.
-    QVERIFY2(source.contains(QStringLiteral("droppedKeys()")),
-             "SettingsPage.qml must render the managed keys from the bridge's own list");
+    QCOMPARE(m_bridge->getValue(QStringLiteral("hostaudio")).toBool(), true);
+
+    m_bridge->prepareForSession(); // a "load" moment - must NOT touch hostaudio
+    QCOMPARE(prefs->playAudioOnHost, false);
+    QCOMPARE(m_bridge->getValue(QStringLiteral("hostaudio")).toBool(), true);
+
+    // The customer unticks it (unmutes the host), and that choice survives a "load" too.
+    QVERIFY(m_bridge->setValue(QStringLiteral("hostaudio"), false));
+    QCOMPARE(prefs->playAudioOnHost, true);
+    m_bridge->prepareForSession();
+    QCOMPARE(prefs->playAudioOnHost, true);
+    QCOMPARE(m_bridge->getValue(QStringLiteral("hostaudio")).toBool(), false);
+}
+
+void TstSettingsBridge::statsTogglesDefaultOffAndTheDerivedOptionFollowsInBothDirections()
+{
+    // D-23/CUST-17/OD-03: one toggle per line, eleven of them, in `copy.md`'s own order.
+    const QStringList keys = m_bridge->statsToggleKeys();
+    QCOMPARE(keys.size(), 11);
+
+    QCOMPARE(m_bridge->statsToggleLabel(keys.first()), QStringLiteral("Video stream"));
+    QCOMPARE(m_bridge->statsToggleLabel(keys.last()),
+             QStringLiteral("Average rendering time (including monitor V-sync latency)"));
+    QVERIFY(keys.contains(QStringLiteral("statsNetworkLatency")));
+    QCOMPARE(m_bridge->statsToggleLabel(QStringLiteral("statsNetworkLatency")),
+             QStringLiteral("Average network latency"));
+
+    // OD-03/OD-04: all off by default, and all-off is a valid state - the master option follows.
     for (const QString& key : keys) {
-        const QRegularExpression named(QStringLiteral("\\b") + QRegularExpression::escape(key)
-                                       + QStringLiteral("\\b"));
-        QVERIFY2(named.match(source).hasMatch() || m_bridge->isDropped(key),
-                 qPrintable(QStringLiteral("SettingsPage.qml never names the key ") + key));
+        QVERIFY2(!m_bridge->getStatsToggle(key), qPrintable(key));
     }
+    QCOMPARE(m_bridge->getValue(QStringLiteral("showperfoverlay")).toBool(), false);
 
-    // The audit's split: 34 keys with a control, 4 SeatHub reports without offering a choice.
-    QCOMPARE(int(keys.size() - m_bridge->droppedKeys().size()), 34);
-    QCOMPARE(m_bridge->groupOf(QStringLiteral("width")), QStringLiteral("video"));
-    QCOMPARE(m_bridge->groupOf(QStringLiteral("audiocfg")), QStringLiteral("audio"));
-    QCOMPARE(m_bridge->groupOf(QStringLiteral("multicontroller")), QStringLiteral("input"));
-    QCOMPARE(m_bridge->groupOf(QStringLiteral("packetsize")), QStringLiteral("network"));
-    QCOMPARE(m_bridge->groupOf(QStringLiteral("capturesyskeys")), QStringLiteral("advanced"));
-    QCOMPARE(m_bridge->groups().size(), 5);
+    // Turning any one on turns the derived master on (CUST-17: "on when any toggle is on").
+    QVERIFY(m_bridge->setStatsToggle(QStringLiteral("statsNetworkLatency"), true));
+    QCOMPARE(m_bridge->getStatsToggle(QStringLiteral("statsNetworkLatency")), true);
+    QCOMPARE(m_bridge->getValue(QStringLiteral("showperfoverlay")).toBool(), true);
 
-    // The four keys that must never become a second, conflicting control. They report which
-    // control covers them, and that control reports which upstream keys it spans - one direction
-    // so a page can render "Merges X and Y" from the catalogue instead of restating it.
-    QVERIFY(m_bridge->isMerged(QStringLiteral("fullscreen")));
-    QVERIFY(m_bridge->isMerged(QStringLiteral("windowmode")));
-    QVERIFY(m_bridge->mergedSources(QStringLiteral("displayMode"))
-                .contains(QStringLiteral("fullscreen")));
-    QVERIFY(m_bridge->mergedSources(QStringLiteral("displayMode"))
-                .contains(QStringLiteral("windowmode")));
-    QVERIFY(m_bridge->isMerged(QStringLiteral("startwindowed")));
-    QVERIFY(m_bridge->isMerged(QStringLiteral("uidisplaymode")));
-    QVERIFY(m_bridge->mergedSources(QStringLiteral("launchDisplayMode"))
-                .contains(QStringLiteral("startwindowed")));
-    QVERIFY(m_bridge->mergedSources(QStringLiteral("launchDisplayMode"))
-                .contains(QStringLiteral("uidisplaymode")));
-    QVERIFY(m_bridge->mergedSources(QStringLiteral("resolutionPreset"))
-                .contains(QStringLiteral("width")));
-    QVERIFY(m_bridge->mergedSources(QStringLiteral("resolutionPreset"))
-                .contains(QStringLiteral("height")));
+    // A second one on, master stays on.
+    QVERIFY(m_bridge->setStatsToggle(QStringLiteral("statsDecodingFrameRate"), true));
+    QCOMPARE(m_bridge->getValue(QStringLiteral("showperfoverlay")).toBool(), true);
 
-    // The four the audit marks intentionally dropped still have a reason attached.
-    const QStringList dropped = m_bridge->droppedKeys();
-    QVERIFY(dropped.contains(QStringLiteral("mdns")));
-    QVERIFY(dropped.contains(QStringLiteral("quitAppAfter")));
-    QVERIFY(dropped.contains(QStringLiteral("richpresence")));
-    QVERIFY(dropped.contains(QStringLiteral("defaultver")));
-    for (const QString& key : dropped) {
-        QVERIFY2(!m_bridge->dropReason(key).isEmpty(),
-                 qPrintable(QStringLiteral("no reason recorded for ") + key));
-    }
+    // Turning the first back off, with the second still on, leaves the master on.
+    QVERIFY(m_bridge->setStatsToggle(QStringLiteral("statsNetworkLatency"), false));
+    QCOMPARE(m_bridge->getValue(QStringLiteral("showperfoverlay")).toBool(), true);
+
+    // Turning the last one off too, master goes off ("off when none is").
+    QVERIFY(m_bridge->setStatsToggle(QStringLiteral("statsDecodingFrameRate"), false));
+    QCOMPARE(m_bridge->getValue(QStringLiteral("showperfoverlay")).toBool(), false);
+
+    // The master itself is not a customer control any more: a direct write is refused.
+    QVERIFY(!m_bridge->setValue(QStringLiteral("showperfoverlay"), true));
+
+    // Refused during a stream, exactly like any other write.
+    m_bridge->setStreamingActive(true);
+    QVERIFY(!m_bridge->setStatsToggle(QStringLiteral("statsVideoStream"), true));
+    m_bridge->setStreamingActive(false);
 }
 
 void TstSettingsBridge::sessionOverridesAreInMemoryOnly()

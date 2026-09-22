@@ -25,6 +25,11 @@ class StreamingPreferences;
 //     engine's own sentence is kept for diagnostics only and is never rendered (D-51, T-03-05).
 //   * Every `[streamsettings]` key upstream serializes is listed here, including the ones
 //     SeatHub deliberately manages itself, so nothing is hidden (D-11, CUST-05).
+//   * The page is the engine's own settings page, section for section and row for row (D-24). The
+//     only differences from upstream's own v6.1.0 page are the ones D-25/D-25a name, plus the
+//     brand substitution and the tooltip-to-description move that D-24 itself requires. A key
+//     D-25 removes is not rendered at all - not disabled, not hidden behind a disclosure - and its
+//     value is corrected back to the fixed one on every load, not only the first (D-25, T-05-45).
 //
 // The catalogue (keys, groups, labels, enum vocabularies) lives in this class rather than in
 // QML so there is one place to check against `settings-audit.md`.
@@ -52,10 +57,12 @@ public:
 
     explicit SettingsBridge(QObject* parent = nullptr);
 
-    // ---------------------------------------------------------------- the catalogue (D-11/D-48)
+    // ---------------------------------------------------------------- the catalogue (D-11/D-24)
 
-    /// The D-48 group order: Video, Audio, Input, Network, Advanced.
+    /// The seven upstream sections, in upstream's own order (D-24, superseding Phase 3's D-48).
     Q_INVOKABLE QStringList groups() const;
+    /// The upstream section title for a group id (`"Basic Settings"`, and so on).
+    Q_INVOKABLE QString groupTitle(const QString& group) const;
     /// Every `[streamsettings]` key upstream serializes, in catalogue order.
     Q_INVOKABLE QStringList keys() const;
     Q_INVOKABLE QStringList keysInGroup(const QString& group) const;
@@ -67,10 +74,15 @@ public:
     Q_INVOKABLE bool isMerged(const QString& key) const;
     /// The legacy keys folded into the merged control, for the audit trail.
     Q_INVOKABLE QStringList mergedSources(const QString& key) const;
-    /// True when SeatHub manages the key internally and shows no control for it (D-47).
+    /// True when this row is not rendered on the page: either D-25 removed it and forced its
+    /// value, or it was never part of upstream's own settings page to begin with (D-47).
     Q_INVOKABLE bool isDropped(const QString& key) const;
     Q_INVOKABLE QString dropReason(const QString& key) const;
     Q_INVOKABLE QStringList droppedKeys() const;
+    /// True for the five D-25(b)/(c) keys corrected back to their fixed value on every load -
+    /// distinct from a key that is merely not rendered (`packetsize`, `defaultver`, OD-06),
+    /// whose stored value is left exactly as it is.
+    Q_INVOKABLE bool isForced(const QString& key) const;
 
     // ------------------------------------------------------------- read and write (STREAM-02)
 
@@ -91,6 +103,12 @@ public:
     Q_INVOKABLE bool setResolutionPreset(const QString& preset);
     Q_INVOKABLE QStringList resolutionPresets() const;
 
+    /// Frame rate is one control over `fps`; "Custom" means the value is neither of the two
+    /// upstream-fixed presets (30, 60), matching upstream's own "30 FPS / 60 FPS / Custom" set.
+    Q_INVOKABLE QString frameRatePreset() const;
+    Q_INVOKABLE bool setFrameRatePreset(const QString& preset);
+    Q_INVOKABLE QStringList frameRatePresets() const;
+
     /// Display mode is one control over `windowmode` + its legacy predecessor `fullscreen`.
     Q_INVOKABLE QString displayMode() const;
     Q_INVOKABLE bool setDisplayMode(const QString& mode);
@@ -107,6 +125,23 @@ public:
     Q_INVOKABLE QString captureSysKeysMode() const;
     Q_INVOKABLE bool setCaptureSysKeysMode(const QString& mode);
     Q_INVOKABLE QStringList captureSysKeysModes() const;
+
+    /// The bound the bitrate slider/field accepts right now: upstream widens it from 150000 to
+    /// 500000 Kbps only while `unlockbitrate` is on (`streamingpreferences.h`, D-26).
+    Q_INVOKABLE int bitrateMaximum() const;
+
+    // ------------------------------------------------------- performance stats toggles (CUST-17)
+
+    /// One boolean per line Moonlight's own `stringifyVideoStats()` writes (D-23, D-26), in the
+    /// order `copy.md` § Settings lists them. Stored under their own SeatHub keys in the same
+    /// preference store (D-12) - not `StreamingPreferences` members, since that file is upstream's.
+    Q_INVOKABLE QStringList statsToggleKeys() const;
+    /// The line's own verbatim label (`copy.md` § Settings), with no number in it (OD-03).
+    Q_INVOKABLE QString statsToggleLabel(const QString& statsKey) const;
+    Q_INVOKABLE bool getStatsToggle(const QString& statsKey) const;
+    /// Writes the toggle and recomputes the derived `showperfoverlay` value: on when any toggle
+    /// is on, off when none is (CUST-17). Refused while streaming, like any other write.
+    Q_INVOKABLE bool setStatsToggle(const QString& statsKey, bool value);
 
     // ------------------------------------------------- negotiated results and warnings (D-14)
 
@@ -137,6 +172,12 @@ public:
 
     /// Pitfall 6: while this is true every write is refused.
     void setStreamingActive(bool active);
+    /// D-25/T-05-45: called by `SeatHubClient` at the start of every connect attempt, before the
+    /// engine is started (`beginSession()`/`beginLocalAttempt()`) and therefore before
+    /// `app/streaming/session.cpp` reads `StreamingPreferences` to build the connection. A value
+    /// edited by hand in the store between sessions is corrected here, on every load - not only
+    /// the first - so the engine never reads a forced key's stale value.
+    void prepareForSession();
     /// D-14: from here on a negotiated value can be reported.
     void noteConnectionStarted();
     /// D-14/D-37: the session is over - negotiated results go stale and overrides are dropped.
@@ -163,6 +204,13 @@ private:
     /// SeatHub's own captured values, applied once on first run where ADR-0042 freezes a
     /// default that differs from upstream's (capture-system-keys: checked + "In fullscreen").
     void applySeatHubDefaults();
+    /// D-25/D-25a: `language`, `richpresence`, `mdns`, `detectnetblocking` and `quitAppAfter` are
+    /// corrected back to their fixed value and saved, on every load - not only the first
+    /// (T-05-45). `hostaudio` is deliberately excluded (D-25a amendment): it stays user-editable.
+    void applyForcedValues();
+    /// D-23/CUST-17: `showperfoverlay` follows the eleven stats toggles - on when any is on, off
+    /// when none is - recomputed on every load and on every toggle write.
+    void recomputeShowPerfOverlay();
     /// The setting an engine warning is about, or an empty string when it cannot be attributed.
     static QString warningKeyFor(const QString& engineText);
 
