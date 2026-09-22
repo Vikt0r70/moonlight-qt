@@ -38,7 +38,7 @@ var SEATHUB_TITLE = "SeatHub Setup";                        // config.xml <Title
 var SEATHUB_MAINTENANCE_TOOL = "SeatHubMaintenanceTool.exe"; // config.xml <MaintenanceToolName> + .exe
 var SEATHUB_CLIENT = "SeatHub.exe";                          // config.xml <RunProgram>
 var SEATHUB_REMOVED_KEY = "SeatHubPreviousInstallRemoved";
-var SEATHUB_FOLDER_WAIT_SECONDS = 30;
+var SEATHUB_TOOL_WAIT_SECONDS = 30;
 
 // ifw-cli.html: `purge` - "Uninstall all packages and remove the program directory" (`remove`
 // would leave the maintenance tool, and the tool is what the refusal keys on).
@@ -108,7 +108,7 @@ function seathubRemovePreviousInstall(targetDir)
 
     var removed = false;
     try {
-        removed = seathubPurge(tool) && seathubWaitForFolderToGo(targetDir, tool);
+        removed = seathubPurge(tool) && seathubWaitForToolToGo(targetDir, tool);
     } finally {
         if (backup !== "")
             seathubRestoreTokens(backup, tokenDir);
@@ -183,22 +183,39 @@ function seathubRunPurge(tool)
     return Number(result[1]);
 }
 
-// Point 4 at the top: wait for uninstall.vbs to delete the folder before the wizard moves on.
-function seathubWaitForFolderToGo(targetDir, tool)
+// Point 4 at the top: `purge` hands the deletion to a detached %TEMP%\uninstall.vbs. MEASURED
+// (scratch harness, 2026-09-22): that script deletes the maintenance tool in ~0.2 s, then makes ONE
+// attempt at the whole folder and exits by ~1.1 s. So wait for the TOOL, not the folder. IFW's
+// TargetDirectoryInUse refusal keys only on <dir>/SeatHubMaintenanceTool.exe; a single leftover file
+// that something still holds open (antivirus, a lingering handle) keeps the FOLDER present forever.
+// Polling the folder is what froze the wizard here: it ran all 30 waits (~30 s, non-pumping GUI ->
+// "(Not Responding)") on a folder that never cleared, even though the tool had gone ~0.2 s in. Polling
+// the tool returns in a fraction of a second in that same case.
+function seathubWaitForToolToGo(targetDir, tool)
 {
-    for (var i = 0; i < SEATHUB_FOLDER_WAIT_SECONDS; ++i) {
-        if (!installer.fileExists(targetDir))
+    for (var i = 0; i < SEATHUB_TOOL_WAIT_SECONDS; ++i) {
+        if (!installer.fileExists(tool)) {
+            // Tool gone -> IFW will accept this folder. If the folder is gone too the vbs finished;
+            // if not, give its one-shot folder delete a moment to fire so it cannot delete the files
+            // this install is about to write, then continue. A non-empty folder WITHOUT the tool is
+            // not refused; IFW only asks before reusing it ("OverwriteTargetDirectory").
+            if (installer.fileExists(targetDir)) {
+                seathubSleepOneSecond();
+                seathubLog("tool removed; " + targetDir + " still has leftovers, continuing");
+            } else {
+                // The vbs finished its one-shot folder delete: the folder is already gone, so IFW
+                // accepts it outright (no "OverwriteTargetDirectory" ask). Logged on purpose - this
+                // is the only place that says the clean path ran, so a real update tells us whether
+                // the folder was gone at continue-time (WINDOWS #22 could not, run 1 returned silently).
+                seathubLog("tool removed; " + targetDir + " is gone");
+            }
             return true;
+        }
         seathubSleepOneSecond();
     }
-    if (installer.fileExists(tool)) {
-        seathubLog("the maintenance tool is still in " + targetDir);
-        return false;
-    }
-    // The tool is gone but files are left (something held one open). The folder check no longer
-    // refuses; it asks before reusing a non-empty folder ("OverwriteTargetDirectory").
-    seathubLog(targetDir + " was not fully removed; continuing");
-    return true;
+    // Tool still present after the cap: IFW would refuse. Report failure; the caller shows the box.
+    seathubLog("the maintenance tool is still in " + targetDir);
+    return false;
 }
 
 // Token store backup. TokenStore::defaultDirectory() is %APPDATA%\Seven Hills\SeatHub, built here
