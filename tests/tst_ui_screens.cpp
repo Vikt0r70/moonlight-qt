@@ -720,6 +720,7 @@ private slots:
     void balancePillDrawsEachOfItsStates();
     void balancePillChangesColourExactlyAtTheSpecsThresholds();
     void menuHasItsThreeItemsAndTopUpAsksTheFacadeForTheWebsite();
+    void menuPopupIsWideEnoughToShowItsThreeItems();
     void theProfileIsRoutedAsAViewInsideHomeAndHomeNoLongerSignsOut();
     void theProfileShowsTheThreeIdentityRowsReadOnlyWithTheEmailMarkInWords();
     void aMissingEmailOrPhoneKeepsItsRowAndSaysNotAdded();
@@ -1568,6 +1569,131 @@ void TstUiScreens::menuHasItsThreeItemsAndTopUpAsksTheFacadeForTheWebsite()
     const int policy = popup->property("closePolicy").toInt();
     QVERIFY2(policy & 0x01, "a click outside must close the menu");  // Popup.CloseOnPressOutside
     QVERIFY2(policy & 0x10, "Escape must close the menu");           // Popup.CloseOnEscape
+}
+
+void TstUiScreens::menuPopupIsWideEnoughToShowItsThreeItems()
+{
+    // The bug this test pins: the header menu opened but rendered a near-zero-width sliver, so
+    // Profile / Top up / Settings were invisible and unclickable (menu-popup-zero-width). The
+    // existing menu tests never measure the *popup's rendered width* - `menuHasItsThreeItems...`
+    // asserts the root Item's implicitWidth (the 40x40 trigger), and finds items by objectName,
+    // which exist regardless of geometry. A zero-width popup passed everything.
+    //
+    // A Menu is a Popup: it needs a shown, exposed window to lay out. This builds one (the
+    // technique of `menuOpensOnSpace...`), opens the popup, waits for it to be visible, and only
+    // then measures. The width math lives in the shared C++ template `T.Menu` and both the Basic
+    // (forced here) and Material (production, app/main.cpp:733) styles share an identical
+    // `implicitWidth: max(implicitBackgroundWidth + insets, implicitContentWidth + hpadding)`
+    // formula and an identical default `background: Rectangle { implicitWidth: 200 }`, so a
+    // Basic-style measurement reproduces the Material-style production bug faithfully.
+    QQuickStyle::setStyle(QStringLiteral("Basic"));
+    QQmlEngine engine;
+    registerTokenSingletons(&engine);
+
+    FakeShellClient client;
+    QQmlComponent component(&engine);
+    component.setData(QByteArrayLiteral(
+                          "import QtQuick\n"
+                          "import QtQuick.Controls\n"
+                          "ApplicationWindow {\n"
+                          "    id: win\n"
+                          "    width: 400; height: 300; visible: true\n"
+                          "    property var client: null\n"
+                          "    SeatHubMenu {\n"
+                          "        objectName: \"underTest\"\n"
+                          "        anchors.right: parent.right\n"
+                          "        anchors.top: parent.top\n"
+                          "        client: win.client\n"
+                          "    }\n"
+                          "}\n"),
+                      QUrl::fromLocalFile(guiDir() + QStringLiteral("/tst_menu_width_window.qml")));
+    QScopedPointer<QObject> created(component.create());
+    QVERIFY2(created, qPrintable(component.errorString()));
+    auto* window = qobject_cast<QQuickWindow*>(created.data());
+    QVERIFY(window);
+    QVERIFY(window->setProperty("client", QVariant::fromValue(static_cast<QObject*>(&client))));
+    QVERIFY(QTest::qWaitForWindowExposed(window));
+    window->requestActivate();
+    QVERIFY(QTest::qWaitForWindowActive(window));
+
+    QObject* menu = window->findChild<QObject*>(QStringLiteral("underTest"));
+    QVERIFY(menu);
+    QObject* popup = menu->property("menu").value<QObject*>();
+    QVERIFY(popup);
+
+    // Open it the way the customer does, and wait until it has genuinely laid out. A reading of 0
+    // would mean the popup never opened (a suspect harness), not the bug - so verify visible first.
+    QVERIFY(QMetaObject::invokeMethod(popup, "open"));
+    QTRY_VERIFY_WITH_TIMEOUT(popup->property("opened").toBool(), 3000);
+    QTRY_VERIFY_WITH_TIMEOUT(popup->property("visible").toBool(), 3000);
+
+    auto* contentItem = popup->property("contentItem").value<QQuickItem*>();
+    auto* profile = menu->findChild<QQuickItem*>(QStringLiteral("menuItemProfile"));
+    auto* topUp = menu->findChild<QQuickItem*>(QStringLiteral("menuItemTopUp"));
+    auto* settings = menu->findChild<QQuickItem*>(QStringLiteral("menuItemSettings"));
+    QVERIFY(profile);
+    QVERIFY(topUp);
+    QVERIFY(settings);
+
+    const qreal popupWidth = popup->property("width").toReal();
+    const qreal popupImplicitWidth = popup->property("implicitWidth").toReal();
+    const qreal implicitContentWidth = popup->property("implicitContentWidth").toReal();
+    const qreal implicitBackgroundWidth = popup->property("implicitBackgroundWidth").toReal();
+    const qreal contentWidth = popup->property("contentWidth").toReal();
+    const qreal leftPadding = popup->property("leftPadding").toReal();
+    const qreal rightPadding = popup->property("rightPadding").toReal();
+    const qreal listWidth = contentItem ? contentItem->width() : -1;
+    const qreal listImplicitWidth = contentItem ? contentItem->implicitWidth() : -1;
+    const qreal listContentWidth = contentItem ? contentItem->property("contentWidth").toReal() : -1;
+    const qreal rowImplicitWidth = profile->implicitWidth();
+    const qreal rowWidth = profile->width();
+
+    qWarning().noquote() << "MENUPROBE style=" << QQuickStyle::name()
+                         << "popup.width=" << popupWidth
+                         << "popup.implicitWidth=" << popupImplicitWidth
+                         << "implicitContentWidth=" << implicitContentWidth
+                         << "implicitBackgroundWidth=" << implicitBackgroundWidth
+                         << "contentWidth=" << contentWidth
+                         << "leftPadding=" << leftPadding << "rightPadding=" << rightPadding
+                         << "list.width=" << listWidth
+                         << "list.implicitWidth=" << listImplicitWidth
+                         << "list.contentWidth=" << listContentWidth
+                         << "row.implicitWidth=" << rowImplicitWidth
+                         << "row.width=" << rowWidth
+                         << "topUp.width=" << topUp->width()
+                         << "settings.width=" << settings->width();
+
+    // The row's implicitWidth is the width a row *wants* (its label plus padding, floored at the
+    // design's menu min-width `Metrics.s24 * 2`). If it is ~0 the diagnosis is measurement, not
+    // propagation, and the fix differs - fail loudly rather than silently mis-measure.
+    QVERIFY2(rowImplicitWidth > 40,
+             qPrintable(QStringLiteral("a row reports implicitWidth %1 (<=40): measurement branch, "
+                                       "not the propagation bug - re-plan").arg(rowImplicitWidth)));
+
+    // Core symptom: the popup must be at least as wide as a row wants to be. On today's code the
+    // popup collapses to padding while the row wants ~192, so this fails; the fix restores the
+    // floor and it passes. Derived from the row (no invented constant).
+    QVERIFY2(popupWidth >= rowImplicitWidth,
+             qPrintable(QStringLiteral("popup width %1 is narrower than a row's implicitWidth %2 - "
+                                       "the items cannot render").arg(popupWidth).arg(rowImplicitWidth)));
+
+    // Each of the three items is laid out at a readable width (the full menu content area, popup
+    // width minus its horizontal padding), not squeezed to a sliver, and lies inside the popup.
+    const qreal availableWidth = popupWidth - leftPadding - rightPadding;
+    for (QQuickItem* row : { profile, topUp, settings }) {
+        QVERIFY2(row->width() >= availableWidth - 1.0,
+                 qPrintable(QStringLiteral("item '%1' is %2px wide, the menu content area is %3px - "
+                                           "it is squeezed")
+                                .arg(row->property("text").toString())
+                                .arg(row->width())
+                                .arg(availableWidth)));
+    }
+
+    // Close what we opened before the window is torn down: a Menu is a Popup with an input grab
+    // (a transient native window on Windows), and destroying its window while it is open is an
+    // abnormal teardown that can leave stale focus state for the next windowed test.
+    QVERIFY(QMetaObject::invokeMethod(popup, "close"));
+    QTRY_VERIFY_WITH_TIMEOUT(!popup->property("opened").toBool(), 3000);
 }
 
 void TstUiScreens::menuOpensOnSpaceMovesWithArrowsAndEscapeReturnsFocusToTheTrigger()

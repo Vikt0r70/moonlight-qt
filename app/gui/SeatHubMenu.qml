@@ -128,6 +128,14 @@ Item {
         onClosed: trigger.forceActiveFocus()
 
         background: Rectangle {
+            // The stock Basic/Material `Menu.background` ships `implicitWidth: 200`, which is the
+            // only non-zero term feeding the menu's `implicitWidth`
+            // (`max(implicitBackgroundWidth, implicitContentWidth + padding)`): the default ListView
+            // contentItem is unsized, so `implicitContentWidth` is 0. Overriding the background
+            // without an implicitWidth collapsed the popup to its padding (~8px) and gave every row
+            // width 0 - invisible and unclickable. Floor it at the same `s24 * 2` the rows use, so
+            // the menu is exactly one row-floor wide and the items render (menu-popup-zero-width).
+            implicitWidth: Metrics.s24 * 2
             radius: Metrics.radiusSm
             color: Tokens.surface3Default
             border.width: 1

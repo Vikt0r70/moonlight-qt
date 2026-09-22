@@ -154,6 +154,17 @@ CI diff gate's exception list (the gate only checks files that exist in the upst
 | `app/gui/SeatHubListView.qml` | UI primitive - one history in a region of its own: 44px rows (date and time and the number in mono, the words between), loading skeletons and the named line, the empty sentence and its one action, the footer row for the next page or its failure, the end-of-feed line, and the error state. It asks the facade for the next page only when its rows end. | 05-09 |
 | `tests/tst_ui_screens.cpp`, `tests/tst_ui_screens.pro` | test (pre-existing since Plan 03-02; this row records only the Plan 05-11 addition, not its full history) — six checks against the rebuilt Settings page, linking the real `SettingsBridge`/`StreamingPreferences` for the first time in this suite (`tests/tst_facade_wiring.pro`'s pairing, plus `app/wm.cpp` for `reload()`): the seven upstream sections in order, a D-25-removed row rendering no row at all, the eleven stats toggles (found by walking the real `QQuickItem` visual tree, not `QObject::findChildren` — a Repeater's own delegates are not reachable that way, which is the whole finding this addition's own code comment on `statsCheckBoxFor` records), the host-speaker row's inverted default, the streaming banner and a D-14 negotiated fallback, and the brand check. | 05-11 |
 
+## Debug fixes to SeatHub-owned files
+
+These files are SeatHub's own additions under `app/gui/` and `tests/`, so they are outside the CI
+diff gate's exception list (the gate only checks files that exist in the upstream tag). Recorded
+here per the fork-change rule even though no diff-gate obligation attaches.
+
+| File | Change | Session |
+|------|--------|---------|
+| `app/gui/SeatHubMenu.qml` | Added `implicitWidth: Metrics.s24 * 2` to the header menu's custom `Menu.background`. Overriding the stock `background: Rectangle { implicitWidth: 200 }` had zeroed the only non-zero term in the menu's `implicitWidth` (the default ListView `contentItem` leaves `implicitContentWidth` at 0), collapsing the popup to ~8px of padding, so Profile / Top up / Settings rendered at width 0 — invisible and unclickable on live build 0.1.12. Floors the menu at the same `s24 * 2` the rows use; no new value. | `.planning/debug/menu-popup-zero-width` |
+| `tests/tst_ui_screens.cpp` | Added regression test `menuPopupIsWideEnoughToShowItsThreeItems`: opens the real popup in a shown, exposed window and asserts the popup is at least as wide as a row's `implicitWidth` and that each item fills the menu content area. RED on the pre-fix code (popup 8px, rows 0px), GREEN on the fix (popup 192px, rows 184px) — where the pre-existing menu test only measured the 40×40 root Item, never the popup's rendered width. | `.planning/debug/menu-popup-zero-width` |
+
 ## Upstream files that must never be modified
 
 For the avoidance of doubt, the CI diff gate fails the build if any file under
