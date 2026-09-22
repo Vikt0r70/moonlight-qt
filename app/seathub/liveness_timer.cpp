@@ -145,8 +145,32 @@ void LivenessTimer::tick()
         return;
     }
 
+    // The wallet first, so the report stays the last request of a tick. Its outcome is independent
+    // of the report's: neither can fail the other.
+    m_client->fetchWallet([this](const ControlPlaneResult& result) { handleWalletResult(result); });
+
     m_client->postLiveness(m_sessionId, m_reportedState, m_errorCode,
                            [this](const ControlPlaneResult& result) { handleResult(result); });
+}
+
+void LivenessTimer::handleWalletResult(const ControlPlaneResult& result)
+{
+    // The tick was stopped while the read was on its way: the session it belonged to is over.
+    if (m_sessionId.isEmpty()) {
+        return;
+    }
+
+    // A body that is not a balance is not a balance of zero (`WalletInfo::parse`): reporting zero
+    // for "we could not read it" would put a two-minute warning in front of a customer with credit.
+    WalletInfo wallet;
+    if (!result.ok || !WalletInfo::parse(result.body, &wallet)) {
+        qCInfo(seathubLiveness) << "wallet read failed; keeping the last balance; status"
+                                << result.statusCode;
+        emit walletReadFailed();
+        return;
+    }
+
+    emit walletRead(wallet.balanceMinutes);
 }
 
 void LivenessTimer::handleResult(const ControlPlaneResult& result)

@@ -39,6 +39,7 @@
 #include <QtTest>
 #include <QBuffer>
 #include <QDir>
+#include <QElapsedTimer>
 #include <QFile>
 #include <QJsonArray>
 #include <QJsonDocument>
@@ -56,6 +57,9 @@
 #include <QTimer>
 #include <QUrlQuery>
 #include <QWindow>
+
+#include <atomic>
+#include <functional>
 
 #include "seathub/control_plane_client.h"
 #include "seathub/countries.h"
@@ -443,6 +447,26 @@ public:
     int interrupts = 0;
 };
 
+/// Waits for `condition` WITHOUT running this thread's event loop, and says whether it came true.
+///
+/// This is the point of the in-stream tests below. The facade's own thread is suspended for the whole
+/// of a stream (`session.cpp:1965-1966`), so anything a stream must do has to happen without it; a
+/// `QTRY_*` spins the event loop and would let a queued hop to this thread rescue a design that is
+/// dead in production. Here the loop is never run, so only what the network thread does by itself
+/// can make the condition true.
+bool waitWithoutTheEventLoop(const std::function<bool()>& condition, int timeoutMs = 10000)
+{
+    QElapsedTimer clock;
+    clock.start();
+    while (!condition()) {
+        if (clock.elapsed() > timeoutMs) {
+            return false;
+        }
+        QThread::msleep(5);
+    }
+    return true;
+}
+
 } // namespace
 
 class TstFacadeWiring : public QObject
@@ -652,6 +676,59 @@ private:
             }
         }
         return QString();
+    }
+
+    /// One in-stream wallet answer, as counted on the network thread. Counted with direct connections,
+    /// because the main thread's event loop is deliberately never run while these tests wait.
+    struct WalletTicks
+    {
+        std::atomic<int> read{0};
+        std::atomic<int> failed{0};
+        std::atomic<qint64> lastBalance{-1};
+    };
+
+    /// A facade streaming under a control-plane session, its HUD begun and its liveness reporter
+    /// running on the network thread, with `walletMinutes` as what the wallet answers. The pre-stream
+    /// balance (what Home showed) is `homeMinutes`.
+    void beginStreaming(SeatHubClient& client, FakeEngineSession* engine, WalletTicks* ticks,
+                        int homeMinutes, int walletMinutes)
+    {
+        reachHome(client, homeMinutes);
+        QVERIFY(!QTest::currentTestFailed());
+        client.session()->attachSession(engine);
+        m_fake->answerPairing(409, playRefusalBody(QStringLiteral("The rig is not ready yet."),
+                                                   QStringLiteral("SH-2K2XQ1")));
+        m_fake->answerWallet(200, walletBody(walletMinutes));
+
+        // Counted where the liveness reporter emits them: on its own thread, as the HUD receives them.
+        connect(client.liveness(), &LivenessTimer::walletRead, &client,
+                [ticks](qint64 minutes) {
+                    ticks->lastBalance.store(minutes);
+                    ticks->read.fetch_add(1);
+                },
+                Qt::DirectConnection);
+        connect(client.liveness(), &LivenessTimer::walletReadFailed, &client,
+                [ticks]() { ticks->failed.fetch_add(1); }, Qt::DirectConnection);
+
+        client.beginSession(QStringLiteral("s-live"));
+        emit engine->connectionStarted();
+        QCOMPARE(client.appState(), QStringLiteral("streaming"));
+    }
+
+    /// Runs one more liveness tick and waits, without the event loop, for its wallet answer to have
+    /// been dealt with (read or failed).
+    bool tickAndWait(SeatHubClient& client, WalletTicks* ticks)
+    {
+        const int before = ticks->read.load() + ticks->failed.load();
+        client.liveness()->tick();
+        return waitWithoutTheEventLoop(
+            [&]() { return ticks->read.load() + ticks->failed.load() > before; });
+    }
+
+    static void endStreaming(SeatHubClient& client, FakeEngineSession* engine)
+    {
+        client.session()->attachSession(nullptr);
+        delete engine;
     }
 
 private slots:
@@ -3131,6 +3208,222 @@ private slots:
                                  << QStringLiteral("-45 min");
         QTest::newRow("a debit over an hour") << qint64(-65) << QStringLiteral("-1 h 05 min")
                                               << QStringLiteral("-1 h 05 min");
+    }
+
+    // --- Phase 5 plan 10: the credit and the low-balance warnings, on the liveness tick -------------------
+
+    void theWalletIsReadOnTheLivenessTickAndReachesTheHudWhileTheFacadesThreadIsSuspended()
+    {
+        // The whole of CUST-15 rests on this: nothing in the client knew the balance during a stream,
+        // and the one thread that is stopped for the stream is the facade's. The reads are made and
+        // the HUD is fed on the network thread; this test never runs its own event loop, so a design
+        // that hopped to the facade's thread to update the HUD would leave the value at the seed.
+        SeatHubClient client;
+        auto* engine = new FakeEngineSession;
+        WalletTicks ticks;
+        beginStreaming(client, engine, &ticks, /*home*/ 40, /*wallet*/ 7);
+        QVERIFY(!QTest::currentTestFailed());
+
+        // At the first frame: the balance Home showed, and no card - that value can be old.
+        QVERIFY(client.hud()->isVisible());
+        QVERIFY(client.hud()->creditMinutes() >= 0);
+
+        // The immediate first report reads the wallet; the server's answer replaces the seed and, at
+        // seven minutes, brings the ten-minute card up.
+        QVERIFY2(waitWithoutTheEventLoop([&]() { return client.hud()->creditMinutes() == 7; }),
+                 "the wallet read on the liveness tick never reached the HUD");
+        QCOMPARE(int(client.hud()->activeCard()), int(HudOverlay::Card::TenMinutes));
+        QCOMPARE(client.hud()->warningsFired(HudOverlay::Card::TenMinutes), 1);
+
+        // The facade's own properties have not moved: they are marshalled to its thread, which has
+        // not run. They catch up when it does - and the value they end on is the server's.
+        QCOMPARE(client.balanceMinutes(), qint64(40));
+        QTRY_COMPARE_WITH_TIMEOUT(client.balanceMinutes(), qint64(7), 15000);
+        QCOMPARE(client.balanceText(), QStringLiteral("7 min"));
+
+        endStreaming(client, engine);
+    }
+
+    void theWalletIsReadOnTheExistingTickAndNowhereElse()
+    {
+        SeatHubClient client;
+        auto* engine = new FakeEngineSession;
+        WalletTicks ticks;
+        beginStreaming(client, engine, &ticks, 90, 90);
+        QVERIFY(!QTest::currentTestFailed());
+        QVERIFY(waitWithoutTheEventLoop([&]() { return ticks.read.load() >= 1; }));
+
+        // Two more ticks, and each is one liveness report and one wallet read: the read has no
+        // cadence of its own.
+        QVERIFY(tickAndWait(client, &ticks));
+        QVERIFY(tickAndWait(client, &ticks));
+        QVERIFY(waitWithoutTheEventLoop([&]() {
+            return m_fake->countOfPathEndingWith(QStringLiteral("/liveness")) >= 3;
+        }));
+        const int reports = m_fake->countOfPathEndingWith(QStringLiteral("/liveness"));
+        const int reads = ticks.read.load() + ticks.failed.load();
+        QCOMPARE(reads, reports);
+
+        // And the source agrees: the reporter still has its two locked constants and no third.
+        // (`kIntervalMs` is D-31's 10 seconds; the grace is the server's 30.)
+        const QString dir = seathubSourceDir();
+        QVERIFY2(!dir.isEmpty(), "app/seathub could not be found from the test binary");
+        QFile header(dir + QStringLiteral("/liveness_timer.h"));
+        QVERIFY(header.open(QIODevice::ReadOnly));
+        const QString text = QString::fromUtf8(header.readAll());
+        QCOMPARE(text.count(QStringLiteral("static const int k")), 2);
+        QVERIFY(text.contains(QStringLiteral("kIntervalMs = 10000")));
+        QFile hud(dir + QStringLiteral("/hud_overlay.cpp"));
+        QVERIFY(hud.open(QIODevice::ReadOnly));
+        QVERIFY2(!QString::fromUtf8(hud.readAll()).contains(QStringLiteral("SDL_AddTimer(kWallet")),
+                 "the HUD must not run a wallet timer of its own");
+
+        endStreaming(client, engine);
+    }
+
+    void aFailedWalletReadKeepsTheHudsLastValueAndFiresNothing()
+    {
+        SeatHubClient client;
+        auto* engine = new FakeEngineSession;
+        WalletTicks ticks;
+        beginStreaming(client, engine, &ticks, 90, 30);
+        QVERIFY(!QTest::currentTestFailed());
+        QVERIFY(waitWithoutTheEventLoop([&]() { return client.hud()->creditMinutes() == 30; }));
+
+        struct Failure { int status; QByteArray body; const char* what; };
+        const Failure failures[] = {
+            { 0, QByteArray(), "the control plane is unreachable" },
+            { 500, errorJson(QStringLiteral("Something went wrong."), QStringLiteral("SH-9K2XQ1")),
+              "a server error" },
+            { 200, QByteArrayLiteral("{}"), "an answer with no balance in it" },
+            { 401, refusedBody(), "a rejected credential" },
+        };
+        for (const Failure& failure : failures) {
+            m_fake->answerWallet(failure.status, failure.body);
+            const int failedBefore = ticks.failed.load();
+            QVERIFY2(tickAndWait(client, &ticks), failure.what);
+            QCOMPARE(ticks.failed.load(), failedBefore + 1);
+
+            // Nothing changed: the last value stays, no card fired, and it is not zero.
+            QCOMPARE(client.hud()->creditMinutes(), qint64(30));
+            QCOMPARE(int(client.hud()->activeCard()), int(HudOverlay::Card::None));
+            QCOMPARE(client.hud()->warningsFired(HudOverlay::Card::TenMinutes), 0);
+            QCOMPARE(client.hud()->warningsFired(HudOverlay::Card::TwoMinutes), 0);
+        }
+
+        // Not even a rejected credential ends the stream or signs anybody out from a wallet read.
+        QCOMPARE(client.appState(), QStringLiteral("streaming"));
+        QVERIFY(client.signedIn());
+
+        // A later read that succeeds is taken up as if nothing had happened.
+        m_fake->answerWallet(200, walletBody(9));
+        QVERIFY(tickAndWait(client, &ticks));
+        QCOMPARE(client.hud()->creditMinutes(), qint64(9));
+        QCOMPARE(int(client.hud()->activeCard()), int(HudOverlay::Card::TenMinutes));
+
+        endStreaming(client, engine);
+    }
+
+    void eachThresholdFiresExactlyOnceAcrossASession()
+    {
+        SeatHubClient client;
+        auto* engine = new FakeEngineSession;
+        WalletTicks ticks;
+        beginStreaming(client, engine, &ticks, 90, 90);
+        QVERIFY(!QTest::currentTestFailed());
+        QVERIFY(waitWithoutTheEventLoop([&]() { return client.hud()->creditMinutes() == 90; }));
+
+        // One minute at a time, past both thresholds and to zero, and a read repeated at each.
+        for (int minutes = 15; minutes >= 0; --minutes) {
+            m_fake->answerWallet(200, walletBody(minutes));
+            QVERIFY(tickAndWait(client, &ticks));
+            QVERIFY(tickAndWait(client, &ticks));   // the same balance again changes nothing
+            QCOMPARE(client.hud()->creditMinutes(), qint64(minutes));
+
+            const bool tenFired = minutes <= 10;
+            const bool twoFired = minutes <= 2;
+            QCOMPARE(client.hud()->warningsFired(HudOverlay::Card::TenMinutes), tenFired ? 1 : 0);
+            QCOMPARE(client.hud()->warningsFired(HudOverlay::Card::TwoMinutes), twoFired ? 1 : 0);
+            // Ten minutes: the ten-minute card, until its lifetime; two minutes: the two-minute
+            // one, which replaced it and is still there at zero.
+            if (minutes <= 2) {
+                QCOMPARE(int(client.hud()->activeCard()), int(HudOverlay::Card::TwoMinutes));
+            }
+        }
+        QCOMPARE(client.hud()->warningsFired(HudOverlay::Card::TenMinutes), 1);
+        QCOMPARE(client.hud()->warningsFired(HudOverlay::Card::TwoMinutes), 1);
+
+        // A top-up mid-stream and back down: the thresholds are spent for this session.
+        m_fake->answerWallet(200, walletBody(60));
+        QVERIFY(tickAndWait(client, &ticks));
+        m_fake->answerWallet(200, walletBody(8));
+        QVERIFY(tickAndWait(client, &ticks));
+        QCOMPARE(client.hud()->warningsFired(HudOverlay::Card::TenMinutes), 1);
+        QCOMPARE(client.hud()->warningsFired(HudOverlay::Card::TwoMinutes), 1);
+
+        endStreaming(client, engine);
+    }
+
+    void aSessionThatBeginsUnderTwoMinutesFiresOnlyTheLowerWarning()
+    {
+        SeatHubClient client;
+        auto* engine = new FakeEngineSession;
+        WalletTicks ticks;
+        beginStreaming(client, engine, &ticks, 90, 1);
+        QVERIFY(!QTest::currentTestFailed());
+        QVERIFY(waitWithoutTheEventLoop([&]() { return client.hud()->creditMinutes() == 1; }));
+
+        QCOMPARE(client.hud()->warningsFired(HudOverlay::Card::TwoMinutes), 1);
+        QCOMPARE(client.hud()->warningsFired(HudOverlay::Card::TenMinutes), 0);
+        QCOMPARE(int(client.hud()->activeCard()), int(HudOverlay::Card::TwoMinutes));
+
+        endStreaming(client, engine);
+    }
+
+    void theFirstReadFailingLeavesTheSeedOnTheHudAndFiresNothing()
+    {
+        // Home said one minute a moment ago; the wallet cannot be reached now. A warning built on a
+        // balance that may be stale would spend a threshold the real one has not reached, so the seed
+        // is shown and nothing fires until a read has actually answered.
+        SeatHubClient client;
+        auto* engine = new FakeEngineSession;
+        WalletTicks ticks;
+        reachHome(client, 1);
+        QVERIFY(!QTest::currentTestFailed());
+        client.session()->attachSession(engine);
+        m_fake->answerPairing(409, playRefusalBody(QStringLiteral("The rig is not ready yet."),
+                                                   QStringLiteral("SH-2K2XQ1")));
+        m_fake->answerWallet(0, QByteArray());
+        connect(client.liveness(), &LivenessTimer::walletReadFailed, &client,
+                [&ticks]() { ticks.failed.fetch_add(1); }, Qt::DirectConnection);
+
+        client.beginSession(QStringLiteral("s-live"));
+        emit engine->connectionStarted();
+        QVERIFY(waitWithoutTheEventLoop([&]() { return ticks.failed.load() >= 1; }));
+
+        QCOMPARE(client.hud()->creditMinutes(), qint64(1));
+        QCOMPARE(int(client.hud()->activeCard()), int(HudOverlay::Card::None));
+        QCOMPARE(client.hud()->warningsFired(HudOverlay::Card::TwoMinutes), 0);
+
+        endStreaming(client, engine);
+    }
+
+    void theRemainingCreditIsNeverDerivedFromTheLeasesHorizon()
+    {
+        // The horizon (`authorized_through`) is advisory: the facade arms its stop from it (D-33) and
+        // nothing else reads it. The HUD and the liveness reporter's code, which is where the credit
+        // comes from, name it nowhere. (The reporter's header explains the horizon in a comment, as the
+        // backstop this report is not, so it is the code that is checked, not that page.)
+        const QString dir = seathubSourceDir();
+        QVERIFY2(!dir.isEmpty(), "app/seathub could not be found from the test binary");
+        for (const char* name : {"hud_overlay.cpp", "hud_overlay.h", "liveness_timer.cpp"}) {
+            QFile file(dir + QLatin1Char('/') + QLatin1String(name));
+            QVERIFY(file.open(QIODevice::ReadOnly));
+            const QString text = QString::fromUtf8(file.readAll());
+            QVERIFY2(!text.contains(QStringLiteral("authorized_through"))
+                         && !text.contains(QStringLiteral("authorizedThrough")),
+                     name);
+        }
     }
 
     void durationText_isHoursAndMinutesAndNeverARawMinuteCount()

@@ -355,6 +355,17 @@ SeatHubClient::SeatHubClient(QObject* parent)
     // heartbeat is the failure mode this connection exists to prevent.
     connect(m_liveness, &LivenessTimer::livenessWarning, this, &SeatHubClient::onLivenessWarning);
 
+    // CUST-15: the balance the liveness report's own wallet read produced. To the HUD it goes
+    // straight from the network thread - a queued hop to this thread would wait out the whole
+    // stream, because this thread is suspended for it (`session.cpp:1965-1966`), and the credit
+    // would never move and no warning would ever fire. `HudOverlay::noteCreditMinutes` is built
+    // for that call (a mutex-guarded state, a publisher safe from any thread). The facade's own
+    // properties, which only the hidden Qt window reads, follow when this thread runs again.
+    connect(m_liveness, &LivenessTimer::walletRead, this,
+            [this](qint64 minutes) { m_hud.noteCreditMinutes(minutes); }, Qt::DirectConnection);
+    connect(m_liveness, &LivenessTimer::walletRead, this,
+            [this](qint64 minutes) { applyLiveBalance(minutes); }, Qt::QueuedConnection);
+
     // The HUD composites through the engine's own overlay path; wiring it here rather than in
     // the HUD keeps the engine reference in one place (and the HUD free of `Session`). The session
     // is read per call rather than captured: which engine session is attached changes per launch.
@@ -1295,16 +1306,31 @@ void SeatHubClient::applyWalletResult(quint64 epoch, const ControlPlaneResult& r
         return;
     }
 
-    m_balanceMinutes = wallet.balanceMinutes;
-    m_balanceText = durationText(wallet.balanceMinutes);
-    m_balanceStale = false;
-    emit balanceChanged();
+    setBalance(wallet.balanceMinutes);
 
     // The control plane is reachable, so an offline label from an unconfirmed restore (or a failed
     // Play) no longer describes the world.
     if (m_homeStatus == QLatin1String(kHomeOffline)) {
         setHomeStatus(QString::fromLatin1(kHomeReady));
     }
+}
+
+void SeatHubClient::setBalance(qint64 minutes)
+{
+    m_balanceMinutes = minutes;
+    m_balanceText = durationText(minutes);
+    m_balanceStale = false;
+    emit balanceChanged();
+}
+
+void SeatHubClient::applyLiveBalance(qint64 minutes)
+{
+    // Signed out since the read was made (a queued answer can outlive the stream that asked): not
+    // this session's to show. And nothing to say when it is what is already held.
+    if (!m_signedIn || (m_balanceMinutes == minutes && !m_balanceStale)) {
+        return;
+    }
+    setBalance(minutes);
 }
 
 void SeatHubClient::resetBalance()
@@ -1366,13 +1392,10 @@ void SeatHubClient::handleConnectionStarted()
     advanceConnectStage(kStageStreamingNow);
     setAppState(QString::fromLatin1(kStateStreaming));
 
-    // D-31/D-34: liveness starts with the stream and reports every 10 s, including `state` and
-    // `error_code`. It runs on the network thread, because the Qt main thread is inside SDL's
-    // event loop from here until the stream ends (`session.cpp:1965-1966`).
-    if (inControlPlaneSession()) {
-        m_liveness->start(m_sessionId);
-    }
-
+    // The HUD is begun before liveness starts, because the reads liveness makes feed it:
+    // `beginSession()` resets the credit and the once-per-session warning state, so a wallet read
+    // that beat it would be wiped.
+    //
     // D-56: the duration timer starts here. This fires before the engine creates its SDL window
     // (D-01), so the first HUD publish may arrive before the renderer has registered; the 1 Hz
     // heartbeat re-publishes and the stream picks the HUD up on its first frame.
@@ -1381,6 +1404,21 @@ void SeatHubClient::handleConnectionStarted()
     // A stream that just started is by definition connected (audit F12): whatever the last
     // session's channel did, this one is live now.
     m_hud.setReconnecting(false);
+
+    // `Credit left` from the first frame: the last balance read before the stream (`screens.md`
+    // 25). Display only - it can be old, so it fires no warning; the report below reads the wallet
+    // at once and that read is the first thing that can.
+    if (m_balanceMinutes >= 0) {
+        m_hud.seedCreditMinutes(m_balanceMinutes);
+    }
+
+    // D-31/D-34: liveness starts with the stream and reports every 10 s, including `state` and
+    // `error_code`, and reads the wallet on the same tick (CUST-15). It runs on the network thread,
+    // because the Qt main thread is inside SDL's event loop from here until the stream ends
+    // (`session.cpp:1965-1966`).
+    if (inControlPlaneSession()) {
+        m_liveness->start(m_sessionId);
+    }
 }
 
 void SeatHubClient::handleDisplayLaunchError(const QString& text)

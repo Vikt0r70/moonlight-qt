@@ -240,6 +240,11 @@ public:
     SessionWebSocket* sessionChannel() const { return m_sessionChannel; }
     PairingController* pairing() const { return m_pairing; }
     TeardownController* teardown() const { return m_teardown; }
+    /// The in-stream HUD and the liveness reporter that feeds it a balance. Exposed the way
+    /// `session()` and `teardown()` are: so a test can drive the real objects through the real
+    /// facade. Nothing in the app reads them through here.
+    HudOverlay* hud() { return &m_hud; }
+    LivenessTimer* liveness() const { return m_liveness; }
     QVariantMap billing() const { return m_billing; }
     QString sessionWarning() const { return m_sessionWarning; }
     bool inSettings() const { return m_inSettings; }
@@ -542,6 +547,12 @@ private:
     /// Applies an answer to `GET /api/wallet`. `epoch` is the credential generation the read was
     /// issued under; an answer that arrives after a sign-out (or a different sign-in) is dropped.
     void applyWalletResult(quint64 epoch, const ControlPlaneResult& result);
+    /// Takes a balance the liveness report's own wallet read produced during a stream (CUST-15).
+    /// Delivered queued to this thread, so it lands whenever the stream is over; the HUD does not
+    /// wait for it (`LivenessTimer::walletRead` reaches the HUD directly, on the network thread).
+    void applyLiveBalance(qint64 minutes);
+    /// Sets the three balance properties from a server balance and says so.
+    void setBalance(qint64 minutes);
     /// Forgets the balance. Called at sign-out so the next customer never sees this one's.
     void resetBalance();
     /// Fills `m_identity` and `m_account` from a confirmed account.

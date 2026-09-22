@@ -34,7 +34,11 @@ win32 {
 
 DEFINES += FORK_ROOT=\\\"$$PWD/..\\\"
 
+# `duration_text.cpp` is the one formatter every client surface uses (FLOW-09); the HUD's `Credit
+# left` calls it rather than making a second one, so this project has to link it.
 SOURCES += tst_hud_bitmap.cpp \
-    ../app/seathub/hud_overlay.cpp
+    ../app/seathub/hud_overlay.cpp \
+    ../app/seathub/duration_text.cpp
 
-HEADERS += ../app/seathub/hud_overlay.h
+HEADERS += ../app/seathub/hud_overlay.h \
+    ../app/seathub/duration_text.h

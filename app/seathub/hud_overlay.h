@@ -13,10 +13,12 @@
 
 #include <atomic>
 #include <functional>
+#include <mutex>
 
 // The SeatHub in-session HUD: the D-56 Phase 3 subset (session duration timer + the End session
-// affordance), with the D-04 auto-hide. Nothing else - no remaining credit, no connection
-// quality, no help. Those are Phase 5.
+// affordance), with the D-04 auto-hide, and since Phase 5 (CUST-15, D-21) the customer's remaining
+// credit and the two low-balance warning cards. Connection quality is Moonlight's own stats text,
+// not drawn here.
 //
 // The HUD is not QML. `ADR-0045` records why: the Qt window is hidden for the whole session
 // (D-01), so `QQuickItem::grabToImage()` is structurally impossible, and the engine already
@@ -41,11 +43,32 @@
 // `OverlayManager::updateOverlaySurface()` hands the surface over atomically with its renderer
 // notification explicitly "callable on an arbitrary thread").
 //
+// The remaining credit and the warning cards (Phase 5) are written from a third thread: the
+// liveness timer's, which is the control-plane thread and the only one still running a Qt event
+// loop during a stream. A wallet read reaches `noteCreditMinutes()` straight from that thread - it
+// must never be marshalled through the facade's thread, which is suspended for the whole stream and
+// would leave the credit frozen and every warning unfired. That state is several fields that have
+// to change together (the balance, which thresholds have fired, which card is up and since when),
+// so it sits behind one small mutex rather than in separate atomics; nothing is done under it but
+// reading and writing those fields, and the render and the publisher run outside it.
+//
 // `setClock()` and `setPublisher()` are configuration, not state: set them once before the first
 // `beginSession()`, never while a session is running.
 class HudOverlay
 {
 public:
+    // `docs/spec/timing.md`: "Low-balance warnings: 10 min, then 2 min", and the two card
+    // lifetimes (the ten-minute card for 15 seconds, the two-minute card until the session ends).
+    // The balance element (`BalancePill.qml`) reads the same two numbers from the same spec row;
+    // `tst_hud_bitmap` pins them here so a change of the row has to change this file too.
+    static constexpr qint64 kWarnMinutes = 10;
+    static constexpr qint64 kCriticalMinutes = 2;
+    static constexpr qint64 kTenMinuteCardMs = 15000;
+
+    /// Which low-balance card is on screen. At most one: the two-minute card replaces the
+    /// ten-minute one.
+    enum class Card { None, TenMinutes, TwoMinutes };
+
     // Milliseconds. Injectable so a test can advance time instead of waiting for it: four
     // seconds of auto-hide is four seconds of real time otherwise.
     using Clock = std::function<qint64()>;
@@ -68,7 +91,8 @@ public:
     void setPublisher(Publisher publisher);
 
     // Wired to the session lifecycle: `connectionStarted` starts the clock, `sessionFinished`
-    // (and `readyForDeletion`, defensively) stops it - D-56's stated interval.
+    // (and `readyForDeletion`, defensively) stops it - D-56's stated interval. A new session also
+    // starts with no balance known, no threshold fired and no card up.
     void beginSession();
     void endSession();
 
@@ -86,15 +110,56 @@ public:
     // HUD deterministically instead of waiting for the timer thread.
     void tick();
 
+    // What the customer has left, in whole minutes, as the server's wallet says it (CUST-15,
+    // `client.md` Wallet authority): never derived from the lease's advisory horizon and never
+    // computed here.
+    //
+    // `seedCreditMinutes` shows the last balance read before the stream (`screens.md` 25: at
+    // stream start the HUD shows it) and fires nothing: that value can be old, and a card fired on
+    // an old value would use up a threshold the real balance has not reached. `noteCreditMinutes`
+    // is a fresh read - one arrives on every liveness report - and is what drives the two cards. A
+    // read that fails is simply not reported: the HUD keeps its last value, fires nothing and shows
+    // no error text. Negative values are not balances and are ignored. Any thread may call either.
+    void seedCreditMinutes(qint64 minutes);
+    void noteCreditMinutes(qint64 minutes);
+    /// -1 until a value is known.
+    qint64 creditMinutes() const;
+
+    /// The card on screen now, and how many times each has fired this session (each is 0 or 1;
+    /// the count exists so a test can say "exactly once" instead of "at least once").
+    Card activeCard() const;
+    int warningsFired(Card card) const;
+
+    /// The stream window's width in pixels, which the bottom-right placement needs (ADR-0045: the
+    /// overlay is anchored bottom-left and pixels map 1:1, so a card at the right edge is drawn
+    /// inside a bitmap as wide as the frame). Left alone it is learnt from SDL's own window events
+    /// and, failing that, from the focused window - the same `SDL_GetWindowSize` the D3D11 renderer
+    /// sizes its swapchain from. A test (or a caller that knows better) sets it directly; that also
+    /// stops it being learnt. 0 means unknown, and a card is then drawn next to the strip instead.
+    void setDisplayWidth(int pixels);
+    int displayWidth() const { return m_displayWidth.load(); }
+
     // The strip as it would look with `elapsedSeconds` on the timer. `displayWidth` of 0 sizes
     // the strip to its content, which is what production uses: the card is anchored at the
     // overlay's own bottom-left origin and overlay pixels map 1:1 onto swapchain pixels, so the
     // card's position never depends on knowing the display size. A larger value pads the strip
     // with transparent pixels - the technique ADR-0045 records for placing the card anywhere
-    // other than the left edge without editing a renderer file.
+    // other than the left edge without editing a renderer file. Shows the remaining credit when
+    // one is known, and never a warning card.
     QImage renderStripAt(qint64 elapsedSeconds, int displayWidth) const;
 
+    // One published frame: the strip when `strip` is set, and `card` at the bottom right of a
+    // bitmap `displayWidth` wide (or, with no width known, beside the strip). Everything else is
+    // transparent. The two-minute card is drawn last, so where a very small window makes them meet
+    // it wins.
+    QImage renderFrame(qint64 elapsedSeconds, int displayWidth, bool strip, Card card) const;
+
+    /// The sentence a card carries, exactly as `copy.md` "In session" has it.
+    static QString warningText(Card card);
+
+    /// True while the strip is up (it auto-hides). A warning card is separate: see `isCardShown`.
     bool isVisible() const { return m_visible.load(); }
+    bool isCardShown() const { return activeCard() != Card::None; }
     qint64 elapsedSeconds() const { return m_elapsedSeconds.load(); }
     QString timerText() const; // HH:MM:SS
 
@@ -102,9 +167,14 @@ public:
     static qint64 autoHideMs();
 
 private:
-    void publishStrip();
+    void publishFrame(bool strip);
     void hideStrip();
     qint64 nowMs() const;
+    /// The width the next frame is placed against: the pinned one, else what the window events
+    /// have said, else the focused SDL window's, else 0.
+    int resolveDisplayWidth();
+    /// Ends the ten-minute card once its lifetime has passed. True when the card list changed.
+    bool expireTenMinuteCard(qint64 now);
 
     static Uint32 SDLCALL onTimer(Uint32 interval, void* param);
     static int SDLCALL watchEvents(void* userdata, SDL_Event* event);
@@ -123,4 +193,19 @@ private:
     std::atomic<qint64> m_sessionStartedMs{0};
     std::atomic<qint64> m_lastActivityMs{0};
     std::atomic<qint64> m_elapsedSeconds{0};
+
+    // The stream window's width; see `setDisplayWidth`. Written by SDL's event watch (the main
+    // thread) and by `setDisplayWidth`, read on whichever thread publishes.
+    std::atomic<int> m_displayWidth{0};
+    std::atomic<bool> m_displayWidthPinned{false};
+
+    // The credit and the warning state, which change together (see the Threading note).
+    mutable std::mutex m_warnMutex;
+    qint64 m_credit = -1;
+    bool m_tenFired = false;
+    bool m_twoFired = false;
+    int m_tenFiredCount = 0;
+    int m_twoFiredCount = 0;
+    Card m_card = Card::None;
+    qint64 m_tenShownAtMs = 0;
 };

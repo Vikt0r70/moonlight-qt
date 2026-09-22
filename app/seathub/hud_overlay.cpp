@@ -1,5 +1,7 @@
 #include "hud_overlay.h"
 
+#include "duration_text.h"
+
 #include <QColor>
 #include <QCoreApplication>
 #include <QDateTime>
@@ -9,6 +11,7 @@
 #include <QPainter>
 #include <QPen>
 #include <QPointF>
+#include <QPolygonF>
 #include <QRectF>
 
 #include <cmath>
@@ -31,6 +34,7 @@ constexpr QRgb kTextPrimary = 0xFFFAFAFA; // Tokens.foregroundDefault
 constexpr QRgb kTextMuted = 0xFFA3A3A3;   // Tokens.foregroundMutedDefault
 constexpr QRgb kLiveDot = 0xFF10B981;     // Tokens.successDefault
 constexpr QRgb kHairline = 0xFF262626;    // Tokens.borderDefault
+constexpr QRgb kWarn = 0xFFF59E0B;        // Tokens.warnDefault (credit at 10 minutes, its card)
 
 // Metrics mirror `app/gui/Metrics.qml`, which mirrors `Tokens.qml` at a 16px root.
 constexpr int kStripHeight = 56;
@@ -55,6 +59,14 @@ constexpr const char* kLiveLabel = "LIVE";
 constexpr const char* kElapsedLabel = "Elapsed";
 constexpr const char* kEndSessionLabel = "End session";
 constexpr const char* kEndSessionKeys = "Ctrl+Alt+Shift+Q";
+
+// `copy.md` "In session": the HUD label for the balance, and the two warning sentences, one card
+// each, character for character. The dash in the second is U+2014, spelled as UTF-8 escapes for
+// the same reason the ellipsis below is - the sentence has to survive any source charset. The
+// cards say how much time is left and nothing else: no offer, no pressure (values).
+constexpr const char* kCreditLabel = "Credit left";
+constexpr const char* kTenMinutesLine = "10 minutes left.";
+constexpr const char* kTwoMinutesLine = "2 minutes left \xE2\x80\x94 find a save point.";
 
 // copy.md §In session, "Disconnect": `Connection lost. Reconnecting… (2 of 5)`. The attempt
 // counter in the parentheses is D-56-deferred, so the strip renders the sentence without it.
@@ -157,6 +169,65 @@ void drawPowerGlyph(QPainter& painter, qreal left, qreal centreY, QRgb colour)
                      QPointF(centre.x(), centre.y() - 0.5));
 }
 
+// The warning card's sentence: Inter 14/400 (`05-UI-SPEC` "In-stream overlay"). No letter spacing -
+// that tracking is the strip's label treatment - and the regular weight, not the label's medium.
+QFont cardFont()
+{
+    QFont font(QStringLiteral("Inter"));
+    font.setPixelSize(kMonoPx);
+    font.setWeight(QFont::Normal);
+    return font;
+}
+
+// The colour a credit value carries: normal above ten minutes, warn at ten or fewer, destructive at
+// two or fewer. Nothing here is the client's own number - the thresholds are `timing.md`'s, through
+// `HudOverlay`'s two constants - and the glyph is drawn wherever this is not the normal colour, so
+// colour is never the only signal (`ui.md` 12).
+QRgb creditColour(qint64 minutes)
+{
+    if (minutes <= HudOverlay::kCriticalMinutes) {
+        return kTextDestructive;
+    }
+    if (minutes <= HudOverlay::kWarnMinutes) {
+        return kWarn;
+    }
+    return kTextPrimary;
+}
+
+// `triangle-alert` (ui.md 8, Lucide, 1.5px stroke) for the ten-minute level and `octagon-alert` for
+// the two-minute one: two different silhouettes, so the two levels also differ by shape. Drawn with
+// QPainter because the fork ships no icon set (as the pill's geometric characters, 05-02).
+void drawAlertGlyph(QPainter& painter, bool critical, qreal left, qreal centreY, QRgb colour)
+{
+    const qreal half = kGlyphSize / 2.0;
+    const QPointF centre(left + half, centreY);
+
+    painter.setBrush(Qt::NoBrush);
+    painter.setPen(QPen(QColor::fromRgba(colour), 1.5, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+
+    if (critical) {
+        // A regular octagon, flat sides top and bottom.
+        const qreal r = half - 1.0;
+        QPolygonF octagon;
+        for (int i = 0; i < 8; ++i) {
+            const qreal angle = (22.5 + 45.0 * i) * 3.14159265358979323846 / 180.0;
+            octagon << QPointF(centre.x() + r * std::cos(angle), centre.y() + r * std::sin(angle));
+        }
+        painter.drawPolygon(octagon);
+    }
+    else {
+        QPolygonF triangle;
+        triangle << QPointF(centre.x(), centre.y() - half + 1.5)
+                 << QPointF(centre.x() + half - 0.75, centre.y() + half - 2.0)
+                 << QPointF(centre.x() - half + 0.75, centre.y() + half - 2.0);
+        painter.drawPolygon(triangle);
+    }
+
+    // The exclamation mark: a stem and a dot.
+    painter.drawLine(QPointF(centre.x(), centre.y() - 3.0), QPointF(centre.x(), centre.y() + 1.0));
+    painter.drawPoint(QPointF(centre.x(), centre.y() + 3.5));
+}
+
 bool isUserInput(Uint32 type)
 {
     switch (type) {
@@ -224,8 +295,37 @@ QString HudOverlay::timerText() const
     return formatDuration(m_elapsedSeconds.load());
 }
 
+QString HudOverlay::warningText(Card card)
+{
+    switch (card) {
+    case Card::TenMinutes:
+        return hudTr(kTenMinutesLine);
+    case Card::TwoMinutes:
+        return hudTr(kTwoMinutesLine);
+    case Card::None:
+        break;
+    }
+    return QString();
+}
+
 QImage HudOverlay::renderStripAt(qint64 elapsedSeconds, int displayWidth) const
 {
+    return renderFrame(elapsedSeconds, displayWidth, true, Card::None);
+}
+
+QImage HudOverlay::renderFrame(qint64 elapsedSeconds, int displayWidth, bool showStrip,
+                               Card card) const
+{
+    qint64 credit = -1;
+    {
+        std::lock_guard<std::mutex> lock(m_warnMutex);
+        credit = m_credit;
+    }
+    const bool hasCredit = credit >= 0;
+    const QString creditLabel = hudTr(kCreditLabel);
+    const QString creditText = hasCredit ? durationText(credit) : QString();
+    const bool creditAlert = hasCredit && credit <= kWarnMinutes;
+
     const QString timer = formatDuration(elapsedSeconds);
     const QString live = hudTr(kLiveLabel);
     const QString elapsedLabel = hudTr(kElapsedLabel);
@@ -254,14 +354,50 @@ QImage HudOverlay::renderStripAt(qint64 elapsedSeconds, int displayWidth) const
                                 + timerMetrics.horizontalAdvance(timer);
     const qreal statusGroupW = std::max(elapsedGroupW,
                                         mutedMetrics.horizontalAdvance(reconnectLine));
+    // The remaining credit, when one is known: its label, a glyph at ten minutes or fewer, and the
+    // value in the one duration format (mono, like the timer). It sits after the status group and
+    // adds no width at all while nothing is known, so a strip without a balance is what it always
+    // was.
+    const QFontMetricsF creditValueMetrics(timerFont);
+    const qreal creditGroupW = !hasCredit ? 0.0
+                               : kGroupGap + mutedMetrics.horizontalAdvance(creditLabel) + kGap
+                                     + (creditAlert ? kGlyphSize + kGap : 0.0)
+                                     + creditValueMetrics.horizontalAdvance(creditText);
     const qreal contentWidth = kPadX + kDotDiameter + kGap + liveMetrics.horizontalAdvance(live)
-                               + kGroupGap + statusGroupW + kGroupGap + kGlyphSize
+                               + kGroupGap + statusGroupW + creditGroupW + kGroupGap + kGlyphSize
                                + (kGap * 0.75) + endSessionW + kGap
                                + keysMetrics.horizontalAdvance(keys) + kPadX;
 
-    const int cardWidth = int(std::ceil(contentWidth));
-    const int width = std::max(cardWidth, displayWidth);
+    const int stripWidth = int(std::ceil(contentWidth));
     const qreal centreY = kStripHeight / 2.0;
+
+    // The warning card: a panel sized to its own sentence (`05-UI-SPEC` "In-stream overlay").
+    const QFont warnFont = cardFont();
+    const QString cardText = warningText(card);
+    const int cardWidth = card == Card::None
+        ? 0
+        : int(std::ceil(kPadX + kGlyphSize + kGap
+                        + QFontMetricsF(warnFont).horizontalAdvance(cardText) + kPadX));
+
+    // Where the bitmap ends and where the card sits in it. The overlay is anchored bottom-left and
+    // its pixels map 1:1 onto the swapchain (ADR-0045), so a card at the right edge needs a bitmap
+    // as wide as the frame, padded transparently. With a width that is known the card is flush
+    // right - and stays inside the frame however narrow that is, where it would rather cover the
+    // strip than fall off the edge. With none known it goes beside the strip: not where it was
+    // meant to be, but a warning that is on the screen beats one that is not.
+    int width = 0;
+    int cardX = 0;
+    if (card == Card::None) {
+        width = std::max(showStrip ? stripWidth : 1, displayWidth);
+    }
+    else if (displayWidth > 0) {
+        width = std::max(displayWidth, cardWidth);
+        cardX = width - cardWidth;
+    }
+    else {
+        cardX = showStrip ? stripWidth + kGroupGap : 0;
+        width = cardX + cardWidth;
+    }
 
     // Painted premultiplied - Qt's native raster format and its fast path - then converted once
     // at the end. The renderers blend with SRC_ALPHA/INV_SRC_ALPHA and apply no alpha
@@ -274,75 +410,114 @@ QImage HudOverlay::renderStripAt(qint64 elapsedSeconds, int displayWidth) const
         painter.setRenderHint(QPainter::Antialiasing, true);
         painter.setRenderHint(QPainter::TextAntialiasing, true);
 
-        // Half-pixel inset so the 1px border lands inside the image rather than on its edge.
-        painter.setPen(QPen(QColor::fromRgba(kCardBorder), 1.0));
-        painter.setBrush(QColor::fromRgba(kCardFill));
-        painter.drawRoundedRect(QRectF(0.5, 0.5, cardWidth - 1.0, kStripHeight - 1.0), kRadius,
-                                kRadius);
+        if (showStrip) {
+            // Half-pixel inset so the 1px border lands inside the image rather than on its edge.
+            painter.setPen(QPen(QColor::fromRgba(kCardBorder), 1.0));
+            painter.setBrush(QColor::fromRgba(kCardFill));
+            painter.drawRoundedRect(QRectF(0.5, 0.5, stripWidth - 1.0, kStripHeight - 1.0), kRadius,
+                                    kRadius);
 
-        qreal x = kPadX;
+            qreal x = kPadX;
 
-        // ui.md §6: `live pulse 2s ease-in-out loop on live dot + glow-live`, and exactly one
-        // glowing element per page (ui.md §12). The overlay repaints once a second (kTickMs), so
-        // the breath is two steps across a two-second loop keyed to the elapsed second: a
-        // continuous curve would need a faster heartbeat than the overlay can be published at.
-        // The halo's alpha is `--glow-live`'s own 0.18 (46/255) in `successDefault`.
-        painter.setPen(Qt::NoPen);
-        if ((elapsedSeconds % 2) == 0) {
-            const qreal halo = kDotDiameter + 8.0;
-            painter.setBrush(QColor(16, 185, 129, 46));
-            painter.drawEllipse(QRectF(x - 4.0, centreY - (halo / 2.0), halo, halo));
-        }
-        painter.setBrush(QColor::fromRgba(kLiveDot));
-        painter.drawEllipse(QRectF(x, centreY - (kDotDiameter / 2.0), kDotDiameter, kDotDiameter));
-        x += kDotDiameter + kGap;
+            // ui.md §6: `live pulse 2s ease-in-out loop on live dot + glow-live`, and exactly one
+            // glowing element per page (ui.md §12). The overlay repaints once a second (kTickMs),
+            // so the breath is two steps across a two-second loop keyed to the elapsed second: a
+            // continuous curve would need a faster heartbeat than the overlay can be published at.
+            // The halo's alpha is `--glow-live`'s own 0.18 (46/255) in `successDefault`.
+            painter.setPen(Qt::NoPen);
+            if ((elapsedSeconds % 2) == 0) {
+                const qreal halo = kDotDiameter + 8.0;
+                painter.setBrush(QColor(16, 185, 129, 46));
+                painter.drawEllipse(QRectF(x - 4.0, centreY - (halo / 2.0), halo, halo));
+            }
+            painter.setBrush(QColor::fromRgba(kLiveDot));
+            painter.drawEllipse(QRectF(x, centreY - (kDotDiameter / 2.0), kDotDiameter,
+                                       kDotDiameter));
+            x += kDotDiameter + kGap;
 
-        x = drawLabel(painter, liveFont, kTextPrimary, live, x, centreY);
-        x += kGroupGap;
+            x = drawLabel(painter, liveFont, kTextPrimary, live, x, centreY);
+            x += kGroupGap;
 
-        if (reconnecting) {
-            // The media path is what the dot reports and it is still live - this window is
-            // composited over the stream - so the dot stays green while the sentence says which
-            // channel is down (audit F12, copy.md §In session "Disconnect").
-            x = drawLabel(painter, mutedFont, kTextDestructive, reconnectLine, x, centreY);
-        } else {
-            x = drawLabel(painter, mutedFont, kTextMuted, elapsedLabel, x, centreY);
+            if (reconnecting) {
+                // The media path is what the dot reports and it is still live - this window is
+                // composited over the stream - so the dot stays green while the sentence says
+                // which channel is down (audit F12, copy.md §In session "Disconnect").
+                x = drawLabel(painter, mutedFont, kTextDestructive, reconnectLine, x, centreY);
+            } else {
+                x = drawLabel(painter, mutedFont, kTextMuted, elapsedLabel, x, centreY);
+                x += kGap;
+                x = drawLabel(painter, timerFont, kTextPrimary, timer, x, centreY);
+            }
+
+            if (hasCredit) {
+                // `Credit left` (`copy.md` "In session"), the wallet balance in the duration
+                // format: warn-coloured with a glyph at ten minutes or fewer, destructive with a
+                // different glyph at two or fewer. A glyph as well as a colour, always.
+                x += kGroupGap;
+                x = drawLabel(painter, mutedFont, kTextMuted, creditLabel, x, centreY);
+                x += kGap;
+                const QRgb creditRgb = creditColour(credit);
+                if (creditAlert) {
+                    drawAlertGlyph(painter, credit <= kCriticalMinutes, x, centreY, creditRgb);
+                    x += kGlyphSize + kGap;
+                }
+                x = drawLabel(painter, timerFont, creditRgb, creditText, x, centreY);
+            }
+            x += kGroupGap;
+
+            drawPowerGlyph(painter, x, centreY, kTextMuted);
+            x += kGlyphSize + (kGap * 0.75);
+
+            const qreal endLeft = x;
+            x = drawLabel(painter, mutedFont, kTextMuted, endSession, x, centreY);
+
+            // Hairline between the affordance's label and its binding, so the two read as one
+            // legend rather than as two unrelated strings.
+            painter.setPen(QPen(QColor::fromRgba(kHairline), 1.0));
+            painter.drawLine(QPointF(x + (kGap / 2.0), centreY - 11.0),
+                             QPointF(x + (kGap / 2.0), centreY + 11.0));
+            Q_ASSERT(x >= endLeft);
+
             x += kGap;
-            x = drawLabel(painter, timerFont, kTextPrimary, timer, x, centreY);
+            drawLabel(painter, keysFont, kTextMuted, keys, x, centreY);
         }
-        x += kGroupGap;
 
-        drawPowerGlyph(painter, x, centreY, kTextMuted);
-        x += kGlyphSize + (kGap * 0.75);
+        if (card != Card::None) {
+            // The low-balance card: `--surface-1` fill, a 1px border and its glyph in the level's
+            // colour (`--warn` at ten minutes, `--destructive` at two), the sentence in
+            // `--foreground`. Drawn after the strip so it is never the one covered.
+            const bool critical = card == Card::TwoMinutes;
+            const QRgb accent = critical ? kTextDestructive : kWarn;
 
-        const qreal endLeft = x;
-        x = drawLabel(painter, mutedFont, kTextMuted, endSession, x, centreY);
+            painter.setPen(QPen(QColor::fromRgba(accent), 1.0));
+            painter.setBrush(QColor::fromRgba(kCardFill));
+            painter.drawRoundedRect(QRectF(cardX + 0.5, 0.5, cardWidth - 1.0, kStripHeight - 1.0),
+                                    kRadius, kRadius);
 
-        // Hairline between the affordance's label and its binding, so the two read as one
-        // legend rather than as two unrelated strings.
-        painter.setPen(QPen(QColor::fromRgba(kHairline), 1.0));
-        painter.drawLine(QPointF(x + (kGap / 2.0), centreY - 11.0),
-                         QPointF(x + (kGap / 2.0), centreY + 11.0));
-        Q_ASSERT(x >= endLeft);
-
-        x += kGap;
-        drawLabel(painter, keysFont, kTextMuted, keys, x, centreY);
+            qreal x = cardX + kPadX;
+            drawAlertGlyph(painter, critical, x, centreY, accent);
+            x += kGlyphSize + kGap;
+            drawLabel(painter, warnFont, kTextPrimary, cardText, x, centreY);
+        }
     }
 
     return image.convertToFormat(QImage::Format_ARGB32);
 }
 
-void HudOverlay::publishStrip()
+void HudOverlay::publishFrame(bool strip)
 {
     if (!m_publisher) {
         return;
     }
 
-    // Production passes 0: the card is anchored at the overlay's bottom-left origin, where
-    // overlay pixels are 1:1 with swapchain pixels, so no display size is needed. The padding
-    // parameter exists because a card placed anywhere else would need the strip to reach that
-    // x - ADR-0045 records the technique; Phase 3 does not use it.
-    const QImage image = renderStripAt(m_elapsedSeconds.load(), 0);
+    // The strip alone is anchored at the overlay's bottom-left origin, where overlay pixels are
+    // 1:1 with swapchain pixels, so it needs no display size and is sized to its content. A warning
+    // card sits at the bottom right, and ADR-0045's technique for anywhere but the left edge is a
+    // bitmap padded transparently out to that x: so a frame with a card is as wide as the stream
+    // window, and the window's width is asked for only then.
+    const Card card = activeCard();
+    const int width = card == Card::None ? 0 : resolveDisplayWidth();
+    const QImage image = renderFrame(m_elapsedSeconds.load(), width, strip, card);
     if (image.isNull()) {
         return;
     }
@@ -398,6 +573,22 @@ void HudOverlay::beginSession()
     m_lastActivityMs.store(now);
     m_elapsedSeconds.store(0);
     m_publishedVisible.store(false);
+    {
+        // Each threshold fires once per session, so a new session starts with none fired, no card
+        // up and no balance known: the facade seeds the last one it read straight afterwards.
+        std::lock_guard<std::mutex> lock(m_warnMutex);
+        m_credit = -1;
+        m_tenFired = false;
+        m_twoFired = false;
+        m_tenFiredCount = 0;
+        m_twoFiredCount = 0;
+        m_card = Card::None;
+        m_tenShownAtMs = 0;
+    }
+    if (!m_displayWidthPinned.load()) {
+        // A new session is a new window; whatever the last one measured is not this one's.
+        m_displayWidth.store(0);
+    }
     m_sessionActive.store(true);
 
     // Auto-hide needs to observe input, and event watches need SDL's *events* subsystem. If the
@@ -421,7 +612,7 @@ void HudOverlay::beginSession()
     }
 
     m_visible.store(true);
-    publishStrip();
+    publishFrame(true);
     m_publishedVisible.store(true);
 
     // SDL's timer thread, not a QTimer: the streaming loop suspends Qt processing for the whole
@@ -456,6 +647,11 @@ void HudOverlay::endSession()
     }
 
     m_visible.store(false);
+    {
+        // The two-minute card stays "until the session ends" (`timing.md`); this is that end.
+        std::lock_guard<std::mutex> lock(m_warnMutex);
+        m_card = Card::None;
+    }
 }
 
 void HudOverlay::setReconnecting(bool reconnecting)
@@ -469,8 +665,144 @@ void HudOverlay::setReconnecting(bool reconnecting)
     // are both documented as callable off the main thread (see the class comment), and the flag
     // itself is an atomic.
     if (m_sessionActive.load()) {
-        publishStrip();
+        publishFrame(true);
     }
+}
+
+void HudOverlay::seedCreditMinutes(qint64 minutes)
+{
+    if (minutes < 0) {
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(m_warnMutex);
+        m_credit = minutes;
+    }
+    // Shown at once when the strip is up; a hidden strip shows it the next time it returns.
+    if (m_sessionActive.load() && m_visible.load()) {
+        publishFrame(true);
+    }
+}
+
+void HudOverlay::noteCreditMinutes(qint64 minutes)
+{
+    // Not a balance, or not a session: nothing to show and nothing to arm. A read that lands after
+    // the stream ended must not leave a card waiting for the next one.
+    if (minutes < 0 || !m_sessionActive.load()) {
+        return;
+    }
+
+    bool changed = false;
+    {
+        std::lock_guard<std::mutex> lock(m_warnMutex);
+        if (m_credit != minutes) {
+            m_credit = minutes;
+            changed = true;
+        }
+
+        // `timing.md`: ten minutes, then two, each once per session. A balance that is already
+        // under two when the first read arrives fires only the lower card - the higher one is
+        // marked spent with it, so it can never show later on the way down from a top-up.
+        if (minutes <= kCriticalMinutes) {
+            if (!m_twoFired) {
+                m_twoFired = true;
+                m_tenFired = true;
+                ++m_twoFiredCount;
+                m_card = Card::TwoMinutes;
+                changed = true;
+            }
+        }
+        else if (minutes <= kWarnMinutes) {
+            if (!m_tenFired) {
+                m_tenFired = true;
+                ++m_tenFiredCount;
+                m_card = Card::TenMinutes;
+                m_tenShownAtMs = nowMs();
+                changed = true;
+            }
+        }
+    }
+
+    if (!changed) {
+        return;
+    }
+
+    // Straight away rather than on the next heartbeat: a card is a warning, and this read may be
+    // the last one before the balance runs out. Nothing to publish while the strip is hidden and no
+    // card is up - the value shows the next time the strip does.
+    if (m_visible.load() || activeCard() != Card::None) {
+        publishFrame(m_visible.load());
+        m_publishedVisible.store(true);
+    }
+}
+
+qint64 HudOverlay::creditMinutes() const
+{
+    std::lock_guard<std::mutex> lock(m_warnMutex);
+    return m_credit;
+}
+
+HudOverlay::Card HudOverlay::activeCard() const
+{
+    std::lock_guard<std::mutex> lock(m_warnMutex);
+    return m_card;
+}
+
+int HudOverlay::warningsFired(Card card) const
+{
+    std::lock_guard<std::mutex> lock(m_warnMutex);
+    switch (card) {
+    case Card::TenMinutes:
+        return m_tenFiredCount;
+    case Card::TwoMinutes:
+        return m_twoFiredCount;
+    case Card::None:
+        break;
+    }
+    return 0;
+}
+
+bool HudOverlay::expireTenMinuteCard(qint64 now)
+{
+    std::lock_guard<std::mutex> lock(m_warnMutex);
+    if (m_card == Card::TenMinutes && now - m_tenShownAtMs >= kTenMinuteCardMs) {
+        m_card = Card::None;
+        return true;
+    }
+    return false;
+}
+
+void HudOverlay::setDisplayWidth(int pixels)
+{
+    m_displayWidth.store(pixels > 0 ? pixels : 0);
+    m_displayWidthPinned.store(true);
+}
+
+int HudOverlay::resolveDisplayWidth()
+{
+    if (m_displayWidthPinned.load()) {
+        return m_displayWidth.load();
+    }
+
+    // The focused SDL window is the stream window (nothing else in the process is an SDL window
+    // while streaming), and `SDL_GetWindowSize` is the call `D3D11VARenderer` sizes its swapchain
+    // from, so the two agree by construction. Asked each time rather than remembered: a window that
+    // was resized or went fullscreen since is measured as it is now.
+    SDL_Window* window = SDL_GetKeyboardFocus();
+    if (window == nullptr) {
+        window = SDL_GetMouseFocus();
+    }
+    if (window != nullptr) {
+        int w = 0;
+        int h = 0;
+        SDL_GetWindowSize(window, &w, &h);
+        if (w > 0) {
+            return w;
+        }
+    }
+
+    // Focus is elsewhere for the moment: the last size a window event reported, else unknown.
+    return m_displayWidth.load();
 }
 
 void HudOverlay::noteActivity()
@@ -490,18 +822,23 @@ void HudOverlay::tick()
     const bool wanted = !m_autoHide.load() || (now - m_lastActivityMs.load()) < kAutoHideMs;
     m_visible.store(wanted);
 
-    if (wanted) {
-        // Re-published every tick while visible, not only when the second changes: the renderer
-        // keeps the last texture it was handed, so one publish a second is what keeps the timer
-        // on screen current, and re-publishing also repairs a texture lost to a swapchain
-        // recreation.
-        publishStrip();
+    // A warning card does not auto-hide with the strip: the ten-minute one has its own lifetime
+    // and the two-minute one stays until the session ends (`timing.md`).
+    expireTenMinuteCard(now);
+    const bool cardShown = activeCard() != Card::None;
+
+    if (wanted || cardShown) {
+        // Re-published every tick while anything is visible, not only when the second changes: the
+        // renderer keeps the last texture it was handed, so one publish a second is what keeps the
+        // timer on screen current, and re-publishing also repairs a texture lost to a swapchain
+        // recreation. With the strip hidden and a card up, the frame carries the card alone.
+        publishFrame(wanted);
     }
     else if (m_publishedVisible.load()) {
         hideStrip();
     }
 
-    m_publishedVisible.store(wanted);
+    m_publishedVisible.store(wanted || cardShown);
 }
 
 Uint32 SDLCALL HudOverlay::onTimer(Uint32, void* param)
@@ -519,6 +856,14 @@ int SDLCALL HudOverlay::watchEvents(void* userdata, SDL_Event* event)
     auto* self = static_cast<HudOverlay*>(userdata);
     if (isUserInput(event->type)) {
         self->noteActivity();
+    }
+    else if (event->type == SDL_WINDOWEVENT
+             && (event->window.event == SDL_WINDOWEVENT_SIZE_CHANGED
+                 || event->window.event == SDL_WINDOWEVENT_RESIZED)
+             && event->window.data1 > 0 && !self->m_displayWidthPinned.load()) {
+        // The stream window's width, for the bottom-right card. Only a fallback for when no SDL
+        // window has focus at the moment a frame is placed (`resolveDisplayWidth`).
+        self->m_displayWidth.store(event->window.data1);
     }
 
     // The return value of an event watch is ignored; this is an observer, not a filter, and it

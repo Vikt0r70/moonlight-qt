@@ -17,6 +17,14 @@ class ControlPlaneClient;
 // SH-XXXXXX". The server's own grace is 30 s (`LIVENESS_GRACE_SECONDS`, `docs/spec/timing.md`),
 // refreshed on every report.
 //
+// It also reads the wallet on the same tick (Phase 5, CUST-15, `docs/spec/timing.md` "Client's
+// in-stream wallet read"): no timer of its own and no new interval - the balance rides the report
+// the client already sends. The balance is announced through `walletRead` on this object's own
+// thread, the control-plane thread, because that is the only one still running an event loop
+// while a stream is up; whoever consumes it for the HUD must do so from there, not through the
+// facade's (suspended) thread. A read that fails is only a `walletReadFailed`: nothing about the
+// session or the balance changes, and it is never a liveness failure.
+//
 // What it deliberately does NOT do: end the session when a report fails.
 //
 // D-33 is the whole reason this class exists in this shape. If the control plane is unreachable
@@ -90,6 +98,12 @@ signals:
     void livenessWarning();
     /// The state or error code changed and the next report will carry it.
     void payloadChanged();
+    /// This tick's wallet read succeeded: the server's own balance in whole minutes. Emitted on
+    /// this object's thread (see the class comment).
+    void walletRead(qint64 balanceMinutes);
+    /// This tick's wallet read did not produce a balance. Carries nothing on purpose: the caller
+    /// keeps what it has.
+    void walletReadFailed();
 
 public slots:
     /// One report. Public so the interval and the grace window can be driven deterministically
@@ -98,6 +112,7 @@ public slots:
 
 private:
     void handleResult(const ControlPlaneResult& result);
+    void handleWalletResult(const ControlPlaneResult& result);
     /// True when the calling thread is the one this object lives on (or when it lives on no
     /// thread at all, which only happens after its thread has been destroyed).
     bool onOwnThread() const;
