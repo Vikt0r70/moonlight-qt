@@ -1901,6 +1901,17 @@ void SeatHubClient::handleHostResolved(const PairedHostPtr& host)
         return;
     }
 
+    // CUST-17/D-23/D-26/OD-04: the compositor's per-line filter is set from the customer's
+    // current choice here, at the engine session's one and only construction point - before
+    // `run()` (started from `handlePairingCompleted()`) ever lets the engine write a stats line.
+    // Moonlight's own stats hotkey (Ctrl+Alt+Shift+S, or the gamepad chord) can still enable the
+    // overlay mid-stream on its own; the filter set here is what it draws through either way,
+    // because the compositor consults it on every rasterise regardless of what turned the overlay
+    // on (`overlaymanager.cpp`'s own comment on `notifyOverlayUpdated()`). There is only this one
+    // filtered path - never a second "show everything" one - so with nothing chosen the hotkey
+    // draws nothing, which is the owner's OD-04 answer (05-01-SUMMARY) over the alternative.
+    engine->setDebugLineFilter(m_settings->enabledStatsLabels());
+
     m_engineSession = engine;
     m_session->attachSession(engine);
 }

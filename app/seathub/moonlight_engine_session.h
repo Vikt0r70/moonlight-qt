@@ -11,6 +11,7 @@
 #include <QByteArray>
 #include <QByteArrayView>
 #include <QString>
+#include <QStringList>
 #include <QVector>
 
 #include "engine_session.h"
@@ -86,6 +87,14 @@ public:
     void run(QWindow* window) override;
     void interrupt() override;
     bool publishOverlaySurface(SDL_Surface* surface) override;
+
+    /// CUST-17/D-23: sets which of the engine's own OverlayDebug lines may be drawn, from the
+    /// customer's current settings choice (`SettingsBridge::enabledStatsLabels()`, D-26). A thin
+    /// forward to the attached engine's own compositor (`OverlayManager::setDebugLineFilter()`,
+    /// the D-28 exception) - this class holds no filtering logic of its own. Safe to call before
+    /// `run()` starts the stream; the compositor reads the filter fresh on its own next
+    /// rasterise, so calling this before the engine ever writes a stats line is enough.
+    void setDebugLineFilter(const QStringList& enabledLabels);
 
 private:
     PairedHostPtr m_host;

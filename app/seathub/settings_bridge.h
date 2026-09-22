@@ -142,6 +142,11 @@ public:
     /// Writes the toggle and recomputes the derived `showperfoverlay` value: on when any toggle
     /// is on, off when none is (CUST-17). Refused while streaming, like any other write.
     Q_INVOKABLE bool setStatsToggle(const QString& statsKey, bool value);
+    /// The label text of every stats toggle currently on, in the engine's own line order (D-26) -
+    /// what Plan 12's overlay filter (`OverlayManager::setDebugLineFilter()`, the D-28 exception)
+    /// draws. This is the one place both this bridge and that filter read the label catalogue
+    /// from; the filter itself carries no copy. Empty when every toggle is off.
+    Q_INVOKABLE QStringList enabledStatsLabels() const;
 
     // ------------------------------------------------- negotiated results and warnings (D-14)
 

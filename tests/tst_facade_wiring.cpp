@@ -91,6 +91,15 @@ MoonlightEngineSession* MoonlightEngineSession::create(const PairedHostPtr&, QOb
     return nullptr;
 }
 
+// Phase 5 plan 12 (CUST-17): `create()` above always returns null, so `handleHostResolved()`
+// never reaches a real `MoonlightEngineSession` to call this on - it is unreachable-by-
+// construction in this binary, exactly like `create()` itself. Defined only so this translation
+// unit links without pulling in the real engine (`moonlight_engine_session.cpp`, deliberately not
+// part of this suite - see this file's own header).
+void MoonlightEngineSession::setDebugLineFilter(const QStringList&)
+{
+}
+
 PairingHandshakeResult runUpstreamPairingHandshake(const PairingTarget&)
 {
     PairingHandshakeResult result;

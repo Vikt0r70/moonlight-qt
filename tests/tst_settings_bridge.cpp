@@ -38,6 +38,7 @@ private slots:
     void forcedValuesAreCorrectedOnEveryLoadNotOnlyTheFirst();
     void hostSpeakerRowStaysEditableAtUpstreamsDefault();
     void statsTogglesDefaultOffAndTheDerivedOptionFollowsInBothDirections();
+    void enabledStatsLabelsListsOnlyTheOnesTurnedOnInTheEnginesOwnOrder();
     void sessionOverridesAreInMemoryOnly();
     void negotiatedResultsAreExposedOnlyAfterConnectionStarted();
 
@@ -374,6 +375,27 @@ void TstSettingsBridge::statsTogglesDefaultOffAndTheDerivedOptionFollowsInBothDi
     m_bridge->setStreamingActive(true);
     QVERIFY(!m_bridge->setStatsToggle(QStringLiteral("statsVideoStream"), true));
     m_bridge->setStreamingActive(false);
+}
+
+void TstSettingsBridge::enabledStatsLabelsListsOnlyTheOnesTurnedOnInTheEnginesOwnOrder()
+{
+    // Phase 5 plan 12 (D-26): the one place `moonlight_engine_session.cpp`'s overlay filter
+    // wiring reads the customer's choice from.
+    QVERIFY(m_bridge->enabledStatsLabels().isEmpty());
+
+    // Turned on out of the engine's own order - "Rendering frame rate" before "Video stream" -
+    // the result must still read in the engine's order.
+    QVERIFY(m_bridge->setStatsToggle(QStringLiteral("statsRenderingFrameRate"), true));
+    QVERIFY(m_bridge->setStatsToggle(QStringLiteral("statsVideoStream"), true));
+
+    QCOMPARE(m_bridge->enabledStatsLabels(),
+             QStringList({ QStringLiteral("Video stream"), QStringLiteral("Rendering frame rate") }));
+
+    QVERIFY(m_bridge->setStatsToggle(QStringLiteral("statsVideoStream"), false));
+    QCOMPARE(m_bridge->enabledStatsLabels(), QStringList({ QStringLiteral("Rendering frame rate") }));
+
+    QVERIFY(m_bridge->setStatsToggle(QStringLiteral("statsRenderingFrameRate"), false));
+    QVERIFY(m_bridge->enabledStatsLabels().isEmpty());
 }
 
 void TstSettingsBridge::sessionOverridesAreInMemoryOnly()

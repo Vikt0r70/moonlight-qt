@@ -187,6 +187,14 @@ void MoonlightEngineSession::interrupt()
     }
 }
 
+void MoonlightEngineSession::setDebugLineFilter(const QStringList& enabledLabels)
+{
+    // See this method's own header comment: a thin forward to the engine's own compositor. Reached
+    // through this session object rather than the engine's `Session::get()` global, for the same
+    // reason `publishOverlaySurface()` is.
+    m_engine->getOverlayManager().setDebugLineFilter(enabledLabels);
+}
+
 bool MoonlightEngineSession::publishOverlaySurface(SDL_Surface* surface)
 {
     // The overlay manager ADR-0045 added a bitmap input to. Reached through this session object

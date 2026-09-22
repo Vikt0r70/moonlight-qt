@@ -1019,6 +1019,20 @@ bool SettingsBridge::setStatsToggle(const QString& statsKey, bool value)
     return true;
 }
 
+QStringList SettingsBridge::enabledStatsLabels() const
+{
+    // D-26: this is the one place both this bridge and Plan 12's overlay filter read the label
+    // catalogue from - `kStatsToggles` above is defined once, here, and the filter itself
+    // (`OverlayManager::setDebugLineFilter()`) carries no copy of it.
+    QStringList out;
+    for (const StatsToggle& t : kStatsToggles) {
+        if (getStatsToggle(QString::fromLatin1(t.key))) {
+            out.append(QString::fromLatin1(t.label));
+        }
+    }
+    return out;
+}
+
 void SettingsBridge::recomputeShowPerfOverlay()
 {
     QSettings settings;
