@@ -767,6 +767,9 @@ private slots:
     void theHostSpeakerRowIsPresentAndEditableAtUpstreamsDefault();
     void theStreamingBannerAndNegotiatedFallbackStillRenderOnTheRebuiltPage();
     void noSettingsPageStringCarriesTheUpstreamBrand();
+    void customResolutionSelectionRevealsAndPersistsTheWidthHeightFields();
+    void customFrameRateSelectionRevealsAndPersistsTheFpsField();
+    void aStoredCustomResolutionOrFrameRateShowsItsFieldsOnLoad();
     void disabledActionLabelStaysLegible();
     void agentConfigPanelMasksTheTokenAndNeverRendersIt();
     void theWindowSequenceRestoresOnlyAfterTheEngineIsDone();
@@ -2996,6 +2999,33 @@ QHash<QString, QObject*> statsCheckBoxesByKey(QObject* rootObject, SettingsBridg
     return out;
 }
 
+// The settings row (a SeatHubSelect or SeatHubNumberField) carrying a given `title` - the label
+// the user reads. Every row on the page has a unique title, so the title alone identifies one, the
+// same way `checkBoxNear` finds a control by its label rather than by an objectName the Basic-style
+// controls do not carry to the C++ boundary in this Qt build. A hidden row is still in the object
+// tree, so this finds the Custom fields whether or not they are visible.
+QObject* itemByTitle(QObject* root, const QString& title)
+{
+    for (QObject* child : root->findChildren<QObject*>()) {
+        if (child->metaObject()->indexOfProperty("title") >= 0
+            && child->property("title").toString() == title) {
+            return child;
+        }
+    }
+    return nullptr;
+}
+
+// The real ComboBox inside a SeatHubSelect row.
+QObject* comboInside(QObject* row)
+{
+    for (QObject* item : row->findChildren<QObject*>()) {
+        if (item->inherits("QQuickComboBox")) {
+            return item;
+        }
+    }
+    return nullptr;
+}
+
 } // namespace
 
 void TstUiScreens::settingsPageRendersTheSevenUpstreamSectionsInOrder()
@@ -3202,6 +3232,187 @@ void TstUiScreens::noSettingsPageStringCarriesTheUpstreamBrand()
         QVERIFY2(!text.contains(QStringLiteral("Moonlight")),
                  qPrintable(QStringLiteral("a rendered string carries the upstream brand: ") + text));
     }
+}
+
+void TstUiScreens::customResolutionSelectionRevealsAndPersistsTheWidthHeightFields()
+{
+    // custom-resolution-fps-dead: picking "Custom" in the Resolution dropdown must reveal the
+    // Custom width and Custom height fields, and they must STAY revealed while width/height are
+    // edited to a preset-matching pair. "Custom" was a value DERIVED from the stored pair, never a
+    // requestable mode: setResolutionPreset("Custom") stored nothing and emitted no valueChanged
+    // while the values still matched a preset, so refreshDerived() never ran and the fields'
+    // `visible` gate (bound to page.customResolution) never turned true. No prior test drove the
+    // select to "Custom" or asserted the fields appear, which is how this shipped.
+    SettingsFixture fixture;
+    QQuickStyle::setStyle(QStringLiteral("Basic"));
+    QQmlEngine engine;
+    registerTokenSingletons(&engine);
+
+    // Start on a concrete preset (720p) - the reported starting state, and the one the derive-only
+    // bug needs: resolutionPreset() returns "720p", so the pre-fix "Custom" write is a silent no-op.
+    fixture.bridge->setValue(QStringLiteral("width"), 1280);
+    fixture.bridge->setValue(QStringLiteral("height"), 720);
+    QCOMPARE(fixture.bridge->resolutionPreset(), QStringLiteral("720p"));
+
+    QString error;
+    QScopedPointer<QObject> root(instantiateSettingsPage(&engine, fixture.client, &error));
+    QVERIFY2(root, qPrintable(error));
+
+    QObject* resolutionSelect = itemByTitle(root.data(), QStringLiteral("Resolution"));
+    QVERIFY2(resolutionSelect, "the Basic Settings section must render a Resolution select");
+    QObject* widthField = itemByTitle(root.data(), QStringLiteral("Custom width"));
+    QObject* heightField = itemByTitle(root.data(), QStringLiteral("Custom height"));
+    // Exist regardless of visibility - a hidden Item is still in the object tree. The bug is that
+    // they never become visible, not that they are absent (guards a vacuous "object exists" pass).
+    QVERIFY2(widthField, "the Custom width field must exist in the page tree");
+    QVERIFY2(heightField, "the Custom height field must exist in the page tree");
+
+    // Anchor the visibility reads: the Resolution select is unconditionally visible in this same
+    // instantiation, so a `visible:false` reading on the Custom fields is the real bug, not a dead
+    // or unrealized item tree.
+    QVERIFY2(effectivelyVisible(resolutionSelect),
+             "the Resolution select must be visible - anchors the fields' visibility reads");
+
+    // Pre-reveal: at a preset start the Custom fields are correctly hidden.
+    QVERIFY2(!widthField->property("visible").toBool(), "Custom width starts hidden at a preset");
+    QVERIFY2(!heightField->property("visible").toBool(), "Custom height starts hidden at a preset");
+
+    // Drive the real ComboBox the way the user does: select "Custom" and fire activated, which runs
+    // SeatHubSelect.onActivated -> edited("Custom") -> the page's onEdited handler -> the select's
+    // own refresh(). A bare edited() emit would skip that trailing refresh and leave the
+    // dropdown-display half of the fix (the select must show "Custom", not snap back) untested.
+    QObject* combo = comboInside(resolutionSelect);
+    QVERIFY2(combo, "the Resolution select must render a real ComboBox");
+    const int customIdx = fixture.bridge->resolutionPresets().indexOf(QStringLiteral("Custom"));
+    QVERIFY2(customIdx >= 0, "the resolution options must offer Custom");
+    QVERIFY(combo->setProperty("currentIndex", customIdx));
+    QVERIFY2(QMetaObject::invokeMethod(combo, "activated", Q_ARG(int, customIdx)),
+             "could not fire the Resolution ComboBox's activated signal");
+
+    // (a) picking Custom reveals BOTH fields - the reported failure. RED on today's code (they stay
+    // hidden, the "Custom" write being a silent no-op from a preset start).
+    QVERIFY2(widthField->property("visible").toBool(), "picking Custom must reveal Custom width");
+    QVERIFY2(heightField->property("visible").toBool(), "picking Custom must reveal Custom height");
+    QVERIFY(effectivelyVisible(widthField));
+    QVERIFY(effectivelyVisible(heightField));
+    // The dropdown must DISPLAY Custom, not snap back to "720p" for the still-preset stored pair.
+    QCOMPARE(resolutionSelect->property("value").toString(), QStringLiteral("Custom"));
+
+    // (b) the fields STAY visible while width/height are edited to a PRESET-MATCHING pair (1080p) -
+    // the mid-edit-vanish a refreshDerived()-from-the-pair-only fix leaves. Prove the pair really
+    // matches a preset first, or this guard - the one that separates the real fix from the naive
+    // one - passes vacuously.
+    fixture.bridge->setValue(QStringLiteral("width"), 1920);
+    fixture.bridge->setValue(QStringLiteral("height"), 1080);
+    QCOMPARE(fixture.bridge->resolutionPreset(), QStringLiteral("1080p"));
+    QVERIFY2(widthField->property("visible").toBool(),
+             "Custom width must stay visible while editing to a preset-matching pair");
+    QVERIFY2(heightField->property("visible").toBool(),
+             "Custom height must stay visible while editing to a preset-matching pair");
+
+    // (c) picking a concrete preset hides the fields again and stores that preset.
+    const int idx720 = fixture.bridge->resolutionPresets().indexOf(QStringLiteral("720p"));
+    QVERIFY(idx720 >= 0);
+    QVERIFY(combo->setProperty("currentIndex", idx720));
+    QVERIFY(QMetaObject::invokeMethod(combo, "activated", Q_ARG(int, idx720)));
+    QVERIFY2(!widthField->property("visible").toBool(), "picking a preset must hide Custom width");
+    QVERIFY2(!heightField->property("visible").toBool(), "picking a preset must hide Custom height");
+    QCOMPARE(fixture.bridge->resolutionPreset(), QStringLiteral("720p"));
+    QCOMPARE(resolutionSelect->property("value").toString(), QStringLiteral("720p"));
+}
+
+void TstUiScreens::customFrameRateSelectionRevealsAndPersistsTheFpsField()
+{
+    // custom-resolution-fps-dead, the Frame rate half: identical derive-only bug in
+    // setFrameRatePreset("Custom") (settings_bridge.cpp), gating the Custom frame rate field.
+    SettingsFixture fixture;
+    QQuickStyle::setStyle(QStringLiteral("Basic"));
+    QQmlEngine engine;
+    registerTokenSingletons(&engine);
+
+    // Start on a concrete preset (60 FPS).
+    fixture.bridge->setValue(QStringLiteral("fps"), 60);
+    QCOMPARE(fixture.bridge->frameRatePreset(), QStringLiteral("60 FPS"));
+
+    QString error;
+    QScopedPointer<QObject> root(instantiateSettingsPage(&engine, fixture.client, &error));
+    QVERIFY2(root, qPrintable(error));
+
+    QObject* frameRateSelect = itemByTitle(root.data(), QStringLiteral("Frame rate"));
+    QVERIFY2(frameRateSelect, "the Basic Settings section must render a Frame rate select");
+    QObject* fpsField = itemByTitle(root.data(), QStringLiteral("Custom frame rate"));
+    QVERIFY2(fpsField, "the Custom frame rate field must exist in the page tree");
+    QVERIFY2(effectivelyVisible(frameRateSelect),
+             "the Frame rate select must be visible - anchors the field's visibility reads");
+    QVERIFY2(!fpsField->property("visible").toBool(), "Custom frame rate starts hidden at a preset");
+
+    QObject* combo = comboInside(frameRateSelect);
+    QVERIFY2(combo, "the Frame rate select must render a real ComboBox");
+    const int customIdx = fixture.bridge->frameRatePresets().indexOf(QStringLiteral("Custom"));
+    QVERIFY2(customIdx >= 0, "the frame-rate options must offer Custom");
+    QVERIFY(combo->setProperty("currentIndex", customIdx));
+    QVERIFY2(QMetaObject::invokeMethod(combo, "activated", Q_ARG(int, customIdx)),
+             "could not fire the Frame rate ComboBox's activated signal");
+
+    // (a) picking Custom reveals the fps field. RED on today's code.
+    QVERIFY2(fpsField->property("visible").toBool(), "picking Custom must reveal the fps field");
+    QVERIFY(effectivelyVisible(fpsField));
+    QCOMPARE(frameRateSelect->property("value").toString(), QStringLiteral("Custom"));
+
+    // (b) the field STAYS visible while fps is edited to a preset-matching value (30 FPS). Prove the
+    // value matches a preset first. (The Frame rate select's own refresh() fires only on
+    // width/height, never fps, so this asserts the FIELD's visibility - the select-display half is
+    // covered by the activated-path assertions above and in (c).)
+    fixture.bridge->setValue(QStringLiteral("fps"), 30);
+    QCOMPARE(fixture.bridge->frameRatePreset(), QStringLiteral("30 FPS"));
+    QVERIFY2(fpsField->property("visible").toBool(),
+             "the fps field must stay visible while editing to a preset-matching value");
+
+    // (c) picking a concrete preset hides the field again and stores that preset.
+    const int idx60 = fixture.bridge->frameRatePresets().indexOf(QStringLiteral("60 FPS"));
+    QVERIFY(idx60 >= 0);
+    QVERIFY(combo->setProperty("currentIndex", idx60));
+    QVERIFY(QMetaObject::invokeMethod(combo, "activated", Q_ARG(int, idx60)));
+    QVERIFY2(!fpsField->property("visible").toBool(), "picking a preset must hide the fps field");
+    QCOMPARE(fixture.bridge->frameRatePreset(), QStringLiteral("60 FPS"));
+    QCOMPARE(frameRateSelect->property("value").toString(), QStringLiteral("60 FPS"));
+}
+
+void TstUiScreens::aStoredCustomResolutionOrFrameRateShowsItsFieldsOnLoad()
+{
+    // (d): a stored pair/value that is already non-preset (genuinely custom) must show its fields
+    // on load - the one path that worked before the fix, kept as a regression guard so a future
+    // change to refreshDerived() cannot silently break it.
+    SettingsFixture fixture;
+    QQuickStyle::setStyle(QStringLiteral("Basic"));
+    QQmlEngine engine;
+    registerTokenSingletons(&engine);
+
+    // Non-preset values: 1600x900 is none of 720p/1080p/1440p/4K; 144 is neither 30 nor 60.
+    fixture.bridge->setValue(QStringLiteral("width"), 1600);
+    fixture.bridge->setValue(QStringLiteral("height"), 900);
+    fixture.bridge->setValue(QStringLiteral("fps"), 144);
+    QCOMPARE(fixture.bridge->resolutionPreset(), QStringLiteral("Custom"));
+    QCOMPARE(fixture.bridge->frameRatePreset(), QStringLiteral("Custom"));
+
+    QString error;
+    QScopedPointer<QObject> root(instantiateSettingsPage(&engine, fixture.client, &error));
+    QVERIFY2(root, qPrintable(error));
+
+    QObject* widthField = itemByTitle(root.data(), QStringLiteral("Custom width"));
+    QObject* heightField = itemByTitle(root.data(), QStringLiteral("Custom height"));
+    QObject* fpsField = itemByTitle(root.data(), QStringLiteral("Custom frame rate"));
+    QVERIFY(widthField && heightField && fpsField);
+    QVERIFY2(widthField->property("visible").toBool(), "a stored custom pair must show Custom width on load");
+    QVERIFY2(heightField->property("visible").toBool(), "a stored custom pair must show Custom height on load");
+    QVERIFY2(fpsField->property("visible").toBool(), "a stored custom fps must show the fps field on load");
+
+    // And the selects display Custom for the custom stored state.
+    QObject* resolutionSelect = itemByTitle(root.data(), QStringLiteral("Resolution"));
+    QObject* frameRateSelect = itemByTitle(root.data(), QStringLiteral("Frame rate"));
+    QVERIFY(resolutionSelect && frameRateSelect);
+    QCOMPARE(resolutionSelect->property("value").toString(), QStringLiteral("Custom"));
+    QCOMPARE(frameRateSelect->property("value").toString(), QStringLiteral("Custom"));
 }
 
 void TstUiScreens::disabledActionLabelStaysLegible()

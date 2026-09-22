@@ -33,11 +33,23 @@ Item {
     readonly property var prefs: client ? client.settings : null
 
     // The custom width/height fields are the "Custom" state of the Resolution control (`width` +
-    // `height`), so they appear only when the pair is neither of the four upstream presets.
+    // `height`), so they appear when the pair is neither of the four upstream presets OR when the
+    // user has explicitly asked for Custom from the dropdown (see requestedCustomResolution).
     property bool customResolution: false
     // Same pattern for Frame rate: "Custom" means `fps` is neither of upstream's two fixed
-    // presets (30, 60).
+    // presets (30, 60), or the user asked for Custom.
     property bool customFrameRate: false
+
+    // "Custom" is a state of the stored pair, not a value the bridge can store (settings_bridge.cpp:
+    // setResolutionPreset("Custom") is a deliberate no-op). So a user who picks "Custom" while the
+    // stored values still match a preset would otherwise never see the fields — refreshDerived()
+    // computed customResolution purely from the pair, which reads as a preset until the user can type
+    // a custom value, which they can't because the fields are hidden. These flags carry the user's
+    // REQUEST as transient UI state: set true when "Custom" is picked, false when a concrete preset
+    // is picked. They deliberately do NOT persist across page reconstruction — if the user never
+    // typed a distinct value, nothing custom is stored and showing the preset on reopen is correct.
+    property bool requestedCustomResolution: false
+    property bool requestedCustomFrameRate: false
 
     // ADR-0042 / D-49: one checkbox (unchecked = never) plus a dropdown reachable only when the
     // checkbox is checked. The stored value is a single key, `capturesyskeys`.
@@ -47,8 +59,11 @@ Item {
     function refreshDerived() {
         if (!prefs)
             return
-        customResolution = prefs.resolutionPreset() === "Custom"
-        customFrameRate = prefs.frameRatePreset() === "Custom"
+        // A genuinely-custom stored pair, or an explicit request, keeps the fields open. The
+        // request term is what lets "Custom" work from a preset start and survive editing the pair
+        // to preset-matching values (until the user picks a concrete preset, which clears it).
+        customResolution = requestedCustomResolution || prefs.resolutionPreset() === "Custom"
+        customFrameRate = requestedCustomFrameRate || prefs.frameRatePreset() === "Custom"
         var mode = String(prefs.captureSysKeysMode())
         captureChecked = mode !== "never"
         captureWhen = captureChecked ? mode : "fullscreen"
@@ -164,8 +179,19 @@ Item {
                             title: qsTr("Resolution")
                             description: qsTr("Half of upstream's \"Resolution and FPS\" row (merges \"width\" and \"height\"). Presets 720p, 1080p, 1440p and 4K, or Custom.")
                             optionsOverride: page.prefs ? page.prefs.resolutionPresets() : []
-                            valueProvider: function() { return page.prefs ? page.prefs.resolutionPreset() : "" }
-                            onEdited: page.prefs.setResolutionPreset(value)
+                            // Display "Custom" whenever the fields are open (requested or derived),
+                            // so the dropdown never snaps back to a preset name while a custom value
+                            // is being entered.
+                            valueProvider: function() { return page.customResolution ? "Custom" : (page.prefs ? page.prefs.resolutionPreset() : "") }
+                            onEdited: function(value) {
+                                // Record the request BEFORE the bridge write: a concrete preset's
+                                // write emits valueChanged synchronously, and refreshDerived() must
+                                // already see the cleared flag. The trailing refreshDerived() covers
+                                // the "Custom" case, which stores nothing and emits no signal.
+                                page.requestedCustomResolution = (value === "Custom")
+                                page.prefs.setResolutionPreset(value)
+                                page.refreshDerived()
+                            }
                         }
 
                         SeatHubNumberField {
@@ -193,8 +219,12 @@ Item {
                             bridge: page.prefs
                             description: qsTr("The other half of upstream's \"Resolution and FPS\" row (merges \"fps\"). 30 FPS, 60 FPS, or Custom.")
                             optionsOverride: page.prefs ? page.prefs.frameRatePresets() : []
-                            valueProvider: function() { return page.prefs ? page.prefs.frameRatePreset() : "" }
-                            onEdited: page.prefs.setFrameRatePreset(value)
+                            valueProvider: function() { return page.customFrameRate ? "Custom" : (page.prefs ? page.prefs.frameRatePreset() : "") }
+                            onEdited: function(value) {
+                                page.requestedCustomFrameRate = (value === "Custom")
+                                page.prefs.setFrameRatePreset(value)
+                                page.refreshDerived()
+                            }
                         }
 
                         SeatHubNumberField {
