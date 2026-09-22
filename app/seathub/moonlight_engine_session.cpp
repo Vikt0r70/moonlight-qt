@@ -195,6 +195,11 @@ bool MoonlightEngineSession::publishOverlaySurface(SDL_Surface* surface)
     Overlay::OverlayManager& manager = m_engine->getOverlayManager();
 
     if (surface == nullptr) {
+        // The HUD published nothing this frame - the slot's SeatHub content is genuinely gone,
+        // not merely toggled off by the engine (Task 05-10-2, ADR-0045). Told apart here rather
+        // than in the compositor, which cannot otherwise distinguish this from Moonlight's own
+        // `session.cpp` disabling the same overlay while a low-balance warning should stay put.
+        manager.clearSeatHubSurface(Overlay::OverlayStatusUpdate);
         manager.setOverlayState(Overlay::OverlayStatusUpdate, false);
         return true;
     }

@@ -34,6 +34,10 @@ OverlayManager::~OverlayManager()
         if (m_Overlays[i].surface != nullptr) {
             SDL_FreeSurface(m_Overlays[i].surface);
         }
+        // SeatHub: D-28 exception, see FORK-CHANGES.md and ADR-0045.
+        if (m_Overlays[i].seatHubSurface != nullptr) {
+            SDL_FreeSurface(m_Overlays[i].seatHubSurface);
+        }
         if (m_Overlays[i].font != nullptr) {
             TTF_CloseFont(m_Overlays[i].font);
         }
@@ -113,6 +117,24 @@ bool OverlayManager::updateOverlaySurface(OverlayType type, SDL_Surface* surface
         return false;
     }
 
+    // SeatHub: D-28 exception, see FORK-CHANGES.md and ADR-0045. Remembers a private copy of
+    // this bitmap (see the `seatHubSurface` field comment) so `notifyOverlayUpdated()` can
+    // re-publish it if the engine writes its own text or toggles this slot's enabled state
+    // before the HUD publishes again. A copy, because `surface` itself is handed to the
+    // renderer below and is not this class's to keep past that hand-off. A failed duplicate
+    // (out of memory) only degrades to pre-05-10 behaviour - the engine's text can blank this
+    // publish until the next one succeeds - so it is logged, not treated as a refusal.
+    SDL_Surface* remembered = SDL_ConvertSurface(surface, surface->format, 0);
+    if (remembered == nullptr) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                    "SeatHub overlay: could not remember a bitmap for overlay %d: %s",
+                    (int)type, SDL_GetError());
+    }
+    if (m_Overlays[type].seatHubSurface != nullptr) {
+        SDL_FreeSurface(m_Overlays[type].seatHubSurface);
+    }
+    m_Overlays[type].seatHubSurface = remembered;
+
     SDL_Surface* oldSurface = (SDL_Surface*)SDL_AtomicSetPtr((void**)&m_Overlays[type].surface, surface);
 
     // Free the surface this bitmap replaced, exactly as the text path does.
@@ -127,6 +149,15 @@ bool OverlayManager::updateOverlaySurface(OverlayType type, SDL_Surface* surface
     }
 
     return true;
+}
+
+// SeatHub: D-28 exception, see FORK-CHANGES.md and ADR-0045.
+void OverlayManager::clearSeatHubSurface(OverlayType type)
+{
+    if (m_Overlays[type].seatHubSurface != nullptr) {
+        SDL_FreeSurface(m_Overlays[type].seatHubSurface);
+        m_Overlays[type].seatHubSurface = nullptr;
+    }
 }
 
 void OverlayManager::setOverlayTextUpdated(OverlayType type)
@@ -164,9 +195,55 @@ void OverlayManager::setOverlayRenderer(IOverlayRenderer* renderer)
     m_Renderer = renderer;
 }
 
+// SeatHub: D-28 exception, see FORK-CHANGES.md and ADR-0045.
+void OverlayManager::reassertPublishedSurface(OverlayType type)
+{
+    SDL_Surface* source = m_Overlays[type].seatHubSurface;
+    if (source == nullptr) {
+        return;
+    }
+
+    // A fresh copy each time: whatever is swapped into `m_Overlays[type].surface` below is taken
+    // and freed by the renderer (`getUpdatedOverlaySurface()`'s documented contract), so the
+    // remembered copy itself must never be handed out directly - it has to survive to be
+    // re-published again the next time this runs.
+    SDL_Surface* copy = SDL_ConvertSurface(source, source->format, 0);
+    if (copy == nullptr) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                    "SeatHub overlay: could not re-assert the bitmap for overlay %d: %s",
+                    (int)type, SDL_GetError());
+        return;
+    }
+
+    SDL_Surface* oldSurface = (SDL_Surface*)SDL_AtomicSetPtr((void**)&m_Overlays[type].surface, copy);
+    if (oldSurface != nullptr) {
+        SDL_FreeSurface(oldSurface);
+    }
+
+    if (m_Renderer != nullptr) {
+        m_Renderer->notifyOverlayUpdated(type);
+    }
+}
+
 void OverlayManager::notifyOverlayUpdated(OverlayType type)
 {
     if (m_Renderer == nullptr) {
+        return;
+    }
+
+    // SeatHub: D-28 exception, see FORK-CHANGES.md and ADR-0045.
+    //
+    // A remembered SeatHub bitmap is authoritative for this slot for as long as the overlay stays
+    // enabled: an engine text write (`updateOverlayText()` -> `setOverlayTextUpdated()`) and a
+    // state toggle (`setOverlayState()`) both call this function, and both would otherwise
+    // rasterise `text` over exactly the frame a low-balance warning needs to stay on screen for
+    // (RESEARCH Pitfall 2) - the first case is the poor-connection message overwriting it while
+    // still enabled, the second is the overlay coming back enabled with nothing published since.
+    // `clearSeatHubSurface()` is the only way out of this branch; disabling alone does not clear
+    // it, which is what lets the bitmap reappear on re-enable rather than being replaced by
+    // whatever the engine last wrote to `text`.
+    if (m_Overlays[type].enabled && m_Overlays[type].seatHubSurface != nullptr) {
+        reassertPublishedSurface(type);
         return;
     }
 

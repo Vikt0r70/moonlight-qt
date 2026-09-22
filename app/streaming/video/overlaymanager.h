@@ -75,10 +75,21 @@ public:
     // accepted), false when it was refused.
     bool updateOverlaySurface(OverlayType type, SDL_Surface* surface);
 
+    // SeatHub: D-28 exception, see FORK-CHANGES.md and ADR-0045.
+    //
+    // Tells this slot its SeatHub content is genuinely gone (the HUD published nothing this
+    // frame, not merely a state the engine happens to be toggling) - see the `seatHubSurface`
+    // field comment for why that distinction matters. After this call the engine's own text is
+    // free to draw here again the next time it writes one, exactly as it could before
+    // `updateOverlaySurface()` ever ran. Idempotent; safe on any thread, same as the rest of
+    // this class.
+    void clearSeatHubSurface(OverlayType type);
+
     void setOverlayRenderer(IOverlayRenderer* renderer);
 
 private:
     void notifyOverlayUpdated(OverlayType type);
+    void reassertPublishedSurface(OverlayType type);
 
     struct {
         bool enabled;
@@ -88,6 +99,20 @@ private:
 
         TTF_Font* font;
         SDL_Surface* surface;
+
+        // SeatHub: D-28 exception, see FORK-CHANGES.md and ADR-0045.
+        //
+        // Remembers the caller-rendered bitmap this slot last published (`updateOverlaySurface()`),
+        // as a private copy the caller owes nothing to and this class owns for as long as it holds
+        // it: `updateOverlaySurface()`'s surface argument is consumed on delivery, and the renderer
+        // takes it too, so the same pointer cannot be kept without a second reference or a copy.
+        // Existing to close a real gap: `notifyOverlayUpdated()` - the text path, run whenever the
+        // engine calls `updateOverlayText()` / `setOverlayState()` - always rasterises `text` and
+        // replaces whatever is in the slot, which took SeatHub's bitmap off screen exactly when
+        // Moonlight's own status text (a poor-connection warning, or nothing at all on recovery)
+        // wrote to the same overlay (RESEARCH Pitfall 2). With this set, the text path re-publishes
+        // this copy immediately afterwards instead, so a low-balance warning survives it.
+        SDL_Surface* seatHubSurface;
     } m_Overlays[OverlayMax];
     IOverlayRenderer* m_Renderer;
     QByteArray m_FontData;
