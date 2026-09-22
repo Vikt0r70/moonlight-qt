@@ -70,6 +70,43 @@ Uint32 pixelAt(const SDL_Surface* surface, int x, int y)
     return row[x];
 }
 
+// Phase 5 plan 12 (CUST-17/D-23/D-26): the eleven lines Moonlight 6.1.0's own
+// `stringifyVideoStats()` writes (`git show v6.1.0:app/streaming/video/ffmpeg.cpp`), verbatim
+// including each line's own trailing colon, in the engine's own output order - the "single list
+// the test pins" the plan's own verify checks against the live upstream source, so a rename here
+// is caught there. `settings_bridge.cpp`'s `kStatsToggles` carries the same eleven labels (without
+// the colon, D-26); this is the compositor test's own copy for building realistic raw-text
+// fixtures, not a second source of truth for what the labels mean.
+constexpr const char* kAllDebugLinesRaw =
+    "Video stream: 1920x1080 60.00 FPS (Codec: H.264)\n"
+    "Incoming frame rate from network: 60.00 FPS\n"
+    "Decoding frame rate: 60.00 FPS\n"
+    "Rendering frame rate: 60.00 FPS\n"
+    "Host processing latency min/max/average: 1.0/2.0/1.5 ms\n"
+    "Frames dropped by your network connection: 0.10%\n"
+    "Frames dropped due to network jitter: 0.05%\n"
+    "Average network latency: 12 ms (variance: 1 ms)\n"
+    "Average decoding time: 3.20 ms\n"
+    "Average frame queue delay: 0.80 ms\n"
+    "Average rendering time (including monitor V-sync latency): 4.10 ms\n";
+
+// The same eleven labels (no colon), matching `settings_bridge.cpp`'s `kStatsToggles` exactly -
+// what a real caller (`SettingsBridge::enabledStatsLabels()`) would ever pass to
+// `setDebugLineFilter()` in production.
+const QStringList kAllPinnedLabels = {
+    QStringLiteral("Video stream"),
+    QStringLiteral("Incoming frame rate from network"),
+    QStringLiteral("Decoding frame rate"),
+    QStringLiteral("Rendering frame rate"),
+    QStringLiteral("Host processing latency min/max/average"),
+    QStringLiteral("Frames dropped by your network connection"),
+    QStringLiteral("Frames dropped due to network jitter"),
+    QStringLiteral("Average network latency"),
+    QStringLiteral("Average decoding time"),
+    QStringLiteral("Average frame queue delay"),
+    QStringLiteral("Average rendering time (including monitor V-sync latency)"),
+};
+
 } // namespace
 
 class TestOverlayInjection : public QObject
@@ -313,6 +350,147 @@ private slots:
         SDL_Surface* taken = manager.getUpdatedOverlaySurface(Overlay::OverlayDebug);
         QCOMPARE(taken, bitmap);
         SDL_FreeSurface(taken);
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // Phase 5 plan 12 (CUST-17/D-23/D-26): the per-line OverlayDebug filter. `filteredDebugText()`
+    // is exercised directly rather than through the TTF-rasterised surface, because this test
+    // project links no font resource (see this file's own header) - `notifyOverlayUpdated()`
+    // returns before reaching the filter for exactly the same reason `publishesTheBitmapAnd
+    // NotifiesExactlyOnce` already documents for the pre-existing text path. `filteredDebugText()`
+    // is the same computation that path uses once a font is linked (production).
+    // ------------------------------------------------------------------------------------------
+
+    void withNoFilterEverSetNothingIsDrawn()
+    {
+        // The safe default before any wiring runs (Plan 12 Task 2's own job): nothing enabled
+        // means nothing drawn, the same as an explicit empty list.
+        Overlay::OverlayManager manager;
+        manager.updateOverlayText(Overlay::OverlayDebug, kAllDebugLinesRaw);
+
+        QVERIFY(manager.filteredDebugText().isEmpty());
+    }
+
+    void onlyEnabledLinesRenderInTheEnginesOwnOrder()
+    {
+        Overlay::OverlayManager manager;
+        manager.updateOverlayText(Overlay::OverlayDebug, kAllDebugLinesRaw);
+
+        // The filter list itself is NOT in the engine's order; the output must be.
+        manager.setDebugLineFilter({ QStringLiteral("Rendering frame rate"),
+                                     QStringLiteral("Video stream"),
+                                     QStringLiteral("Average network latency") });
+
+        QCOMPARE(manager.filteredDebugText(),
+                 QByteArray("Video stream: 1920x1080 60.00 FPS (Codec: H.264)\n"
+                            "Rendering frame rate: 60.00 FPS\n"
+                            "Average network latency: 12 ms (variance: 1 ms)\n"));
+    }
+
+    void aDisabledLineInTheMiddleLeavesNoGap()
+    {
+        // "Decoding frame rate" sits between these two in the engine's own text and is disabled.
+        Overlay::OverlayManager manager;
+        manager.updateOverlayText(Overlay::OverlayDebug, kAllDebugLinesRaw);
+        manager.setDebugLineFilter({ QStringLiteral("Incoming frame rate from network"),
+                                     QStringLiteral("Rendering frame rate") });
+
+        QCOMPARE(manager.filteredDebugText(),
+                 QByteArray("Incoming frame rate from network: 60.00 FPS\n"
+                            "Rendering frame rate: 60.00 FPS\n"));
+    }
+
+    void twoAdjacentEnabledLinesRenderWithNothingBetweenThem()
+    {
+        // CUST-17 adjacency edge: two lines the engine already writes next to each other stay
+        // next to each other when both are enabled.
+        Overlay::OverlayManager manager;
+        manager.updateOverlayText(Overlay::OverlayDebug, kAllDebugLinesRaw);
+        manager.setDebugLineFilter({ QStringLiteral("Decoding frame rate"),
+                                     QStringLiteral("Rendering frame rate") });
+
+        QCOMPARE(manager.filteredDebugText(),
+                 QByteArray("Decoding frame rate: 60.00 FPS\n"
+                            "Rendering frame rate: 60.00 FPS\n"));
+    }
+
+    void nothingRendersWithEveryLineDisabled()
+    {
+        // CUST-17 empty edge: no empty box, no heading - nothing at all.
+        Overlay::OverlayManager manager;
+        manager.updateOverlayText(Overlay::OverlayDebug, kAllDebugLinesRaw);
+        manager.setDebugLineFilter({});
+
+        QVERIFY(manager.filteredDebugText().isEmpty());
+    }
+
+    void anEngineLineWithNoMatchingLabelIsNeverDrawnEvenWhenEverythingElseIsEnabled()
+    {
+        // T-05-49: simulates an upstream rename/addition. Even with every one of the eleven known
+        // labels enabled, a line whose label is not among them is dropped, not defaulted to
+        // visible - there is no "draw unknown content" branch anywhere in the filter.
+        Overlay::OverlayManager manager;
+        manager.updateOverlayText(Overlay::OverlayDebug,
+                                  QByteArray(kAllDebugLinesRaw) + "Host public address: 10.0.0.5\n");
+        manager.setDebugLineFilter(kAllPinnedLabels);
+
+        const QByteArray filtered = manager.filteredDebugText();
+        QVERIFY(!filtered.contains("Host public address"));
+        QCOMPARE(filtered, QByteArray(kAllDebugLinesRaw));
+    }
+
+    void changingTheFilterAfterTheTextWasSetIsReflectedImmediately()
+    {
+        // The filter is read fresh on every call, never cached at the point the raw text was
+        // written (T-05-52).
+        Overlay::OverlayManager manager;
+        manager.updateOverlayText(Overlay::OverlayDebug, kAllDebugLinesRaw);
+
+        manager.setDebugLineFilter({ QStringLiteral("Video stream") });
+        QCOMPARE(manager.filteredDebugText(),
+                 QByteArray("Video stream: 1920x1080 60.00 FPS (Codec: H.264)\n"));
+
+        manager.setDebugLineFilter({ QStringLiteral("Decoding frame rate") });
+        QCOMPARE(manager.filteredDebugText(), QByteArray("Decoding frame rate: 60.00 FPS\n"));
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // Phase 5 plan 12 Task 2 (OD-04): Moonlight's own stats hotkey (Ctrl+Alt+Shift+S, or the
+    // gamepad chord) can enable OverlayDebug mid-stream on its own, with no SeatHub code path in
+    // between (`session.cpp`'s own keyboard/gamepad handling; not edited by this fork). The owner
+    // chose "the filter keeps applying" over "the hotkey shows everything" - there is only ever
+    // the one filtered read, so these two are about what happens when something OTHER than a
+    // connect-time write toggles the overlay on.
+    // ------------------------------------------------------------------------------------------
+
+    void theFilterKeepsApplyingWhicheverThingTurnedTheOverlayOn()
+    {
+        Overlay::OverlayManager manager;
+        MockOverlayRenderer renderer;
+        manager.setOverlayRenderer(&renderer);
+
+        // The filter is set once, as if at connect time, before the overlay is ever enabled.
+        manager.setDebugLineFilter({ QStringLiteral("Video stream") });
+        manager.updateOverlayText(Overlay::OverlayDebug, kAllDebugLinesRaw);
+        QVERIFY(!manager.isOverlayEnabled(Overlay::OverlayDebug));
+
+        // The hotkey's own effect, from the filter's point of view, is just this: the overlay
+        // becomes enabled with no SeatHub call in between.
+        manager.setOverlayState(Overlay::OverlayDebug, true);
+
+        QCOMPARE(manager.filteredDebugText(),
+                 QByteArray("Video stream: 1920x1080 60.00 FPS (Codec: H.264)\n"));
+    }
+
+    void theHotkeyDrawsNothingWithEveryLineTurnedOff()
+    {
+        Overlay::OverlayManager manager;
+        manager.updateOverlayText(Overlay::OverlayDebug, kAllDebugLinesRaw);
+        manager.setDebugLineFilter({});
+
+        manager.setOverlayState(Overlay::OverlayDebug, true);
+
+        QVERIFY(manager.filteredDebugText().isEmpty());
     }
 };
 

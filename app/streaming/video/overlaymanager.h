@@ -1,6 +1,8 @@
 #pragma once
 
+#include <QByteArray>
 #include <QString>
+#include <QStringList>
 
 #include <SDL.h>
 #include <SDL_ttf.h>
@@ -85,6 +87,44 @@ public:
     // this class.
     void clearSeatHubSurface(OverlayType type);
 
+    // SeatHub: D-28 exception, see FORK-CHANGES.md and ADR-0045.
+    //
+    // CUST-17/D-23/D-26: sets which of the OverlayDebug lines Moonlight's own stats writer
+    // (`ffmpeg.cpp`'s `stringifyVideoStats()`, untouched) may be drawn. `enabledLabels` is the
+    // caller's complete current choice - not additive with a previous call - matched against the
+    // text up to (not including) the first ':' on each `\n`-terminated line the engine writes.
+    // The full label catalogue lives in `SettingsBridge` (D-26, `settings_bridge.cpp`'s
+    // `kStatsToggles`): this class carries no copy of it and simply draws whatever subset of
+    // lines it is told is enabled, in the engine's own order, with no gap left where a disabled
+    // line was. An empty list disables every line - nothing is drawn at all. A raw line whose
+    // label is not present in `enabledLabels` - disabled on purpose, or unrecognised because the
+    // engine renamed it - is never drawn either way (T-05-49): this filter has no "draw by
+    // default" case.
+    //
+    // Applies only to `OverlayDebug`; `OverlayStatusUpdate` (the SeatHub HUD/warning surface) has
+    // no per-line concept and this call does not touch it.
+    //
+    // OD-04: Moonlight's own stats hotkey (Ctrl+Alt+Shift+S, or the gamepad chord) can enable
+    // `OverlayDebug` mid-stream on its own, with no SeatHub code path in between - this filter is
+    // exactly what `notifyOverlayUpdated()` consults on every rasterise regardless of what turned
+    // the overlay on, so there is only ever the one filtered read, never a separate "show
+    // everything" path the hotkey could reach instead: with nothing enabled, the hotkey draws
+    // nothing.
+    //
+    // Threading: same lock-free contract as the rest of this class (the atomic pointer swap the
+    // bitmap path already uses). Settings are read-only while a stream is active (T-05-52), so
+    // this is set once before the engine starts and read fresh on every OverlayDebug rasterise
+    // afterwards - never cached in the surface.
+    void setDebugLineFilter(const QStringList& enabledLabels);
+
+    // SeatHub: D-28 exception, see FORK-CHANGES.md. CUST-17: the `OverlayDebug` text this class
+    // would draw next - the engine's own raw text with `setDebugLineFilter()`'s current choice
+    // applied, in the engine's own line order. The exact computation `notifyOverlayUpdated()`
+    // uses to build the rasterised surface, exposed as its own read-only step because it needs no
+    // TTF font to answer, and this fork's test project links none (see
+    // `tests/tst_overlay_injection.cpp`'s own file header).
+    QByteArray filteredDebugText() const;
+
     void setOverlayRenderer(IOverlayRenderer* renderer);
 
 private:
@@ -116,6 +156,14 @@ private:
     } m_Overlays[OverlayMax];
     IOverlayRenderer* m_Renderer;
     QByteArray m_FontData;
+
+    // SeatHub: D-28 exception, see FORK-CHANGES.md. CUST-17/D-23: the OverlayDebug line filter -
+    // see `setDebugLineFilter()`'s own comment for the full contract. A `QByteArray*` (the
+    // caller's enabled labels, `\n`-joined) swapped the same lock-free way `m_Overlays[type].
+    // surface` already is; nullptr means "nothing enabled", the same as an explicit empty list.
+    // `mutable` because `filteredDebugText()` is logically const (it changes no externally
+    // visible state) but reads this through the same atomic API the setter writes it with.
+    mutable void* m_DebugLineFilter;
 };
 
 }

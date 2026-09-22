@@ -1,11 +1,67 @@
 #include "overlaymanager.h"
 #include "path.h"
 
+#include <QList>
+#include <QSet>
+
 using namespace Overlay;
+
+namespace {
+
+// SeatHub: D-28 exception, see FORK-CHANGES.md. CUST-17/D-23/D-26: the shared filtering logic
+// `OverlayManager::setDebugLineFilter()`/`filteredDebugText()` and `notifyOverlayUpdated()` all
+// rely on. Matches each `\n`-terminated line's label (the text up to, not including, its first
+// ':') against `enabledLabelsJoined` (itself `\n`-joined, as `setDebugLineFilter()` stores it).
+// See `setDebugLineFilter()`'s own header comment for the full contract this implements: engine
+// order preserved, no gap left by a skipped line, no "draw by default" case for an unmatched
+// label.
+QByteArray filterDebugLines(const char* rawText, const QByteArray& enabledLabelsJoined)
+{
+    if (rawText == nullptr || rawText[0] == '\0') {
+        return QByteArray();
+    }
+
+    QSet<QByteArray> enabledLabels;
+    if (!enabledLabelsJoined.isEmpty()) {
+        const QList<QByteArray> parts = enabledLabelsJoined.split('\n');
+        for (const QByteArray& label : parts) {
+            if (!label.isEmpty()) {
+                enabledLabels.insert(label);
+            }
+        }
+    }
+
+    if (enabledLabels.isEmpty()) {
+        return QByteArray();
+    }
+
+    QByteArray filtered;
+    const QList<QByteArray> lines = QByteArray(rawText).split('\n');
+    for (const QByteArray& line : lines) {
+        if (line.isEmpty()) {
+            continue;
+        }
+
+        const int colon = line.indexOf(':');
+        if (colon < 0 || !enabledLabels.contains(line.left(colon))) {
+            // No colon at all (not one of the engine's own lines), or a label this filter was
+            // not told is enabled - disabled on purpose, or unrecognised because the engine
+            // renamed or added it (T-05-49). Either way: skipped, with no gap left behind.
+            continue;
+        }
+
+        filtered += line;
+        filtered += '\n';
+    }
+    return filtered;
+}
+
+} // namespace
 
 OverlayManager::OverlayManager() :
     m_Renderer(nullptr),
-    m_FontData(Path::readDataFile("ModeSeven.ttf"))
+    m_FontData(Path::readDataFile("ModeSeven.ttf")),
+    m_DebugLineFilter(nullptr)
 {
     memset(m_Overlays, 0, sizeof(m_Overlays));
 
@@ -42,6 +98,9 @@ OverlayManager::~OverlayManager()
             TTF_CloseFont(m_Overlays[i].font);
         }
     }
+
+    // SeatHub: D-28 exception, see FORK-CHANGES.md.
+    delete static_cast<QByteArray*>(m_DebugLineFilter);
 
     TTF_Quit();
 
@@ -158,6 +217,23 @@ void OverlayManager::clearSeatHubSurface(OverlayType type)
         SDL_FreeSurface(m_Overlays[type].seatHubSurface);
         m_Overlays[type].seatHubSurface = nullptr;
     }
+}
+
+// SeatHub: D-28 exception, see FORK-CHANGES.md and ADR-0045. See the header's own comment on
+// this method for the full contract.
+void OverlayManager::setDebugLineFilter(const QStringList& enabledLabels)
+{
+    QByteArray* buffer = new QByteArray(enabledLabels.join(QLatin1Char('\n')).toUtf8());
+    void* old = SDL_AtomicSetPtr(&m_DebugLineFilter, buffer);
+    delete static_cast<QByteArray*>(old);
+}
+
+// SeatHub: D-28 exception, see FORK-CHANGES.md. See the header's own comment on this method.
+QByteArray OverlayManager::filteredDebugText() const
+{
+    const QByteArray* filter = static_cast<QByteArray*>(SDL_AtomicGetPtr(&m_DebugLineFilter));
+    const QByteArray filterCopy = (filter != nullptr) ? *filter : QByteArray();
+    return filterDebugLines(m_Overlays[OverlayType::OverlayDebug].text, filterCopy);
 }
 
 void OverlayManager::setOverlayTextUpdated(OverlayType type)
@@ -277,12 +353,33 @@ void OverlayManager::notifyOverlayUpdated(OverlayType type)
     }
 
     if (m_Overlays[type].enabled) {
-        // The _Wrapped variant is required for line breaks to work
-        SDL_Surface* surface = TTF_RenderText_Blended_Wrapped(m_Overlays[type].font,
-                                                              m_Overlays[type].text,
-                                                              m_Overlays[type].color,
-                                                              1024);
-        SDL_AtomicSetPtr((void**)&m_Overlays[type].surface, surface);
+        if (type == OverlayType::OverlayDebug) {
+            // SeatHub: D-28 exception, see FORK-CHANGES.md. CUST-17/D-23/D-26: draw only the
+            // per-line subset the customer chose (`setDebugLineFilter()`/`filteredDebugText()`'s
+            // own comments have the full contract, including OD-04's hotkey case). The engine's
+            // own `text` field is untouched by this - `ffmpeg.cpp`'s writer still writes its
+            // whole text every window; only what gets rasterised here changes, and it is
+            // recomputed fresh on every call rather than cached, so a filter change before this
+            // session's first window is what applies (T-05-52).
+            const QByteArray filteredText = filteredDebugText();
+            if (!filteredText.isEmpty()) {
+                SDL_Surface* surface = TTF_RenderText_Blended_Wrapped(m_Overlays[type].font,
+                                                                      filteredText.constData(),
+                                                                      m_Overlays[type].color,
+                                                                      1024);
+                SDL_AtomicSetPtr((void**)&m_Overlays[type].surface, surface);
+            }
+            // else: nothing enabled - the surface slot was already cleared above (CUST-17 empty
+            // edge: nothing drawn at all, no empty box, no heading).
+        }
+        else {
+            // The _Wrapped variant is required for line breaks to work
+            SDL_Surface* surface = TTF_RenderText_Blended_Wrapped(m_Overlays[type].font,
+                                                                  m_Overlays[type].text,
+                                                                  m_Overlays[type].color,
+                                                                  1024);
+            SDL_AtomicSetPtr((void**)&m_Overlays[type].surface, surface);
+        }
     }
 
     // Notify the renderer
