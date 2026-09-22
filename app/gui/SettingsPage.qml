@@ -501,7 +501,13 @@ Item {
                                     }
 
                                     popup.width: captureWhenBox.width
-                                    popup.height: Math.min(contentItem.implicitHeight, 320)
+                                    // BUG (combobox-popup-collapsed): unqualified `contentItem`
+                                    // resolved to this ComboBox's own one-line display Text, not
+                                    // the popup's ListView - see SeatHubSelect.qml for the full
+                                    // mechanism (this is a second, hand-copied instance of the
+                                    // same override pattern).
+                                    popup.height: Math.min(popup.contentItem.implicitHeight
+                                                           + popup.topPadding + popup.bottomPadding, 320)
 
                                     delegate: ItemDelegate {
                                         id: captureDelegate

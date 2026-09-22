@@ -39,6 +39,7 @@
 #include <QUrl>
 #include <QVariantMap>
 
+#include <algorithm>
 #include <cmath>
 
 #include <QSettings>
@@ -758,6 +759,8 @@ private slots:
     void noSeatHubScreenBuildsAWebsiteAddressItself();
     void forcedUpdateModalKeepsUpdateTabbableAndUndismissable();
     void settingsDropdownElidesLongOptionNames();
+    void settingsDropdownPopupIsTallEnoughToShowItsOptions();
+    void noComboBoxPopupHeightBindsToTheControlsOwnContentItem();
     void settingsPageRendersTheSevenUpstreamSectionsInOrder();
     void aSettingsRowD25RemovesRendersNoRowAtAll();
     void theStatsGroupRendersOneToggleAndTheyDefaultOff();
@@ -2665,6 +2668,200 @@ void TstUiScreens::settingsDropdownElidesLongOptionNames()
     QCOMPARE(label->property("elide").toInt(), int(Qt::ElideRight));
     QVERIFY2(label->property("width").toReal() <= dropdown->property("width").toReal(),
              "the popup label must fit the popup width");
+}
+
+void TstUiScreens::settingsDropdownPopupIsTallEnoughToShowItsOptions()
+{
+    // The bug this test pins (combobox-popup-collapsed): both SeatHubSelect.qml and the raw
+    // ComboBox at SettingsPage.qml (captureWhenBox) bound `popup.height` to an UNQUALIFIED
+    // `contentItem.implicitHeight`. That dot-property binding lives inside the ComboBox's own
+    // body, not inside a `popup: T.Popup { ... }` block, so `contentItem` there resolves to the
+    // ComboBox's OWN one-line display contentItem, not the popup's ListView - every opened
+    // Settings dropdown rendered as a ~one-line grey band with no visible/selectable rows. The
+    // pre-existing `settingsDropdownElidesLongOptionNames` test never opens the popup or measures
+    // its height; object-existence and width assertions pass on a collapsed popup regardless.
+    //
+    // Confirmed against stock Qt source (Basic and Material ComboBox.qml): both set
+    // `contentItem: ListView { implicitHeight: contentHeight }` on the POPUP itself, and compute
+    // `height: Math.min(contentItem.implicitHeight [+ verticalPadding*2], ...)` from INSIDE the
+    // popup's own scope, where the unqualified name correctly resolves to that ListView. The fix
+    // re-qualifies the same expression as `popup.contentItem.implicitHeight + popup.topPadding +
+    // popup.bottomPadding` (topPadding/bottomPadding generalize Material's verticalPadding*2 and
+    // collapse to 0 under Basic, which sets none) - it is the minimal reversal of the scoping
+    // mistake, not a new formula.
+    //
+    // A ComboBox popup is a Popup: it needs a shown, exposed window to lay out (the technique of
+    // `menuPopupIsWideEnoughToShowItsThreeItems`).
+    QQuickStyle::setStyle(QStringLiteral("Basic"));
+    QQmlEngine engine;
+    registerTokenSingletons(&engine);
+
+    FakeBridge bridge;
+    QQmlComponent component(&engine);
+    component.setData(QByteArrayLiteral(
+                          "import QtQuick\n"
+                          "import QtQuick.Controls\n"
+                          "ApplicationWindow {\n"
+                          "    id: win\n"
+                          "    width: 500; height: 700; visible: true\n"
+                          "    property var bridge: null\n"
+                          "    Column {\n"
+                          "        anchors.fill: parent\n"
+                          "        spacing: 8\n"
+                          "        SeatHubSelect {\n"
+                          "            objectName: \"shortList\"\n"
+                          "            bridge: win.bridge\n"
+                          "            title: \"Short\"\n"
+                          "            optionsOverride: [\"Option A\", \"Option B\", \"Option C\", "
+                          "\"Option D\", \"Option E\"]\n"
+                          "        }\n"
+                          "        SeatHubSelect {\n"
+                          "            objectName: \"longList\"\n"
+                          "            bridge: win.bridge\n"
+                          "            title: \"Long\"\n"
+                          "            optionsOverride: (function() { var a = []; "
+                          "for (var i = 0; i < 30; i++) a.push(\"Option \" + i); return a; })()\n"
+                          "        }\n"
+                          "    }\n"
+                          "}\n"),
+                      QUrl::fromLocalFile(guiDir()
+                                          + QStringLiteral("/tst_combobox_popup_height_window.qml")));
+    QScopedPointer<QObject> created(component.create());
+    QVERIFY2(created, qPrintable(component.errorString()));
+    auto* window = qobject_cast<QQuickWindow*>(created.data());
+    QVERIFY(window);
+    QVERIFY(window->setProperty("bridge", QVariant::fromValue(static_cast<QObject*>(&bridge))));
+    QVERIFY(QTest::qWaitForWindowExposed(window));
+    window->requestActivate();
+    QVERIFY(QTest::qWaitForWindowActive(window));
+
+    auto findDropdown = [](QObject* row) -> QObject* {
+        for (QObject* item : row->findChildren<QObject*>()) {
+            if (item->inherits("QQuickComboBox"))
+                return item;
+        }
+        return nullptr;
+    };
+
+    // --- Short list (5 options): the popup must show more than a single display line. ---
+    QObject* shortRow = window->findChild<QObject*>(QStringLiteral("shortList"));
+    QVERIFY(shortRow);
+    QObject* shortDropdown = findDropdown(shortRow);
+    QVERIFY2(shortDropdown, "the row must render a real ComboBox");
+
+    QObject* shortPopup = shortDropdown->property("popup").value<QObject*>();
+    QVERIFY(shortPopup);
+    QVERIFY(QMetaObject::invokeMethod(shortPopup, "open"));
+    QTRY_VERIFY_WITH_TIMEOUT(shortPopup->property("opened").toBool(), 3000);
+    QTRY_VERIFY_WITH_TIMEOUT(shortPopup->property("visible").toBool(), 3000);
+
+    auto* shortListView = shortPopup->property("contentItem").value<QQuickItem*>();
+    QVERIFY2(shortListView && shortListView->inherits("QQuickListView"),
+             "the popup's content item must be a ListView");
+
+    auto* dropdownContentItem = shortDropdown->property("contentItem").value<QQuickItem*>();
+    QVERIFY(dropdownContentItem);
+    const qreal oneLineHeight = dropdownContentItem->property("implicitHeight").toReal();
+    QVERIFY2(oneLineHeight > 0, "the ComboBox's own display line must have a real height");
+
+    // Dump the runtime probe BEFORE the flip assertion below, which returns out of the test
+    // function on failure - a dump placed after it would never print pre-fix, and "record the
+    // REAL numbers" is the whole point of this probe.
+    auto dumpProbe = [&](const char* label) {
+        qWarning().noquote()
+            << "COMBOPROBE" << label << "style=" << QQuickStyle::name()
+            << "popup.height=" << shortPopup->property("height").toReal()
+            << "popup.contentItem.contentHeight=" << shortListView->property("contentHeight").toReal()
+            << "popup.contentItem.implicitHeight=" << shortListView->property("implicitHeight").toReal()
+            << "popup.topPadding=" << shortPopup->property("topPadding").toReal()
+            << "popup.bottomPadding=" << shortPopup->property("bottomPadding").toReal()
+            << "dropdown.contentItem.implicitHeight=" << oneLineHeight;
+    };
+    dumpProbe("(at-visible)");
+
+    // Core symptom, made a QTRY: post-fix, popup.height re-evaluates via a live binding once the
+    // ListView's contentHeight settles a frame after `visible` flips, so an instantaneous read
+    // right after QTRY_VERIFY(visible) risks a flaky red-or-green. On today's code popup.height is
+    // pinned to oneLineHeight (the wrong object) and never grows regardless of how long this waits.
+    QTRY_VERIFY_WITH_TIMEOUT(shortPopup->property("height").toReal() > oneLineHeight * 1.5, 3000);
+
+    dumpProbe("(post-flip)");
+    const qreal popupHeight = shortPopup->property("height").toReal();
+
+    // Not just tall - the actual option rows must be inside the popup and visible, the same
+    // "options are reachable, not just a box is tall" check the menu test made for width.
+    // `QQuickItemView::itemAtIndex(int)` (the same mechanism ListView/GridView expose to QML) is
+    // used rather than searching the QObject tree: ComboBox popup delegates are managed by the
+    // view's own delegate model and are not reliably reachable via QObject::findChildren.
+    QQuickItem* firstDelegate = nullptr;
+    QQuickItem* secondDelegate = nullptr;
+    auto realizedBothRows = [&]() {
+        firstDelegate = nullptr;
+        secondDelegate = nullptr;
+        QMetaObject::invokeMethod(shortListView, "itemAtIndex", Q_RETURN_ARG(QQuickItem*, firstDelegate),
+                                  Q_ARG(int, 0));
+        QMetaObject::invokeMethod(shortListView, "itemAtIndex", Q_RETURN_ARG(QQuickItem*, secondDelegate),
+                                  Q_ARG(int, 1));
+        return firstDelegate != nullptr && secondDelegate != nullptr;
+    };
+    // contentHeight (and so popup.height) can settle before the ListView has actually incubated
+    // its delegate items, so realizing them is its own QTRY.
+    QTRY_VERIFY_WITH_TIMEOUT(realizedBothRows(), 3000);
+    QVERIFY2(firstDelegate, "the first option row must be realized inside the popup");
+    QVERIFY2(secondDelegate, "the second option row must be realized inside the popup - "
+                             "one visible row is still the collapsed-popup symptom");
+    QVERIFY2(firstDelegate->height() > 0, "the first option row must have a real height");
+    QVERIFY2(secondDelegate->y() + secondDelegate->height() <= popupHeight + 0.5,
+             "the second option row must fit inside the popup's own height");
+
+    QVERIFY(QMetaObject::invokeMethod(shortPopup, "close"));
+    QTRY_VERIFY_WITH_TIMEOUT(!shortPopup->property("opened").toBool(), 3000);
+
+    // --- Long list (30 options): E9's 320px elision cap must still hold. ---
+    QObject* longRow = window->findChild<QObject*>(QStringLiteral("longList"));
+    QVERIFY(longRow);
+    QObject* longDropdown = findDropdown(longRow);
+    QVERIFY2(longDropdown, "the row must render a real ComboBox");
+    QObject* longPopup = longDropdown->property("popup").value<QObject*>();
+    QVERIFY(longPopup);
+    QVERIFY(QMetaObject::invokeMethod(longPopup, "open"));
+    QTRY_VERIFY_WITH_TIMEOUT(longPopup->property("opened").toBool(), 3000);
+    QTRY_VERIFY_WITH_TIMEOUT(longPopup->property("visible").toBool(), 3000);
+    QTest::qWait(50);  // let the ListView's contentHeight settle before the cap read
+
+    const qreal longPopupHeight = longPopup->property("height").toReal();
+    qWarning().noquote() << "COMBOPROBE(long) popup.height=" << longPopupHeight;
+    QVERIFY2(longPopupHeight <= 320.5,
+             qPrintable(QStringLiteral("popup height %1 exceeds the E9 320px elision cap")
+                            .arg(longPopupHeight)));
+    QVERIFY2(longPopupHeight > oneLineHeight * 1.5,
+             "the long-model popup must also show real rows, not just respect the cap");
+
+    QVERIFY(QMetaObject::invokeMethod(longPopup, "close"));
+    QTRY_VERIFY_WITH_TIMEOUT(!longPopup->property("opened").toBool(), 3000);
+}
+
+void TstUiScreens::noComboBoxPopupHeightBindsToTheControlsOwnContentItem()
+{
+    // Recurrence guard for combobox-popup-collapsed: the defect was copy-pasted into TWO sites
+    // (SeatHubSelect.qml and SettingsPage.qml's captureWhenBox) before this fix, and nothing
+    // stopped a third. A functional test only covering SeatHubSelect would leave that second site,
+    // and any future copy-paste, undetected. This scans every QML file the app ships for the
+    // literal unqualified pattern, independent of which file it turns up in.
+    const QDir dir(guiDir());
+    const QStringList qmlFiles = dir.entryList(QStringList() << QStringLiteral("*.qml"), QDir::Files);
+    QVERIFY2(!qmlFiles.isEmpty(), "app/gui could not be located from the test binary");
+
+    const QRegularExpression unqualified(
+        QStringLiteral("popup\\.height\\s*:\\s*Math\\.min\\(\\s*contentItem\\."));
+
+    for (const QString& name : qmlFiles) {
+        const QString source = readSource(dir.filePath(name));
+        QVERIFY2(!unqualified.match(source).hasMatch(),
+                 qPrintable(name + QStringLiteral(": popup.height binds to the unqualified "
+                                                  "contentItem (the CONTROL's own content, not the "
+                                                  "popup's) - use popup.contentItem.implicitHeight")));
+    }
 }
 
 namespace {

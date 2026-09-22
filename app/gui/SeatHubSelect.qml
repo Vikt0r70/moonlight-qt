@@ -131,7 +131,17 @@ Item {
                 // decoder names must not widen the flat page at the 960px minimum window width.
                 // The popup is capped to the control's own width and the row's text elides.
                 popup.width: dropdown.width
-                popup.height: Math.min(contentItem.implicitHeight, 320)
+                // BUG (combobox-popup-collapsed): the unqualified `contentItem` here resolved to
+                // the ComboBox's OWN one-line display Text (see line 120 below), not the popup's
+                // ListView, collapsing every opened dropdown to a ~one-line grey band. The stock
+                // Basic/Material ComboBox.qml write this same expression FROM INSIDE their own
+                // `popup: T.Popup { }` block, where the unqualified name resolves correctly; this
+                // override sets `popup.height` from outside that scope, so it must qualify the
+                // object explicitly. `topPadding`/`bottomPadding` generalize Material's
+                // `verticalPadding * 2` term and collapse to 0 under Basic (neither is overridden
+                // here, so the style's own values stand).
+                popup.height: Math.min(popup.contentItem.implicitHeight
+                                       + popup.topPadding + popup.bottomPadding, 320)
 
                 delegate: ItemDelegate {
                     id: optionDelegate
