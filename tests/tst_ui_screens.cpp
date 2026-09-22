@@ -41,7 +41,12 @@
 
 #include <cmath>
 
+#include <QSettings>
+#include <QTemporaryDir>
+
 #include "seathub/agent_config.h"
+#include "seathub/settings_bridge.h"
+#include "settings/streamingpreferences.h"
 
 namespace {
 
@@ -667,6 +672,30 @@ signals:
     void sessionOverridesChanged();
 };
 
+// The `client` a SettingsPage row talks to for Plan 05-11's own tests (D-24 rebuild): the real
+// `SettingsBridge` behind `client.settings`, exactly as production wires it, rather than
+// `FakeBridge` above - the rebuild's own truths (which keys render, which are forced, the
+// eleven stats toggles) are the bridge's real catalogue, not a hand-maintained stand-in that
+// could silently drift from it.
+class FakeSettingsClient : public QObject
+{
+    Q_OBJECT
+    Q_PROPERTY(QObject* settings READ settings CONSTANT)
+
+public:
+    explicit FakeSettingsClient(SettingsBridge* bridge, QObject* parent = nullptr)
+        : QObject(parent), m_bridge(bridge) {}
+
+    QObject* settings() const { return m_bridge; }
+
+    Q_INVOKABLE void closeSettings() { ++m_closes; }
+    int closes() const { return m_closes; }
+
+private:
+    SettingsBridge* m_bridge;
+    int m_closes = 0;
+};
+
 } // namespace
 
 class TstUiScreens : public QObject
@@ -728,6 +757,12 @@ private slots:
     void noSeatHubScreenBuildsAWebsiteAddressItself();
     void forcedUpdateModalKeepsUpdateTabbableAndUndismissable();
     void settingsDropdownElidesLongOptionNames();
+    void settingsPageRendersTheSevenUpstreamSectionsInOrder();
+    void aSettingsRowD25RemovesRendersNoRowAtAll();
+    void theStatsGroupRendersOneToggleAndTheyDefaultOff();
+    void theHostSpeakerRowIsPresentAndEditableAtUpstreamsDefault();
+    void theStreamingBannerAndNegotiatedFallbackStillRenderOnTheRebuiltPage();
+    void noSettingsPageStringCarriesTheUpstreamBrand();
     void disabledActionLabelStaysLegible();
     void agentConfigPanelMasksTheTokenAndNeverRendersIt();
     void theWindowSequenceRestoresOnlyAfterTheEngineIsDone();
@@ -2504,6 +2539,346 @@ void TstUiScreens::settingsDropdownElidesLongOptionNames()
     QCOMPARE(label->property("elide").toInt(), int(Qt::ElideRight));
     QVERIFY2(label->property("width").toReal() <= dropdown->property("width").toReal(),
              "the popup label must fit the popup width");
+}
+
+namespace {
+
+// A fresh, isolated `SettingsBridge` for each Plan 05-11 settings test: QSettings is redirected
+// to its own temporary directory so no test's writes can leak into another's, and so this suite
+// never touches the machine's real preferences (same technique `tst_settings_bridge.cpp` uses).
+struct SettingsFixture
+{
+    QTemporaryDir dir;
+    SettingsBridge* bridge;
+    FakeSettingsClient* client;
+
+    SettingsFixture()
+    {
+        QCoreApplication::setOrganizationName(QStringLiteral("SeatHubTest"));
+        QCoreApplication::setApplicationName(QStringLiteral("SeatHubUiScreensSettingsTest"));
+        QSettings::setDefaultFormat(QSettings::IniFormat);
+        QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, dir.path());
+        QSettings::setPath(QSettings::IniFormat, QSettings::SystemScope, dir.path());
+        bridge = new SettingsBridge();
+        client = new FakeSettingsClient(bridge);
+    }
+
+    ~SettingsFixture()
+    {
+        delete client;
+        delete bridge;
+    }
+};
+
+// `client` is set at CREATION time (`createWithInitialProperties`, the same technique
+// `ProfileScreen.qml`'s own tests already use), matching how `main.qml` actually wires it -
+// `SettingsPage { client: seatHub }` inline, never a later `setProperty`. Setting `client` only
+// after `component.create()` leaves every row's own `Component.onCompleted: refresh()` looking
+// at a still-null bridge, which is a timing gap this page's own components do not otherwise
+// guard against (they refresh on the bridge's `valueChanged`, not on the bridge object itself
+// being attached later) - not a gap production ever hits, so this test matches production
+// instead of instrumenting the components for a case they never see.
+QObject* instantiateSettingsPage(QQmlEngine* engine, FakeSettingsClient* client, QString* error)
+{
+    QQmlComponent component(engine, QUrl::fromLocalFile(guiDir() + QStringLiteral("/SettingsPage.qml")));
+    QObject* root = component.createWithInitialProperties(
+        { { QStringLiteral("client"), QVariant::fromValue(static_cast<QObject*>(client)) } });
+    if (!root && error) {
+        *error = component.errorString();
+    }
+    return root;
+}
+
+// The CheckBox for a given row label, found by walking up from the label `Text` until an
+// ancestor's subtree contains one - not by `objectName`, which Qt Quick Controls 2's "Basic"
+// style CheckBox does not carry through to `QObject::objectName()` in this Qt build (verified:
+// a `CheckBox { objectName: "x" }` reports `objectName() == ""` at the C++ boundary here, for
+// every CheckBox on the page, not just the Repeater-built ones). Walking the tree structurally
+// is what the pre-existing `settingsDropdownElidesLongOptionNames` test already does for a
+// ComboBox, and what this does for a CheckBox: no assumption about exactly how many Column
+// levels sit between a row's label and its control, so it covers both SeatHubToggle's
+// `Row{Column{Text,Text};CheckBox}` shape and the stats group's flatter `Row{Text;CheckBox}`.
+QObject* checkBoxNear(QObject* root, const QString& labelText)
+{
+    for (QObject* text : textItems(root)) {
+        if (text->property("text").toString() != labelText) {
+            continue;
+        }
+        QObject* ancestor = text->parent();
+        for (int depth = 0; ancestor && depth < 5; depth++, ancestor = ancestor->parent()) {
+            for (QObject* child : ancestor->findChildren<QObject*>()) {
+                if (child->inherits("QQuickCheckBox")) {
+                    return child;
+                }
+            }
+        }
+    }
+    return nullptr;
+}
+
+void collectVisualItems(QQuickItem* item, QList<QQuickItem*>& out)
+{
+    for (QQuickItem* child : item->childItems()) {
+        out.append(child);
+        collectVisualItems(child, out);
+    }
+}
+
+// The CheckBox for one stats-toggle row, found by walking the real (`QQuickItem`) VISUAL tree
+// rather than the `QObject` tree `checkBoxNear`/`findChildren` walk. This is not a style choice:
+// `Repeater` sets each delegate's `QQuickItem::parentItem()` (its rendering parent) to the
+// Repeater's own parent, but does NOT reparent the delegate's `QObject::parent()` to match -
+// verified empirically here (a Repeater reporting `count: 11` whose own `QObject::findChildren`
+// returns 4, and whose parent Column's `findChildren` returns 0 of the 11 labels). Every other
+// helper in this file (`textItems`, `checkBoxNear`) walks `QObject::children()`, which is why
+// they see every statically declared row perfectly well and would see none of a Repeater's.
+QObject* statsCheckBoxFor(QQuickItem* root, const QString& labelText)
+{
+    QList<QQuickItem*> all;
+    collectVisualItems(root, all);
+    for (QQuickItem* candidate : all) {
+        if (candidate->property("text").toString() != labelText) {
+            continue;
+        }
+        for (QQuickItem* ancestor = candidate->parentItem(); ancestor;
+             ancestor = ancestor->parentItem()) {
+            QList<QQuickItem*> siblings;
+            collectVisualItems(ancestor, siblings);
+            for (QQuickItem* sibling : siblings) {
+                if (sibling->inherits("QQuickCheckBox")) {
+                    return sibling;
+                }
+            }
+        }
+    }
+    return nullptr;
+}
+
+// Every stats-toggle CheckBox, keyed by the bridge's own key (via its label - see
+// `statsCheckBoxFor` for why this cannot use `checkBoxNear`). One entry per key
+// `statsToggleKeys()` names.
+QHash<QString, QObject*> statsCheckBoxesByKey(QObject* rootObject, SettingsBridge* bridge)
+{
+    QHash<QString, QObject*> out;
+    QQuickItem* root = qobject_cast<QQuickItem*>(rootObject);
+    if (!root) {
+        return out;
+    }
+    for (const QString& key : bridge->statsToggleKeys()) {
+        QObject* box = statsCheckBoxFor(root, bridge->statsToggleLabel(key));
+        if (box) {
+            out.insert(key, box);
+        }
+    }
+    return out;
+}
+
+} // namespace
+
+void TstUiScreens::settingsPageRendersTheSevenUpstreamSectionsInOrder()
+{
+    SettingsFixture fixture;
+    QQuickStyle::setStyle(QStringLiteral("Basic"));
+    QQmlEngine engine;
+    registerTokenSingletons(&engine);
+
+    QString error;
+    QScopedPointer<QObject> root(instantiateSettingsPage(&engine, fixture.client, &error));
+    QVERIFY2(root, qPrintable(error));
+
+    // D-24: the seven upstream sections, upstream's own titles, upstream's own order - not
+    // Phase 3's D-48 grouping.
+    const QStringList sections = { QStringLiteral("Basic Settings"), QStringLiteral("Audio Settings"),
+                                   QStringLiteral("Host Settings"), QStringLiteral("UI Settings"),
+                                   QStringLiteral("Input Settings"), QStringLiteral("Gamepad Settings"),
+                                   QStringLiteral("Advanced Settings") };
+    QList<QObject*> items = textItems(root.data());
+    QList<int> positions;
+    for (const QString& section : sections) {
+        int position = -1;
+        for (int i = 0; i < items.size(); i++) {
+            if (items.at(i)->property("text").toString() != section) {
+                continue;
+            }
+            const QFont font = items.at(i)->property("font").value<QFont>();
+            if (font.pixelSize() == 24) { // Metrics.fontH2
+                position = i;
+                break;
+            }
+        }
+        QVERIFY2(position >= 0, qPrintable(QStringLiteral("SettingsPage must render the ")
+                                          + section + QStringLiteral(" heading (D-24)")));
+        positions.append(position);
+    }
+    for (int i = 1; i < positions.size(); i++) {
+        QVERIFY2(positions.at(i) > positions.at(i - 1),
+                 qPrintable(QStringLiteral("section out of upstream order at ") + sections.at(i)));
+    }
+
+    // The way back Task 2 asks for.
+    bool sawBack = false;
+    for (QObject* item : items) {
+        if (item->property("text").toString() == QStringLiteral("Back")) {
+            sawBack = true;
+            break;
+        }
+    }
+    QVERIFY2(sawBack, "the settings page must offer a way back to the home view");
+}
+
+void TstUiScreens::aSettingsRowD25RemovesRendersNoRowAtAll()
+{
+    SettingsFixture fixture;
+    QQuickStyle::setStyle(QStringLiteral("Basic"));
+    QQmlEngine engine;
+    registerTokenSingletons(&engine);
+
+    QString error;
+    QScopedPointer<QObject> root(instantiateSettingsPage(&engine, fixture.client, &error));
+    QVERIFY2(root, qPrintable(error));
+
+    // D-25/D-25a: not disabled, not behind a disclosure - not rendered at all. Five forced rows
+    // plus the derived `showperfoverlay` (replaced by the stats group, not a row of its own).
+    const QStringList removedLabels = {
+        QStringLiteral("Language"),
+        QStringLiteral("Discord Rich Presence integration"),
+        QStringLiteral("Automatically find PCs on the local network (Recommended)"),
+        QStringLiteral("Automatically detect blocked connections (Recommended)"),
+        QStringLiteral("Quit app on host PC after ending stream"),
+    };
+    for (QObject* item : textItems(root.data())) {
+        const QString text = item->property("text").toString();
+        for (const QString& removed : removedLabels) {
+            QVERIFY2(text != removed,
+                     qPrintable(QStringLiteral("a removed row must not render at all: ") + removed));
+        }
+    }
+
+    // And no leftover "Managed by SeatHub" disclosure section (Phase 3's pattern, prohibited now).
+    for (QObject* item : textItems(root.data())) {
+        QVERIFY2(item->property("text").toString() != QStringLiteral("Managed by SeatHub"),
+                 "removed rows must not be disclosed on screen; the audit carries them instead");
+    }
+}
+
+void TstUiScreens::theStatsGroupRendersOneToggleAndTheyDefaultOff()
+{
+    SettingsFixture fixture;
+    QQuickStyle::setStyle(QStringLiteral("Basic"));
+    QQmlEngine engine;
+    registerTokenSingletons(&engine);
+
+    QString error;
+    QScopedPointer<QObject> root(instantiateSettingsPage(&engine, fixture.client, &error));
+    QVERIFY2(root, qPrintable(error));
+
+    // The group's own title.
+    bool sawGroupTitle = false;
+    for (QObject* item : textItems(root.data())) {
+        if (item->property("text").toString() == QStringLiteral("Show performance stats while streaming")) {
+            sawGroupTitle = true;
+            break;
+        }
+    }
+    QVERIFY2(sawGroupTitle, "the stats group title must be upstream's own label");
+
+    // D-23/OD-03: one toggle per line, eleven of them, each off by default. Found through the
+    // real (visual) item tree, not `QObject::findChildren` - see `statsCheckBoxFor`'s comment
+    // for why a Repeater's own delegates are invisible to that walk.
+    const QStringList keys = fixture.bridge->statsToggleKeys();
+    QCOMPARE(keys.size(), 11);
+    const QHash<QString, QObject*> boxes = statsCheckBoxesByKey(root.data(), fixture.bridge);
+    QCOMPARE(boxes.size(), 11);
+    for (auto it = boxes.constBegin(); it != boxes.constEnd(); ++it) {
+        QVERIFY2(!it.value()->property("checked").toBool(),
+                 qPrintable(QStringLiteral("stats toggle must default off: ") + it.key()));
+    }
+
+    // Each toggle's own label is Moonlight's own line text (`copy.md` § Settings), with no
+    // number in it (OD-03) - `statsCheckBoxesByKey` already proved a control exists for
+    // "Average network latency" specifically, since it is one of the eleven keys.
+    QVERIFY2(boxes.contains(QStringLiteral("statsNetworkLatency")),
+             "a stats toggle must be labelled with the line's own text");
+}
+
+void TstUiScreens::theHostSpeakerRowIsPresentAndEditableAtUpstreamsDefault()
+{
+    SettingsFixture fixture;
+    QQuickStyle::setStyle(QStringLiteral("Basic"));
+    QQmlEngine engine;
+    registerTokenSingletons(&engine);
+
+    // Upstream's own default: `playAudioOnHost = false`, shown checked (host muted) because the
+    // row is the inverse of the stored key (D-25a).
+    QCOMPARE(fixture.bridge->getValue(QStringLiteral("hostaudio")).toBool(), true);
+
+    QString error;
+    QScopedPointer<QObject> root(instantiateSettingsPage(&engine, fixture.client, &error));
+    QVERIFY2(root, qPrintable(error));
+
+    QObject* checkbox = checkBoxNear(root.data(), QStringLiteral("Mute host PC speakers while streaming"));
+    QVERIFY2(checkbox, "D-25a: the host-speaker row must be present");
+    QVERIFY2(checkbox->property("checked").toBool(), "must ship checked, upstream's own default");
+    QVERIFY2(checkbox->property("enabled").toBool(), "D-25a: the row must stay user-editable");
+}
+
+void TstUiScreens::theStreamingBannerAndNegotiatedFallbackStillRenderOnTheRebuiltPage()
+{
+    SettingsFixture fixture;
+    QQuickStyle::setStyle(QStringLiteral("Basic"));
+    QQmlEngine engine;
+    registerTokenSingletons(&engine);
+
+    QString error;
+    QScopedPointer<QObject> root(instantiateSettingsPage(&engine, fixture.client, &error));
+    QVERIFY2(root, qPrintable(error));
+
+    auto bannerVisible = [&]() {
+        for (QObject* item : textItems(root.data())) {
+            if (item->property("text").toString()
+                == QStringLiteral("You're streaming. These settings can't be changed until the session ends.")) {
+                return item->property("visible").toBool();
+            }
+        }
+        return false;
+    };
+    QVERIFY2(!bannerVisible(), "the banner must be hidden while writable");
+
+    fixture.bridge->setStreamingActive(true);
+    QVERIFY2(bannerVisible(), "Pitfall 6: the banner must show while a session is streaming");
+
+    fixture.bridge->setStreamingActive(false);
+    QVERIFY2(!bannerVisible(), "the banner must clear once the session ends");
+
+    // D-14: a fallback the engine negotiated is shown beside the saved value, in SeatHub's own
+    // words, without rewriting what was saved.
+    fixture.bridge->noteLaunchWarning(QStringLiteral("Your host PC doesn't support HDR streaming."));
+    bool sawWarning = false;
+    for (QObject* item : textItems(root.data())) {
+        if (item->property("text").toString().contains(QStringLiteral("HDR isn't available for this session"))) {
+            sawWarning = item->property("visible").toBool();
+            break;
+        }
+    }
+    QVERIFY2(sawWarning, "a negotiated fallback must render beside the saved value");
+}
+
+void TstUiScreens::noSettingsPageStringCarriesTheUpstreamBrand()
+{
+    SettingsFixture fixture;
+    QQuickStyle::setStyle(QStringLiteral("Basic"));
+    QQmlEngine engine;
+    registerTokenSingletons(&engine);
+
+    QString error;
+    QScopedPointer<QObject> root(instantiateSettingsPage(&engine, fixture.client, &error));
+    QVERIFY2(root, qPrintable(error));
+
+    for (QObject* item : textItems(root.data())) {
+        const QString text = item->property("text").toString();
+        QVERIFY2(!text.contains(QStringLiteral("Moonlight")),
+                 qPrintable(QStringLiteral("a rendered string carries the upstream brand: ") + text));
+    }
 }
 
 void TstUiScreens::disabledActionLabelStaysLegible()

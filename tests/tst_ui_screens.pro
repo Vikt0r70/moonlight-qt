@@ -20,11 +20,28 @@ TEMPLATE = app
 TARGET = tst_ui_screens
 DESTDIR = $$OUT_PWD
 
-INCLUDEPATH += $$PWD/.. $$PWD/../app
+INCLUDEPATH += $$PWD/.. $$PWD/../app $$PWD/../libs/windows/include
+
+win32 {
+    INCLUDEPATH += $$PWD/../libs/windows/include/x64
+    LIBS += -L$$PWD/../libs/windows/lib/x64 -lSDL2
+}
 
 DEFINES += FORK_ROOT=\\\"$$PWD/..\\\"
 
+# Plan 05-11: the Settings-page tests exercise the real `SettingsBridge` (D-24 rebuild), not a
+# hand-maintained fake of its whole catalogue surface - the same pairing `tst_facade_wiring.pro`
+# and `tst_settings_bridge.pro` already link for the same reason. `app/wm.cpp` comes with it
+# because `StreamingPreferences::reload()` consults `WMUtils::isRunningWayland()`.
+# `streamingpreferences.h` is listed so qmake runs moc on it: without its own meta-object the
+# upstream class links as unresolved externals.
 SOURCES += tst_ui_screens.cpp \
-    ../app/seathub/agent_config.cpp
+    ../app/seathub/agent_config.cpp \
+    ../app/seathub/settings_bridge.cpp \
+    ../app/settings/streamingpreferences.cpp \
+    ../app/wm.cpp
 
-HEADERS += ../app/seathub/agent_config.h
+HEADERS += ../app/seathub/agent_config.h \
+    ../app/seathub/settings_bridge.h \
+    ../app/settings/streamingpreferences.h \
+    ../app/utils.h

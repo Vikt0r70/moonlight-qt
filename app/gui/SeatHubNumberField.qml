@@ -20,6 +20,13 @@ Item {
     property string suffix: ""
     /// See `SeatHubSelect.valueProvider`.
     property var valueProvider: null
+    /// A function returning this field's own bound, re-read on `refresh()`. Used when the bound
+    /// itself depends on another setting (the bitrate ceiling widens while "Unlock bitrate
+    /// limit" is on, D-26) - `maximum` alone would not react to that other key's own writes.
+    property var maximumProvider: null
+    /// Extra keys, besides `settingKey`, whose `valueChanged` should also trigger a refresh -
+    /// the key `maximumProvider` reads, when it is not this field's own.
+    property var refreshTriggerKeys: []
 
     property int value: 0
     property string warning: ""
@@ -35,6 +42,8 @@ Item {
     function refresh() {
         if (!bridge)
             return
+        if (maximumProvider !== null)
+            maximum = maximumProvider()
         value = valueProvider !== null ? parseInt(valueProvider(), 10)
                                        : (settingKey.length > 0 ? parseInt(bridge.getValue(settingKey), 10) : 0)
         if (isNaN(value))
@@ -49,7 +58,7 @@ Item {
         target: root.bridge
 
         function onValueChanged(key) {
-            if (key === root.settingKey)
+            if (key === root.settingKey || root.refreshTriggerKeys.indexOf(key) >= 0)
                 root.refresh()
         }
 
