@@ -170,7 +170,14 @@ void PairingController::handleAuthorization(const ControlPlaneResult& result)
         if (result.statusCode == kHttpConflict) {
             // No pairing target yet. This is the expected state for the first polls while the
             // host is still being prepared, so it is not logged as a problem.
+            //
+            // Nor does it spend D-08's 90 s, which bounds a pairing resolving, not the rig getting
+            // ready: preparation has its own server deadline, and a session that deadline fails
+            // arrives here as a terminal session read (`SeatHubClient::handleSessionState`). The
+            // clock restarts on every "not yet", so it counts from the last moment the rig could
+            // not pair. A transport failure does not restart it, so an outage is still bounded.
             ++m_conflictPolls;
+            m_clock.restart();
             scheduleNextPoll();
             return;
         }

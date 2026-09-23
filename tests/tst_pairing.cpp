@@ -403,6 +403,41 @@ private slots:
         QCOMPARE(seam->lastTarget.pairingPin, QString::fromLatin1(kPin));
     }
 
+    void conflict_doesNotSpendThePairingDeadline()
+    {
+        // A 409 means the rig is still being prepared. D-08's 90 s is the time a pairing has to
+        // resolve (`docs/spec/README.md`), not the time the rig takes to get ready - that has its
+        // own server deadline, and a session it fails reaches this client as a terminal session
+        // read. Live on 2026-09-23 "Preparing the rig" took 64-81 s on a single-OS rig and the
+        // clock that started at Play ran out before the rig could pair, so the customer had to
+        // press Try again. Here the 409s outlast the deadline several times over, then the PIN
+        // arrives, and the pairing must still go ahead.
+        PairingController controller;
+        auto* fake = new FakeNetworkAccessManager;
+        auto* seam = new RecordingSeam;
+        wire(controller, fake);
+        controller.setSeam(seam);
+        controller.setPollIntervalMs(20);
+        controller.setDeadlineMs(100);
+
+        // Each poll spends two replies (the authorization and the session read), so forty 409s
+        // are about twenty polls, about 400 ms of "not yet" against a 100 ms deadline.
+        for (int i = 0; i < 40; ++i) {
+            fake->statuses.append(409);
+            fake->bodies.append(conflictBody());
+        }
+        fake->statuses.append(200);
+        fake->bodies.append(authorizationBody(QString::fromLatin1(kPin)));
+
+        QSignalSpy failed(&controller, &PairingController::pairingFailed);
+        QSignalSpy completed(&controller, &PairingController::pairingCompleted);
+
+        controller.start(QString::fromLatin1(kSessionId));
+        QTRY_COMPARE_WITH_TIMEOUT(completed.count(), 1, 5000);
+        QCOMPARE(failed.count(), 0);
+        QCOMPARE(seam->calls, 1);
+    }
+
     void deadline_expiresAndFailsClosedWithASeatHubError()
     {
         PairingController controller;
@@ -413,9 +448,10 @@ private slots:
         controller.setPollIntervalMs(1);
         controller.setDeadlineMs(1);
 
-        // Never resolves: the host never produces a pairing target.
-        fake->statuses = { 409 };
-        fake->bodies = { conflictBody() };
+        // Never resolves: the rig has a pairing target but no PIN ever arrives for it. (A run of
+        // 409s no longer spends this deadline - see conflict_doesNotSpendThePairingDeadline.)
+        fake->statuses = { 200 };
+        fake->bodies = { authorizationBody(QString()) };
 
         QSignalSpy failed(&controller, &PairingController::pairingFailed);
         controller.start(QString::fromLatin1(kSessionId));

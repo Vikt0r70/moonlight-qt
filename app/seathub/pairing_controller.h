@@ -72,7 +72,9 @@ public:
 //   * This client hands the same PIN to upstream's pairing flow and waits for the handshake.
 //     The two halves meet at the PIN.
 //
-// The deadline is 90 s from `start()` (D-08). At expiry the controller fails closed with a
+// The deadline is 90 s (D-08), counted from `start()` or from the last 409 "not pairable yet",
+// whichever is later: the rig's preparation is bounded by the server's own readiness deadline,
+// not by this one (2026-09-23). At expiry the controller fails closed with a
 // SeatHub error, which the error screen renders with a reason, a retry and an `SH-` reference
 // - never a Moonlight dialog (ADR-0008, D-51).
 class PairingController : public QObject
