@@ -157,6 +157,9 @@ jobs:
     needs: seathub-windows-build
     runs-on: ubuntu-latest
     if: github.event_name == 'push' && github.ref == 'refs/heads/seathub/main'
+    # `contents: write` is only for the GitHub Release at the end (owner decision A-22).
+    permissions:
+      contents: write
     concurrency:
       group: client-app-publish
       cancel-in-progress: false
@@ -309,3 +312,27 @@ jobs:
           [ "$(echo "$feed" | jq -r '.version')" = "$VERSION" ] || { echo "::error::feed is not serving $VERSION"; exit 1; }
           [ "$(echo "$feed" | jq -r '.sha256')" != "null" ] || { echo "::error::feed row has no sha256, so no installed client can verify this build"; exit 1; }
           echo "Feed now serves client $VERSION with a checksum. The retired Tauri row is superseded."
+
+      # Owner decision A-22 (seven-hills-alpha OWNER-ACTIONS.md): every published build is also a
+      # GitHub Release, so the newest installer can be fetched without asking anyone. Last, after
+      # the feed read-back, so a release never names a build the feed does not serve. The feed stays
+      # the in-app update channel; this is a download page.
+      - name: Publish the build as a GitHub Release
+        if: steps.creds.outputs.ok == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.artifact.outputs.version }}
+          INSTALLER: ${{ steps.artifact.outputs.installer }}
+        run: |
+          set -euo pipefail
+          sha=$(sha256sum "dist/$INSTALLER" | cut -d' ' -f1)
+          tag="seathub-v$VERSION"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $tag already exists (a re-run); leaving it as it is."
+            exit 0
+          fi
+          gh release create "$tag" "dist/$INSTALLER" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "SeatHub $VERSION" \
+            --notes "SeatHub client $VERSION, built from ${GITHUB_SHA::7}. Installer SHA-256: \`$sha\`. The same build the in-app update feed serves."
