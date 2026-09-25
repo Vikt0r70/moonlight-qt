@@ -818,6 +818,32 @@ private:
             [&]() { return ticks->read.load() + ticks->failed.load() > before; });
     }
 
+    /// Waits, without the event loop, for the session's opening wallet answer, then drives one tick
+    /// inside the stream and waits for that tick's answer too. Every in-stream test calls this before
+    /// it reads the HUD or samples a counter.
+    ///
+    /// Why (06.3 test-race fix): since D-11 (Plan 06.3-06) liveness starts at `beginSession()`, and
+    /// its immediate first tick reads the wallet there - before `handleConnectionStarted()` has begun
+    /// the HUD's session. Whether that answer lands before or after `HudOverlay::beginSession()` is up
+    /// to the network thread; one that lands before is dropped by design (`noteCreditMinutes`: not a
+    /// session) and the HUD shows the seed until the next tick. The move to stage `streaming` is one
+    /// more report, with no wallet read (`reportNow()`), queued to the network thread with nothing
+    /// ordering it against that first answer. So the first answer is not a read the HUD is sure to
+    /// get, and a counter sampled right after it may or may not include the stage report.
+    ///
+    /// The tick driven here settles both. It is queued behind the stage report (events posted to one
+    /// thread at one priority run in the order posted), and its read is made inside the HUD's session.
+    /// When this returns, every report the session start made has been sent, no wallet answer is in
+    /// flight, and the HUD has had one real read - all without this thread's event loop running.
+    bool settleIntoTheStream(SeatHubClient& client, WalletTicks* ticks)
+    {
+        if (!waitWithoutTheEventLoop(
+                [ticks]() { return ticks->read.load() + ticks->failed.load() >= 1; })) {
+            return false;
+        }
+        return tickAndWait(client, ticks);
+    }
+
     static void endStreaming(SeatHubClient& client, FakeEngineSession* engine)
     {
         client.session()->attachSession(nullptr);
@@ -3925,14 +3951,18 @@ private slots:
         beginStreaming(client, engine, &ticks, /*home*/ 40, /*wallet*/ 7);
         QVERIFY(!QTest::currentTestFailed());
 
-        // At the first frame: the balance Home showed, and no card - that value can be old.
+        // At the first frame: a balance is shown (the seed Home read, or already the server's).
         QVERIFY(client.hud()->isVisible());
         QVERIFY(client.hud()->creditMinutes() >= 0);
 
-        // The immediate first report reads the wallet; the server's answer replaces the seed and, at
-        // seven minutes, brings the ten-minute card up.
-        QVERIFY2(waitWithoutTheEventLoop([&]() { return client.hud()->creditMinutes() == 7; }),
-                 "the wallet read on the liveness tick never reached the HUD");
+        // A liveness tick inside the stream reads the wallet; the server's answer replaces the seed
+        // and, at seven minutes, brings the ten-minute card up. The session's opening read (made at
+        // `beginSession()`, before the HUD's session began) may or may not have reached the HUD, so
+        // one tick is driven and waited for (`settleIntoTheStream`). The HUD's own direct connection
+        // was made in the facade's constructor, ahead of the counter this waits on, so the value is
+        // on the HUD by the time the wait returns - read here with no event loop having run.
+        QVERIFY2(settleIntoTheStream(client, &ticks), "no wallet answer came back on the tick");
+        QCOMPARE(client.hud()->creditMinutes(), qint64(7));
         QCOMPARE(int(client.hud()->activeCard()), int(HudOverlay::Card::TenMinutes));
         QCOMPARE(client.hud()->warningsFired(HudOverlay::Card::TenMinutes), 1);
 
@@ -3952,27 +3982,33 @@ private slots:
         WalletTicks ticks;
         beginStreaming(client, engine, &ticks, 90, 90);
         QVERIFY(!QTest::currentTestFailed());
-        QVERIFY(waitWithoutTheEventLoop([&]() { return ticks.read.load() >= 1; }));
 
         // D-11: the stage moving to "streaming" inside `beginStreaming` (`handleConnectionStarted`)
         // reports at once, the same way any stage change does, and that report carries no wallet
-        // read - so the running totals are captured here, before the two ticks below, rather than
-        // assumed to start at zero.
+        // read. It is queued to the network thread with nothing ordering it against the opening
+        // read's answer, so the totals are captured only once it has certainly been sent: after
+        // `settleIntoTheStream`, whose tick runs behind it. Sampled earlier, it could land between
+        // the two samples and be counted as a third report with no read (06.3 test-race fix).
+        QVERIFY(settleIntoTheStream(client, &ticks));
         const int reportsBeforeTicks = m_fake->countOfPathEndingWith(QStringLiteral("/liveness"));
         const int readsBeforeTicks = ticks.read.load() + ticks.failed.load();
+        const int walletGetsBeforeTicks = m_fake->countOfPathEndingWith(QStringLiteral("/api/wallet"));
 
         // Two more ticks, and each is one liveness report and one wallet read: the read has no
-        // cadence of its own.
+        // cadence of its own. A tick sends its report in the same call that sends its read, before
+        // either can be answered, so both counts are final once the read's answer is in. The read is
+        // counted twice over: as the reporter's own answer, and as a `GET /api/wallet` on the wire -
+        // the second is what would see a read that came from anywhere but a tick.
         QVERIFY(tickAndWait(client, &ticks));
         QVERIFY(tickAndWait(client, &ticks));
-        QVERIFY(waitWithoutTheEventLoop([&]() {
-            return m_fake->countOfPathEndingWith(QStringLiteral("/liveness")) >= reportsBeforeTicks + 2;
-        }));
         const int reports =
             m_fake->countOfPathEndingWith(QStringLiteral("/liveness")) - reportsBeforeTicks;
         const int reads = ticks.read.load() + ticks.failed.load() - readsBeforeTicks;
-        QCOMPARE(reads, reports);
+        const int walletGets =
+            m_fake->countOfPathEndingWith(QStringLiteral("/api/wallet")) - walletGetsBeforeTicks;
         QCOMPARE(reports, 2);
+        QCOMPARE(reads, reports);
+        QCOMPARE(walletGets, reports);
 
         // And the source agrees: the reporter still has its two locked constants and no third.
         // (`kIntervalMs` is D-31's 10 seconds; the grace is the server's 30.)
@@ -3998,7 +4034,10 @@ private slots:
         WalletTicks ticks;
         beginStreaming(client, engine, &ticks, 90, 30);
         QVERIFY(!QTest::currentTestFailed());
-        QVERIFY(waitWithoutTheEventLoop([&]() { return client.hud()->creditMinutes() == 30; }));
+        // A read inside the stream first, so the HUD's last value is the server's 30 and not the
+        // seed, and no answer is in flight to be counted against the failures below.
+        QVERIFY(settleIntoTheStream(client, &ticks));
+        QCOMPARE(client.hud()->creditMinutes(), qint64(30));
 
         struct Failure { int status; QByteArray body; const char* what; };
         const Failure failures[] = {
@@ -4041,7 +4080,10 @@ private slots:
         WalletTicks ticks;
         beginStreaming(client, engine, &ticks, 90, 90);
         QVERIFY(!QTest::currentTestFailed());
-        QVERIFY(waitWithoutTheEventLoop([&]() { return client.hud()->creditMinutes() == 90; }));
+        // The seed is also 90, so the HUD's value alone cannot say a read has landed; the settle's
+        // tick can, and it leaves no earlier answer in flight to arrive one step late in the loop.
+        QVERIFY(settleIntoTheStream(client, &ticks));
+        QCOMPARE(client.hud()->creditMinutes(), qint64(90));
 
         // One minute at a time, past both thresholds and to zero, and a read repeated at each.
         for (int minutes = 15; minutes >= 0; --minutes) {
@@ -4081,7 +4123,10 @@ private slots:
         WalletTicks ticks;
         beginStreaming(client, engine, &ticks, 90, 1);
         QVERIFY(!QTest::currentTestFailed());
-        QVERIFY(waitWithoutTheEventLoop([&]() { return client.hud()->creditMinutes() == 1; }));
+        // The opening read may have landed before the HUD's session began (and been dropped); the
+        // settle's tick is a read inside it. Whichever read fired the card, it fired once.
+        QVERIFY(settleIntoTheStream(client, &ticks));
+        QCOMPARE(client.hud()->creditMinutes(), qint64(1));
 
         QCOMPARE(client.hud()->warningsFired(HudOverlay::Card::TwoMinutes), 1);
         QCOMPARE(client.hud()->warningsFired(HudOverlay::Card::TenMinutes), 0);
@@ -4109,7 +4154,10 @@ private slots:
 
         client.beginSession(QStringLiteral("s-live"));
         emit engine->connectionStarted();
-        QVERIFY(waitWithoutTheEventLoop([&]() { return ticks.failed.load() >= 1; }));
+        // The opening read fails at `beginSession()`, which may be before the HUD's session began and
+        // so prove nothing about the HUD. The settle's tick is a failed read inside the stream.
+        QVERIFY(settleIntoTheStream(client, &ticks));
+        QCOMPARE(ticks.failed.load(), 2);
 
         QCOMPARE(client.hud()->creditMinutes(), qint64(1));
         QCOMPARE(int(client.hud()->activeCard()), int(HudOverlay::Card::None));
