@@ -226,6 +226,9 @@ SOURCES += \
     seathub/engine_session.cpp \
     seathub/moonlight_engine_session.cpp \
     seathub/stub_engine_session.cpp \
+    seathub/log_tee.cpp \
+    seathub/stream_stats.cpp \
+    seathub/engine_termination.cpp \
     streaming/streamutils.cpp \
     backend/autoupdatechecker.cpp \
     path.cpp \
@@ -289,6 +292,9 @@ HEADERS += \
     seathub/moonlight_engine_session.h \
     seathub/stream_window_name.h \
     seathub/stub_engine_session.h \
+    seathub/log_tee.h \
+    seathub/stream_stats.h \
+    seathub/engine_termination.h \
     streaming/video/decoder.h \
     streaming/streamutils.h \
     backend/autoupdatechecker.h \

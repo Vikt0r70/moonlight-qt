@@ -14,6 +14,7 @@
 // real engine session the pairing handshake's resolved host is attached to. The tracer survives as
 // an explicitly injected fake (`stub_engine_session.h`), never as a fallback.
 
+#include <QJsonObject>
 #include <QObject>
 #include <QString>
 #include <QUrl>
@@ -30,11 +31,13 @@
 #include "error_map.h"
 #include "hud_overlay.h"
 #include "liveness_timer.h"
+#include "log_tee.h"
 #include "moonlight_engine_session.h"
 #include "pairing_controller.h"
 #include "pairing_seam.h"
 #include "session_lifecycle.h"
 #include "session_websocket.h"
+#include "stream_stats.h"
 // Included rather than forward-declared: moc needs complete types for the `SettingsBridge*` and
 // `UpdateFeedClient*` properties below (a bare forward declaration fails the pointer-metatype
 // static_assert in Qt's meta-object code).
@@ -473,6 +476,11 @@ private slots:
     void handleSessionWarning(const QString& sessionId, const QString& warning,
                               const QString& deadlineAt);
 
+    /// D-17/Plan 15: the tee's `StatsWatcher` parsed the end-of-stream "Global video stats"
+    /// block. Held here with the session it belongs to (`m_sessionId`, still the ending
+    /// session's at this point - Pitfall 7) until `handleTeardownCompleted()` posts it once.
+    void handleVideoStatsParsed(VideoStats stats);
+
     // D-33: the only locally enforced end. Liveness failure is not one (see `onLivenessWarning`).
     void handleHorizonReached();
     void onLivenessWarning();
@@ -659,6 +667,21 @@ private:
     // no business starting or stopping either one.
     LivenessTimer* m_liveness = nullptr;
     AuthorizedThroughTimer* m_horizon = nullptr;
+
+    // D-17/A-51, Plan 15: SeatHub's one log tee and its two sinks (`log_tee.h`'s own header
+    // comment on why there is exactly one installation point). Both handles are unregistered at
+    // the top of `~SeatHubClient()`, before anything the two sink lambdas capture - `this` and
+    // `m_liveness` - is destroyed: `LogTee`'s sink list is process-global and outlives any one
+    // `SeatHubClient`, which is exactly what a test that constructs and destroys many of them
+    // (`tst_facade_wiring.cpp`) would otherwise turn into a dangling-lambda call on every later
+    // log line.
+    StatsWatcher* m_statsWatcher = nullptr;
+    LogTee::SinkHandle m_statsSinkHandle = 0;
+    LogTee::SinkHandle m_terminationSinkHandle = 0;
+    /// The stats block parsed before this session's teardown began (Pitfall 7), held until
+    /// `handleTeardownCompleted()` posts it once.
+    QJsonObject m_pendingQualityReport;
+    bool m_hasPendingQualityReport = false;
 
     /// The engine session this launch attached, or null. Owned here: the lifecycle drives it and
     /// deliberately does not destroy it (it cannot know whether the attacher has other uses for

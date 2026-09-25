@@ -11,9 +11,12 @@
 #include "agent_config.h"
 #include "countries.h"
 #include "duration_text.h"
+#include "engine_termination.h"
+#include "log_tee.h"
 #include "region.h"
 #include "session_lifecycle.h"
 #include "settings_bridge.h"
+#include "stream_stats.h"
 #include "update_feed_client.h"
 #include "web_origin.h"
 
@@ -270,6 +273,35 @@ SeatHubClient::SeatHubClient(QObject* parent)
       m_liveness(new LivenessTimer(nullptr)),
       m_horizon(new AuthorizedThroughTimer(nullptr))
 {
+    // D-17/A-51, Plan 15: the one log tee for this process, installed before anything else in
+    // this constructor could log. A second call from a later `SeatHubClient` constructed in the
+    // same process (as `tst_facade_wiring.cpp` does, once per test) is a no-op
+    // (`LogTee::install()`'s own header comment).
+    LogTee::install();
+
+    // A-51: the engine's own termination code, read from `Session::clConnectionTerminated`'s log
+    // line (`engine_termination.h`'s own header comment says why this is the one route to it)
+    // and handed to the liveness timer. Runs on whichever thread logged the line -
+    // moonlight-common-c's own connection thread in production - and only parses and hands off:
+    // `LivenessTimer::noteTermination()` marshals itself onto its own thread, the same way
+    // `stop()` already does, so this lambda never touches timer state directly.
+    m_terminationSinkHandle = LogTee::addSink(
+        [this](LogLevel level, int category, int priority, const QString& text) {
+            Q_UNUSED(level);
+            int code = 0;
+            const QByteArray utf8 = text.toUtf8();
+            if (parseConnectionTerminated(category, priority, utf8.constData(), &code)) {
+                m_liveness->noteTermination(code);
+            }
+        });
+
+    // D-17: the end-of-stream video-stats block, read the same way and held until
+    // `handleTeardownCompleted()` posts it (`handleVideoStatsParsed()`).
+    m_statsWatcher = new StatsWatcher(this);
+    m_statsSinkHandle = LogTee::addSink(m_statsWatcher->sink());
+    connect(m_statsWatcher, &StatsWatcher::videoStatsParsed,
+            this, &SeatHubClient::handleVideoStatsParsed);
+
     // The sign-in field's data: read from the binary, never fetched (Phase 5 D-02).
     qRegisterMetaType<SessionInfo>("SessionInfo");
     m_countries = SeatHubCountries::all();
@@ -389,6 +421,17 @@ SeatHubClient::SeatHubClient(QObject* parent)
 
 SeatHubClient::~SeatHubClient()
 {
+    // D-17/A-51: unregister both `LogTee` sinks FIRST, before anything either lambda captures -
+    // `this` (the termination sink calls `m_liveness->noteTermination()`) and `m_statsWatcher`
+    // (owned by the stats sink) - is destroyed. `LogTee`'s sink list is process-global and
+    // outlives any one `SeatHubClient`; skipping this would leave a dangling-lambda call
+    // registered for the rest of the process every time a `SeatHubClient` is destroyed, which
+    // `tst_facade_wiring.cpp` does once per test (`log_tee.h`'s own `addSink()` header comment).
+    LogTee::removeSink(m_terminationSinkHandle);
+    LogTee::removeSink(m_statsSinkHandle);
+    m_terminationSinkHandle = 0;
+    m_statsSinkHandle = 0;
+
     // Order matters. Everything that was moved to the control-plane thread is brought home *from
     // inside that thread* first, the thread is then stopped and joined, and only then is anything
     // destroyed here. Qt refuses both a cross-thread destruction and a cross-thread
@@ -2021,8 +2064,39 @@ void SeatHubClient::handleAuthorizationGranted(const QString& qualityProfile)
     m_liveness->setStage(QStringLiteral("pairing"));
 }
 
+void SeatHubClient::handleVideoStatsParsed(VideoStats stats)
+{
+    // Pitfall 7: the engine logs this block during its own teardown, strictly before
+    // `handleReadyForDeletion()` runs (D-03's own SDL-destruction guarantee) and therefore
+    // strictly before `handleTeardownCompleted()` posts it. `m_sessionId` is still the ending
+    // session's here - `setAttachedSession(QString())` only runs inside
+    // `handleTeardownCompleted()`, below. With no session attached at all (a local, non-control-
+    // plane attempt, or a stats block that arrived with nothing to post it against) there is
+    // nothing to hold it for.
+    if (m_sessionId.isEmpty()) {
+        return;
+    }
+    m_pendingQualityReport = toQualityReport(stats);
+    m_hasPendingQualityReport = true;
+}
+
 void SeatHubClient::handleTeardownCompleted(const SessionInfo& finalSession)
 {
+    // D-17: post the held stats block once, for the session that is ending here. Cleared
+    // immediately after so a second `handleTeardownCompleted()` for a later session - or one with
+    // no stats block at all - never re-sends an earlier session's numbers.
+    if (m_hasPendingQualityReport) {
+        m_controlPlane->postSessionQuality(
+            m_sessionId, m_pendingQualityReport, [](const ControlPlaneResult& result) {
+                if (!result.ok) {
+                    qCWarning(seathubClient)
+                        << "stream-quality report failed; status" << result.statusCode;
+                }
+            });
+        m_hasPendingQualityReport = false;
+        m_pendingQualityReport = QJsonObject();
+    }
+
     // Home says why the session ended, read from the session itself now that teardown has confirmed it
     // is over (CUST-15, D-21). The minute count is the server's own `minutes_billed`. A session the
     // server gave no reason for leaves the line empty: showing nothing is honest, inventing a sentence

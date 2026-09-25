@@ -50,6 +50,9 @@ SOURCES += \
     ../app/seathub/teardown_controller.cpp \
     ../app/seathub/liveness_timer.cpp \
     ../app/seathub/authorized_through_timer.cpp \
+    ../app/seathub/log_tee.cpp \
+    ../app/seathub/stream_stats.cpp \
+    ../app/seathub/engine_termination.cpp \
     ../app/seathub/hud_overlay.cpp \
     ../app/seathub/error_map.cpp \
     ../app/seathub/settings_bridge.cpp \
@@ -79,6 +82,9 @@ HEADERS += \
     ../app/seathub/teardown_guard.h \
     ../app/seathub/liveness_timer.h \
     ../app/seathub/authorized_through_timer.h \
+    ../app/seathub/log_tee.h \
+    ../app/seathub/stream_stats.h \
+    ../app/seathub/engine_termination.h \
     ../app/seathub/hud_overlay.h \
     ../app/seathub/error_map.h \
     ../app/seathub/settings_bridge.h \
