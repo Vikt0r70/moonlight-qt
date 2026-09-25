@@ -66,8 +66,8 @@ void LogTee::removeSink(SinkHandle handle)
     }
     // WR-07: the write lock blocks until every `dispatch()` currently holding the read lock -
     // including one calling this very `handle`'s sink on another thread right now - has finished
-    // and released it. By the time this constructor returns, no dispatch that started before it
-    // is still running.
+    // and released it. By the time `removeSink()` returns, no dispatch that started before it was
+    // called is still running.
     QWriteLocker locker(&s_sinksLock);
     s_sinks.erase(std::remove_if(s_sinks.begin(), s_sinks.end(),
                                  [handle](const std::pair<SinkHandle, Sink>& entry) {

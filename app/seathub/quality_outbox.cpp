@@ -54,6 +54,12 @@ QString QualityOutbox::pathFor(const QString& sessionId) const
 
 QualityOutbox::Outcome QualityOutbox::classify(const ControlPlaneResult& result)
 {
+    // CR-03: checked first - an aborted attempt never reached the network at all, so `ok` and
+    // `statusCode` are both still their unset defaults and must not be read as "a transport
+    // failure" (which `Outcome::Retryable`'s own default case below would otherwise call it).
+    if (result.wasAborted) {
+        return Outcome::Aborted;
+    }
     // `ok` is the only success this outbox trusts (Pitfall 4 - a 200 carrying `status:false` is
     // already `ok == false` by the time it reaches here); 409 ("this session never streamed",
     // `docs/spec/openapi.yaml`) is grouped with it per this plan's own truth line - no retry ever
@@ -117,7 +123,9 @@ void QualityOutbox::drain(const QString& tokenGeneration, const QString& account
         return;
     }
     // A drain already in flight (a `postFn` callback has not yet returned) must not start a
-    // second pass over the same files.
+    // second pass over the same files - unless `cancel()` has already reset it (CR-03: a sign-out
+    // or a sign-in as someone else calls `cancel()` first, precisely so this guard does not
+    // silently swallow the new account's own drain).
     if (m_draining) {
         return;
     }
@@ -129,14 +137,23 @@ void QualityOutbox::drain(const QString& tokenGeneration, const QString& account
     }
 
     m_draining = true;
-    drainFiles(files, 0, tokenGeneration, accountId, postFn);
+    const quint64 generation = ++m_drainGeneration;
+    drainFiles(files, 0, tokenGeneration, accountId, postFn, generation);
+}
+
+void QualityOutbox::cancel()
+{
+    ++m_drainGeneration;
+    m_draining = false;
 }
 
 void QualityOutbox::drainFiles(const QStringList& files, int index, const QString& tokenGeneration,
-                               const QString& accountId, const PostFn& postFn)
+                               const QString& accountId, const PostFn& postFn, quint64 generation)
 {
     if (index >= files.size()) {
-        m_draining = false;
+        if (generation == m_drainGeneration) {
+            m_draining = false;
+        }
         return;
     }
 
@@ -149,7 +166,7 @@ void QualityOutbox::drainFiles(const QStringList& files, int index, const QStrin
     if (!file.open(QIODevice::ReadOnly)) {
         // Could not even read it (removed from under us, or a permissions error): leave it and
         // move on - nothing was sent, and nothing was lost.
-        drainFiles(files, index + 1, tokenGeneration, accountId, postFn);
+        drainFiles(files, index + 1, tokenGeneration, accountId, postFn, generation);
         return;
     }
     const QByteArray bytes = file.readAll();
@@ -160,7 +177,7 @@ void QualityOutbox::drainFiles(const QStringList& files, int index, const QStrin
     if (parseError.error != QJsonParseError::NoError || !doc.isObject()) {
         // Not a report this outbox wrote - never trusted, never sent.
         QFile::remove(path);
-        drainFiles(files, index + 1, tokenGeneration, accountId, postFn);
+        drainFiles(files, index + 1, tokenGeneration, accountId, postFn, generation);
         return;
     }
     const QJsonObject envelope = doc.object();
@@ -171,14 +188,19 @@ void QualityOutbox::drainFiles(const QStringList& files, int index, const QStrin
         qCWarning(seathubQualityOutbox)
             << "quality report for" << sessionId << "belongs to another account; dropped";
         QFile::remove(path);
-        drainFiles(files, index + 1, tokenGeneration, accountId, postFn);
+        drainFiles(files, index + 1, tokenGeneration, accountId, postFn, generation);
         return;
     }
 
     postFn(sessionId, report,
-           [this, files, index, tokenGeneration, accountId, postFn, path,
-            sessionId](const ControlPlaneResult& result) {
+           [this, files, index, tokenGeneration, accountId, postFn, path, sessionId,
+            generation](const ControlPlaneResult& result) {
                const Outcome outcome = classify(result);
+               // File-side effects reflect real server truth (or a real local decision, like an
+               // aborted send) whatever `drain()` call asked for them, so they always run -
+               // CR-03's generation check below gates only this call's own loop continuation and
+               // its `m_draining`/`m_blockedTokenGeneration` bookkeeping, which belong to whichever
+               // `drain()` call is CURRENT, not to a superseded one.
                switch (outcome) {
                case Outcome::Delivered:
                    QFile::remove(path);
@@ -189,17 +211,33 @@ void QualityOutbox::drainFiles(const QStringList& files, int index, const QStrin
                    QFile::remove(path);
                    break;
                case Outcome::AuthFailed:
-                   m_blockedTokenGeneration = tokenGeneration;
+                   if (generation == m_drainGeneration) {
+                       m_blockedTokenGeneration = tokenGeneration;
+                   }
                    break;
                case Outcome::Retryable:
                    break;
+               case Outcome::Aborted:
+                   // CR-03: the account changed mid-drain. Kept, and the loop stops here exactly
+                   // like AuthFailed - but `m_blockedTokenGeneration` is deliberately left alone:
+                   // nothing about this (now stale) generation's credential failed, so a fresh
+                   // `drain()` call under the new generation must not find itself blocked by it.
+                   break;
                }
 
-               if (outcome == Outcome::AuthFailed) {
-                   // The same token would fail the rest too - stop here, not just this file.
+               if (generation != m_drainGeneration) {
+                   // A newer `drain()` call (or a `cancel()`) has started since this attempt was
+                   // issued; that call's own loop owns `m_draining` now, and continuing this one
+                   // would run a second pass concurrently with it.
+                   return;
+               }
+               if (outcome == Outcome::AuthFailed || outcome == Outcome::Aborted) {
+                   // AuthFailed: the same token would fail the rest too. Aborted: the account this
+                   // call started for is no longer the signed-in one. Either way, stop here, not
+                   // just this file.
                    m_draining = false;
                    return;
                }
-               drainFiles(files, index + 1, tokenGeneration, accountId, postFn);
+               drainFiles(files, index + 1, tokenGeneration, accountId, postFn, generation);
            });
 }
