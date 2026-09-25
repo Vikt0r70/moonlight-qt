@@ -339,6 +339,14 @@ public:
     void setAccessToken(const QString& token);
     bool hasAccessToken() const { return !m_accessToken.isEmpty(); }
 
+    /// D-27: the W3C trace id this client stamps as `traceparent` on every request until
+    /// `clearTraceId()`. Must be 32 lowercase hex characters and not all zeros (W3C); anything
+    /// else is ignored, so a malformed value never reaches the wire and `send()` behaves exactly
+    /// as it did with no trace id set.
+    void setTraceId(const QString& traceId);
+    /// Stops sending `traceparent`.
+    void clearTraceId();
+
     /// Replaces the access manager. Exists so a test can drive every response path without a
     /// server; production never calls it.
     void setNetworkAccessManager(QNetworkAccessManager* manager);
@@ -451,4 +459,8 @@ private:
     QThread* m_thread = nullptr;
     QString m_baseUrl;
     QString m_accessToken;
+    /// D-27: read only inside `send()`, on the owning thread - never captured into the queued
+    /// re-invoke lambda `send()` already uses to marshal a foreign-thread call, so a `setTraceId`
+    /// that lands after the marshal but before `send()` actually runs is still picked up.
+    QString m_traceId;
 };

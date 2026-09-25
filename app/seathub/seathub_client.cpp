@@ -2,6 +2,7 @@
 
 #include <QDesktopServices>
 #include <QLoggingCategory>
+#include <QRandomGenerator>
 #include <QThread>
 #include <QWindow>
 
@@ -215,6 +216,16 @@ bool publishHudSurface(SessionLifecycle* lifecycle, SDL_Surface* surface)
     }
 
     return lifecycle->publishOverlaySurface(surface);
+}
+
+// D-27: 16 bytes of `QRandomGenerator::system()`, hex-encoded - a fresh W3C trace id, 32
+// lowercase hex characters, minted once per Play (`beginPlayRequest`).
+QString randomTraceId()
+{
+    auto* generator = QRandomGenerator::system();
+    const QString high = QString::number(generator->generate64(), 16).rightJustified(16, QLatin1Char('0'));
+    const QString low = QString::number(generator->generate64(), 16).rightJustified(16, QLatin1Char('0'));
+    return high + low;
 }
 
 } // namespace
@@ -816,6 +827,11 @@ void SeatHubClient::beginPlayRequest()
     setHomeStatus(QString::fromLatin1(kHomeChecking));
 
     startNetworkThreads();
+
+    // D-27: one trace id per Play, minted here so it covers this very request - the session
+    // create - and every later request of the same Play, through to teardown
+    // (`handleTeardownCompleted` clears it).
+    m_controlPlane->setTraceId(randomTraceId());
 
     const QString profile = QString::fromLatin1(kDefaultQualityProfile);
 
@@ -2018,6 +2034,9 @@ void SeatHubClient::handleTeardownCompleted(const SessionInfo& finalSession)
     m_liveness->stop();
     m_horizon->disarm();
     m_sessionChannel->close();
+    // D-27: the Play this trace id covered is over; the next one (`beginPlayRequest`) mints its
+    // own.
+    m_controlPlane->clearTraceId();
 
     setAttachedSession(QString());
     m_clientUuid.clear();
