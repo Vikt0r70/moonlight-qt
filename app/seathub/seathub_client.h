@@ -35,6 +35,7 @@
 #include "moonlight_engine_session.h"
 #include "pairing_controller.h"
 #include "pairing_seam.h"
+#include "quality_outbox.h"
 #include "session_lifecycle.h"
 #include "session_websocket.h"
 #include "stream_stats.h"
@@ -563,8 +564,21 @@ private:
     void setBalance(qint64 minutes);
     /// Forgets the balance. Called at sign-out so the next customer never sees this one's.
     void resetBalance();
-    /// Fills `m_identity` and `m_account` from a confirmed account.
+    /// Fills `m_identity` and `m_account` from a confirmed account. Also fills `m_accountId`
+    /// (D-17, Plan 30) and, once a token is present, drains the quality outbox - the one place
+    /// this facade ever learns the signed-in account's real id (`AccountInfo::id`), since a
+    /// fresh sign-in itself never reads it (`tst_facade_wiring.cpp`'s own "the in-session
+    /// sign-ins never fill it" contract).
     void setAccount(const AccountInfo& account);
+    /// D-17/Plan 30: resends every quality report this outbox is holding for `m_accountId`, once
+    /// both it and an access token are known. A no-op otherwise (see `QualityOutbox::drain()`'s
+    /// own no-op conditions, including one already in flight and a token generation an earlier
+    /// call already saw refused with 401/403).
+    void drainQualityOutbox();
+    /// The subfolder of wherever `TokenStore` currently is that the quality outbox reads and
+    /// writes - re-derived on every call rather than cached, so a test's `isolateStore()` (which
+    /// runs after construction) still isolates this outbox with no test file of its own changed.
+    QString qualityOutboxDirectory() const;
     /// The success tail both sign-in routes share: the credential goes to the access slot as a DPAPI
     /// blob, whatever 0.1.x left in its own slot is dropped, the control-plane client takes it, and
     /// the facade becomes signed in as `identity`. False (with `failureText` set) when this PC would
@@ -606,6 +620,16 @@ private:
     QVariantMap m_failure;
     QString m_identity;
     QVariantMap m_account;
+    /// `AccountInfo::id`, D-17/Plan 30: the tag every stored quality report is written and
+    /// checked against. Empty until `setAccount()` has run at least once this process (a
+    /// restore, or the profile) - never derived from `m_identity`, which is the typed
+    /// phone/email/username at sign-in and can differ across sign-ins of the same account.
+    /// Cleared at sign-out and at a refused restore, alongside every other per-account field.
+    QString m_accountId;
+    /// D-17/Plan 30: the one on-disk outbox for a quality report that failed to send. Its
+    /// directory is re-derived from `m_tokenStore` before every use (`qualityOutboxDirectory()`),
+    /// not cached, so it always follows wherever the token store is currently pointed.
+    QualityOutbox m_qualityOutbox;
 
     // The profile (Phase 5 plan 09). The three lists and the totals are each independent: one failing
     // never blanks another, and none is computed here - every number is the server's own answer.

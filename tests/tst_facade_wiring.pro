@@ -53,6 +53,7 @@ SOURCES += \
     ../app/seathub/log_tee.cpp \
     ../app/seathub/stream_stats.cpp \
     ../app/seathub/engine_termination.cpp \
+    ../app/seathub/quality_outbox.cpp \
     ../app/seathub/hud_overlay.cpp \
     ../app/seathub/error_map.cpp \
     ../app/seathub/settings_bridge.cpp \
@@ -85,6 +86,7 @@ HEADERS += \
     ../app/seathub/log_tee.h \
     ../app/seathub/stream_stats.h \
     ../app/seathub/engine_termination.h \
+    ../app/seathub/quality_outbox.h \
     ../app/seathub/hud_overlay.h \
     ../app/seathub/error_map.h \
     ../app/seathub/settings_bridge.h \

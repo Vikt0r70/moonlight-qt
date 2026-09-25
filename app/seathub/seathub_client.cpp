@@ -1,6 +1,7 @@
 #include "seathub_client.h"
 
 #include <QDesktopServices>
+#include <QDir>
 #include <QLoggingCategory>
 #include <QRandomGenerator>
 #include <QThread>
@@ -13,6 +14,7 @@
 #include "duration_text.h"
 #include "engine_termination.h"
 #include "log_tee.h"
+#include "quality_outbox.h"
 #include "region.h"
 #include "session_lifecycle.h"
 #include "settings_bridge.h"
@@ -1089,6 +1091,32 @@ bool SeatHubClient::adoptSignIn(const AuthTokenPair& pair, const QString& identi
     m_account.clear();
     m_identity = identity;
     emit identityChanged();
+
+    // D-17/Plan 30: a fresh sign-in never reads the account's real id itself
+    // (`tst_facade_wiring.cpp`'s own "the in-session sign-ins never fill it" contract - identity
+    // and account rows come from a restore or the profile, never here), so a report that fails to
+    // send from THIS session cannot yet be tagged and is dropped rather than stored untagged (see
+    // `handleTeardownCompleted()`). The only thing worth an extra `GET /api/me` for is a report
+    // some EARLIER process already queued - every existing test's outbox directory is empty, so
+    // this costs those tests nothing, and it is the one way a report survives to "the next
+    // sign-in" (this plan's own truth line) rather than only ever reaching the next launch.
+    m_qualityOutbox.setDirectory(qualityOutboxDirectory());
+    if (m_qualityOutbox.hasQueuedReports()) {
+        const quint64 epoch = m_authEpoch;
+        m_controlPlane->fetchMe([this, epoch](const ControlPlaneResult& result) {
+            onClientThread(this, [this, epoch, result]() {
+                if (epoch != m_authEpoch) {
+                    return;
+                }
+                AccountInfo account;
+                if (result.ok && AccountInfo::parse(result.body, &account)) {
+                    m_accountId = account.id;
+                    drainQualityOutbox();
+                }
+            });
+        });
+    }
+
     return true;
 }
 
@@ -1235,6 +1263,9 @@ void SeatHubClient::signOut()
     setSignedIn(false);
     m_account.clear();
     m_identity.clear();
+    // D-17/Plan 30: the next sign-in's reports are never tagged with a previous customer's id on
+    // a shared PC.
+    m_accountId.clear();
     emit identityChanged();
     resetBalance();
     clearFailure();
@@ -1309,6 +1340,9 @@ void SeatHubClient::applyRestoreResult(const ControlPlaneResult& result)
         ++m_authEpoch;
         m_tokenStore->clearAll();
         m_controlPlane->setAccessToken(QString());
+        // D-17/Plan 30: no account is signed in past this point; a stale id from a process that
+        // never signed out cleanly must not tag a later report.
+        m_accountId.clear();
         setAppState(QString::fromLatin1(kStateSignedOut));
         return;
     }
@@ -1344,6 +1378,48 @@ void SeatHubClient::setAccount(const AccountInfo& account)
         }
     }
     emit identityChanged();
+
+    // D-17/Plan 30: the real, stable tag a stored quality report is written and checked against -
+    // `m_identity` above is the typed phone/email/username and can differ across two sign-ins of
+    // the same account, which would tag two reports for one customer as "different accounts".
+    m_accountId = account.id;
+    drainQualityOutbox();
+}
+
+QString SeatHubClient::qualityOutboxDirectory() const
+{
+    return QDir(m_tokenStore->directory()).filePath(QStringLiteral("quality-outbox"));
+}
+
+void SeatHubClient::drainQualityOutbox()
+{
+    if (m_accountId.isEmpty() || !m_controlPlane->hasAccessToken()) {
+        return;
+    }
+
+    m_qualityOutbox.setDirectory(qualityOutboxDirectory());
+
+    // D-35: the real bearer token never leaves `ControlPlaneClient`. `m_authEpoch` already
+    // uniquely names "which sign-in/restore is current" (bumped by every sign-in, restore result
+    // and sign-out), so its string form is the opaque `tokenGeneration` `QualityOutbox::drain()`
+    // needs to tell "the same refused token" from "a new one" - without ever holding the secret
+    // itself.
+    const QString tokenGeneration = QString::number(m_authEpoch);
+
+    m_qualityOutbox.drain(
+        tokenGeneration, m_accountId,
+        [this](const QString& sessionId, const QJsonObject& report,
+               ControlPlaneClient::Callback callback) {
+            m_controlPlane->postSessionQuality(
+                sessionId, report, [this, callback](const ControlPlaneResult& result) {
+                    // `postSessionQuality`'s callback runs on the control-plane's own (network)
+                    // thread; `QualityOutbox`'s own state (`m_draining`,
+                    // `m_blockedTokenGeneration`) is only ever touched from this facade's thread
+                    // (`drain()` is called from here, on `setAccount()`), so the continuation
+                    // `callback` runs is marshalled back before it touches any of it.
+                    onClientThread(this, [callback, result]() { callback(result); });
+                });
+        });
 }
 
 // ---------------------------------------------------------------------------
@@ -2086,12 +2162,42 @@ void SeatHubClient::handleTeardownCompleted(const SessionInfo& finalSession)
     // immediately after so a second `handleTeardownCompleted()` for a later session - or one with
     // no stats block at all - never re-sends an earlier session's numbers.
     if (m_hasPendingQualityReport) {
+        // Captured by value: this callback runs on the control-plane thread, and `m_sessionId` is
+        // cleared by `setAttachedSession(QString())` a few lines below, on this thread, possibly
+        // before the callback fires.
+        const QString sessionId = m_sessionId;
+        const QJsonObject report = m_pendingQualityReport;
+        const QString accountId = m_accountId;
         m_controlPlane->postSessionQuality(
-            m_sessionId, m_pendingQualityReport, [](const ControlPlaneResult& result) {
-                if (!result.ok) {
-                    qCWarning(seathubClient)
-                        << "stream-quality report failed; status" << result.statusCode;
-                }
+            sessionId, report,
+            [this, sessionId, report, accountId](const ControlPlaneResult& result) {
+                onClientThread(this, [this, sessionId, report, accountId, result]() {
+                    switch (QualityOutbox::classify(result)) {
+                    case QualityOutbox::Outcome::Delivered:
+                        break;
+                    case QualityOutbox::Outcome::Refused:
+                        qCWarning(seathubClient) << "quality report for" << sessionId
+                                                  << "refused" << result.statusCode;
+                        break;
+                    case QualityOutbox::Outcome::AuthFailed:
+                    case QualityOutbox::Outcome::Retryable:
+                        // Rule 2: kept for a later attempt (the next sign-in or launch), rather
+                        // than lost to a dropped connection or a momentarily refused credential -
+                        // this plan's own write-trigger line names only the transport/5xx/408/429
+                        // set, but a 401/403 that never gets a second chance is exactly the
+                        // missing-critical-functionality this outbox exists to close.
+                        if (accountId.isEmpty()) {
+                            qCWarning(seathubClient)
+                                << "quality report for" << sessionId
+                                << "has no signed-in account to tag it with; dropped";
+                        }
+                        else {
+                            m_qualityOutbox.setDirectory(qualityOutboxDirectory());
+                            m_qualityOutbox.put(sessionId, accountId, report);
+                        }
+                        break;
+                    }
+                });
             });
         m_hasPendingQualityReport = false;
         m_pendingQualityReport = QJsonObject();

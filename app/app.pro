@@ -229,6 +229,7 @@ SOURCES += \
     seathub/log_tee.cpp \
     seathub/stream_stats.cpp \
     seathub/engine_termination.cpp \
+    seathub/quality_outbox.cpp \
     streaming/streamutils.cpp \
     backend/autoupdatechecker.cpp \
     path.cpp \
@@ -295,6 +296,7 @@ HEADERS += \
     seathub/log_tee.h \
     seathub/stream_stats.h \
     seathub/engine_termination.h \
+    seathub/quality_outbox.h \
     streaming/video/decoder.h \
     streaming/streamutils.h \
     backend/autoupdatechecker.h \

@@ -19,12 +19,15 @@
 
 #include <QtTest>
 
+#include <QDir>
+#include <QFile>
 #include <QHostAddress>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QString>
 #include <QTcpServer>
 #include <QTcpSocket>
+#include <QTemporaryDir>
 
 // This file defines `main()` via `QTEST_MAIN` below. `<SDL.h>` otherwise `#define`s `main` to
 // `SDL_main` (its own cross-platform entry-point redirection), which would rename QTest's
@@ -37,6 +40,7 @@
 #include "seathub/engine_termination.h"
 #include "seathub/liveness_timer.h"
 #include "seathub/log_tee.h"
+#include "seathub/quality_outbox.h"
 #include "seathub/stream_stats.h"
 
 namespace {
@@ -77,6 +81,26 @@ QString blockWithMissingLinesAndNoRtt()
 }
 
 const char* const kDashesPrefix = "----------------------------------------------------------\n";
+
+// --- QualityOutbox fixtures ---------------------------------------------------------------
+
+const char* const kSessionA = "11111111-1111-1111-1111-111111111111";
+const char* const kSessionB = "22222222-2222-2222-2222-222222222222";
+
+ControlPlaneResult resultWithStatus(int statusCode, bool ok = false)
+{
+    ControlPlaneResult result;
+    result.statusCode = statusCode;
+    result.ok = ok;
+    return result;
+}
+
+QJsonObject sampleReport()
+{
+    QJsonObject report;
+    report.insert(QStringLiteral("rendered_fps"), 59.94);
+    return report;
+}
 
 int g_previousQtHandlerCalls = 0;
 void previousQtHandler(QtMsgType, const QMessageLogContext&, const QString&)
@@ -471,6 +495,267 @@ private slots:
              QStringLiteral("Some other error entirely"));
 
         QVERIFY(!liveness.hasEngineError());
+    }
+
+    // --- QualityOutbox (Plan 30, D-17) --------------------------------------------------------
+
+    void put_writesOneFileNamedForTheSessionId()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        QualityOutbox outbox(dir.path());
+
+        outbox.put(QString::fromLatin1(kSessionA), QStringLiteral("acct-1"), sampleReport());
+
+        QVERIFY(QFile::exists(dir.filePath(QString::fromLatin1(kSessionA) + QStringLiteral(".json"))));
+    }
+
+    void put_withANonUuidSessionId_writesNothing()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        QualityOutbox outbox(dir.path());
+
+        outbox.put(QStringLiteral("../escape"), QStringLiteral("acct-1"), sampleReport());
+
+        QCOMPARE(QDir(dir.path()).entryList(QDir::Files).size(), 0);
+    }
+
+    void drain_deliveredOutcome_sendsAndDeletesTheFile_data()
+    {
+        QTest::addColumn<int>("status");
+        QTest::addColumn<bool>("ok");
+
+        QTest::newRow("200 ok") << 200 << true;
+        // 409 ("this session never streamed") is grouped with the successes per this plan's own
+        // truth line: no retry ever changes that answer either.
+        QTest::newRow("409 never streamed") << 409 << false;
+    }
+
+    void drain_deliveredOutcome_sendsAndDeletesTheFile()
+    {
+        QFETCH(int, status);
+        QFETCH(bool, ok);
+
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        QualityOutbox outbox(dir.path());
+        outbox.put(QString::fromLatin1(kSessionA), QStringLiteral("acct-1"), sampleReport());
+
+        int sendCount = 0;
+        outbox.drain(QStringLiteral("gen-1"), QStringLiteral("acct-1"),
+                     [&](const QString& sessionId, const QJsonObject&,
+                         ControlPlaneClient::Callback callback) {
+                         QCOMPARE(sessionId, QString::fromLatin1(kSessionA));
+                         ++sendCount;
+                         callback(resultWithStatus(status, ok));
+                     });
+
+        QCOMPARE(sendCount, 1);
+        QVERIFY(!QFile::exists(dir.filePath(QString::fromLatin1(kSessionA) + QStringLiteral(".json"))));
+    }
+
+    void drain_refusedOutcome_deletesTheFileAndSendsNothingAgain_data()
+    {
+        QTest::addColumn<int>("status");
+
+        QTest::newRow("400") << 400;
+        QTest::newRow("404") << 404;
+        QTest::newRow("413") << 413;
+        QTest::newRow("422") << 422;
+    }
+
+    void drain_refusedOutcome_deletesTheFileAndSendsNothingAgain()
+    {
+        QFETCH(int, status);
+
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        QualityOutbox outbox(dir.path());
+        outbox.put(QString::fromLatin1(kSessionA), QStringLiteral("acct-1"), sampleReport());
+
+        int sendCount = 0;
+        outbox.drain(QStringLiteral("gen-1"), QStringLiteral("acct-1"),
+                     [&](const QString&, const QJsonObject&, ControlPlaneClient::Callback callback) {
+                         ++sendCount;
+                         callback(resultWithStatus(status));
+                     });
+
+        QCOMPARE(sendCount, 1);
+        QVERIFY(!QFile::exists(dir.filePath(QString::fromLatin1(kSessionA) + QStringLiteral(".json"))));
+    }
+
+    void drain_authFailedOutcome_keepsTheFileAndStopsTheRestOfTheLoop_data()
+    {
+        QTest::addColumn<int>("status");
+
+        QTest::newRow("401") << 401;
+        QTest::newRow("403") << 403;
+    }
+
+    void drain_authFailedOutcome_keepsTheFileAndStopsTheRestOfTheLoop()
+    {
+        QFETCH(int, status);
+
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        QualityOutbox outbox(dir.path());
+        outbox.put(QString::fromLatin1(kSessionA), QStringLiteral("acct-1"), sampleReport());
+        outbox.put(QString::fromLatin1(kSessionB), QStringLiteral("acct-1"), sampleReport());
+
+        int sendCount = 0;
+        outbox.drain(QStringLiteral("gen-1"), QStringLiteral("acct-1"),
+                     [&](const QString&, const QJsonObject&, ControlPlaneClient::Callback callback) {
+                         ++sendCount;
+                         callback(resultWithStatus(status));
+                     });
+
+        // Only the first (name-sorted) file was attempted; a 401/403 stops the loop rather than
+        // trying the second file with a token that just failed.
+        QCOMPARE(sendCount, 1);
+        QVERIFY(QFile::exists(dir.filePath(QString::fromLatin1(kSessionA) + QStringLiteral(".json"))));
+        QVERIFY(QFile::exists(dir.filePath(QString::fromLatin1(kSessionB) + QStringLiteral(".json"))));
+    }
+
+    void drain_retryableOutcome_keepsTheFileAndStillAttemptsTheNextOne_data()
+    {
+        QTest::addColumn<int>("status");
+
+        QTest::newRow("transport failure") << 0;
+        QTest::newRow("500") << 500;
+        QTest::newRow("503") << 503;
+        QTest::newRow("408") << 408;
+        QTest::newRow("429") << 429;
+    }
+
+    void drain_retryableOutcome_keepsTheFileAndStillAttemptsTheNextOne()
+    {
+        QFETCH(int, status);
+
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        QualityOutbox outbox(dir.path());
+        outbox.put(QString::fromLatin1(kSessionA), QStringLiteral("acct-1"), sampleReport());
+        outbox.put(QString::fromLatin1(kSessionB), QStringLiteral("acct-1"), sampleReport());
+
+        int sendCount = 0;
+        outbox.drain(QStringLiteral("gen-1"), QStringLiteral("acct-1"),
+                     [&](const QString&, const QJsonObject&, ControlPlaneClient::Callback callback) {
+                         ++sendCount;
+                         callback(resultWithStatus(status));
+                     });
+
+        // Retryable does not stop the loop - both files are attempted and both are kept.
+        QCOMPARE(sendCount, 2);
+        QVERIFY(QFile::exists(dir.filePath(QString::fromLatin1(kSessionA) + QStringLiteral(".json"))));
+        QVERIFY(QFile::exists(dir.filePath(QString::fromLatin1(kSessionB) + QStringLiteral(".json"))));
+    }
+
+    void drain_anotherAccountsReport_isDeletedWithOneWarnAndNeverSent()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        QualityOutbox outbox(dir.path());
+        outbox.put(QString::fromLatin1(kSessionA), QStringLiteral("acct-OTHER"), sampleReport());
+
+        int sendCount = 0;
+        outbox.drain(QStringLiteral("gen-1"), QStringLiteral("acct-1"),
+                     [&](const QString&, const QJsonObject&, ControlPlaneClient::Callback) {
+                         ++sendCount;
+                     });
+
+        QCOMPARE(sendCount, 0);
+        QVERIFY(!QFile::exists(dir.filePath(QString::fromLatin1(kSessionA) + QStringLiteral(".json"))));
+    }
+
+    void drain_withNoTokenOrNoAccount_sendsNothing()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        QualityOutbox outbox(dir.path());
+        outbox.put(QString::fromLatin1(kSessionA), QStringLiteral("acct-1"), sampleReport());
+
+        int sendCount = 0;
+        auto postFn = [&](const QString&, const QJsonObject&, ControlPlaneClient::Callback) {
+            ++sendCount;
+        };
+
+        outbox.drain(QString(), QStringLiteral("acct-1"), postFn);
+        outbox.drain(QStringLiteral("gen-1"), QString(), postFn);
+
+        QCOMPARE(sendCount, 0);
+        QVERIFY(QFile::exists(dir.filePath(QString::fromLatin1(kSessionA) + QStringLiteral(".json"))));
+    }
+
+    void drain_sameGenerationAfterAuthFailed_sendsNothingUntilANewGeneration()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        QualityOutbox outbox(dir.path());
+        outbox.put(QString::fromLatin1(kSessionA), QStringLiteral("acct-1"), sampleReport());
+
+        int sendCount = 0;
+        auto refusing = [&](const QString&, const QJsonObject&, ControlPlaneClient::Callback callback) {
+            ++sendCount;
+            callback(resultWithStatus(401));
+        };
+        outbox.drain(QStringLiteral("gen-1"), QStringLiteral("acct-1"), refusing);
+        QCOMPARE(sendCount, 1);
+
+        // The same generation is not retried at all.
+        outbox.drain(QStringLiteral("gen-1"), QStringLiteral("acct-1"), refusing);
+        QCOMPARE(sendCount, 1);
+
+        // A new generation (a new token) is attempted again.
+        int newGenerationSendCount = 0;
+        outbox.drain(QStringLiteral("gen-2"), QStringLiteral("acct-1"),
+                     [&](const QString&, const QJsonObject&, ControlPlaneClient::Callback callback) {
+                         ++newGenerationSendCount;
+                         callback(resultWithStatus(200, true));
+                     });
+        QCOMPARE(newGenerationSendCount, 1);
+        QVERIFY(!QFile::exists(dir.filePath(QString::fromLatin1(kSessionA) + QStringLiteral(".json"))));
+    }
+
+    void drain_whileAlreadyDraining_doesNotSendTheSameFileTwice()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        QualityOutbox outbox(dir.path());
+        outbox.put(QString::fromLatin1(kSessionA), QStringLiteral("acct-1"), sampleReport());
+
+        int sendCount = 0;
+        ControlPlaneClient::Callback pendingCallback;
+        outbox.drain(QStringLiteral("gen-1"), QStringLiteral("acct-1"),
+                     [&](const QString&, const QJsonObject&, ControlPlaneClient::Callback callback) {
+                         ++sendCount;
+                         // Held, not answered yet: this call is still "in flight".
+                         pendingCallback = callback;
+                     });
+        QCOMPARE(sendCount, 1);
+        QVERIFY(pendingCallback);
+
+        // A second drain call while the first is still in flight must not re-send the same file.
+        outbox.drain(QStringLiteral("gen-1"), QStringLiteral("acct-1"),
+                     [&](const QString&, const QJsonObject&, ControlPlaneClient::Callback) {
+                         ++sendCount;
+                     });
+        QCOMPARE(sendCount, 1);
+
+        pendingCallback(resultWithStatus(200, true));
+        QVERIFY(!QFile::exists(dir.filePath(QString::fromLatin1(kSessionA) + QStringLiteral(".json"))));
+    }
+
+    void hasQueuedReports_emptyDirectory_isFalse()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        QualityOutbox outbox(dir.path());
+
+        QVERIFY(!outbox.hasQueuedReports());
+
+        outbox.put(QString::fromLatin1(kSessionA), QStringLiteral("acct-1"), sampleReport());
+        QVERIFY(outbox.hasQueuedReports());
     }
 };
 
