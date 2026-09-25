@@ -537,10 +537,16 @@ bool waitWithoutTheEventLoop(const std::function<bool()>& condition, int timeout
 /// same-thread dispatch does for a real decoder destroyed on the SDL/main thread.
 void emitStatsBlock(double renderedFps)
 {
+    // IN-08 (code review 06.3-REVIEW-fork.md, second review pass): the "Host processing
+    // latency..." line a Sunshine host's own encode latency adds
+    // (`app/streaming/video/ffmpeg.cpp:811-819`, gated on `framesWithHostProcessingLatency > 0`)
+    // between `Rendering frame rate:` and the drop lines, matching production - see
+    // `tst_stream_stats.cpp`'s own `productionStatsBlock()` comment for the same fix.
     const QByteArray body = QStringLiteral(
                                  "Incoming frame rate from network: 60.00 FPS\n"
                                  "Decoding frame rate: 59.98 FPS\n"
                                  "Rendering frame rate: %1 FPS\n"
+                                 "Host processing latency min/max/average: 0.8/3.4/1.6 ms\n"
                                  "Frames dropped by your network connection: 0.42%\n"
                                  "Frames dropped due to network jitter: 0.10%\n"
                                  "Average network latency: 23 ms (variance: 4 ms)\n"
@@ -2166,6 +2172,112 @@ private slots:
         const QJsonObject envelope = QJsonDocument::fromJson(file.readAll()).object();
         QCOMPARE(envelope.value(QStringLiteral("account_id")).toString(),
                  QStringLiteral("6f1c6f5e-3a1e-4b1e-9f2e-0f1a2b3c4d5e"));
+
+        client.session()->attachSession(nullptr);
+        delete engine;
+    }
+
+    // --- CR-04 (code review 06.3-REVIEW-fork.md, second review pass): a late reply to an
+    // untagged report is never re-tagged under whichever epoch happens to be current when it
+    // lands -----------------------------------------------------------------------------------
+
+    // The WR-06 fix's own regression: A's `/api/me` fails at sign-in (`m_accountId` stays empty
+    // for A's whole session, WR-06's own held-not-dropped path), A's `/quality` POST stalls past
+    // both a sign-out AND a different account's sign-in, and only THEN lands. Before this fix the
+    // stalled reply's handler read `m_authEpoch` at REPLY time (whatever is current then, B's),
+    // not at the moment the report was actually posted (A's own, already gone) - so a later
+    // `reloadAccount()` tagged and sent A's report as B's, under B's bearer token, reaching the
+    // same threat (T-06.3-51) CR-03 already closed for the outbox's own drain, by a different
+    // path. RED on the pre-fix code: this test's own `2>1` occurrence count and outbox-existence
+    // assertions below both fail on `2cf61ab4` (a second POST for A's session, under B's token,
+    // and an outbox file for A's session tagged `account_id: B`) and pass once the epoch is
+    // captured at post time instead.
+    void aLateReplyToAnUntaggedReportIsDroppedNeverReTaggedUnderALaterAccount()
+    {
+        SeatHubClient client;
+        isolateStore(client);
+        client.controlPlane()->setBaseUrl(QStringLiteral("https://control.invalid"));
+        armControlPlane(client);
+
+        const QString sessionA = QStringLiteral("aaaaaaaa-7777-7777-7777-777777777777");
+        const QString qualityPathA =
+            QStringLiteral("/api/sessions/%1/quality").arg(sessionA);
+
+        // A signs in fresh; `/api/me` (the `fetchMe` `adoptSignIn()` always runs, WR-06) fails,
+        // so `m_accountId` stays empty for the whole of A's session - CR-04's own precondition
+        // (the finding's own "Failed /api/me at sign-in" case).
+        m_fake->answerMe(503, QByteArray());
+        m_fake->answerWallet(200, walletBody(90));
+        client.verifyOtp(QStringLiteral("+962790000002"), QStringLiteral("123456"));
+        QTRY_COMPARE_WITH_TIMEOUT(client.appState(), QStringLiteral("home"), 15000);
+        QTRY_VERIFY_WITH_TIMEOUT(m_fake->requestPaths().contains(QStringLiteral("/api/me")), 15000);
+
+        auto* engine = new FakeEngineSession;
+        client.session()->attachSession(engine);
+        client.teardown()->setVerifyIntervalMs(1);
+        client.beginSession(sessionA);
+        QTRY_VERIFY_WITH_TIMEOUT(client.liveSession(), 15000);
+
+        emitStatsBlock(48.0);
+
+        // The reply stays in flight (delayed) well past the sign-out and the next sign-in below -
+        // exactly the window CR-04's own finding names ("the time A's `/quality` request stays in
+        // flight ... a stalled POST can outlast a sign-out and a sign-in").
+        m_fake->answerQuality(503); // Retryable once it finally answers
+        m_fake->delayQuality(2500);
+        QSignalSpy completed(client.teardown(), &TeardownController::teardownCompleted);
+        emit engine->readyForDeletion();
+        QTRY_COMPARE_WITH_TIMEOUT(completed.count(), 1, 15000);
+
+        // The POST itself already went out, under A's own token, before any of what follows.
+        QTRY_VERIFY_WITH_TIMEOUT(m_fake->requestPaths().contains(qualityPathA), 15000);
+        QCOMPARE(m_fake->requestPaths().count(qualityPathA), 1);
+
+        client.signOut();
+        QTRY_COMPARE_WITH_TIMEOUT(client.appState(), QStringLiteral("signed_out"), 15000);
+
+        // B signs in - a distinct, distinguishable bearer token (unlike OTP verify, which always
+        // answers the same fixed token - see `FakeControlPlane::createRequest()`), the same way
+        // `aSignOutMidDrainNeverSendsTheRemainingFileUnderTheNextAccountsToken` (CR-03) does.
+        QByteArray bAccountBody = QByteArrayLiteral(
+            "{\"id\":\"77777777-7777-7777-7777-777777777777\",\"display_name\":\"Omar\","
+            "\"username\":\"omar\",\"email\":\"omar@example.com\",\"phone_e164\":\"+962790000001\","
+            "\"role\":\"customer\",\"signup_stage\":\"complete\",\"email_verified\":true,"
+            "\"phone_verified\":true,\"created_at\":\"2026-09-01T00:00:00Z\"}");
+        m_fake->answerMe(200, bAccountBody);
+        m_fake->answerWallet(200, walletBody(45));
+        m_fake->answerLogin(200, QByteArrayLiteral("{\"access_token\":\"sb_at_for_b\"}"));
+        client.signInWithPassword(QStringLiteral("omar@example.com"), QStringLiteral("irrelevant"));
+        QTRY_COMPARE_WITH_TIMEOUT(client.appState(), QStringLiteral("home"), 15000);
+        QTRY_VERIFY_WITH_TIMEOUT(m_fake->requestPaths().count(QStringLiteral("/api/me")) >= 2, 15000);
+        // B's own `fetchMe` reply is undelayed; give its callback a moment to fill `m_accountId`
+        // before A's own delayed reply (below) lands.
+        QTest::qWait(200);
+
+        // A's held-open reply finally lands, well after both the sign-out and B's own sign-in.
+        QTest::qWait(2700);
+
+        // The trigger the finding's own fix steps name: a later account read that flushes
+        // whatever is still held in `m_untaggedQualityReports`.
+        client.reloadAccount();
+        QTRY_VERIFY_WITH_TIMEOUT(m_fake->requestPaths().count(QStringLiteral("/api/me")) >= 3, 15000);
+        // Give `setAccount()`'s own `flushUntaggedQualityReports()`/`drainQualityOutbox()` call a
+        // moment to run (or, pre-fix, to write and send the mis-tagged file).
+        QTest::qWait(300);
+
+        // CR-04's own guarantee: A's report is dropped once the epoch that posted it is no
+        // longer current - never re-tagged and sent as B's. Exactly one attempt for A's session
+        // ever happened (the original, under A's own token); no second one, under B's, followed
+        // the reload.
+        QCOMPARE(m_fake->requestPaths().count(qualityPathA), 1);
+        QVERIFY2(m_fake->authorizationFor(qualityPathA) != QByteArrayLiteral("Bearer sb_at_for_b"),
+                 "A's session must never be sent under B's bearer token");
+
+        const QString outboxPathA =
+            QDir(m_dir->path()).filePath(QStringLiteral("quality-outbox/%1.json").arg(sessionA));
+        QVERIFY2(!QFile::exists(outboxPathA),
+                 "a dropped, never-re-tagged report must not be written to the outbox under a "
+                 "later account either");
 
         client.session()->attachSession(nullptr);
         delete engine;
