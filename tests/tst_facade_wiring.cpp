@@ -2033,8 +2033,11 @@ private slots:
         SeatHubClient client;
         reachHome(client, 90);
         QVERIFY(!QTest::currentTestFailed());
-        m_fake->answerPairing(409, playRefusalBody(QStringLiteral("The rig is not ready yet."),
-                                                   QStringLiteral("SH-2K2XQ1")));
+        // A run of 409s no longer stalls this deadline (fork `15962514`: "a 409 while the rig is
+        // prepared does not spend the pairing deadline" - it restarts D-08's clock on every "not
+        // yet" answer). A transport failure still does, so the authorization poll never resolving
+        // at all is what makes this deadline expire.
+        m_fake->answerPairing(0);
 
         // The deadline is measured by the pairing controller, on its own thread: shorten it there, then
         // let a real pairing wait for a rig that never becomes ready.
