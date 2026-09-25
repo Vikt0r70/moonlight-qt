@@ -2182,11 +2182,21 @@ void SeatHubClient::releaseEngineSession()
 
 void SeatHubClient::clearThisPlaysTraceIdAfterAnyQueuedLivenessReport()
 {
-    // Captured here, on whichever thread called this (the facade thread, in both current
-    // callers) - still this Play's own id, since nothing has changed it yet.
-    const QString thisPlaysTraceId = m_controlPlane->traceId();
-    onClientThread(m_controlPlane, [this, thisPlaysTraceId]() {
-        m_controlPlane->clearTraceIdIfEquals(thisPlaysTraceId);
+    // WR-11 (code review 06.3-REVIEW-fork.md, second review pass): `controlPlane` is read from
+    // the member ONCE, here, on the calling thread, and captured by value - never read again as
+    // `m_controlPlane` inside the queued lambda below. `~SeatHubClient()` sets `m_controlPlane =
+    // nullptr` on the main thread before its own blocking join with the control-plane thread
+    // completes (see the destructor's own ordering comment); a lambda that instead read
+    // `m_controlPlane` when IT ran, on the control-plane thread, would race that write - and,
+    // since the queued call is already ahead of the join in the network thread's own event
+    // queue, it can still run after the member has been nulled, dereferencing a null pointer
+    // through `this`. Capturing the pointer by value here removes the member read entirely: the
+    // lambda never touches `this` at all, only its own captured local, which cannot change
+    // after this function returns.
+    ControlPlaneClient* controlPlane = m_controlPlane;
+    const QString thisPlaysTraceId = controlPlane->traceId();
+    onClientThread(controlPlane, [controlPlane, thisPlaysTraceId]() {
+        controlPlane->clearTraceIdIfEquals(thisPlaysTraceId);
     });
 }
 
@@ -2275,14 +2285,23 @@ void SeatHubClient::postOrStoreQualityReport()
     const QString sessionId = m_pendingQualitySessionId;
     const QJsonObject report = m_pendingQualityReport;
     const QString accountId = m_accountId;
+    // CR-04 (code review 06.3-REVIEW-fork.md, second review pass): captured here, at the
+    // moment this report is POSTED - not read again from `m_authEpoch` when the asynchronous
+    // reply below eventually lands. A sign-out (or a sign-in as someone else) can happen while
+    // this POST is still in flight; without this capture the WR-06 hold below stamped a late
+    // reply with whatever epoch happened to be current when the reply arrived, so a stalled
+    // report of an untagged account A could be re-tagged and sent under a later account B's
+    // token once B's own `m_accountId` was filled - the same threat (T-06.3-51) CR-03 already
+    // closed for the outbox's own drain, reached here by a different path.
+    const quint64 epochAtPost = m_authEpoch;
     m_hasPendingQualityReport = false;
     m_pendingQualityReport = QJsonObject();
     m_pendingQualitySessionId.clear();
 
     m_controlPlane->postSessionQuality(
         sessionId, report,
-        [this, sessionId, report, accountId](const ControlPlaneResult& result) {
-            onClientThread(this, [this, sessionId, report, accountId, result]() {
+        [this, sessionId, report, accountId, epochAtPost](const ControlPlaneResult& result) {
+            onClientThread(this, [this, sessionId, report, accountId, epochAtPost, result]() {
                 switch (QualityOutbox::classify(result)) {
                 case QualityOutbox::Outcome::Delivered:
                     break;
@@ -2300,8 +2319,18 @@ void SeatHubClient::postOrStoreQualityReport()
                     if (accountId.isEmpty()) {
                         // WR-06: held, not dropped - `flushUntaggedQualityReports()` tags and
                         // stores it once `m_accountId` is next filled for this same epoch.
-                        m_untaggedQualityReports.append(
-                            PendingUntaggedQualityReport{ sessionId, report, m_authEpoch });
+                        // CR-04: only if the epoch this report was POSTED under is still
+                        // current - `signOut()`'s own epoch bump (and every sign-in's) means a
+                        // reply landing after either one belongs to an account that has
+                        // already signed out; it is dropped here, exactly once, rather than
+                        // re-tagged under whichever epoch happens to be current when this late
+                        // reply arrives.
+                        if (epochAtPost == m_authEpoch) {
+                            m_untaggedQualityReports.append(
+                                PendingUntaggedQualityReport{ sessionId, report, epochAtPost });
+                        }
+                        // else: the account that owned it has signed out - drop, never re-tag
+                        // under a later sign-in's epoch.
                     }
                     else {
                         m_qualityOutbox.setDirectory(qualityOutboxDirectory());
