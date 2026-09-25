@@ -851,6 +851,16 @@ void ControlPlaneClient::postLiveness(const QString& sessionId, const QString& s
          buildLiveness(state, errorCode), true, callback);
 }
 
+void ControlPlaneClient::postLiveness(const QString& sessionId, const QJsonObject& payload,
+                                     Callback callback)
+{
+    const QByteArray body =
+        payload.isEmpty() ? QByteArray() : QJsonDocument(payload).toJson(QJsonDocument::Compact);
+    send(QStringLiteral("POST"), QStringLiteral("/api/sessions/") + encodedPathSegment(sessionId)
+             + QStringLiteral("/liveness"),
+         body, true, callback);
+}
+
 void ControlPlaneClient::endSession(const QString& sessionId, Callback callback)
 {
     send(QStringLiteral("POST"), QStringLiteral("/api/sessions/") + encodedPathSegment(sessionId)

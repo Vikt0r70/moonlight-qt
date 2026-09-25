@@ -420,9 +420,17 @@ public:
     void fetchSessionAuthorization(const QString& sessionId, Callback callback);
 
     /// The 10-second liveness report (D-31) carrying `state` and/or `error_code` (D-34,
-    /// ADR-0041). Both are optional; both empty is the pre-1.6.0 deadline extension.
+    /// ADR-0041). Both are optional; both empty is the pre-1.6.0 deadline extension. Kept for the
+    /// callers this exact shape still has (tests exercising the class directly); production
+    /// callers use the `QJsonObject` overload below.
     void postLiveness(const QString& sessionId, const QString& state,
                       const QString& errorCode, Callback callback);
+
+    /// Contract 3.1.0 (D-11): the full liveness body, built by the caller (`LivenessTimer::buildPayload`)
+    /// and posted verbatim - `stage`, `state`, `error_code`, `engine_stage`, `engine_error`,
+    /// `failing_ports`, each present only when the caller set it. An empty object is the same
+    /// pre-1.6.0 deadline extension the string overload sends for two empty strings.
+    void postLiveness(const QString& sessionId, const QJsonObject& payload, Callback callback);
 
     /// `POST /api/sessions/{session_id}/end`. Idempotent server-side: ending an
     /// already-ending or terminal session returns it unchanged.

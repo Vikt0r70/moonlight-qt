@@ -315,9 +315,11 @@ SeatHubClient::SeatHubClient(QObject* parent)
     // thread may call it; this connection is queued to the facade's thread anyway.
     connect(m_sessionChannel, &SessionWebSocket::opened, this, [this]() {
         m_hud.setReconnecting(false);
+        m_liveness->setStage(QStringLiteral("streaming"));
     });
     connect(m_sessionChannel, &SessionWebSocket::dropped, this, [this](int, int) {
         m_hud.setReconnecting(true);
+        m_liveness->setStage(QStringLiteral("reconnecting"));
     });
 
     // The session as the control plane reports it, read on the pairing poll's own tick (ADR-0055):
@@ -477,6 +479,11 @@ void SeatHubClient::startNetworkThreads()
 void SeatHubClient::beginSession(const QString& sessionId)
 {
     if (sessionId.isEmpty()) {
+        // No session to report against - `m_liveness` has no session attached yet either
+        // (`reportFailure` no-ops with no session, the same guard `tick()` uses), so this call is
+        // for completeness with the other pre-engine failure paths (RESEARCH Q1) rather than
+        // because it posts anything here.
+        m_liveness->reportFailure(QStringLiteral("preparing_rig"));
         raiseFailure(SeatHubFailure::local(QStringLiteral("We couldn't start this session.")));
         return;
     }
@@ -501,6 +508,13 @@ void SeatHubClient::beginSession(const QString& sessionId)
     setAppState(QString::fromLatin1(kStateConnecting));
 
     startNetworkThreads();
+
+    // D-11: liveness starts here, at session begin, not at the stream's first frame - a
+    // pre-engine failure is invisible to the server otherwise (`questions.md` #2). The first tick
+    // reports stage `preparing_rig`. `start()` re-invokes itself on its own thread when called
+    // from another one (the same pattern `stop()` and every other entry point use), so this is
+    // called directly rather than marshalled through `onClientThread()`.
+    m_liveness->start(sessionId);
 
     // Pairing starts with the session and runs while the customer watches the connecting view; it
     // never asks them for anything (STREAM-03). The engine is started from `handlePairingCompleted()`
@@ -1367,13 +1381,19 @@ void SeatHubClient::handleStageStarting(const QString& stage)
 {
     // The engine only starts its own stages once the rig is ready and paired, so reaching any of them
     // means the second stage is under way. Its own name for the stage is internal and is not shown
-    // (D-51), so nothing of it is read beyond the fact that it began.
-    Q_UNUSED(stage);
+    // (D-51), so nothing of it is read beyond the fact that it began - `engine_stage` is diagnostic
+    // data for the server (D-11), never rendered here.
+    m_liveness->setEngineStage(stage);
     advanceConnectStage(kStageStream);
 }
 
 void SeatHubClient::handleStageFailed(const QString& stage, int errorCode, const QString& failingPorts)
 {
+    // D-11: the server sees exactly what the customer's screen is about to say, before liveness
+    // stops - the engine's own stage, its code and the ports it named, whether this failure is
+    // pre-stream or (rarely) mid-stream.
+    m_liveness->reportFailure(stage, errorCode, failingPorts);
+
     if (m_appState == QLatin1String(kStateStreaming)) {
         // Mid-stream failures keep the session's own end-reason copy; the engine's stage
         // failure is diagnostic detail from here on.
@@ -1417,12 +1437,13 @@ void SeatHubClient::handleConnectionStarted()
         m_hud.seedCreditMinutes(m_balanceMinutes);
     }
 
-    // D-31/D-34: liveness starts with the stream and reports every 10 s, including `state` and
-    // `error_code`, and reads the wallet on the same tick (CUST-15). It runs on the network thread,
-    // because the Qt main thread is inside SDL's event loop from here until the stream ends
-    // (`session.cpp:1965-1966`).
+    // D-31/D-34/D-11: liveness itself started at `beginSession()` (session begin, not the stream's
+    // first frame - RESEARCH Q1); from here it keeps reporting every 10 s, now with `state`
+    // "streaming" (ADR-0041's meaning is unchanged, only the moment `start()` itself runs has
+    // moved) and stage `streaming`, and it keeps reading the wallet on the same tick (CUST-15).
     if (inControlPlaneSession()) {
-        m_liveness->start(m_sessionId);
+        m_liveness->setReportedState(QStringLiteral("streaming"));
+        m_liveness->setStage(QStringLiteral("streaming"));
     }
 }
 
@@ -1824,7 +1845,9 @@ void SeatHubClient::handleSessionWarning(const QString& sessionId, const QString
     // Audit F12: `DISCONNECTED` is the server saying this client stopped reporting, which is
     // exactly the moment the HUD's strip leaves "Elapsed" and says what is happening. The
     // strip never shows the "(2 of 5)" attempt counter D-56 defers.
-    m_hud.setReconnecting(warning == QLatin1String("DISCONNECTED"));
+    const bool reconnecting = warning == QLatin1String("DISCONNECTED");
+    m_hud.setReconnecting(reconnecting);
+    m_liveness->setStage(reconnecting ? QStringLiteral("reconnecting") : QStringLiteral("streaming"));
 }
 
 // ---------------------------------------------------------------------------
@@ -1880,8 +1903,15 @@ void SeatHubClient::handlePairingCompleted(const QString& clientUuid)
     // session against nothing. Before the Plan 03-06 fix this `start()` fell through to the 03-02
     // tracer, which is how the client paired for real and then streamed a fake.
     if (!m_session->start(m_hostWindow)) {
+        // Pairing itself succeeded, but nothing was attached to start with - connecting never
+        // truly began, so the stage this stopped at is still `pairing` (D-11).
+        m_liveness->reportFailure(QStringLiteral("pairing"));
         raiseFailure(SeatHubFailure::generic());
+        return;
     }
+
+    // The engine session is attached and about to start: connecting is now under way (D-11).
+    m_liveness->setStage(QStringLiteral("connecting"));
 }
 
 void SeatHubClient::handleHostResolved(const PairedHostPtr& host)
@@ -1940,6 +1970,11 @@ void SeatHubClient::releaseEngineSession()
 
 void SeatHubClient::handlePairingFailed(const SeatHubFailure& failure)
 {
+    // D-11: a pairing timeout or a control-plane refusal of the pairing read, neither with an
+    // engine code - reported before liveness stops, so the server sees "SeatHub failed at
+    // pairing" rather than a session that simply went quiet.
+    m_liveness->reportFailure(QStringLiteral("pairing"));
+
     // Fail closed with a SeatHub error the error screen can render - a reason, a retry and an
     // `SH-` reference - never a Moonlight dialog (ADR-0008, D-51, STREAM-03).
     m_sessionChannel->close();
@@ -1964,6 +1999,10 @@ void SeatHubClient::handleAuthorizationGranted(const QString& qualityProfile)
     // The controller is the only object that sees the authorization; it puts this one field on the
     // signal and keeps the rest, including `pairing_pin` (STREAM-03).
     m_settings->applySessionOverride(qualityProfile);
+
+    // D-11: a real authorization means the rig has a pairing target - the session has moved past
+    // the 409 "not ready yet" polls that are `preparing_rig`, whether or not a PIN has arrived yet.
+    m_liveness->setStage(QStringLiteral("pairing"));
 }
 
 void SeatHubClient::handleTeardownCompleted(const SessionInfo& finalSession)
