@@ -52,13 +52,22 @@ namespace {
 
 // The real end-of-stream block `FFmpegVideoDecoder::logVideoStats()` prints in production
 // (`app/streaming/video/ffmpeg.cpp:279-296`, read-only, this file's own literal strings copied
-// from :794-801 and :835-848): every conditional line the engine can print with
+// from :794-801, :811-819 and :835-848): every conditional line the engine can print with
 // `m_VideoDecoderCtx` already freed. There is NO "Video stream: ..." line - that line is gated on
 // `m_VideoDecoderCtx != nullptr` (:778) and `logVideoStats()` runs strictly after
 // `avcodec_free_context()` has nulled it (:280, :296) - which is exactly CR-01's finding: the
 // earlier fixture here (`fullStatsBlock()`) carried a "Video stream:" line production can never
 // emit, which is how a wrong parse source went untested. Field values are chosen so no two are
 // equal, so a test that reads the wrong field fails loudly.
+//
+// IN-08 (code review 06.3-REVIEW-fork.md, second review pass): the "Host processing latency
+// min/max/average: ... ms" line (:811-819, gated on `stats.framesWithHostProcessingLatency > 0` -
+// a Sunshine host reporting its own encode latency) is between `Rendering frame rate:` and the
+// drop-percentage lines here because that is where `stringifyVideoStats()` actually prints it.
+// `parseVideoStatsBlock()` has no regex for it and never will (it is not one of
+// `SessionQualityReport`'s eight fields) - it is here purely so this fixture matches a Sunshine
+// host's real output; the earlier revision of this comment claimed the fixture carried "every
+// conditional line the engine can print" while missing this one.
 QString productionStatsBlock()
 {
     return QStringLiteral(
@@ -66,6 +75,7 @@ QString productionStatsBlock()
         "Incoming frame rate from network: 60.00 FPS\n"
         "Decoding frame rate: 59.98 FPS\n"
         "Rendering frame rate: 59.96 FPS\n"
+        "Host processing latency min/max/average: 0.8/3.4/1.6 ms\n"
         "Frames dropped by your network connection: 0.42%\n"
         "Frames dropped due to network jitter: 0.10%\n"
         "Average network latency: 23 ms (variance: 4 ms)\n"
@@ -83,6 +93,7 @@ QString productionStatsBlockWithNoRtt()
         "Incoming frame rate from network: 60.00 FPS\n"
         "Decoding frame rate: 59.98 FPS\n"
         "Rendering frame rate: 59.96 FPS\n"
+        "Host processing latency min/max/average: 0.8/3.4/1.6 ms\n"
         "Frames dropped by your network connection: 0.42%\n"
         "Frames dropped due to network jitter: 0.10%\n"
         "Average network latency: N/A\n"
@@ -256,6 +267,77 @@ private slots:
         QVERIFY(removerThread->wait(5000));
         QVERIFY(sinkDone);
         QVERIFY(removeReturned);
+    }
+
+    // WR-10 (code review 06.3-REVIEW-fork.md, second review pass): a sink that calls
+    // `removeSink()` on itself, from inside its own dispatch, on the SAME thread that is
+    // dispatching it. Before this fix, `removeSink()` unconditionally took the same write lock
+    // `dispatch()` holds for reading across the whole sink-calling loop - `QReadWriteLock` is
+    // non-recursive (Qt's own documentation), so this thread would deadlock against its own read
+    // lock and this test would hang forever rather than fail loudly. The fix defers the removal
+    // instead: this call returns immediately, and the removal takes effect the moment `dispatch()`
+    // (still running, further up this same thread's call stack) returns.
+    void logTee_removeSink_calledFromInsideItsOwnDispatch_deferredNotDeadlocked()
+    {
+        LogTee::clearSinksForTests();
+
+        int callCount = 0;
+        LogTee::SinkHandle handle = 0;
+        handle = LogTee::addSink([&](LogLevel, int, int, const QString& text) {
+            if (!text.contains(QStringLiteral("wr10-self-remove-trigger"))) {
+                return;
+            }
+            ++callCount;
+            // The scenario itself: removing this very sink, on this thread, from inside its own
+            // call. Must return at once (never wait on itself) and must not corrupt the sink list
+            // dispatch() is still iterating over (`dispatch()`'s own copy-then-call ordering
+            // means this is safe either way, but the removal itself must not run here).
+            LogTee::removeSink(handle);
+        });
+
+        qWarning() << "wr10-self-remove-trigger"; // must return promptly, not hang
+
+        QCOMPARE(callCount, 1);
+
+        // The deferred removal must have actually applied once dispatch() returned - not been
+        // silently dropped: a second trigger line must not reach the sink again.
+        qWarning() << "wr10-self-remove-trigger";
+        QCOMPARE(callCount, 1);
+    }
+
+    // WR-10: the same guarantee for `addSink()` - a sink that registers ANOTHER sink from inside
+    // its own dispatch must not deadlock either, and the new sink must actually be registered
+    // once dispatch() returns (not lost, and not called for the very message that triggered its
+    // own registration - it was not on the list yet when this dispatch copied it).
+    void logTee_addSink_calledFromInsideAnotherSinksDispatch_deferredNotDeadlocked()
+    {
+        LogTee::clearSinksForTests();
+
+        int outerCalls = 0;
+        int innerCalls = 0;
+        LogTee::SinkHandle innerHandle = 0;
+        const LogTee::SinkHandle outerHandle = LogTee::addSink(
+            [&](LogLevel, int, int, const QString& text) {
+                if (!text.contains(QStringLiteral("wr10-add-from-dispatch-trigger"))) {
+                    return;
+                }
+                ++outerCalls;
+                if (innerHandle == 0) {
+                    innerHandle = LogTee::addSink(
+                        [&](LogLevel, int, int, const QString&) { ++innerCalls; });
+                }
+            });
+
+        qWarning() << "wr10-add-from-dispatch-trigger"; // registers the inner sink, must not hang
+        QCOMPARE(outerCalls, 1);
+        QCOMPARE(innerCalls, 0); // not registered yet when this dispatch copied the sink list
+
+        qWarning() << "wr10-add-from-dispatch-trigger"; // a later message reaches both sinks
+        QCOMPARE(outerCalls, 2);
+        QCOMPARE(innerCalls, 1);
+
+        LogTee::removeSink(outerHandle);
+        LogTee::removeSink(innerHandle);
     }
 
     // --- parseVideoStatsBlock / toQualityReport --------------------------------------------
@@ -480,12 +562,18 @@ private slots:
         VideoStats first;
         first.renderedFps = OptionalMetric::of(30.0);
         first.networkDroppedFramePct = OptionalMetric::of(1.0);
+        // WR-09: both segments print the SAME `receivedFps`, so `networkDroppedFramePct`'s own
+        // weight (`receivedFps x durationMs`) reduces to plain duration weighting here, exactly
+        // like `renderedFps` above - this test is about equal-duration weighting, not about
+        // unequal frame rates (`aggregator_frameRateWeighting...` below covers that).
+        first.receivedFps = OptionalMetric::of(60.0);
         first.rttMs = OptionalMetric::of(10.0);
         first.rttVarianceMs = OptionalMetric::of(1.0);
 
         VideoStats second;
         second.renderedFps = OptionalMetric::of(60.0);
         second.networkDroppedFramePct = OptionalMetric::of(3.0);
+        second.receivedFps = OptionalMetric::of(60.0);
         second.rttMs = OptionalMetric::of(50.0);
         second.rttVarianceMs = OptionalMetric::of(5.0);
 
@@ -497,6 +585,58 @@ private slots:
         QCOMPARE(aggregate.renderedFps.value, 45.0);
         QVERIFY(aggregate.networkDroppedFramePct.present);
         QCOMPARE(aggregate.networkDroppedFramePct.value, 2.0);
+    }
+
+    // WR-09 (code review 06.3-REVIEW-fork.md, second review pass): the reviewer's own worked
+    // example. Duration weighting alone (the pre-fix code) would average the two decode times
+    // as (3 + 12) / 2 = 7.5 ms; frame weighting - the ruling's own words, "average times weighted
+    // by frames" - gives (36000 x 3 + 12000 x 12) / 48000 = 5.25 ms instead. Equal DURATIONS on
+    // purpose: this isolates the frame-rate weighting itself from the duration weighting
+    // `aggregator_twoUnequalDurationSegments_weightsTheLongerOneMore` above already covers.
+    void aggregator_unequalFrameRatesAcrossEqualDurationSegments_weightsByFramesNotDuration()
+    {
+        VideoStatsAggregator aggregator;
+
+        // Segment 1: 10 minutes at 60 fps, 3 ms decode time.
+        VideoStats fast;
+        fast.decodedFps = OptionalMetric::of(60.0);
+        fast.decodeTimeMs = OptionalMetric::of(3.0);
+
+        // Segment 2: 10 minutes at 20 fps (a bad network), 12 ms decode time.
+        VideoStats slow;
+        slow.decodedFps = OptionalMetric::of(20.0);
+        slow.decodeTimeMs = OptionalMetric::of(12.0);
+
+        aggregator.addSegmentForTesting(fast, 600000);
+        aggregator.addSegmentForTesting(slow, 600000);
+        const VideoStats aggregate = aggregator.aggregate();
+
+        QVERIFY(aggregate.decodeTimeMs.present);
+        QCOMPARE(aggregate.decodeTimeMs.value, 5.25);
+        QVERIFY2(qAbs(aggregate.decodeTimeMs.value - 7.5) > 0.01,
+                 "must not fall back to the plain duration-weighted 7.5 ms");
+    }
+
+    // The single-segment case is unaffected by frame-weighting: with only one segment,
+    // `aggregate()` returns it unchanged before any weighting helper ever runs (see the trivial
+    // case at the top of `aggregate()`).
+    void aggregator_oneSegmentWithUnequalFrameRateFields_reportsItUnchanged()
+    {
+        VideoStatsAggregator aggregator;
+
+        VideoStats only;
+        only.decodedFps = OptionalMetric::of(20.0);
+        only.decodeTimeMs = OptionalMetric::of(12.0);
+        only.receivedFps = OptionalMetric::of(18.0);
+        only.networkDroppedFramePct = OptionalMetric::of(2.5);
+
+        aggregator.addSegmentForTesting(only, 600000);
+        const VideoStats aggregate = aggregator.aggregate();
+
+        QVERIFY(aggregate.decodeTimeMs.present);
+        QCOMPARE(aggregate.decodeTimeMs.value, 12.0);
+        QVERIFY(aggregate.networkDroppedFramePct.present);
+        QCOMPARE(aggregate.networkDroppedFramePct.value, 2.5);
     }
 
     // A one-minute segment must not count as much as a one-hour one: the longer segment's rate
@@ -556,6 +696,10 @@ private slots:
 
         VideoStats withValue;
         withValue.networkDroppedFramePct = OptionalMetric::of(4.0);
+        // WR-09: `networkDroppedFramePct` is now frame-weighted (by `receivedFps`), not
+        // duration-weighted - the segment that carries the metric also carries its weight, since
+        // both are printed in `stringifyVideoStats()`'s own text together or not at all.
+        withValue.receivedFps = OptionalMetric::of(60.0);
 
         VideoStats withoutValue; // this decoder segment never printed the line at all
 
