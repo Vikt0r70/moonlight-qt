@@ -117,6 +117,15 @@ public:
         return m_paths;
     }
 
+    // WR-01: the `traceparent` header of the most recent request, empty when it carried none -
+    // read from `createRequest()`, which runs on this manager's own (worker) thread, so it is
+    // guarded by the same mutex `recordedPaths()` uses.
+    QByteArray recordedTraceparent()
+    {
+        QMutexLocker locker(&m_mutex);
+        return m_lastTraceparent;
+    }
+
 protected:
     QNetworkReply* createRequest(Operation operation, const QNetworkRequest& request,
                                  QIODevice* outgoingData = nullptr) override
@@ -126,6 +135,8 @@ protected:
         {
             QMutexLocker locker(&m_mutex);
             m_paths.append(request.url().path());
+            m_lastTraceparent =
+                request.hasRawHeader("traceparent") ? request.rawHeader("traceparent") : QByteArray();
         }
         ++calls;
         return new FakeReply(status.load(), body, this);
@@ -134,6 +145,7 @@ protected:
 private:
     QMutex m_mutex;
     QStringList m_paths;
+    QByteArray m_lastTraceparent;
 };
 
 // The thread handle the calling code runs on, read from the object's own thread. `quintptr` rather
@@ -309,6 +321,9 @@ private slots:
     void controlPlaneClientDestroysItselfExactlyOnceOnItsOwnThread();
     void controlPlaneClientThatWasNeverMovedIsDeletedByItsOwner();
 
+    // WR-01
+    void traceIdCapturedAtCallTimeSurvivesAClearTraceIdIssuedRightAfter();
+
     // CR-02
     void livenessTimerStartedFromAnotherThreadKeepsReporting();
     void livenessTimerStoppedFromAnotherThreadStops();
@@ -417,6 +432,41 @@ void TstThreading::controlPlaneClientThatWasNeverMovedIsDeletedByItsOwner()
     client->stopOwnedThread();
 
     delete client;   // exactly once, and a double delete here would crash the suite
+}
+
+// WR-01 (code review 06.3-REVIEW-fork.md): `handleTeardownCompleted()`'s own real-world shape -
+// queue a request, then call `clearTraceId()` synchronously right after, from the SAME (facade)
+// thread the client's owning (network) thread is not. Before this fix `send()` read `m_traceId`
+// again, on the owning thread, after the queued marshal had already run - so the synchronous
+// `clearTraceId()` below almost always won the race and the request went out with no
+// `traceparent` at all. The fix captures the id at `send()`'s own call time (on THIS thread,
+// before the marshal), so the id this test sets is the one that must reach the wire, whatever
+// `clearTraceId()` does immediately afterward.
+void TstThreading::traceIdCapturedAtCallTimeSurvivesAClearTraceIdIssuedRightAfter()
+{
+    std::atomic<int> destroyed{0};
+    std::atomic<quintptr> destroyedOn{0};
+
+    ThreadedFixture fixture;
+    ControlPlaneClient* client = fixture.startClient(&destroyed, &destroyedOn);
+    QVERIFY(client->onOwnThread());
+    QVERIFY(fixture.thread() != QThread::currentThread());
+
+    fixture.network()->body = QByteArrayLiteral("{}");
+
+    client->setTraceId(QStringLiteral("0123456789abcdef0123456789abcdef"));
+
+    bool called = false;
+    client->postSessionQuality(QStringLiteral("6f1c6f5e-3a1e-4b1e-9f2e-0f1a2b3c4d5e"), QJsonObject(),
+                               [&](const ControlPlaneResult&) { called = true; });
+    // Issued right after queuing the call above, on this (the test/facade) thread - exactly the
+    // order `handleTeardownCompleted()` uses in production.
+    client->clearTraceId();
+
+    QTRY_VERIFY(called);
+    QVERIFY2(fixture.network()->recordedTraceparent().startsWith("00-0123456789abcdef0123456789abcdef-"),
+             "the id captured when postSessionQuality() was called must reach the wire, "
+             "even though clearTraceId() ran before the queued send actually did");
 }
 
 void TstThreading::livenessTimerStartedFromAnotherThreadKeepsReporting()
