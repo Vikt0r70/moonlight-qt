@@ -24,10 +24,15 @@
 #include <QHostAddress>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QScopedPointer>
+#include <QSemaphore>
 #include <QString>
 #include <QTcpServer>
 #include <QTcpSocket>
 #include <QTemporaryDir>
+#include <QThread>
+
+#include <atomic>
 
 // This file defines `main()` via `QTEST_MAIN` below. `<SDL.h>` otherwise `#define`s `main` to
 // `SDL_main` (its own cross-platform entry-point redirection), which would rename QTest's
@@ -195,6 +200,62 @@ private slots:
         LogTee::removeSink(handle);
         qWarning() << "after removal";
         QCOMPARE(callCount, afterFirst);
+    }
+
+    // WR-07 (code review 06.3-REVIEW-fork.md): `removeSink()` used to erase the handle from the
+    // sink list and return immediately, even while a `dispatch()` already under way on another
+    // thread had already copied the list and was still calling this very sink - the header's own
+    // promise ("a `removeSink()` call before destruction is sufficient") did not hold. A sink is
+    // parked mid-call on a background thread here (having already announced it is running), and
+    // `removeSink()` - called on a second background thread, so the test thread itself is never
+    // blocked - must not return before the parked sink does.
+    void logTee_removeSink_waitsForADispatchAlreadyInFlightOnAnotherThread()
+    {
+        LogTee::clearSinksForTests();
+
+        QSemaphore entered(0);
+        QSemaphore releaseGate(0);
+        std::atomic<bool> sinkDone{ false };
+        std::atomic<bool> removeReturned{ false };
+
+        const LogTee::SinkHandle handle = LogTee::addSink(
+            [&](LogLevel, int, int, const QString& text) {
+                if (!text.contains(QStringLiteral("wr07-trigger"))) {
+                    return;
+                }
+                entered.release();
+                releaseGate.acquire(); // parked here until the test releases it, below
+                sinkDone = true;
+            });
+
+        // Thread A: logs the trigger line, which dispatch()es into the sink above and parks
+        // there. `QThread::create()` runs the callable directly as the thread's own entry point -
+        // no event loop is needed or running on either side, unlike a `QThread::started`
+        // connection (which would queue back onto this thread's own, absent, event loop).
+        QScopedPointer<QThread> dispatcherThread(QThread::create([&]() { qWarning() << "wr07-trigger"; }));
+        dispatcherThread->start();
+
+        QVERIFY2(entered.tryAcquire(1, 5000), "the sink never started running");
+
+        // Thread B: calls removeSink() for the parked sink's handle. Its own thread, not the test
+        // thread, precisely so the test can observe whether it has returned yet.
+        QScopedPointer<QThread> removerThread(QThread::create([&]() {
+            LogTee::removeSink(handle);
+            removeReturned = true;
+        }));
+        removerThread->start();
+
+        // The sink is still parked on `releaseGate`, so `removeSink()` must still be blocked.
+        QThread::msleep(200);
+        QVERIFY2(!removeReturned,
+                 "removeSink() returned before the in-flight dispatch on another thread finished");
+
+        releaseGate.release(); // lets the parked sink, and therefore dispatch(), finish
+
+        QVERIFY(dispatcherThread->wait(5000));
+        QVERIFY(removerThread->wait(5000));
+        QVERIFY(sinkDone);
+        QVERIFY(removeReturned);
     }
 
     // --- parseVideoStatsBlock / toQualityReport --------------------------------------------

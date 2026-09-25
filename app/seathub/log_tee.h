@@ -70,7 +70,16 @@ public:
     /// caller, exactly the way `SeatHubClient`'s destructor does it.
     static SinkHandle addSink(Sink sink);
 
-    /// Unregisters the sink `handle` named. A handle already removed, or `0`, is a no-op.
+    /// Unregisters the sink `handle` named, and - WR-07, code review 06.3-REVIEW-fork.md - waits
+    /// for any dispatch already calling it on another thread to finish first. `dispatch()` holds a
+    /// read lock for the whole time it is calling sinks (not only while it copies the list), and
+    /// this takes the same lock for writing, which blocks until every reader has released it. The
+    /// header used to promise this and not keep it: `dispatch()` copied the sink list under a
+    /// plain mutex, released it, and then called the copies - a thread that had already made its
+    /// copy just before this ran could still call a sink whose owner this call is meant to make
+    /// safe to destroy. A handle already removed, or `0`, is a no-op. Never call this from inside
+    /// a sink that is itself running (the same-thread re-entry guard in `dispatch()`'s own header
+    /// comment stops that from reaching here at all, but a future sink must not try).
     static void removeSink(SinkHandle handle);
 
     /// Test seam: forgets every registered sink. Does not touch the installed Qt/SDL handler

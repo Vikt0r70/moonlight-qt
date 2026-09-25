@@ -1,7 +1,8 @@
 #include "log_tee.h"
 
-#include <QMutex>
-#include <QMutexLocker>
+#include <QReadLocker>
+#include <QReadWriteLock>
+#include <QWriteLocker>
 
 #include <algorithm>
 #include <utility>
@@ -15,7 +16,13 @@ QtMessageHandler s_previousQtHandler = nullptr;
 SDL_LogOutputFunction s_previousSdlHandler = nullptr;
 void* s_previousSdlUserdata = nullptr;
 
-QMutex s_sinksMutex;
+// WR-07: a non-recursive reader/writer lock. `dispatch()` takes it for reading around the whole
+// sink-calling loop below (not only around the copy), so `removeSink()`'s write lock genuinely
+// waits for every in-flight dispatch to finish before it returns - which is what the header
+// promises. Two different threads logging at the same moment are two concurrent readers, which a
+// `QReadWriteLock` allows; only a writer (`addSink`/`removeSink`/`clearSinksForTests`) excludes
+// every reader.
+QReadWriteLock s_sinksLock;
 std::vector<std::pair<LogTee::SinkHandle, LogTee::Sink>> s_sinks;
 LogTee::SinkHandle s_nextHandle = 1;
 
@@ -46,7 +53,7 @@ void LogTee::install()
 
 LogTee::SinkHandle LogTee::addSink(Sink sink)
 {
-    QMutexLocker locker(&s_sinksMutex);
+    QWriteLocker locker(&s_sinksLock);
     const SinkHandle handle = s_nextHandle++;
     s_sinks.emplace_back(handle, std::move(sink));
     return handle;
@@ -57,7 +64,11 @@ void LogTee::removeSink(SinkHandle handle)
     if (handle == 0) {
         return;
     }
-    QMutexLocker locker(&s_sinksMutex);
+    // WR-07: the write lock blocks until every `dispatch()` currently holding the read lock -
+    // including one calling this very `handle`'s sink on another thread right now - has finished
+    // and released it. By the time this constructor returns, no dispatch that started before it
+    // is still running.
+    QWriteLocker locker(&s_sinksLock);
     s_sinks.erase(std::remove_if(s_sinks.begin(), s_sinks.end(),
                                  [handle](const std::pair<SinkHandle, Sink>& entry) {
                                      return entry.first == handle;
@@ -67,7 +78,7 @@ void LogTee::removeSink(SinkHandle handle)
 
 void LogTee::clearSinksForTests()
 {
-    QMutexLocker locker(&s_sinksMutex);
+    QWriteLocker locker(&s_sinksLock);
     s_sinks.clear();
 }
 
@@ -151,13 +162,20 @@ void LogTee::dispatch(LogLevel level, int category, int priority, const QString&
 {
     s_inDispatch = true;
 
+    // WR-07: the read lock is held for the whole function, across the sink calls below and not
+    // only around the copy - `removeSink()`'s write lock therefore cannot return while this
+    // dispatch (on whichever thread it is running) is still calling a sink. Two different threads
+    // dispatching at the same moment both hold the read lock concurrently, which `QReadWriteLock`
+    // allows; a `removeSink()` call queues behind both and lets neither in until it has the write
+    // lock to itself. No sink registered in this tree calls `addSink()`/`removeSink()`
+    // synchronously from inside itself - doing so would deadlock a thread against its own read
+    // lock, which a non-recursive `QReadWriteLock` does not resolve on its own.
+    QReadLocker locker(&s_sinksLock);
+
     std::vector<Sink> sinksCopy;
-    {
-        QMutexLocker locker(&s_sinksMutex);
-        sinksCopy.reserve(s_sinks.size());
-        for (const std::pair<SinkHandle, Sink>& entry : s_sinks) {
-            sinksCopy.push_back(entry.second);
-        }
+    sinksCopy.reserve(s_sinks.size());
+    for (const std::pair<SinkHandle, Sink>& entry : s_sinks) {
+        sinksCopy.push_back(entry.second);
     }
 
     for (const Sink& sink : sinksCopy) {
