@@ -3265,16 +3265,25 @@ private slots:
         QVERIFY(!QTest::currentTestFailed());
         QVERIFY(waitWithoutTheEventLoop([&]() { return ticks.read.load() >= 1; }));
 
+        // D-11: the stage moving to "streaming" inside `beginStreaming` (`handleConnectionStarted`)
+        // reports at once, the same way any stage change does, and that report carries no wallet
+        // read - so the running totals are captured here, before the two ticks below, rather than
+        // assumed to start at zero.
+        const int reportsBeforeTicks = m_fake->countOfPathEndingWith(QStringLiteral("/liveness"));
+        const int readsBeforeTicks = ticks.read.load() + ticks.failed.load();
+
         // Two more ticks, and each is one liveness report and one wallet read: the read has no
         // cadence of its own.
         QVERIFY(tickAndWait(client, &ticks));
         QVERIFY(tickAndWait(client, &ticks));
         QVERIFY(waitWithoutTheEventLoop([&]() {
-            return m_fake->countOfPathEndingWith(QStringLiteral("/liveness")) >= 3;
+            return m_fake->countOfPathEndingWith(QStringLiteral("/liveness")) >= reportsBeforeTicks + 2;
         }));
-        const int reports = m_fake->countOfPathEndingWith(QStringLiteral("/liveness"));
-        const int reads = ticks.read.load() + ticks.failed.load();
+        const int reports =
+            m_fake->countOfPathEndingWith(QStringLiteral("/liveness")) - reportsBeforeTicks;
+        const int reads = ticks.read.load() + ticks.failed.load() - readsBeforeTicks;
         QCOMPARE(reads, reports);
+        QCOMPARE(reports, 2);
 
         // And the source agrees: the reporter still has its two locked constants and no third.
         // (`kIntervalMs` is D-31's 10 seconds; the grace is the server's 30.)
