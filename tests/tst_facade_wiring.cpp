@@ -229,6 +229,32 @@ public:
         m_pairingCustom = true;
     }
 
+    /// What `POST /api/sessions/{id}/end` answers. The default (never called) is 200
+    /// `{"status":true}` - CR-02's own tests override it to a transport failure.
+    void answerEnd(int status, const QByteArray& body = QByteArrayLiteral("{\"status\":true}"))
+    {
+        QMutexLocker lock(&m_mutex);
+        m_endStatus = status;
+        m_endBody = body;
+    }
+
+    /// What `POST /api/sessions/{id}/quality` answers. The default (never called) is 200
+    /// `{"status":true}`.
+    void answerQuality(int status, const QByteArray& body = QByteArrayLiteral("{\"status\":true}"))
+    {
+        QMutexLocker lock(&m_mutex);
+        m_qualityStatus = status;
+        m_qualityBody = body;
+    }
+    /// CR-03: every `/quality` reply arrives this many milliseconds after it was asked for, so a
+    /// test can sign out (and a different account sign in) while an earlier account's send is
+    /// still in flight.
+    void delayQuality(int milliseconds)
+    {
+        QMutexLocker lock(&m_mutex);
+        m_qualityDelay = milliseconds;
+    }
+
     /// What `GET /api/sessions/{id}` answers: the session in `state`, under `id`, with an end reason
     /// and a billed-minutes count when given. The default is a terminal session under another id,
     /// which teardown's verification wants and the connecting stages ignore.
@@ -313,9 +339,10 @@ protected:
         const QString cursor = QUrlQuery(request.url()).queryItemValue(
             QStringLiteral("cursor"), QUrl::FullyDecoded);
         int meStatus, walletStatus, logoutStatus, loginStatus, otpRequestStatus, playStatus;
-        int pairingStatus;
+        int pairingStatus, endStatus, qualityStatus, qualityDelay;
         bool pairingCustom;
-        QByteArray meBody, walletBody, loginBody, playBody, pairingBody, sessionBody;
+        QByteArray meBody, walletBody, loginBody, playBody, pairingBody, sessionBody, endBody,
+            qualityBody;
         {
             QMutexLocker lock(&m_mutex);
             m_paths.append(path);
@@ -339,6 +366,11 @@ protected:
             pairingBody = m_pairingBody;
             pairingCustom = m_pairingCustom;
             sessionBody = m_sessionBody;
+            endStatus = m_endStatus;
+            endBody = m_endBody;
+            qualityStatus = m_qualityStatus;
+            qualityBody = m_qualityBody;
+            qualityDelay = m_qualityDelay;
         }
 
         if (isList) {
@@ -391,7 +423,10 @@ protected:
         }
 
         if (path.endsWith(QLatin1String("/end"))) {
-            return new FakeReply(200, QByteArrayLiteral("{\"status\":true}"), this);
+            return new FakeReply(endStatus, endBody, this);
+        }
+        if (path.endsWith(QLatin1String("/quality"))) {
+            return new FakeReply(qualityStatus, qualityBody, this, qualityDelay);
         }
         if (path.endsWith(QLatin1String("/pairing")) && pairingCustom) {
             return new FakeReply(pairingStatus, pairingBody, this);
@@ -448,6 +483,11 @@ private:
     QByteArray m_pairingBody;
     bool m_pairingCustom = false;
     QByteArray m_sessionBody;
+    int m_endStatus = 200;
+    QByteArray m_endBody = QByteArrayLiteral("{\"status\":true}");
+    int m_qualityStatus = 200;
+    QByteArray m_qualityBody = QByteArrayLiteral("{\"status\":true}");
+    int m_qualityDelay = 0;
 };
 
 /// An `EngineSession` that records what the facade asked it to do. Engine-free by construction:
@@ -485,6 +525,39 @@ bool waitWithoutTheEventLoop(const std::function<bool()>& condition, int timeout
         QThread::msleep(5);
     }
     return true;
+}
+
+/// Fires the real engine's own end-of-stream "Global video stats" block through the real `LogTee`
+/// singleton (CR-02, WR-04, WR-06 facade tests below), exactly the two `SDL_LogInfo()` calls
+/// `FFmpegVideoDecoder::logVideoStats()` makes (`app/streaming/video/ffmpeg.cpp:858-870`,
+/// read-only) - the dashes line is in the second call's OWN format string, not the body, matching
+/// production. `StatsWatcher` is a process-wide `LogTee` sink (installed by whichever
+/// `SeatHubClient` was constructed first in this binary), so this reaches every attached facade's
+/// own `handleVideoStatsParsed()` synchronously, on this (the test) thread, exactly as a
+/// same-thread dispatch does for a real decoder destroyed on the SDL/main thread.
+void emitStatsBlock(double renderedFps)
+{
+    // IN-08 (code review 06.3-REVIEW-fork.md, second review pass): the "Host processing
+    // latency..." line a Sunshine host's own encode latency adds
+    // (`app/streaming/video/ffmpeg.cpp:811-819`, gated on `framesWithHostProcessingLatency > 0`)
+    // between `Rendering frame rate:` and the drop lines, matching production - see
+    // `tst_stream_stats.cpp`'s own `productionStatsBlock()` comment for the same fix.
+    const QByteArray body = QStringLiteral(
+                                 "Incoming frame rate from network: 60.00 FPS\n"
+                                 "Decoding frame rate: 59.98 FPS\n"
+                                 "Rendering frame rate: %1 FPS\n"
+                                 "Host processing latency min/max/average: 0.8/3.4/1.6 ms\n"
+                                 "Frames dropped by your network connection: 0.42%\n"
+                                 "Frames dropped due to network jitter: 0.10%\n"
+                                 "Average network latency: 23 ms (variance: 4 ms)\n"
+                                 "Average decoding time: 3.21 ms\n"
+                                 "Average frame queue delay: 1.05 ms\n"
+                                 "Average rendering time (including monitor V-sync latency): 2.77 ms\n")
+                                 .arg(renderedFps, 0, 'f', 2)
+                                 .toUtf8();
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Global video stats");
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "----------------------------------------------------------\n%s", body.constData());
 }
 
 } // namespace
@@ -1749,6 +1822,505 @@ private slots:
         QVERIFY2(!secondTraceparent.isEmpty(), "the second Play carries a trace id too");
         QVERIFY2(secondTraceparent.left(36) != firstTraceparent.left(36),
                  "each Play mints its own trace id, refused or not");
+    }
+
+    // --- WR-01: every Play-end path clears the trace id (06.3-REVIEW-fork.md) ---------------------
+
+    void aRefusedPlayLeavesNoTraceIdOnALaterNonPlayRequest()
+    {
+        SeatHubClient client;
+        reachHome(client, 0);
+        QVERIFY(!QTest::currentTestFailed());
+
+        m_fake->answerPlay(402, playRefusalBody(QStringLiteral("Not enough credit."),
+                                                 QStringLiteral("SH-3K2XQ1")));
+        client.start();
+        QTRY_COMPARE_WITH_TIMEOUT(client.homeStatus(), QStringLiteral("refused"), 15000);
+
+        const int beforeReload = m_fake->requestPaths().size();
+        m_fake->answerMe(200, accountBody());
+        client.reloadAccount();
+        QTRY_VERIFY_WITH_TIMEOUT(m_fake->requestPaths().size() > beforeReload, 15000);
+        QCOMPARE(m_fake->requestPaths().at(beforeReload), QStringLiteral("/api/me"));
+        QVERIFY2(m_fake->traceparents().at(beforeReload).isEmpty(),
+                 "a refused Play must not leak its trace id onto a later, unrelated request");
+    }
+
+    // WR-01 and WR-02 together: `handlePairingFailed()` calls `reportFailure()`/`stop()` (which
+    // self-marshal onto the network thread, since this handler runs on the facade thread) and
+    // then clears the trace id - a plain, synchronous clear there would very likely beat the
+    // still-queued failure report to the wire (the same "queue, then clear" race CR-02 closed for
+    // the quality POST, on a different call site). This proves both halves at once: the failure
+    // report itself still carries the Play's id, liveness genuinely stops, and a later request
+    // carries none.
+    void aPairingFailureStopsLivenessAndClearsTheTraceIdWithoutLosingItsOwnFailureReport()
+    {
+        SeatHubClient client;
+        auto* engine = new FakeEngineSession;
+        client.session()->attachSession(engine);
+        reachHome(client, 90);
+        QVERIFY(!QTest::currentTestFailed());
+        // The default answerPairing (no rig assigned) fails pairing at once.
+
+        const int beforePlay = m_fake->requestPaths().size();
+        m_fake->answerPlay(201, QByteArrayLiteral("{\"id\":\"aaaaaaaa-1111-1111-1111-111111111111\"}"));
+        client.start();
+        QTRY_VERIFY_WITH_TIMEOUT(
+            m_fake->requestPaths().count(QStringLiteral("/api/sessions/aaaaaaaa-1111-1111-1111-111111111111/pairing")) >= 1,
+            15000);
+        QTRY_VERIFY_WITH_TIMEOUT(!client.liveness()->isRunning(), 15000); // WR-02
+
+        const QByteArray sessionCreateTrace = m_fake->traceparents().at(beforePlay).left(36);
+        QVERIFY2(!sessionCreateTrace.isEmpty(), "sanity: the session create minted a trace id");
+
+        int livenessIndex = -1;
+        {
+            const QStringList paths = m_fake->requestPaths();
+            for (int i = beforePlay; i < paths.size(); ++i) {
+                if (paths.at(i).endsWith(QStringLiteral("/liveness"))) {
+                    livenessIndex = i;
+                }
+            }
+        }
+        QVERIFY2(livenessIndex >= 0, "the pairing-failure liveness report must have been sent");
+        QVERIFY2(m_fake->traceparents().at(livenessIndex).startsWith(sessionCreateTrace),
+                 "the failed liveness report must still carry this Play's own trace id");
+
+        // WR-02: liveness has genuinely stopped - no further /liveness requests arrive.
+        const int livenessCountAfterFailure = m_fake->countOfPathEndingWith(QStringLiteral("/liveness"));
+        QTest::qWait(300);
+        QCOMPARE(m_fake->countOfPathEndingWith(QStringLiteral("/liveness")), livenessCountAfterFailure);
+
+        // WR-01: the id is cleared - a later, unrelated request carries none.
+        const int beforeReload = m_fake->requestPaths().size();
+        m_fake->answerMe(200, accountBody());
+        client.reloadAccount();
+        QTRY_VERIFY_WITH_TIMEOUT(m_fake->requestPaths().size() > beforeReload, 15000);
+        QVERIFY2(m_fake->traceparents().at(beforeReload).isEmpty(),
+                 "a pairing failure must not leak its trace id onto a later request");
+
+        client.session()->attachSession(nullptr);
+        delete engine;
+    }
+
+    void aTeardownFailureClearsTheTraceIdToo()
+    {
+        SeatHubClient client;
+        auto* engine = new FakeEngineSession;
+        client.session()->attachSession(engine);
+        reachHome(client, 90);
+        QVERIFY(!QTest::currentTestFailed());
+        client.teardown()->setVerifyIntervalMs(1);
+
+        // `beginSession()` skips `beginPlayRequest()` (the teardown tests' own established
+        // pattern), so it mints no trace id of its own - set one directly, standing in for the
+        // Play that would have minted it in production.
+        client.controlPlane()->setTraceId(QStringLiteral("fedcbafedcbafedcbafedcbafedcbafe"));
+        client.beginSession(QStringLiteral("aaaaaaaa-2222-2222-2222-222222222222"));
+        QTRY_VERIFY_WITH_TIMEOUT(client.liveSession(), 15000);
+
+        m_fake->answerEnd(500);
+        QSignalSpy failed(client.teardown(), &TeardownController::teardownFailed);
+        emit engine->readyForDeletion();
+        QTRY_COMPARE_WITH_TIMEOUT(failed.count(), 1, 15000);
+
+        const int beforeReload = m_fake->requestPaths().size();
+        m_fake->answerMe(200, accountBody());
+        client.reloadAccount();
+        QTRY_VERIFY_WITH_TIMEOUT(m_fake->requestPaths().size() > beforeReload, 15000);
+        QVERIFY2(m_fake->traceparents().at(beforeReload).isEmpty(),
+                 "a failed teardown must not leak its trace id onto a later request");
+
+        client.session()->attachSession(nullptr);
+        delete engine;
+    }
+
+    void signOutClearsTheTraceIdToo()
+    {
+        SeatHubClient client;
+        reachHome(client, 90);
+        QVERIFY(!QTest::currentTestFailed());
+
+        m_fake->answerPlay(402, playRefusalBody(QStringLiteral("Not enough credit."),
+                                                 QStringLiteral("SH-3K2XQ1")));
+        client.start();
+        QTRY_COMPARE_WITH_TIMEOUT(client.homeStatus(), QStringLiteral("refused"), 15000);
+
+        // The refused Play itself already clears its own id (the test above); set a fresh one
+        // directly so this test is not just re-proving that one.
+        client.controlPlane()->setTraceId(QStringLiteral("abcdefabcdefabcdefabcdefabcdefab"));
+
+        client.signOut();
+        QTRY_COMPARE_WITH_TIMEOUT(client.appState(), QStringLiteral("signed_out"), 15000);
+
+        m_fake->answerOtpRequest(200);
+        client.requestOtp(QStringLiteral("+962790000000"));
+        QTRY_VERIFY_WITH_TIMEOUT(
+            m_fake->requestPaths().contains(QStringLiteral("/api/auth/otp/request")), 15000);
+        QVERIFY2(m_fake->traceparents().last().isEmpty(),
+                 "signing out must not leave a Play's trace id on the next sign-in's own requests");
+    }
+
+    // --- CR-02: a quality report is never lost to teardown or a sign-out (06.3-REVIEW-fork.md) ----
+
+    void aTeardownPostFailureStoresThePendingQualityReportUnderItsOwnSessionAndAccount()
+    {
+        SeatHubClient client;
+        reachHome(client, 90);
+        QVERIFY(!QTest::currentTestFailed());
+
+        auto* engine = new FakeEngineSession;
+        client.session()->attachSession(engine);
+        client.teardown()->setVerifyIntervalMs(1);
+
+        client.beginSession(QStringLiteral("aaaaaaaa-3333-3333-3333-333333333333"));
+        QTRY_VERIFY_WITH_TIMEOUT(client.liveSession(), 15000);
+
+        emitStatsBlock(42.0);
+
+        // The exact CR-02 scenario: a dropped connection at stream end.
+        m_fake->answerEnd(0);
+        QSignalSpy failed(client.teardown(), &TeardownController::teardownFailed);
+        emit engine->readyForDeletion();
+        QTRY_COMPARE_WITH_TIMEOUT(failed.count(), 1, 15000);
+
+        const QString outboxPath =
+            QDir(m_dir->path()).filePath(QStringLiteral("quality-outbox/aaaaaaaa-3333-3333-3333-333333333333.json"));
+        QTRY_VERIFY_WITH_TIMEOUT(QFile::exists(outboxPath), 15000);
+
+        QFile file(outboxPath);
+        QVERIFY(file.open(QIODevice::ReadOnly));
+        const QJsonObject envelope = QJsonDocument::fromJson(file.readAll()).object();
+        QCOMPARE(envelope.value(QStringLiteral("account_id")).toString(),
+                 QStringLiteral("6f1c6f5e-3a1e-4b1e-9f2e-0f1a2b3c4d5e"));
+        QCOMPARE(envelope.value(QStringLiteral("report")).toObject()
+                     .value(QStringLiteral("rendered_fps")).toDouble(),
+                 42.0);
+        // Never attempted a second POST for a connection that just failed to reach the control
+        // plane once already.
+        QVERIFY2(!m_fake->requestPaths().contains(QStringLiteral("/api/sessions/aaaaaaaa-3333-3333-3333-333333333333/quality")),
+                 "handleTeardownFailed() must store straight to the outbox, not post again");
+
+        client.session()->attachSession(nullptr);
+        delete engine;
+    }
+
+    void signOutWithAPendingQualityReportStoresItUnderTheSigningOutAccount()
+    {
+        SeatHubClient client;
+        reachHome(client, 90);
+        QVERIFY(!QTest::currentTestFailed());
+
+        auto* engine = new FakeEngineSession;
+        client.session()->attachSession(engine);
+        client.teardown()->setVerifyIntervalMs(1);
+
+        client.beginSession(QStringLiteral("aaaaaaaa-4444-4444-4444-444444444444"));
+        QTRY_VERIFY_WITH_TIMEOUT(client.liveSession(), 15000);
+
+        emitStatsBlock(55.0);
+
+        // Signed out before teardown ever ran (before the engine's own readyForDeletion arrived) -
+        // the report is still only held in memory at this point.
+        client.signOut();
+        QTRY_COMPARE_WITH_TIMEOUT(client.appState(), QStringLiteral("signed_out"), 15000);
+
+        const QString outboxPath =
+            QDir(m_dir->path()).filePath(QStringLiteral("quality-outbox/aaaaaaaa-4444-4444-4444-444444444444.json"));
+        QTRY_VERIFY_WITH_TIMEOUT(QFile::exists(outboxPath), 15000);
+        QFile file(outboxPath);
+        QVERIFY(file.open(QIODevice::ReadOnly));
+        const QJsonObject envelope = QJsonDocument::fromJson(file.readAll()).object();
+        QCOMPARE(envelope.value(QStringLiteral("account_id")).toString(),
+                 QStringLiteral("6f1c6f5e-3a1e-4b1e-9f2e-0f1a2b3c4d5e"));
+
+        client.session()->attachSession(nullptr);
+        delete engine;
+    }
+
+    // --- CR-03: a drain in flight is never sent under a different account's token -----------------
+
+    void aSignOutMidDrainNeverSendsTheRemainingFileUnderTheNextAccountsToken()
+    {
+        SeatHubClient client;
+        isolateStore(client);
+        client.controlPlane()->setBaseUrl(QStringLiteral("https://control.invalid"));
+        armControlPlane(client);
+
+        const QString accountA = QStringLiteral("6f1c6f5e-3a1e-4b1e-9f2e-0f1a2b3c4d5e"); // accountBody()
+        const QString accountB = QStringLiteral("77777777-7777-7777-7777-777777777777");
+        const QString sessionA1 = QStringLiteral("11111111-1111-1111-1111-111111111111");
+        const QString sessionA2 = QStringLiteral("22222222-2222-2222-2222-222222222222");
+        const QString sessionB1 = QStringLiteral("33333333-3333-3333-3333-333333333333");
+
+        QDir(m_dir->path()).mkpath(QStringLiteral("quality-outbox"));
+        auto writeOutboxFile = [&](const QString& sessionId, const QString& accountId) {
+            QJsonObject envelope;
+            envelope.insert(QStringLiteral("account_id"), accountId);
+            QJsonObject report;
+            report.insert(QStringLiteral("rendered_fps"), 30.0);
+            envelope.insert(QStringLiteral("report"), report);
+            QFile file(QDir(m_dir->path())
+                           .filePath(QStringLiteral("quality-outbox/%1.json").arg(sessionId)));
+            QVERIFY(file.open(QIODevice::WriteOnly));
+            file.write(QJsonDocument(envelope).toJson(QJsonDocument::Compact));
+        };
+        writeOutboxFile(sessionA1, accountA);
+        writeOutboxFile(sessionA2, accountA);
+        writeOutboxFile(sessionB1, accountB);
+
+        // Held open long enough to sign out and sign back in as a different account while the
+        // first file's own send is still in flight.
+        m_fake->answerQuality(200);
+        m_fake->delayQuality(2000);
+
+        m_fake->answerMe(200, accountBody());
+        m_fake->answerWallet(200, walletBody(90));
+        QVERIFY(client.credentialStore()->storeToken(TokenStore::accessTokenName(),
+                                                      QString::fromLatin1(kAccessToken)));
+        client.restoreSession();
+        QTRY_COMPARE_WITH_TIMEOUT(client.appState(), QStringLiteral("home"), 15000);
+
+        // The first file's send is in flight (held open by delayQuality); the second must not have
+        // been attempted yet.
+        QTRY_VERIFY_WITH_TIMEOUT(
+            m_fake->requestPaths().contains(
+                QStringLiteral("/api/sessions/%1/quality").arg(sessionA1)),
+            15000);
+        QVERIFY2(!m_fake->requestPaths().contains(
+                     QStringLiteral("/api/sessions/%1/quality").arg(sessionA2)),
+                 "the second file must not be sent while the first is still in flight");
+
+        client.signOut();
+        QTRY_COMPARE_WITH_TIMEOUT(client.appState(), QStringLiteral("signed_out"), 15000);
+
+        // Sign in as B while A's held-open reply is still pending.
+        QByteArray bAccountBody = QByteArrayLiteral(
+            "{\"id\":\"77777777-7777-7777-7777-777777777777\",\"display_name\":\"Omar\","
+            "\"username\":\"omar\",\"email\":\"omar@example.com\",\"phone_e164\":\"+962790000001\","
+            "\"role\":\"customer\",\"signup_stage\":\"complete\",\"email_verified\":true,"
+            "\"phone_verified\":true,\"created_at\":\"2026-09-01T00:00:00Z\"}");
+        m_fake->answerMe(200, bAccountBody);
+        m_fake->answerWallet(200, walletBody(45));
+        m_fake->answerLogin(200, QByteArrayLiteral("{\"access_token\":\"sb_at_for_b\"}"));
+        client.signInWithPassword(QStringLiteral("omar@example.com"), QStringLiteral("irrelevant"));
+        QTRY_COMPARE_WITH_TIMEOUT(client.appState(), QStringLiteral("home"), 15000);
+
+        // B's own queued report is sent during B's sign-in.
+        QTRY_VERIFY_WITH_TIMEOUT(
+            m_fake->requestPaths().contains(
+                QStringLiteral("/api/sessions/%1/quality").arg(sessionB1)),
+            15000);
+        QCOMPARE(m_fake->authorizationFor(QStringLiteral("/api/sessions/%1/quality").arg(sessionB1)),
+                 QByteArrayLiteral("Bearer sb_at_for_b"));
+
+        // A's held-open reply finally lands; give the event loop time to process it.
+        QTest::qWait(2200);
+
+        // CR-03's own guarantee: A's second (never-yet-attempted) file was never POSTed at all
+        // once a different account had signed in - neither under A's stale token (the drain that
+        // queued it aborted, via the epoch check, without ever calling postFn for it) nor under
+        // B's (IN-05's own, separately-decided design deletes a foreign-tagged file locally,
+        // before it ever reaches postFn, the moment B's own drain scans across it - see the WARN
+        // line this produces). Either way, no HTTP request for this session ever went out under
+        // the wrong account's credential, which is what T-06.3-51 asks for.
+        QVERIFY2(!m_fake->requestPaths().contains(
+                     QStringLiteral("/api/sessions/%1/quality").arg(sessionA2)),
+                 "A's remaining file must never be sent once a different account has signed in");
+        // Likewise A's first (in-flight) file: its own reply, once it lands, is treated as
+        // Outcome::Aborted by the stale generation check rather than acted on - it must not have
+        // been re-sent a second time under B's token either.
+        QCOMPARE(m_fake->requestPaths().count(
+                     QStringLiteral("/api/sessions/%1/quality").arg(sessionA1)),
+                 1);
+    }
+
+    // --- WR-06: a fresh sign-in's own first session is never dropped for lack of an account id ----
+
+    void aFreshSignInsFirstSessionQualityReportIsStoredUnderTheRealAccountId()
+    {
+        SeatHubClient client;
+        isolateStore(client);
+        client.controlPlane()->setBaseUrl(QStringLiteral("https://control.invalid"));
+        armControlPlane(client);
+        m_fake->answerMe(200, accountBody());
+        m_fake->answerWallet(200, walletBody(90));
+
+        // A fresh sign-in, first time - the outbox is empty, so the pre-WR-06 code never even
+        // asked for the account id.
+        client.verifyOtp(QStringLiteral("+962790000000"), QStringLiteral("123456"));
+        QTRY_COMPARE_WITH_TIMEOUT(client.appState(), QStringLiteral("home"), 15000);
+        QTRY_VERIFY_WITH_TIMEOUT(m_fake->requestPaths().contains(QStringLiteral("/api/me")), 15000);
+
+        auto* engine = new FakeEngineSession;
+        client.session()->attachSession(engine);
+        client.teardown()->setVerifyIntervalMs(1);
+        client.beginSession(QStringLiteral("aaaaaaaa-5555-5555-5555-555555555555"));
+        QTRY_VERIFY_WITH_TIMEOUT(client.liveSession(), 15000);
+
+        emitStatsBlock(48.0);
+        m_fake->answerQuality(503); // Retryable - kept, never dropped
+        QSignalSpy completed(client.teardown(), &TeardownController::teardownCompleted);
+        emit engine->readyForDeletion();
+        QTRY_COMPARE_WITH_TIMEOUT(completed.count(), 1, 15000);
+
+        const QString outboxPath =
+            QDir(m_dir->path()).filePath(QStringLiteral("quality-outbox/aaaaaaaa-5555-5555-5555-555555555555.json"));
+        QTRY_VERIFY_WITH_TIMEOUT(QFile::exists(outboxPath), 15000);
+        QFile file(outboxPath);
+        QVERIFY(file.open(QIODevice::ReadOnly));
+        const QJsonObject envelope = QJsonDocument::fromJson(file.readAll()).object();
+        QCOMPARE(envelope.value(QStringLiteral("account_id")).toString(),
+                 QStringLiteral("6f1c6f5e-3a1e-4b1e-9f2e-0f1a2b3c4d5e"));
+
+        client.session()->attachSession(nullptr);
+        delete engine;
+    }
+
+    // --- CR-04 (code review 06.3-REVIEW-fork.md, second review pass): a late reply to an
+    // untagged report is never re-tagged under whichever epoch happens to be current when it
+    // lands -----------------------------------------------------------------------------------
+
+    // The WR-06 fix's own regression: A's `/api/me` fails at sign-in (`m_accountId` stays empty
+    // for A's whole session, WR-06's own held-not-dropped path), A's `/quality` POST stalls past
+    // both a sign-out AND a different account's sign-in, and only THEN lands. Before this fix the
+    // stalled reply's handler read `m_authEpoch` at REPLY time (whatever is current then, B's),
+    // not at the moment the report was actually posted (A's own, already gone) - so a later
+    // `reloadAccount()` tagged and sent A's report as B's, under B's bearer token, reaching the
+    // same threat (T-06.3-51) CR-03 already closed for the outbox's own drain, by a different
+    // path. RED on the pre-fix code: this test's own `2>1` occurrence count and outbox-existence
+    // assertions below both fail on `2cf61ab4` (a second POST for A's session, under B's token,
+    // and an outbox file for A's session tagged `account_id: B`) and pass once the epoch is
+    // captured at post time instead.
+    void aLateReplyToAnUntaggedReportIsDroppedNeverReTaggedUnderALaterAccount()
+    {
+        SeatHubClient client;
+        isolateStore(client);
+        client.controlPlane()->setBaseUrl(QStringLiteral("https://control.invalid"));
+        armControlPlane(client);
+
+        const QString sessionA = QStringLiteral("aaaaaaaa-7777-7777-7777-777777777777");
+        const QString qualityPathA =
+            QStringLiteral("/api/sessions/%1/quality").arg(sessionA);
+
+        // A signs in fresh; `/api/me` (the `fetchMe` `adoptSignIn()` always runs, WR-06) fails,
+        // so `m_accountId` stays empty for the whole of A's session - CR-04's own precondition
+        // (the finding's own "Failed /api/me at sign-in" case).
+        m_fake->answerMe(503, QByteArray());
+        m_fake->answerWallet(200, walletBody(90));
+        client.verifyOtp(QStringLiteral("+962790000002"), QStringLiteral("123456"));
+        QTRY_COMPARE_WITH_TIMEOUT(client.appState(), QStringLiteral("home"), 15000);
+        QTRY_VERIFY_WITH_TIMEOUT(m_fake->requestPaths().contains(QStringLiteral("/api/me")), 15000);
+
+        auto* engine = new FakeEngineSession;
+        client.session()->attachSession(engine);
+        client.teardown()->setVerifyIntervalMs(1);
+        client.beginSession(sessionA);
+        QTRY_VERIFY_WITH_TIMEOUT(client.liveSession(), 15000);
+
+        emitStatsBlock(48.0);
+
+        // The reply stays in flight (delayed) well past the sign-out and the next sign-in below -
+        // exactly the window CR-04's own finding names ("the time A's `/quality` request stays in
+        // flight ... a stalled POST can outlast a sign-out and a sign-in").
+        m_fake->answerQuality(503); // Retryable once it finally answers
+        m_fake->delayQuality(2500);
+        QSignalSpy completed(client.teardown(), &TeardownController::teardownCompleted);
+        emit engine->readyForDeletion();
+        QTRY_COMPARE_WITH_TIMEOUT(completed.count(), 1, 15000);
+
+        // The POST itself already went out, under A's own token, before any of what follows.
+        QTRY_VERIFY_WITH_TIMEOUT(m_fake->requestPaths().contains(qualityPathA), 15000);
+        QCOMPARE(m_fake->requestPaths().count(qualityPathA), 1);
+
+        client.signOut();
+        QTRY_COMPARE_WITH_TIMEOUT(client.appState(), QStringLiteral("signed_out"), 15000);
+
+        // B signs in - a distinct, distinguishable bearer token (unlike OTP verify, which always
+        // answers the same fixed token - see `FakeControlPlane::createRequest()`), the same way
+        // `aSignOutMidDrainNeverSendsTheRemainingFileUnderTheNextAccountsToken` (CR-03) does.
+        QByteArray bAccountBody = QByteArrayLiteral(
+            "{\"id\":\"77777777-7777-7777-7777-777777777777\",\"display_name\":\"Omar\","
+            "\"username\":\"omar\",\"email\":\"omar@example.com\",\"phone_e164\":\"+962790000001\","
+            "\"role\":\"customer\",\"signup_stage\":\"complete\",\"email_verified\":true,"
+            "\"phone_verified\":true,\"created_at\":\"2026-09-01T00:00:00Z\"}");
+        m_fake->answerMe(200, bAccountBody);
+        m_fake->answerWallet(200, walletBody(45));
+        m_fake->answerLogin(200, QByteArrayLiteral("{\"access_token\":\"sb_at_for_b\"}"));
+        client.signInWithPassword(QStringLiteral("omar@example.com"), QStringLiteral("irrelevant"));
+        QTRY_COMPARE_WITH_TIMEOUT(client.appState(), QStringLiteral("home"), 15000);
+        QTRY_VERIFY_WITH_TIMEOUT(m_fake->requestPaths().count(QStringLiteral("/api/me")) >= 2, 15000);
+        // B's own `fetchMe` reply is undelayed; give its callback a moment to fill `m_accountId`
+        // before A's own delayed reply (below) lands.
+        QTest::qWait(200);
+
+        // A's held-open reply finally lands, well after both the sign-out and B's own sign-in.
+        QTest::qWait(2700);
+
+        // The trigger the finding's own fix steps name: a later account read that flushes
+        // whatever is still held in `m_untaggedQualityReports`.
+        client.reloadAccount();
+        QTRY_VERIFY_WITH_TIMEOUT(m_fake->requestPaths().count(QStringLiteral("/api/me")) >= 3, 15000);
+        // Give `setAccount()`'s own `flushUntaggedQualityReports()`/`drainQualityOutbox()` call a
+        // moment to run (or, pre-fix, to write and send the mis-tagged file).
+        QTest::qWait(300);
+
+        // CR-04's own guarantee: A's report is dropped once the epoch that posted it is no
+        // longer current - never re-tagged and sent as B's. Exactly one attempt for A's session
+        // ever happened (the original, under A's own token); no second one, under B's, followed
+        // the reload.
+        QCOMPARE(m_fake->requestPaths().count(qualityPathA), 1);
+        QVERIFY2(m_fake->authorizationFor(qualityPathA) != QByteArrayLiteral("Bearer sb_at_for_b"),
+                 "A's session must never be sent under B's bearer token");
+
+        const QString outboxPathA =
+            QDir(m_dir->path()).filePath(QStringLiteral("quality-outbox/%1.json").arg(sessionA));
+        QVERIFY2(!QFile::exists(outboxPathA),
+                 "a dropped, never-re-tagged report must not be written to the outbox under a "
+                 "later account either");
+
+        client.session()->attachSession(nullptr);
+        delete engine;
+    }
+
+    // --- WR-04: a decoder recreation mid-session aggregates, rather than overwrites ----------------
+
+    void aDecoderRecreationMidSessionAggregatesBothSegmentsRatherThanReportingOnlyTheLast()
+    {
+        SeatHubClient client;
+        reachHome(client, 90);
+        QVERIFY(!QTest::currentTestFailed());
+
+        auto* engine = new FakeEngineSession;
+        client.session()->attachSession(engine);
+        client.teardown()->setVerifyIntervalMs(1);
+        client.beginSession(QStringLiteral("aaaaaaaa-6666-6666-6666-666666666666"));
+        QTRY_VERIFY_WITH_TIMEOUT(client.liveSession(), 15000);
+
+        // The moment the stream truly begins - starts the aggregator's clock.
+        emit client.session()->connectionStarted();
+
+        QThread::msleep(50);
+        emitStatsBlock(30.0); // segment 1 (a decoder that ran ~50 ms)
+        QThread::msleep(150);
+        emitStatsBlock(60.0); // segment 2, after a fullscreen toggle recreated the decoder
+
+        QSignalSpy completed(client.teardown(), &TeardownController::teardownCompleted);
+        emit engine->readyForDeletion();
+        QTRY_COMPARE_WITH_TIMEOUT(completed.count(), 1, 15000);
+
+        const QByteArray body =
+            m_fake->bodyFor(QStringLiteral("/api/sessions/aaaaaaaa-6666-6666-6666-666666666666/quality"));
+        const double renderedFps =
+            QJsonDocument::fromJson(body).object().value(QStringLiteral("rendered_fps")).toDouble();
+        QVERIFY2(renderedFps > 30.0 && renderedFps < 60.0,
+                 qPrintable(QStringLiteral(
+                                "rendered_fps was %1, expected strictly between 30 and 60 - "
+                                "today's code posts exactly the last segment's 60")
+                                .arg(renderedFps)));
+
+        client.session()->attachSession(nullptr);
+        delete engine;
     }
 
     // --- the connecting stages are the session's own state (CUST-12, ADR-0055) ------------------------

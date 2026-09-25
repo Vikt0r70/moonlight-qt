@@ -68,9 +68,38 @@ public:
     /// shorter lifetime than the process MUST be paired with a `removeSink()` call before that
     /// object is destroyed - `LogTee`'s own sink list is process-global and outlives any one
     /// caller, exactly the way `SeatHubClient`'s destructor does it.
+    ///
+    /// WR-10 (code review 06.3-REVIEW-fork.md, second review pass): called from inside a sink
+    /// that is itself running, on the thread that is dispatching it - the same re-entry
+    /// `dispatch()`'s own `thread_local` guard already detects for the Qt/SDL handler chain -
+    /// this is DEFERRED rather than applied immediately. Taking the same write lock `dispatch()`
+    /// is holding for reading, on the SAME thread, would deadlock that thread against itself
+    /// (`QReadWriteLock` is non-recursive: a thread already holding it for reading cannot also
+    /// take it for writing - Qt's own `QReadWriteLock::RecursionMode` documentation). The handle
+    /// returned here is still valid immediately (allocated up front, independent of the sink
+    /// list itself), and the sink is registered the moment the dispatch that is currently running
+    /// on this thread returns - see `dispatch()`'s own comment for exactly where.
     static SinkHandle addSink(Sink sink);
 
-    /// Unregisters the sink `handle` named. A handle already removed, or `0`, is a no-op.
+    /// Unregisters the sink `handle` named, and - WR-07, code review 06.3-REVIEW-fork.md - waits
+    /// for any dispatch already calling it on another thread to finish first. `dispatch()` holds a
+    /// read lock for the whole time it is calling sinks (not only while it copies the list), and
+    /// this takes the same lock for writing, which blocks until every reader has released it. The
+    /// header used to promise this and not keep it: `dispatch()` copied the sink list under a
+    /// plain mutex, released it, and then called the copies - a thread that had already made its
+    /// copy just before this ran could still call a sink whose owner this call is meant to make
+    /// safe to destroy. A handle already removed, or `0`, is a no-op.
+    ///
+    /// WR-10 (code review 06.3-REVIEW-fork.md, second review pass): calling this from inside a
+    /// sink that is itself running, on the thread dispatching it, does NOT wait and does NOT
+    /// deadlock - it is deferred instead, exactly like `addSink()` above, and applied the moment
+    /// that dispatch returns. A previous revision of this comment claimed the same-thread
+    /// re-entry guard "stops that from reaching here at all"; it did not - that guard is checked
+    /// only inside `qtHandler()`/`sdlHandler()`, before either one ever calls `dispatch()`, and
+    /// neither `addSink()` nor `removeSink()` read it at all before this fix. Nothing in this
+    /// tree calls either function from inside a sink today (this defer path is currently dead
+    /// code, exercised only by its own test), but a future sink now gets a real guarantee instead
+    /// of a silent hang with no diagnostic.
     static void removeSink(SinkHandle handle);
 
     /// Test seam: forgets every registered sink. Does not touch the installed Qt/SDL handler

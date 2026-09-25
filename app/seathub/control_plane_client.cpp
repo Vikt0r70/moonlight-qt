@@ -3,6 +3,7 @@
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonParseError>
+#include <QMutexLocker>
 #include <QNetworkAccessManager>
 #include <QNetworkReply>
 #include <QNetworkRequest>
@@ -48,9 +49,12 @@ bool isValidTraceId(const QString& traceId)
     return !allZero;
 }
 
-// A 16-hex-character value from `QRandomGenerator::system()`, zero-padded - used for both a
-// trace id's low half (when the caller wants one minted, `SeatHubClient::beginPlayRequest`) and
-// a `traceparent` span id (`ControlPlaneClient::send`, one per request).
+// IN-03 (code review 06.3-REVIEW-fork.md): a 16-hex-character value from `QRandomGenerator::
+// system()`, zero-padded - used for the `traceparent` span id (`ControlPlaneClient::send`, one
+// per request). `SeatHubClient::beginPlayRequest()`'s own `randomTraceId()`
+// (`seathub_client.cpp`) mints the trace id itself with its own, separate pair of
+// `QRandomGenerator::system()->generate64()` calls - it does not call this function, despite an
+// earlier version of this comment saying otherwise.
 QString randomHex16()
 {
     return QString::number(QRandomGenerator::system()->generate64(), 16)
@@ -656,12 +660,24 @@ void ControlPlaneClient::setBaseUrl(const QString& baseUrl)
 
 void ControlPlaneClient::setAccessToken(const QString& token)
 {
+    QMutexLocker locker(&m_credentialMutex);
     m_accessToken = token;
+}
+
+bool ControlPlaneClient::hasAccessToken() const
+{
+    QMutexLocker locker(&m_credentialMutex);
+    return !m_accessToken.isEmpty();
 }
 
 void ControlPlaneClient::setTraceId(const QString& traceId)
 {
+    QMutexLocker locker(&m_credentialMutex);
     if (!isValidTraceId(traceId)) {
+        // WR-01: a malformed value clears the id rather than leaving the previous Play's id in
+        // place - `setTraceId()` used to ignore it silently here, so an invalid mint kept
+        // whatever the last Play had set.
+        m_traceId.clear();
         return;
     }
     m_traceId = traceId;
@@ -669,7 +685,25 @@ void ControlPlaneClient::setTraceId(const QString& traceId)
 
 void ControlPlaneClient::clearTraceId()
 {
+    QMutexLocker locker(&m_credentialMutex);
     m_traceId.clear();
+}
+
+QString ControlPlaneClient::traceId() const
+{
+    QMutexLocker locker(&m_credentialMutex);
+    return m_traceId;
+}
+
+void ControlPlaneClient::clearTraceIdIfEquals(const QString& expected)
+{
+    if (expected.isEmpty()) {
+        return;
+    }
+    QMutexLocker locker(&m_credentialMutex);
+    if (m_traceId == expected) {
+        m_traceId.clear();
+    }
 }
 
 void ControlPlaneClient::setNetworkAccessManager(QNetworkAccessManager* manager)
@@ -735,6 +769,28 @@ void ControlPlaneClient::stopOwnedThread()
 void ControlPlaneClient::send(const QString& method, const QString& path, const QByteArray& body,
                              bool authenticated, Callback callback)
 {
+    // WR-01: the access token and the trace id are captured here, at call time, under the same
+    // lock `setAccessToken`/`setTraceId`/`clearTraceId` take - not read from the member again once
+    // this call is queued onto the owning thread. Before this fix both were read from the member
+    // inside the queued lambda below, which for the trace id was a deliberate design (a
+    // `setTraceId` racing the marshal was meant to still be picked up) but broke in exactly the
+    // case that design didn't anticipate: `handleTeardownCompleted()` queues a
+    // `postSessionQuality()` call and then calls `clearTraceId()` synchronously, on the facade
+    // thread, a few lines later - the clear almost always wins the race against the still-queued
+    // send, so the Play's own `/quality` POST went out with no `traceparent` at all. Capturing at
+    // call time removes the race for both fields, and also removes a genuine data race:
+    // `m_accessToken`/`m_traceId` were written from one thread (sign-in, sign-out, a fresh
+    // `traceId`) while `send()` read them from another (the network thread) with no
+    // synchronisation - a plain `QString` is not safe for that, and `clear()` could free the
+    // buffer a concurrent `toUtf8()` was reading.
+    QString accessToken;
+    QString traceId;
+    {
+        QMutexLocker locker(&m_credentialMutex);
+        accessToken = m_accessToken;
+        traceId = m_traceId;
+    }
+
     // Every public call funnels through here, and here is the one place that knows the
     // caller may be on a different thread than this object. A queued invocation makes the
     // access to `m_network` happen on the owning thread, which is what
@@ -742,28 +798,35 @@ void ControlPlaneClient::send(const QString& method, const QString& path, const 
     if (QThread::currentThread() != thread()) {
         QMetaObject::invokeMethod(
             this,
-            [this, method, path, body, authenticated, callback]() {
-                send(method, path, body, authenticated, callback);
+            [this, method, path, body, authenticated, accessToken, traceId, callback]() {
+                sendOnOwningThread(method, path, body, authenticated, accessToken, traceId, callback);
             },
             Qt::QueuedConnection);
         return;
     }
 
+    sendOnOwningThread(method, path, body, authenticated, accessToken, traceId, callback);
+}
+
+void ControlPlaneClient::sendOnOwningThread(const QString& method, const QString& path,
+                                            const QByteArray& body, bool authenticated,
+                                            const QString& accessToken, const QString& traceId,
+                                            Callback callback)
+{
     QUrl url(m_baseUrl + path);
     QNetworkRequest request(url);
     request.setHeader(QNetworkRequest::UserAgentHeader, QStringLiteral("SeatHub"));
 
-    if (authenticated && !m_accessToken.isEmpty()) {
-        request.setRawHeader("Authorization", QByteArrayLiteral("Bearer ") + m_accessToken.toUtf8());
+    if (authenticated && !accessToken.isEmpty()) {
+        request.setRawHeader("Authorization", QByteArrayLiteral("Bearer ") + accessToken.toUtf8());
     }
 
-    // D-27: one trace id per Play, on every request of it. `m_traceId` is read here, on the
-    // owning thread the re-invoke above already marshalled onto - never captured into that
-    // lambda, so a `setTraceId`/`clearTraceId` racing the marshal is still picked up. The span
-    // id is fresh per request (`00-<trace>-<span>-01`, W3C's own form); the trace id is not.
-    if (!m_traceId.isEmpty()) {
+    // D-27: one trace id per Play, on every request of it - the value captured at `send()`'s own
+    // call time (WR-01), above. The span id is fresh per request (`00-<trace>-<span>-01`, W3C's
+    // own form); the trace id is not.
+    if (!traceId.isEmpty()) {
         request.setRawHeader("traceparent",
-                             QByteArrayLiteral("00-") + m_traceId.toUtf8()
+                             QByteArrayLiteral("00-") + traceId.toUtf8()
                                  + QByteArrayLiteral("-") + randomHex16().toUtf8()
                                  + QByteArrayLiteral("-01"));
     }

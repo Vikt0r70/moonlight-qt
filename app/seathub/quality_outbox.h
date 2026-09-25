@@ -55,6 +55,14 @@ public:
         Refused,
         AuthFailed,
         Retryable,
+        /// CR-03: the caller aborted this attempt (`ControlPlaneResult::wasAborted`) before or
+        /// after issuing it, because the account it would have gone out under is no longer the
+        /// signed-in one (a sign-out, or a sign-in as someone else, mid-drain). Kept, exactly like
+        /// `AuthFailed`, and stops the rest of this call's loop the same way - but unlike
+        /// `AuthFailed` it does NOT set `m_blockedTokenGeneration`: nothing about the credential
+        /// itself failed, so a later `drain()` call under a fresh generation must not be blocked
+        /// by this one's own captured (now-stale) generation.
+        Aborted,
     };
 
     /// The rule every attempt (the first try and every `drain()` retry) is judged by. Exposed so
@@ -105,13 +113,34 @@ public:
     /// bullet).
     void drain(const QString& tokenGeneration, const QString& accountId, PostFn postFn);
 
+    /// CR-03 (code review 06.3-REVIEW-fork.md): aborts whatever `drain()` call is currently in
+    /// flight and resets `m_draining` immediately, so the very next `drain()` call - typically the
+    /// next thing `SeatHubClient` does, a sign-out or a sign-in as someone else - is never
+    /// silently swallowed by a stale in-flight state that may never resolve (the account it was
+    /// draining for is no longer the signed-in one, so nothing says its reply will ever arrive, or
+    /// arrive soon). Any `drainFiles()` callback still in flight from before this call becomes a
+    /// no-op for its own bookkeeping - see `drainFiles()`'s own comment on the generation check -
+    /// though a genuine server answer it already received (a 200, a 404, ...) still deletes or
+    /// keeps the file on disk exactly as `classify()` says, since that reflects real server state
+    /// regardless of which `drain()` call asked for it. Called from `SeatHubClient::signOut()` and
+    /// the 401 branch of `applyRestoreResult()`.
+    void cancel();
+
 private:
     QString pathFor(const QString& sessionId) const;
     void drainFiles(const QStringList& files, int index, const QString& tokenGeneration,
-                    const QString& accountId, const PostFn& postFn);
+                    const QString& accountId, const PostFn& postFn, quint64 generation);
 
     QString m_directory;
     bool m_draining = false;
+    /// CR-03: bumped by every `drain()` call and by `cancel()`. Captured into each `drainFiles()`
+    /// callback; a callback whose captured value no longer matches this one belongs to a
+    /// superseded `drain()` (or one `cancel()` explicitly ended) and must not touch `m_draining`,
+    /// `m_blockedTokenGeneration`, or continue that call's own loop - a plain `m_draining` guard
+    /// alone cannot express "a NEWER drain() may proceed even though an OLDER one has not answered
+    /// yet", which is exactly what a sign-out mid-drain, followed immediately by a sign-in as
+    /// someone else, needs.
+    quint64 m_drainGeneration = 0;
     /// The `tokenGeneration` an `AuthFailed` outcome was last refused under, or empty. Compared by
     /// value, not cleared on a successful `Delivered`/`Refused` elsewhere in the same generation -
     /// only a *different* `tokenGeneration` argument to `drain()` clears the block, which is

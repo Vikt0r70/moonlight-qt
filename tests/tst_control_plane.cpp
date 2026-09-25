@@ -789,6 +789,35 @@ private slots:
         QVERIFY2(!fake->lastRequest.hasRawHeader("traceparent"), "clearTraceId stops the header");
     }
 
+    // WR-01 #4 (code review 06.3-REVIEW-fork.md): a malformed value used to be ignored silently,
+    // which left the PREVIOUS Play's id in place - `setTraceId_withAMalformedValue_isIgnored()`
+    // above never actually catches that, because it starts from no id set at all. This one sets a
+    // real id first, confirms it is on the wire, then mints a malformed one (the shape
+    // `beginPlayRequest()`'s own `randomTraceId()` could never actually produce, but the point is
+    // the *clearing* behaviour, not how a caller would get here) and asserts the id is gone, not
+    // still the old one.
+    void setTraceId_withAMalformedValueAfterAValidOne_clearsItRatherThanKeepingTheOld()
+    {
+        ControlPlaneClient client;
+        auto* fake = new FakeNetworkAccessManager;
+        client.setNetworkAccessManager(fake);
+        fake->status = 200;
+        fake->body = okBody();
+
+        client.setTraceId(QStringLiteral("0123456789abcdef0123456789abcdef"));
+        bool called = false;
+        client.fetchSession(QStringLiteral("s"), [&](const ControlPlaneResult&) { called = true; });
+        QTRY_VERIFY(called);
+        QVERIFY(fake->lastRequest.hasRawHeader("traceparent"));
+
+        client.setTraceId(QStringLiteral("not-32-hex-chars"));
+        called = false;
+        client.fetchSession(QStringLiteral("s"), [&](const ControlPlaneResult&) { called = true; });
+        QTRY_VERIFY(called);
+        QVERIFY2(!fake->lastRequest.hasRawHeader("traceparent"),
+                 "a malformed setTraceId() must clear the previous id, not keep it");
+    }
+
     // --- liveness payload (D-34, ADR-0041) --------------------------------------------------
 
     void livenessPayload_carriesStateAndErrorCode()

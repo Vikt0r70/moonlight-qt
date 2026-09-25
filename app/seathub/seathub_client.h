@@ -20,6 +20,7 @@
 #include <QUrl>
 #include <QVariantList>
 #include <QVariantMap>
+#include <QVector>
 #include <QWindow>
 
 #include <functional>
@@ -565,16 +566,58 @@ private:
     /// Forgets the balance. Called at sign-out so the next customer never sees this one's.
     void resetBalance();
     /// Fills `m_identity` and `m_account` from a confirmed account. Also fills `m_accountId`
-    /// (D-17, Plan 30) and, once a token is present, drains the quality outbox - the one place
-    /// this facade ever learns the signed-in account's real id (`AccountInfo::id`), since a
-    /// fresh sign-in itself never reads it (`tst_facade_wiring.cpp`'s own "the in-session
-    /// sign-ins never fill it" contract).
+    /// (D-17, Plan 30), flushes any `m_untaggedQualityReports` entry still waiting on it (WR-06),
+    /// and, once a token is present, drains the quality outbox. Called by `applyRestoreResult()`
+    /// and by the profile's own reads - `adoptSignIn()`'s own `fetchMe` callback fills
+    /// `m_accountId` the same way but does not route back through this method (it has no
+    /// `AccountInfo::displayName`/`username`/etc. worth re-filling `m_account`/`m_identity` from a
+    /// second time, having just set both from what the customer typed).
     void setAccount(const AccountInfo& account);
     /// D-17/Plan 30: resends every quality report this outbox is holding for `m_accountId`, once
     /// both it and an access token are known. A no-op otherwise (see `QualityOutbox::drain()`'s
     /// own no-op conditions, including one already in flight and a token generation an earlier
-    /// call already saw refused with 401/403).
+    /// call already saw refused with 401/403). CR-03: the account is captured at the moment this
+    /// call starts and checked again before every send and every reply, so a sign-out (or a
+    /// sign-in as someone else) mid-drain stops the loop rather than sending the rest of one
+    /// account's reports under another's token.
     void drainQualityOutbox();
+    /// CR-02: the report `handleVideoStatsParsed()` bound to `m_pendingQualitySessionId`, posted
+    /// once and cleared - used by `handleTeardownCompleted()`, where a fresh attempt is worth
+    /// making because teardown itself just succeeded. Falls back to the outbox exactly the way
+    /// the original single-attempt path did: a `Retryable`/`AuthFailed` outcome is stored, and a
+    /// `Refused` one is dropped with a WARN line. WR-06: one with no signed-in account to tag it
+    /// with yet is held in `m_untaggedQualityReports` rather than dropped - see that member's own
+    /// comment. A no-op when nothing is pending.
+    void postOrStoreQualityReport();
+    /// CR-02: the report `handleVideoStatsParsed()` bound to `m_pendingQualitySessionId`, written
+    /// straight to the outbox with no further POST attempt - used by `handleTeardownFailed()`
+    /// (the teardown POST itself already failed to reach the control plane, so attempting another
+    /// one immediately is not worth it) and by `signOut()` (nothing is worth trying once the
+    /// customer has already asked to leave). WR-06: with no account id yet, held the same way
+    /// `postOrStoreQualityReport()` does. A no-op when nothing is pending.
+    void storeQualityReportToOutbox();
+    /// WR-06: tags and stores every `m_untaggedQualityReports` entry whose epoch is still
+    /// `m_authEpoch` - a report parsed before this sign-in's account id was known, now that it is.
+    /// Called from `setAccount()` and from `adoptSignIn()`'s own `fetchMe` callback, both right
+    /// after `m_accountId` is filled. A no-op with no account id or nothing held.
+    void flushUntaggedQualityReports();
+    /// WR-01: clears this Play's trace id, but only after any liveness report `reportFailure()`/
+    /// `stop()` just queued onto `m_liveness`'s own (network) thread has actually run there -
+    /// called from `handlePairingFailed()` and the start-refusal branch of
+    /// `handlePairingCompleted()`, both of which call `reportFailure()`/`stop()` immediately
+    /// before this. Those two re-invoke themselves onto the network thread because this handler
+    /// runs on the facade thread (`LivenessTimer`'s own class comment); a plain, synchronous
+    /// `ControlPlaneClient::clearTraceId()` right after them would very likely run BEFORE that
+    /// queued failure report ever reaches `send()`, so the report - the one line that is supposed
+    /// to say "SeatHub failed at pairing" (D-11) - would go out with no `traceparent` at all
+    /// (the same "queue, then clear" race CR-02's own fix closed for the quality POST, on a
+    /// different call site). The id is captured here, on the facade thread, and the clear itself
+    /// is marshalled onto the control-plane's thread - which places it, in posting order, after
+    /// the already-queued report/stop calls on that same thread's event queue - and only takes
+    /// effect if the id is still the one captured here (`ControlPlaneClient::clearTraceIdIfEquals`):
+    /// a plain queued clear with no comparison would otherwise wipe a DIFFERENT, newer Play's id
+    /// if the customer hit "Try again" before this queued clear ran.
+    void clearThisPlaysTraceIdAfterAnyQueuedLivenessReport();
     /// The subfolder of wherever `TokenStore` currently is that the quality outbox reads and
     /// writes - re-derived on every call rather than cached, so a test's `isolateStore()` (which
     /// runs after construction) still isolates this outbox with no test file of its own changed.
@@ -702,10 +745,35 @@ private:
     StatsWatcher* m_statsWatcher = nullptr;
     LogTee::SinkHandle m_statsSinkHandle = 0;
     LogTee::SinkHandle m_terminationSinkHandle = 0;
-    /// The stats block parsed before this session's teardown began (Pitfall 7), held until
-    /// `handleTeardownCompleted()` posts it once.
+    /// WR-04: combines every decoder segment's own block (a fullscreen toggle, a display
+    /// move/resize, or a renderer reset each recreate the decoder mid-stream) into one report for
+    /// the whole session. Started at `handleConnectionStarted()`, fed by every
+    /// `handleVideoStatsParsed()`, read by `postOrStoreQualityReport()`.
+    VideoStatsAggregator m_statsAggregator;
+    /// The stats block(s) parsed before this session's teardown began (Pitfall 7), held until
+    /// `handleTeardownCompleted()`/`handleTeardownFailed()`/`signOut()` disposes of it once
+    /// (CR-02). Bound to the session it was parsed for (`m_pendingQualitySessionId`) rather than
+    /// read from `m_sessionId` again later, because a later handler may run after `m_sessionId`
+    /// has already moved on to "no session" or a new one.
     QJsonObject m_pendingQualityReport;
+    QString m_pendingQualitySessionId;
     bool m_hasPendingQualityReport = false;
+
+    /// WR-06 (code review 06.3-REVIEW-fork.md): a report that could not be tagged because
+    /// `m_accountId` was still empty when `postOrStoreQualityReport()`/`storeQualityReportToOutbox()`
+    /// needed it - a customer's first session, signed in fresh and played straight away, before
+    /// `adoptSignIn()`'s own `fetchMe()` has answered. Held here, by `m_authEpoch`, rather than
+    /// dropped outright: `flushUntaggedQualityReports()` tags and stores every entry whose epoch is
+    /// still current the moment `m_accountId` is next filled (`setAccount()`, or `adoptSignIn()`'s
+    /// `fetchMe` callback). An entry whose epoch is no longer current (a sign-out moved past it)
+    /// is the one drop this outbox still has - `signOut()`'s own comment names it.
+    struct PendingUntaggedQualityReport
+    {
+        QString sessionId;
+        QJsonObject report;
+        quint64 epoch = 0;
+    };
+    QVector<PendingUntaggedQualityReport> m_untaggedQualityReports;
 
     /// The engine session this launch attached, or null. Owned here: the lifecycle drives it and
     /// deliberately does not destroy it (it cannot know whether the attacher has other uses for

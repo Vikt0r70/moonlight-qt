@@ -47,6 +47,7 @@
 
 #include <QJsonObject>
 #include <QList>
+#include <QMutex>
 #include <QObject>
 #include <QString>
 #include <functional>
@@ -73,6 +74,17 @@ struct ControlPlaneResult
     QString failure;
     /// The parsed response object. Empty on failure.
     QJsonObject body;
+
+    /// CR-03 (code review 06.3-REVIEW-fork.md): true when this "result" never touched the wire at
+    /// all - `QualityOutbox::drain()`'s caller decided, before or after issuing the real request,
+    /// that the account it would have been sent for is no longer the signed-in one. Not a real
+    /// transport or server outcome, so it is never mistaken for one: `QualityOutbox::classify()`
+    /// checks this field first, ahead of `ok`/`statusCode`.
+    bool wasAborted = false;
+
+    /// A result that never reached the network (`wasAborted == true`, everything else at its
+    /// default). See the field's own comment.
+    static ControlPlaneResult aborted() { ControlPlaneResult r; r.wasAborted = true; return r; }
 
     SeatHubFailure toFailure() const;
 };
@@ -335,17 +347,33 @@ public:
     QString baseUrl() const { return m_baseUrl; }
 
     /// The bearer access token. Held here and attached as an `Authorization` header on every
-    /// request; it is never handed out (D-35).
+    /// request; it is never handed out (D-35). Guarded by `m_credentialMutex` (WR-01): written
+    /// from whichever thread signs in or signs out, read at `send()`'s call time from whichever
+    /// thread calls a public method - the same mutex `setTraceId`/`clearTraceId` use.
     void setAccessToken(const QString& token);
-    bool hasAccessToken() const { return !m_accessToken.isEmpty(); }
+    bool hasAccessToken() const;
 
     /// D-27: the W3C trace id this client stamps as `traceparent` on every request until
-    /// `clearTraceId()`. Must be 32 lowercase hex characters and not all zeros (W3C); anything
-    /// else is ignored, so a malformed value never reaches the wire and `send()` behaves exactly
-    /// as it did with no trace id set.
+    /// `clearTraceId()`. Must be 32 lowercase hex characters and not all zeros (W3C); a malformed
+    /// value clears the id instead of being silently ignored (WR-01: an invalid mint must not
+    /// leave the previous Play's id in place). Guarded by `m_credentialMutex`, the same as
+    /// `setAccessToken` (WR-01: both are written from one thread and read from another with no
+    /// synchronisation before this fix - a data race on a non-atomic `QString`, and `clear()`
+    /// could free the buffer a concurrent read was using).
     void setTraceId(const QString& traceId);
     /// Stops sending `traceparent`.
     void clearTraceId();
+    /// The id currently set, or empty. Read under the same lock, so a caller that wants to clear
+    /// it conditionally (`clearTraceIdIfEquals`) can capture "the id I minted for this Play"
+    /// without racing a concurrent `setTraceId`.
+    QString traceId() const;
+    /// WR-01: clears the id only if it still equals `expected` - a no-op for an empty `expected`
+    /// (never means "clear whatever is there"). Exists for a caller whose own clear has to be
+    /// marshalled onto this object's thread to run after an already-queued send that must still
+    /// carry the id (`SeatHubClient::handlePairingFailed()`'s own comment has the whole story): a
+    /// PLAIN queued clear, with no comparison, would otherwise wipe a *different*, newer Play's id
+    /// if the customer retried before the queued clear ran.
+    void clearTraceIdIfEquals(const QString& expected);
 
     /// Replaces the access manager. Exists so a test can drive every response path without a
     /// server; production never calls it.
@@ -460,15 +488,23 @@ signals:
 private:
     void send(const QString& method, const QString& path, const QByteArray& body,
               bool authenticated, Callback callback);
+    /// The rest of what `send()` used to do after its thread marshal, now taking the access token
+    /// and trace id as parameters captured at `send()`'s own call time (WR-01) instead of reading
+    /// `m_accessToken`/`m_traceId` again here, on whichever thread this runs on.
+    void sendOnOwningThread(const QString& method, const QString& path, const QByteArray& body,
+                            bool authenticated, const QString& accessToken, const QString& traceId,
+                            Callback callback);
     void finishReply(QNetworkReply* reply, Callback callback);
 
     QNetworkAccessManager* m_network = nullptr;
     bool m_ownsNetwork = false;
     QThread* m_thread = nullptr;
     QString m_baseUrl;
+
+    /// WR-01: guards `m_accessToken` and `m_traceId`, the two fields a setter writes from one
+    /// thread while `send()` reads from another. `mutable` so `hasAccessToken() const` can lock
+    /// it too.
+    mutable QMutex m_credentialMutex;
     QString m_accessToken;
-    /// D-27: read only inside `send()`, on the owning thread - never captured into the queued
-    /// re-invoke lambda `send()` already uses to marshal a foreign-thread call, so a `setTraceId`
-    /// that lands after the marshal but before `send()` actually runs is still picked up.
     QString m_traceId;
 };

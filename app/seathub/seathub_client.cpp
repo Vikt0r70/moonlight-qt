@@ -903,6 +903,13 @@ void SeatHubClient::beginPlayRequest()
 
 void SeatHubClient::applyPlayFailure(const ControlPlaneResult& result)
 {
+    // WR-01: a refused Play (a balance floor, a duplicate session, or an unreachable control
+    // plane) is a Play end too - the trace id `beginPlayRequest()` minted must not leak onto the
+    // customer's next request (another Play, a wallet poll, or another customer's sign-in on a
+    // shared PC). Before this fix only `handleTeardownCompleted()` ever cleared it, so every
+    // refused Play left its id in place.
+    m_controlPlane->clearTraceId();
+
     // `NO_HOST_AVAILABLE` is the empty state, not an incident (copy.md §Play flow, "No rig"):
     // the right answer is the sentence and the next thing to do, not the error screen.
     if (result.failure == QLatin1String("NO_HOST_AVAILABLE")) {
@@ -1092,30 +1099,33 @@ bool SeatHubClient::adoptSignIn(const AuthTokenPair& pair, const QString& identi
     m_identity = identity;
     emit identityChanged();
 
-    // D-17/Plan 30: a fresh sign-in never reads the account's real id itself
-    // (`tst_facade_wiring.cpp`'s own "the in-session sign-ins never fill it" contract - identity
-    // and account rows come from a restore or the profile, never here), so a report that fails to
-    // send from THIS session cannot yet be tagged and is dropped rather than stored untagged (see
-    // `handleTeardownCompleted()`). The only thing worth an extra `GET /api/me` for is a report
-    // some EARLIER process already queued - every existing test's outbox directory is empty, so
-    // this costs those tests nothing, and it is the one way a report survives to "the next
-    // sign-in" (this plan's own truth line) rather than only ever reaching the next launch.
+    // WR-06 (code review 06.3-REVIEW-fork.md): a fresh sign-in used to read the account's real id
+    // only when the outbox already held a file (`hasQueuedReports()`), so a customer who signed in
+    // for the first time and played straight away had `m_accountId` still empty at their own
+    // teardown - and any `Retryable`/`AuthFailed` outcome for that very first session was then
+    // dropped, "has no signed-in account to tag it with", which undid the outbox for exactly the
+    // sessions it matters most for (a new customer's first one). `fetchMe` now always runs
+    // (guarded by `epoch` the same way it already was), whether or not the outbox has anything
+    // queued yet - it also fills `m_accountId` before this session's own teardown can need it, not
+    // only before an earlier process's leftover report can be drained. If `fetchMe` itself fails,
+    // or simply has not answered yet by the time a report needs a tag, that report is held rather
+    // than dropped (`m_untaggedQualityReports`) and is tagged the moment `m_accountId` is next
+    // filled, this epoch - by this same callback, or by a later `openProfile()`/restore.
     m_qualityOutbox.setDirectory(qualityOutboxDirectory());
-    if (m_qualityOutbox.hasQueuedReports()) {
-        const quint64 epoch = m_authEpoch;
-        m_controlPlane->fetchMe([this, epoch](const ControlPlaneResult& result) {
-            onClientThread(this, [this, epoch, result]() {
-                if (epoch != m_authEpoch) {
-                    return;
-                }
-                AccountInfo account;
-                if (result.ok && AccountInfo::parse(result.body, &account)) {
-                    m_accountId = account.id;
-                    drainQualityOutbox();
-                }
-            });
+    const quint64 epoch = m_authEpoch;
+    m_controlPlane->fetchMe([this, epoch](const ControlPlaneResult& result) {
+        onClientThread(this, [this, epoch, result]() {
+            if (epoch != m_authEpoch) {
+                return;
+            }
+            AccountInfo account;
+            if (result.ok && AccountInfo::parse(result.body, &account)) {
+                m_accountId = account.id;
+                flushUntaggedQualityReports();
+                drainQualityOutbox();
+            }
         });
-    }
+    });
 
     return true;
 }
@@ -1220,6 +1230,27 @@ QVariantMap SeatHubClient::readAgentConfigFile(const QUrl& fileUrl)
 
 void SeatHubClient::signOut()
 {
+    // CR-02: a report still pending when the customer signs out (mid-teardown, or between
+    // `handleVideoStatsParsed()` and a teardown outcome) is written to the outbox under the
+    // account that is about to be cleared below - never dropped just because nobody is waiting
+    // for it any more, and never left to be posted after `m_accountId` and the access token are
+    // gone.
+    storeQualityReportToOutbox();
+
+    // WR-06: an untagged report (parsed before `m_accountId` was ever resolved this epoch) can
+    // never be tagged now - the epoch it was held for is about to be over, and dropping it here,
+    // once, is the one legitimate drop this outbox has left (see `flushUntaggedQualityReports()`'s
+    // own header comment).
+    m_untaggedQualityReports.clear();
+
+    // CR-03: whatever `drainQualityOutbox()` call is in flight for this account must not still be
+    // running by the time a different account signs in - see `QualityOutbox::cancel()`'s own
+    // comment for what would otherwise happen to the new account's own drain.
+    m_qualityOutbox.cancel();
+
+    // WR-01: whatever Play this covered is over.
+    m_controlPlane->clearTraceId();
+
     // Signing out leaves no stored pairing and no usable credential: not on disk, not in memory
     // here, and not valid on the server (ADR-0050, D-06). The channel and both timers stop before
     // the store is swept.
@@ -1343,6 +1374,11 @@ void SeatHubClient::applyRestoreResult(const ControlPlaneResult& result)
         // D-17/Plan 30: no account is signed in past this point; a stale id from a process that
         // never signed out cleanly must not tag a later report.
         m_accountId.clear();
+        // WR-06: an untagged report held for this (now-refused) epoch can never be tagged now.
+        m_untaggedQualityReports.clear();
+        // CR-03: a `drainQualityOutbox()` call this credential started must not still be running
+        // once it has been refused - see `QualityOutbox::cancel()`'s own comment.
+        m_qualityOutbox.cancel();
         setAppState(QString::fromLatin1(kStateSignedOut));
         return;
     }
@@ -1383,6 +1419,9 @@ void SeatHubClient::setAccount(const AccountInfo& account)
     // `m_identity` above is the typed phone/email/username and can differ across two sign-ins of
     // the same account, which would tag two reports for one customer as "different accounts".
     m_accountId = account.id;
+    // WR-06: any report parsed before this account id was known (this session's own, or an
+    // earlier one this process never got a chance to tag) is tagged and stored now.
+    flushUntaggedQualityReports();
     drainQualityOutbox();
 }
 
@@ -1406,18 +1445,37 @@ void SeatHubClient::drainQualityOutbox()
     // itself.
     const QString tokenGeneration = QString::number(m_authEpoch);
 
+    // CR-03: captured once, here, and checked again both before issuing each file's send and
+    // again in its reply continuation - `drain()` walks its files as a chain of callbacks that can
+    // span several event-loop turns, and a sign-out (or a sign-in as a different account) can land
+    // in the middle of that chain. Before this fix the loop kept going under this (now stale)
+    // account id and whatever bearer token `ControlPlaneClient` currently held - which, after a
+    // different customer signed in, was THEIR token - and a 404 from the server then deleted that
+    // file for good (T-06.3-51).
+    const quint64 epoch = m_authEpoch;
+
     m_qualityOutbox.drain(
         tokenGeneration, m_accountId,
-        [this](const QString& sessionId, const QJsonObject& report,
+        [this, epoch](const QString& sessionId, const QJsonObject& report,
                ControlPlaneClient::Callback callback) {
+            if (epoch != m_authEpoch) {
+                // Signed out, or signed in as someone else, since this drain started: never issue
+                // the send at all under a credential that is no longer this account's.
+                callback(ControlPlaneResult::aborted());
+                return;
+            }
             m_controlPlane->postSessionQuality(
-                sessionId, report, [this, callback](const ControlPlaneResult& result) {
+                sessionId, report, [this, epoch, callback](const ControlPlaneResult& result) {
                     // `postSessionQuality`'s callback runs on the control-plane's own (network)
                     // thread; `QualityOutbox`'s own state (`m_draining`,
                     // `m_blockedTokenGeneration`) is only ever touched from this facade's thread
                     // (`drain()` is called from here, on `setAccount()`), so the continuation
-                    // `callback` runs is marshalled back before it touches any of it.
-                    onClientThread(this, [callback, result]() { callback(result); });
+                    // `callback` runs is marshalled back before it touches any of it. The epoch is
+                    // checked again here too: the account can have changed while this particular
+                    // request was in flight.
+                    onClientThread(this, [this, epoch, callback, result]() {
+                        callback(epoch == m_authEpoch ? result : ControlPlaneResult::aborted());
+                    });
                 });
         });
 }
@@ -1560,6 +1618,11 @@ void SeatHubClient::handleConnectionStarted()
     // (D-01), so the first HUD publish may arrive before the renderer has registered; the 1 Hz
     // heartbeat re-publishes and the stream picks the HUD up on its first frame.
     m_hud.beginSession();
+
+    // WR-04: the moment the stream truly begins is the right anchor for the first decoder
+    // segment's own duration - not `beginSession()`, which can run well before the first frame
+    // while pairing and connecting happen and would otherwise overstate it.
+    m_statsAggregator.start();
 
     // A stream that just started is by definition connected (audit F12): whatever the last
     // session's channel did, this one is live now.
@@ -2041,6 +2104,20 @@ void SeatHubClient::handlePairingCompleted(const QString& clientUuid)
         // Pairing itself succeeded, but nothing was attached to start with - connecting never
         // truly began, so the stage this stopped at is still `pairing` (D-11).
         m_liveness->reportFailure(QStringLiteral("pairing"));
+        // WR-02: nothing after this point will ever stop the timer otherwise - `beginSession()`
+        // already started it, and this Play never reaches a stream to run `handleReadyForDeletion()`
+        // or a teardown. Without this it kept reporting `stage: failed` (and reading the wallet)
+        // every 10 s until the next `beginSession()` or sign-out.
+        m_liveness->stop();
+        // WR-01: this Play is over here, at the start refusal - the next one mints its own id.
+        // `reportFailure()` above re-invoked itself onto `m_liveness`'s own (network) thread,
+        // because this handler runs on the facade thread; a plain, synchronous `clearTraceId()`
+        // here would therefore very likely run BEFORE that queued failure report ever reaches
+        // `send()` on the network thread, emptying the id it is supposed to carry. Clearing here
+        // is marshalled the same way, onto the id this Play actually minted, and only takes effect
+        // if that is still the current id - see `clearTraceIdIfEquals()`'s own comment for why a
+        // plain queued clear (with no comparison) is not enough either.
+        clearThisPlaysTraceIdAfterAnyQueuedLivenessReport();
         raiseFailure(SeatHubFailure::generic());
         return;
     }
@@ -2103,12 +2180,41 @@ void SeatHubClient::releaseEngineSession()
     m_engineSession = nullptr;
 }
 
+void SeatHubClient::clearThisPlaysTraceIdAfterAnyQueuedLivenessReport()
+{
+    // WR-11 (code review 06.3-REVIEW-fork.md, second review pass): `controlPlane` is read from
+    // the member ONCE, here, on the calling thread, and captured by value - never read again as
+    // `m_controlPlane` inside the queued lambda below. `~SeatHubClient()` sets `m_controlPlane =
+    // nullptr` on the main thread before its own blocking join with the control-plane thread
+    // completes (see the destructor's own ordering comment); a lambda that instead read
+    // `m_controlPlane` when IT ran, on the control-plane thread, would race that write - and,
+    // since the queued call is already ahead of the join in the network thread's own event
+    // queue, it can still run after the member has been nulled, dereferencing a null pointer
+    // through `this`. Capturing the pointer by value here removes the member read entirely: the
+    // lambda never touches `this` at all, only its own captured local, which cannot change
+    // after this function returns.
+    ControlPlaneClient* controlPlane = m_controlPlane;
+    const QString thisPlaysTraceId = controlPlane->traceId();
+    onClientThread(controlPlane, [controlPlane, thisPlaysTraceId]() {
+        controlPlane->clearTraceIdIfEquals(thisPlaysTraceId);
+    });
+}
+
 void SeatHubClient::handlePairingFailed(const SeatHubFailure& failure)
 {
     // D-11: a pairing timeout or a control-plane refusal of the pairing read, neither with an
     // engine code - reported before liveness stops, so the server sees "SeatHub failed at
     // pairing" rather than a session that simply went quiet.
     m_liveness->reportFailure(QStringLiteral("pairing"));
+    // WR-02: stops it, queued after the report above on the same (network) thread, so the failure
+    // report still goes out first. Without this the timer kept reporting `stage: failed` (and
+    // reading the wallet) every 10 s while the customer read the error screen and after returning
+    // Home, until the next `beginSession()` or sign-out.
+    m_liveness->stop();
+    // WR-01: this Play is over here, at the pairing failure - the next one mints its own id. See
+    // `clearThisPlaysTraceIdAfterAnyQueuedLivenessReport()`'s own comment for why this is not a
+    // plain `clearTraceId()` call.
+    clearThisPlaysTraceIdAfterAnyQueuedLivenessReport();
 
     // Fail closed with a SeatHub error the error screen can render - a reason, a retry and an
     // `SH-` reference - never a Moonlight dialog (ADR-0008, D-51, STREAM-03).
@@ -2144,64 +2250,145 @@ void SeatHubClient::handleVideoStatsParsed(VideoStats stats)
 {
     // Pitfall 7: the engine logs this block during its own teardown, strictly before
     // `handleReadyForDeletion()` runs (D-03's own SDL-destruction guarantee) and therefore
-    // strictly before `handleTeardownCompleted()` posts it. `m_sessionId` is still the ending
-    // session's here - `setAttachedSession(QString())` only runs inside
+    // strictly before `handleTeardownCompleted()`/`handleTeardownFailed()` (CR-02: teardown can
+    // fail as well as succeed, and both paths dispose of whatever is pending here exactly once -
+    // `postOrStoreQualityReport()`/`storeQualityReportToOutbox()`). `m_sessionId` is still the
+    // ending session's here - `setAttachedSession(QString())` only runs inside
     // `handleTeardownCompleted()`, below. With no session attached at all (a local, non-control-
     // plane attempt, or a stats block that arrived with nothing to post it against) there is
     // nothing to hold it for.
     if (m_sessionId.isEmpty()) {
         return;
     }
-    m_pendingQualityReport = toQualityReport(stats);
+
+    // WR-04: a decoder recreation mid-session (a fullscreen toggle, a display move/resize, a
+    // renderer reset) logs a second block, and a third, and so on - each one is added here, and
+    // the pending report always reflects every segment seen so far, not only the last one.
+    m_statsAggregator.addSegment(stats);
+
+    // CR-02: bound to the session it belongs to here, at parse time - not read from `m_sessionId`
+    // again in the handler that eventually posts it, which may run after `m_sessionId` has
+    // already moved on.
+    m_pendingQualitySessionId = m_sessionId;
+    m_pendingQualityReport = toQualityReport(m_statsAggregator.aggregate());
     m_hasPendingQualityReport = true;
+}
+
+void SeatHubClient::postOrStoreQualityReport()
+{
+    // D-17/CR-02: post the held stats block once, for the session it was bound to. Cleared
+    // immediately after so a second call - a later session's teardown, or one with no stats block
+    // at all - never re-sends an earlier session's numbers.
+    if (!m_hasPendingQualityReport) {
+        return;
+    }
+    const QString sessionId = m_pendingQualitySessionId;
+    const QJsonObject report = m_pendingQualityReport;
+    const QString accountId = m_accountId;
+    // CR-04 (code review 06.3-REVIEW-fork.md, second review pass): captured here, at the
+    // moment this report is POSTED - not read again from `m_authEpoch` when the asynchronous
+    // reply below eventually lands. A sign-out (or a sign-in as someone else) can happen while
+    // this POST is still in flight; without this capture the WR-06 hold below stamped a late
+    // reply with whatever epoch happened to be current when the reply arrived, so a stalled
+    // report of an untagged account A could be re-tagged and sent under a later account B's
+    // token once B's own `m_accountId` was filled - the same threat (T-06.3-51) CR-03 already
+    // closed for the outbox's own drain, reached here by a different path.
+    const quint64 epochAtPost = m_authEpoch;
+    m_hasPendingQualityReport = false;
+    m_pendingQualityReport = QJsonObject();
+    m_pendingQualitySessionId.clear();
+
+    m_controlPlane->postSessionQuality(
+        sessionId, report,
+        [this, sessionId, report, accountId, epochAtPost](const ControlPlaneResult& result) {
+            onClientThread(this, [this, sessionId, report, accountId, epochAtPost, result]() {
+                switch (QualityOutbox::classify(result)) {
+                case QualityOutbox::Outcome::Delivered:
+                    break;
+                case QualityOutbox::Outcome::Refused:
+                    qCWarning(seathubClient) << "quality report for" << sessionId
+                                              << "refused" << result.statusCode;
+                    break;
+                case QualityOutbox::Outcome::AuthFailed:
+                case QualityOutbox::Outcome::Retryable:
+                    // Rule 2: kept for a later attempt (the next sign-in or launch), rather
+                    // than lost to a dropped connection or a momentarily refused credential -
+                    // this plan's own write-trigger line names only the transport/5xx/408/429
+                    // set, but a 401/403 that never gets a second chance is exactly the
+                    // missing-critical-functionality this outbox exists to close.
+                    if (accountId.isEmpty()) {
+                        // WR-06: held, not dropped - `flushUntaggedQualityReports()` tags and
+                        // stores it once `m_accountId` is next filled for this same epoch.
+                        // CR-04: only if the epoch this report was POSTED under is still
+                        // current - `signOut()`'s own epoch bump (and every sign-in's) means a
+                        // reply landing after either one belongs to an account that has
+                        // already signed out; it is dropped here, exactly once, rather than
+                        // re-tagged under whichever epoch happens to be current when this late
+                        // reply arrives.
+                        if (epochAtPost == m_authEpoch) {
+                            m_untaggedQualityReports.append(
+                                PendingUntaggedQualityReport{ sessionId, report, epochAtPost });
+                        }
+                        // else: the account that owned it has signed out - drop, never re-tag
+                        // under a later sign-in's epoch.
+                    }
+                    else {
+                        m_qualityOutbox.setDirectory(qualityOutboxDirectory());
+                        m_qualityOutbox.put(sessionId, accountId, report);
+                    }
+                    break;
+                }
+            });
+        });
+}
+
+void SeatHubClient::storeQualityReportToOutbox()
+{
+    // CR-02: the teardown POST that would have carried this report already failed to reach the
+    // control plane, so this stores it straight into the outbox rather than attempting a second
+    // network call that is very likely to fail the same way. Cleared either way, so a later
+    // session never inherits a stale pending report.
+    if (!m_hasPendingQualityReport) {
+        return;
+    }
+    const QString sessionId = m_pendingQualitySessionId;
+    const QJsonObject report = m_pendingQualityReport;
+    const QString accountId = m_accountId;
+    m_hasPendingQualityReport = false;
+    m_pendingQualityReport = QJsonObject();
+    m_pendingQualitySessionId.clear();
+
+    if (accountId.isEmpty()) {
+        // WR-06: held, not dropped - see `postOrStoreQualityReport()`'s own comment.
+        m_untaggedQualityReports.append(
+            PendingUntaggedQualityReport{ sessionId, report, m_authEpoch });
+        return;
+    }
+    m_qualityOutbox.setDirectory(qualityOutboxDirectory());
+    m_qualityOutbox.put(sessionId, accountId, report);
+}
+
+void SeatHubClient::flushUntaggedQualityReports()
+{
+    if (m_accountId.isEmpty() || m_untaggedQualityReports.isEmpty()) {
+        return;
+    }
+    m_qualityOutbox.setDirectory(qualityOutboxDirectory());
+    for (int i = 0; i < m_untaggedQualityReports.size(); ++i) {
+        const PendingUntaggedQualityReport& pending = m_untaggedQualityReports.at(i);
+        if (pending.epoch == m_authEpoch) {
+            m_qualityOutbox.put(pending.sessionId, m_accountId, pending.report);
+        }
+        // else: held for an epoch that is no longer current (a sign-out or another sign-in has
+        // already happened) - the account it was held for is no longer the signed-in one, so it
+        // is dropped rather than mistagged under this one (`signOut()`'s own comment names this).
+    }
+    m_untaggedQualityReports.clear();
 }
 
 void SeatHubClient::handleTeardownCompleted(const SessionInfo& finalSession)
 {
-    // D-17: post the held stats block once, for the session that is ending here. Cleared
-    // immediately after so a second `handleTeardownCompleted()` for a later session - or one with
-    // no stats block at all - never re-sends an earlier session's numbers.
-    if (m_hasPendingQualityReport) {
-        // Captured by value: this callback runs on the control-plane thread, and `m_sessionId` is
-        // cleared by `setAttachedSession(QString())` a few lines below, on this thread, possibly
-        // before the callback fires.
-        const QString sessionId = m_sessionId;
-        const QJsonObject report = m_pendingQualityReport;
-        const QString accountId = m_accountId;
-        m_controlPlane->postSessionQuality(
-            sessionId, report,
-            [this, sessionId, report, accountId](const ControlPlaneResult& result) {
-                onClientThread(this, [this, sessionId, report, accountId, result]() {
-                    switch (QualityOutbox::classify(result)) {
-                    case QualityOutbox::Outcome::Delivered:
-                        break;
-                    case QualityOutbox::Outcome::Refused:
-                        qCWarning(seathubClient) << "quality report for" << sessionId
-                                                  << "refused" << result.statusCode;
-                        break;
-                    case QualityOutbox::Outcome::AuthFailed:
-                    case QualityOutbox::Outcome::Retryable:
-                        // Rule 2: kept for a later attempt (the next sign-in or launch), rather
-                        // than lost to a dropped connection or a momentarily refused credential -
-                        // this plan's own write-trigger line names only the transport/5xx/408/429
-                        // set, but a 401/403 that never gets a second chance is exactly the
-                        // missing-critical-functionality this outbox exists to close.
-                        if (accountId.isEmpty()) {
-                            qCWarning(seathubClient)
-                                << "quality report for" << sessionId
-                                << "has no signed-in account to tag it with; dropped";
-                        }
-                        else {
-                            m_qualityOutbox.setDirectory(qualityOutboxDirectory());
-                            m_qualityOutbox.put(sessionId, accountId, report);
-                        }
-                        break;
-                    }
-                });
-            });
-        m_hasPendingQualityReport = false;
-        m_pendingQualityReport = QJsonObject();
-    }
+    postOrStoreQualityReport();
 
     // Home says why the session ended, read from the session itself now that teardown has confirmed it
     // is over (CUST-15, D-21). The minute count is the server's own `minutes_billed`. A session the
@@ -2239,6 +2426,18 @@ void SeatHubClient::handleTeardownCompleted(const SessionInfo& finalSession)
 
 void SeatHubClient::handleTeardownFailed(const SeatHubFailure& failure)
 {
+    // CR-02: the exact case the outbox header promises to cover - a dropped connection at stream
+    // end. `postSessionQuality()`'s own POST is never attempted here (the teardown POST that
+    // would have carried it already failed to reach the control plane); the report is written
+    // straight to the outbox and picked up at the next sign-in or launch.
+    storeQualityReportToOutbox();
+
+    // WR-01: the Play this trace id covered ended here, at a teardown failure - the next one
+    // (`beginPlayRequest`) mints its own. Before this fix only `handleTeardownCompleted()` cleared
+    // it, so a teardown failure left the id in place for every later request until the next Play,
+    // including another customer's sign-in on a shared PC.
+    m_controlPlane->clearTraceId();
+
     // STREAM-10: the rig-side disable/remove/verify did not complete, or something was left
     // stored on this PC. Reporting success would tell the customer the opposite of what is true,
     // so it is surfaced with a reason, a retry and a reference.
