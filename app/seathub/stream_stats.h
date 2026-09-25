@@ -12,9 +12,12 @@
 // none is edited by this plan - `StatsWatcher` is a `LogTee` sink, and `parseVideoStatsBlock()` is
 // a pure text parser matched against those exact, unedited line formats.
 
+#include <QElapsedTimer>
 #include <QJsonObject>
 #include <QObject>
 #include <QString>
+
+#include <vector>
 
 #include "log_tee.h"
 
@@ -68,16 +71,26 @@ bool parseVideoStatsBlock(const QString& block, VideoStats* out);
 /// `type: [number, "null"]`).
 QJsonObject toQualityReport(const VideoStats& stats);
 
-/// The `LogTee` sink that recognises the two-message "Global video stats" block: it remembers
-/// whether the immediately preceding `SDL_LOG_CATEGORY_APPLICATION`/`SDL_LOG_PRIORITY_INFO`
-/// message equalled the title exactly, and on the next message of that same category/priority
-/// starting with `stringifyVideoStats()`'s own dashes line, parses the remainder and emits
-/// `videoStatsParsed`. A message of a different category or priority is ignored without
-/// disturbing the "previous was the title" state (Qt lines, other SDL categories and other SDL
-/// priorities of the SAME category are frequent during a session); any OTHER
-/// `SDL_LOG_CATEGORY_APPLICATION`/`SDL_LOG_PRIORITY_INFO` message - including one that itself
-/// happens to start with the dashes line, with no title immediately before it - resets the state
-/// and is never treated as the block.
+/// The `LogTee` sink that recognises the "Global video stats" block (WR-05, code review
+/// 06.3-REVIEW-fork.md): a message of `SDL_LOG_CATEGORY_APPLICATION`/`SDL_LOG_PRIORITY_INFO`
+/// whose text starts with `stringifyVideoStats()`'s own dashes line. `logVideoStats()`
+/// (`app/streaming/video/ffmpeg.cpp:858-870`, read-only) is the only place in the whole engine
+/// tree that ever prints that exact 60-dash line (confirmed by grep against
+/// `app/streaming/`), so the content alone identifies the block - `parseVideoStatsBlock()`'s own
+/// `matchedAnyLine` result additionally refuses anything that is not at least one of the known
+/// stats lines.
+///
+/// An earlier revision instead required the dashes-prefixed message to be the message
+/// *immediately following* the block's own title (`"Global video stats"`, logged one call
+/// earlier at ffmpeg.cpp:864-865), tracked with one `bool` member. That state was racy: upstream
+/// deletes the decoder - and so logs this block - while moonlight-common-c's own connection,
+/// audio and input threads are still running (`session.cpp:2319-2320`'s own comment: "This must
+/// happen before `LiStopConnection()`"), and any one of them logging an
+/// `SDL_LOG_CATEGORY_APPLICATION`/`SDL_LOG_PRIORITY_INFO` message between the title and the body
+/// - two separate `SDL_LogInfo()` calls, on whichever thread the decoder is destroyed on - reset
+/// the flag and silently dropped the whole block. Matching on the block's own content removes the
+/// race instead of hardening the state machine that caused it: there is no cross-message state
+/// left to race on.
 class StatsWatcher : public QObject
 {
     Q_OBJECT
@@ -95,6 +108,66 @@ signals:
 
 private:
     void handle(LogLevel level, int category, int priority, const QString& text);
+};
 
-    bool m_previousWasTitle = false;
+/// WR-04 (code review 06.3-REVIEW-fork.md, ruling: fixed now): upstream recreates the video
+/// decoder mid-stream - on a display move or resize, on `SDL_RENDER_DEVICE_RESET`/
+/// `SDL_RENDER_TARGETS_RESET`, and on every fullscreen toggle on Windows
+/// (`app/streaming/session.cpp:2156-2174`, `:1432-1446`, read-only) - and each `FFmpegVideoDecoder`
+/// instance logs its own "Global video stats" block when it is destroyed. Without this, the
+/// report posted at teardown describes only the last decoder instance, not the session (a
+/// fullscreen toggle one minute before the end would report only that last minute).
+///
+/// This collects every segment's block for the current session and combines them into one
+/// `VideoStats` at teardown. The printed block carries no frame count and no duration of its own
+/// (`stringifyVideoStats()`, `app/streaming/video/ffmpeg.cpp:700-856`, prints only rates,
+/// percentages and averages) so a segment's duration is measured here instead, as the wall-clock
+/// time between `start()` (or the previous segment) and this one - which is what "counts summed,
+/// rates recomputed from the summed counts and summed durations" (the ruling's own words) reduces
+/// to when the counts themselves are reconstructed as rate x duration. Every metric this session
+/// can combine that way is a duration-weighted average; `rttMs`/`rttVarianceMs` are excluded from
+/// that and reported from the longest segment instead (`aggregate()`'s own comment says why).
+class VideoStatsAggregator
+{
+public:
+    /// One segment's own parsed block and its measured duration. Public so `aggregate()`'s own
+    /// duration-weighting helper (`stream_stats.cpp`, an anonymous-namespace free function) can
+    /// read it without being a member.
+    struct Segment
+    {
+        VideoStats stats;
+        qint64 durationMs = 0;
+    };
+
+    /// Forgets every segment held so far and (re)starts the duration clock. Called once per
+    /// session, at `SeatHubClient::handleConnectionStarted()` - the moment the stream truly
+    /// begins, not `beginSession()`, which can run well before the first frame while pairing and
+    /// connecting happen and would otherwise overstate the first segment's own duration.
+    void start();
+
+    /// One decoder segment's own end-of-stream block, as `StatsWatcher` parsed it. Measures the
+    /// segment's duration as the wall-clock time since `start()` or the previous `addSegment()`
+    /// call.
+    void addSegment(const VideoStats& stats);
+
+    /// Test seam: appends a segment with an explicit duration instead of the real elapsed-time
+    /// clock, so the weighting can be asserted deterministically. Production never calls this -
+    /// see `addSegment()`.
+    void addSegmentForTesting(const VideoStats& stats, qint64 durationMs);
+
+    bool hasSegments() const { return !m_segments.empty(); }
+
+    /// One `VideoStats` describing the whole session so far: with a single segment, that
+    /// segment's own numbers, unchanged. With more than one, a duration-weighted average for
+    /// every metric except `rttMs`/`rttVarianceMs` - `stringifyVideoStats()` prints those from
+    /// `LiGetEstimatedRttInfo()`'s own instantaneous read at the moment the segment ended
+    /// (`app/streaming/video/ffmpeg.cpp:674`), a point sample despite the printed "Average"
+    /// label, so summing or weighting several of them would not describe anything real; they are
+    /// reported from the longest (by duration) segment instead. A metric absent from every
+    /// segment that held a duration stays absent, never defaulted to zero.
+    VideoStats aggregate() const;
+
+private:
+    QElapsedTimer m_timer;
+    std::vector<Segment> m_segments;
 };

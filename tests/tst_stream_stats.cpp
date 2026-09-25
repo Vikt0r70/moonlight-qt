@@ -45,13 +45,19 @@
 
 namespace {
 
-// A full, normal-session "Global video stats" block: every conditional line present. Field
-// values are chosen so no two are equal, so a test that reads the wrong field fails loudly.
-QString fullStatsBlock()
+// The real end-of-stream block `FFmpegVideoDecoder::logVideoStats()` prints in production
+// (`app/streaming/video/ffmpeg.cpp:279-296`, read-only, this file's own literal strings copied
+// from :794-801 and :835-848): every conditional line the engine can print with
+// `m_VideoDecoderCtx` already freed. There is NO "Video stream: ..." line - that line is gated on
+// `m_VideoDecoderCtx != nullptr` (:778) and `logVideoStats()` runs strictly after
+// `avcodec_free_context()` has nulled it (:280, :296) - which is exactly CR-01's finding: the
+// earlier fixture here (`fullStatsBlock()`) carried a "Video stream:" line production can never
+// emit, which is how a wrong parse source went untested. Field values are chosen so no two are
+// equal, so a test that reads the wrong field fails loudly.
+QString productionStatsBlock()
 {
     return QStringLiteral(
         "----------------------------------------------------------\n"
-        "Video stream: 1920x1080 59.94 FPS (Codec: H.264)\n"
         "Incoming frame rate from network: 60.00 FPS\n"
         "Decoding frame rate: 59.98 FPS\n"
         "Rendering frame rate: 59.96 FPS\n"
@@ -63,9 +69,9 @@ QString fullStatsBlock()
         "Average rendering time (including monitor V-sync latency): 2.77 ms\n");
 }
 
-// The same block with `m_VideoDecoderCtx == nullptr` (no "Video stream:" line) and the network
-// latency line reading "N/A" - `stringifyVideoStats()`'s own fallback when `stats.lastRtt == 0`.
-QString blockWithMissingLinesAndNoRtt()
+// `productionStatsBlock()` with the network latency line reading "N/A" instead -
+// `stringifyVideoStats()`'s own fallback when `stats.lastRtt == 0` (ffmpeg.cpp:828-833).
+QString productionStatsBlockWithNoRtt()
 {
     return QStringLiteral(
         "----------------------------------------------------------\n"
@@ -193,14 +199,18 @@ private slots:
 
     // --- parseVideoStatsBlock / toQualityReport --------------------------------------------
 
-    void parseVideoStatsBlock_fullBlock_fillsEveryField()
+    // CR-01: `rendered_fps` is parsed from `Rendering frame rate: ...` (the line the engine
+    // actually prints, whatever the decoder context's state is at teardown - `stream_stats.cpp`'s
+    // own header comment), not `Video stream: ...` (which production never prints - see
+    // `productionStatsBlock()`'s own comment). This is the block production actually emits.
+    void parseVideoStatsBlock_productionBlock_fillsEveryField()
     {
         VideoStats stats;
-        const bool matched = parseVideoStatsBlock(fullStatsBlock(), &stats);
+        const bool matched = parseVideoStatsBlock(productionStatsBlock(), &stats);
 
         QVERIFY(matched);
         QVERIFY(stats.renderedFps.present);
-        QCOMPARE(stats.renderedFps.value, 59.94);
+        QCOMPARE(stats.renderedFps.value, 59.96);
         QVERIFY(stats.networkDroppedFramePct.present);
         QCOMPARE(stats.networkDroppedFramePct.value, 0.42);
         QVERIFY(stats.jitterDroppedFramePct.present);
@@ -217,13 +227,15 @@ private slots:
         QCOMPARE(stats.renderTimeMs.value, 2.77);
     }
 
-    void parseVideoStatsBlock_naLatencyAndMissingVideoStreamLine_leavesOnlyThoseAbsent()
+    void parseVideoStatsBlock_naLatency_leavesOnlyRttAbsentAndStillFillsRenderedFps()
     {
         VideoStats stats;
-        const bool matched = parseVideoStatsBlock(blockWithMissingLinesAndNoRtt(), &stats);
+        const bool matched = parseVideoStatsBlock(productionStatsBlockWithNoRtt(), &stats);
 
         QVERIFY(matched);
-        QVERIFY2(!stats.renderedFps.present, "no 'Video stream:' line in this block");
+        QVERIFY2(stats.renderedFps.present,
+                 "'Rendering frame rate:' is in every real block with receivedFps > 0 (CR-01)");
+        QCOMPARE(stats.renderedFps.value, 59.96);
         QVERIFY2(!stats.rttMs.present, "N/A must leave rtt_ms absent");
         QVERIFY2(!stats.rttVarianceMs.present, "N/A must leave rtt_variance_ms absent");
         QVERIFY(stats.networkDroppedFramePct.present);
@@ -275,66 +287,263 @@ private slots:
         sink(LogLevel::Info, SDL_LOG_CATEGORY_APPLICATION, SDL_LOG_PRIORITY_INFO,
              QStringLiteral("Global video stats"));
         sink(LogLevel::Info, SDL_LOG_CATEGORY_APPLICATION, SDL_LOG_PRIORITY_INFO,
-             QString::fromLatin1(kDashesPrefix) + fullStatsBlock().mid(qstrlen(kDashesPrefix)));
+             QString::fromLatin1(kDashesPrefix) + productionStatsBlock().mid(qstrlen(kDashesPrefix)));
 
         QCOMPARE(emitCount, 1);
         QVERIFY(captured.renderedFps.present);
-        QCOMPARE(captured.renderedFps.value, 59.94);
+        QCOMPARE(captured.renderedFps.value, 59.96);
     }
 
-    void statsWatcher_dashesLineWithNoPrecedingTitle_isIgnored()
+    // WR-05 (code review 06.3-REVIEW-fork.md): the watcher used to require the dashes-prefixed
+    // message to be the one immediately following the title, tracked with one `bool` member -
+    // and reset that state on ANY other APPLICATION/INFO message in between. Upstream deletes the
+    // decoder (and so logs this block) while moonlight-common-c's own connection/audio/input
+    // threads are still running (`session.cpp:2319-2320`), so a message from one of them landing
+    // between the title and the body silently dropped the whole session's quality report. The fix
+    // matches on the block's own content instead (the dashes line, which only this one call site
+    // in the whole engine prints - `stream_stats.h`'s own header comment), so an intervening
+    // message from another thread no longer matters. RED on the pre-fix code (which required
+    // exact adjacency to a preceding title and had no defence against this at all): this was
+    // untested before this plan - `06.3-REVIEW-fork.md`'s own finding.
+    void statsWatcher_anotherApplicationInfoMessageBetweenTitleAndBlock_stillEmits()
     {
         StatsWatcher watcher;
+        VideoStats captured;
         int emitCount = 0;
         connect(&watcher, &StatsWatcher::videoStatsParsed, &watcher,
-                [&](VideoStats) { ++emitCount; });
-
-        const LogTee::Sink sink = watcher.sink();
-        // No title message first - an unrelated line that happens to start with the same dashes.
-        sink(LogLevel::Info, SDL_LOG_CATEGORY_APPLICATION, SDL_LOG_PRIORITY_INFO,
-             QString::fromLatin1(kDashesPrefix) + QStringLiteral("Frames dropped by your network connection: 0.00%\n"));
-
-        QCOMPARE(emitCount, 0);
-    }
-
-    void statsWatcher_anotherApplicationInfoMessageBetweenTitleAndBlock_resetsTheState()
-    {
-        StatsWatcher watcher;
-        int emitCount = 0;
-        connect(&watcher, &StatsWatcher::videoStatsParsed, &watcher,
-                [&](VideoStats) { ++emitCount; });
+                [&](VideoStats stats) { captured = stats; ++emitCount; });
 
         const LogTee::Sink sink = watcher.sink();
         sink(LogLevel::Info, SDL_LOG_CATEGORY_APPLICATION, SDL_LOG_PRIORITY_INFO,
              QStringLiteral("Global video stats"));
-        // Some other APPLICATION/INFO line in between - the block is no longer "the next one".
+        // A moonlight-common-c thread logging while the main thread is between its own two
+        // SDL_LogInfo() calls (session.cpp:2319-2320's own ordering comment).
         sink(LogLevel::Info, SDL_LOG_CATEGORY_APPLICATION, SDL_LOG_PRIORITY_INFO,
-             QStringLiteral("an unrelated application/info line"));
+             QStringLiteral("an unrelated application/info line from another thread"));
         sink(LogLevel::Info, SDL_LOG_CATEGORY_APPLICATION, SDL_LOG_PRIORITY_INFO,
-             QString::fromLatin1(kDashesPrefix) + fullStatsBlock().mid(qstrlen(kDashesPrefix)));
-
-        QCOMPARE(emitCount, 0);
-    }
-
-    void statsWatcher_unrelatedCategoryOrPriorityBetweenTitleAndBlock_isIgnoredNotReset()
-    {
-        StatsWatcher watcher;
-        int emitCount = 0;
-        connect(&watcher, &StatsWatcher::videoStatsParsed, &watcher,
-                [&](VideoStats) { ++emitCount; });
-
-        const LogTee::Sink sink = watcher.sink();
-        sink(LogLevel::Info, SDL_LOG_CATEGORY_APPLICATION, SDL_LOG_PRIORITY_INFO,
-             QStringLiteral("Global video stats"));
-        // A different SDL category, and a Qt-origin message (category/priority -1) - neither is
-        // "the next SDL info message", so neither should disturb the state.
-        sink(LogLevel::Warning, SDL_LOG_CATEGORY_VIDEO, SDL_LOG_PRIORITY_WARN,
-             QStringLiteral("an unrelated video-category warning"));
-        sink(LogLevel::Info, -1, -1, QStringLiteral("an unrelated Qt info line"));
-        sink(LogLevel::Info, SDL_LOG_CATEGORY_APPLICATION, SDL_LOG_PRIORITY_INFO,
-             QString::fromLatin1(kDashesPrefix) + fullStatsBlock().mid(qstrlen(kDashesPrefix)));
+             QString::fromLatin1(kDashesPrefix) + productionStatsBlock().mid(qstrlen(kDashesPrefix)));
 
         QCOMPARE(emitCount, 1);
+        QVERIFY(captured.renderedFps.present);
+        QCOMPARE(captured.renderedFps.value, 59.96);
+    }
+
+    // The block is recognised by its own content: no title message is required at all (a title
+    // is always logged in production, one call earlier, but the watcher no longer depends on
+    // seeing it).
+    void statsWatcher_dashesLineWithNoPrecedingTitle_stillEmits()
+    {
+        StatsWatcher watcher;
+        int emitCount = 0;
+        connect(&watcher, &StatsWatcher::videoStatsParsed, &watcher,
+                [&](VideoStats) { ++emitCount; });
+
+        const LogTee::Sink sink = watcher.sink();
+        sink(LogLevel::Info, SDL_LOG_CATEGORY_APPLICATION, SDL_LOG_PRIORITY_INFO,
+             QString::fromLatin1(kDashesPrefix) + productionStatsBlock().mid(qstrlen(kDashesPrefix)));
+
+        QCOMPARE(emitCount, 1);
+    }
+
+    void statsWatcher_messageWithoutTheDashesPrefix_isIgnored()
+    {
+        StatsWatcher watcher;
+        int emitCount = 0;
+        connect(&watcher, &StatsWatcher::videoStatsParsed, &watcher,
+                [&](VideoStats) { ++emitCount; });
+
+        const LogTee::Sink sink = watcher.sink();
+        sink(LogLevel::Info, SDL_LOG_CATEGORY_APPLICATION, SDL_LOG_PRIORITY_INFO,
+             QStringLiteral("Global video stats"));
+        sink(LogLevel::Info, SDL_LOG_CATEGORY_APPLICATION, SDL_LOG_PRIORITY_INFO,
+             QStringLiteral("an unrelated application/info line, not the stats block"));
+
+        QCOMPARE(emitCount, 0);
+    }
+
+    void statsWatcher_unrelatedCategoryOrPriority_isIgnored()
+    {
+        StatsWatcher watcher;
+        int emitCount = 0;
+        connect(&watcher, &StatsWatcher::videoStatsParsed, &watcher,
+                [&](VideoStats) { ++emitCount; });
+
+        const LogTee::Sink sink = watcher.sink();
+        // A different SDL category, and a Qt-origin message (category/priority -1), each
+        // carrying the exact dashes-prefixed block: neither is `SDL_LOG_CATEGORY_APPLICATION`/
+        // `SDL_LOG_PRIORITY_INFO`, so neither is ever treated as the block.
+        const QString dashesBlock =
+            QString::fromLatin1(kDashesPrefix) + productionStatsBlock().mid(qstrlen(kDashesPrefix));
+        sink(LogLevel::Warning, SDL_LOG_CATEGORY_VIDEO, SDL_LOG_PRIORITY_WARN, dashesBlock);
+        sink(LogLevel::Info, -1, -1, dashesBlock);
+
+        QCOMPARE(emitCount, 0);
+    }
+
+    // --- VideoStatsAggregator (WR-04) ---------------------------------------------------------
+
+    void aggregator_noSegments_aggregatesToEverythingAbsent()
+    {
+        VideoStatsAggregator aggregator;
+        const VideoStats aggregate = aggregator.aggregate();
+
+        QVERIFY(!aggregate.renderedFps.present);
+        QVERIFY(!aggregate.rttMs.present);
+    }
+
+    // One decoder instance for the whole session (the common case) reports exactly its own
+    // numbers, unchanged - a session that never recreates its decoder must see no aggregation
+    // effect at all.
+    void aggregator_oneSegment_reportsItUnchanged()
+    {
+        VideoStatsAggregator aggregator;
+        VideoStats segment;
+        parseVideoStatsBlock(productionStatsBlock(), &segment);
+
+        aggregator.addSegmentForTesting(segment, 60000);
+        const VideoStats aggregate = aggregator.aggregate();
+
+        QCOMPARE(aggregate.renderedFps.value, segment.renderedFps.value);
+        QCOMPARE(aggregate.networkDroppedFramePct.value, segment.networkDroppedFramePct.value);
+        QCOMPARE(aggregate.rttMs.value, segment.rttMs.value);
+        QCOMPARE(aggregate.rttVarianceMs.value, segment.rttVarianceMs.value);
+    }
+
+    // WR-04's own scenario: a fullscreen toggle recreates the decoder partway through the
+    // session. Two segments of equal duration average their rates and percentages exactly
+    // halfway between the two.
+    void aggregator_twoEqualDurationSegments_averagesRatesAndPercentagesEqually()
+    {
+        VideoStatsAggregator aggregator;
+
+        VideoStats first;
+        first.renderedFps = OptionalMetric::of(30.0);
+        first.networkDroppedFramePct = OptionalMetric::of(1.0);
+        first.rttMs = OptionalMetric::of(10.0);
+        first.rttVarianceMs = OptionalMetric::of(1.0);
+
+        VideoStats second;
+        second.renderedFps = OptionalMetric::of(60.0);
+        second.networkDroppedFramePct = OptionalMetric::of(3.0);
+        second.rttMs = OptionalMetric::of(50.0);
+        second.rttVarianceMs = OptionalMetric::of(5.0);
+
+        aggregator.addSegmentForTesting(first, 30000);
+        aggregator.addSegmentForTesting(second, 30000);
+        const VideoStats aggregate = aggregator.aggregate();
+
+        QVERIFY(aggregate.renderedFps.present);
+        QCOMPARE(aggregate.renderedFps.value, 45.0);
+        QVERIFY(aggregate.networkDroppedFramePct.present);
+        QCOMPARE(aggregate.networkDroppedFramePct.value, 2.0);
+    }
+
+    // A one-minute segment must not count as much as a one-hour one: the longer segment's rate
+    // dominates the combined figure.
+    void aggregator_twoUnequalDurationSegments_weightsTheLongerOneMore()
+    {
+        VideoStatsAggregator aggregator;
+
+        VideoStats short_;
+        short_.renderedFps = OptionalMetric::of(30.0);
+
+        VideoStats long_;
+        long_.renderedFps = OptionalMetric::of(60.0);
+
+        aggregator.addSegmentForTesting(short_, 60000);   // 1 minute
+        aggregator.addSegmentForTesting(long_, 3600000);  // 1 hour
+        const VideoStats aggregate = aggregator.aggregate();
+
+        QVERIFY(aggregate.renderedFps.present);
+        // (30 * 60000 + 60 * 3600000) / (60000 + 3600000) ~= 59.51
+        QVERIFY2(aggregate.renderedFps.value > 59.0 && aggregate.renderedFps.value < 60.0,
+                 qPrintable(QString::number(aggregate.renderedFps.value)));
+    }
+
+    // `rtt_ms`/`rtt_variance_ms` are a point sample (`ffmpeg.cpp:674`), not a true average despite
+    // the printed "Average" label - averaging or summing several of them describes nothing real,
+    // so they come from the longest segment instead (the ruling's own words: "any metric the
+    // block's own numbers cannot combine correctly is reported from the longest segment").
+    void aggregator_rttIsTakenFromTheLongestSegmentNotAveraged()
+    {
+        VideoStatsAggregator aggregator;
+
+        VideoStats shortSegment;
+        shortSegment.rttMs = OptionalMetric::of(999.0);
+        shortSegment.rttVarianceMs = OptionalMetric::of(999.0);
+
+        VideoStats longSegment;
+        longSegment.rttMs = OptionalMetric::of(15.0);
+        longSegment.rttVarianceMs = OptionalMetric::of(2.0);
+
+        aggregator.addSegmentForTesting(shortSegment, 1000);
+        aggregator.addSegmentForTesting(longSegment, 600000);
+        const VideoStats aggregate = aggregator.aggregate();
+
+        QVERIFY(aggregate.rttMs.present);
+        QCOMPARE(aggregate.rttMs.value, 15.0);
+        QVERIFY(aggregate.rttVarianceMs.present);
+        QCOMPARE(aggregate.rttVarianceMs.value, 2.0);
+    }
+
+    // A metric a segment never printed (a weighted-average field like `network_dropped_frame_pct`)
+    // must not drag the combined average toward zero: only segments that held a value contribute
+    // to the weighted sum and its weight.
+    void aggregator_weightedFieldAbsentInOneSegment_isIgnoredNotTreatedAsZero()
+    {
+        VideoStatsAggregator aggregator;
+
+        VideoStats withValue;
+        withValue.networkDroppedFramePct = OptionalMetric::of(4.0);
+
+        VideoStats withoutValue; // this decoder segment never printed the line at all
+
+        aggregator.addSegmentForTesting(withValue, 30000);
+        aggregator.addSegmentForTesting(withoutValue, 30000);
+        const VideoStats aggregate = aggregator.aggregate();
+
+        // If the absent segment counted as 0 the answer would be 2.0 (4.0 averaged with 0 over
+        // equal durations); it must stay 4.0, the one segment that actually measured anything.
+        QVERIFY(aggregate.networkDroppedFramePct.present);
+        QCOMPARE(aggregate.networkDroppedFramePct.value, 4.0);
+    }
+
+    // The longest segment by duration is not automatically the RTT candidate: it may be exactly
+    // the segment whose latency line read "N/A". The longest segment that actually held a sample
+    // must win instead - never a fallback to zero or to the wrong segment's absence.
+    void aggregator_rttFromLongestSegmentThatActuallyHeldASample()
+    {
+        VideoStatsAggregator aggregator;
+
+        VideoStats shortWithRtt;
+        shortWithRtt.rttMs = OptionalMetric::of(20.0);
+        shortWithRtt.rttVarianceMs = OptionalMetric::of(3.0);
+
+        VideoStats longWithoutRtt; // "Average network latency: N/A", but the longer segment
+
+        aggregator.addSegmentForTesting(shortWithRtt, 30000);
+        aggregator.addSegmentForTesting(longWithoutRtt, 600000);
+        const VideoStats aggregate = aggregator.aggregate();
+
+        QVERIFY(aggregate.rttMs.present);
+        QCOMPARE(aggregate.rttMs.value, 20.0);
+        QVERIFY(aggregate.rttVarianceMs.present);
+        QCOMPARE(aggregate.rttVarianceMs.value, 3.0);
+    }
+
+    void aggregator_rttAbsentInEverySegment_aggregatesToAbsent()
+    {
+        VideoStatsAggregator aggregator;
+
+        VideoStats first;  // "Average network latency: N/A"
+        VideoStats second; // also N/A
+
+        aggregator.addSegmentForTesting(first, 30000);
+        aggregator.addSegmentForTesting(second, 30000);
+        const VideoStats aggregate = aggregator.aggregate();
+
+        QVERIFY(!aggregate.rttMs.present);
+        QVERIFY(!aggregate.rttVarianceMs.present);
     }
 
     // --- ControlPlaneClient::postSessionQuality ---------------------------------------------
