@@ -49,9 +49,12 @@ bool isValidTraceId(const QString& traceId)
     return !allZero;
 }
 
-// A 16-hex-character value from `QRandomGenerator::system()`, zero-padded - used for both a
-// trace id's low half (when the caller wants one minted, `SeatHubClient::beginPlayRequest`) and
-// a `traceparent` span id (`ControlPlaneClient::send`, one per request).
+// IN-03 (code review 06.3-REVIEW-fork.md): a 16-hex-character value from `QRandomGenerator::
+// system()`, zero-padded - used for the `traceparent` span id (`ControlPlaneClient::send`, one
+// per request). `SeatHubClient::beginPlayRequest()`'s own `randomTraceId()`
+// (`seathub_client.cpp`) mints the trace id itself with its own, separate pair of
+// `QRandomGenerator::system()->generate64()` calls - it does not call this function, despite an
+// earlier version of this comment saying otherwise.
 QString randomHex16()
 {
     return QString::number(QRandomGenerator::system()->generate64(), 16)
