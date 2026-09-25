@@ -71,6 +71,7 @@ call :suite tst_overlay_injection
 call :suite tst_pairing
 call :suite tst_session_websocket
 call :suite tst_settings_bridge
+call :suite tst_stream_stats
 call :suite tst_teardown
 call :suite tst_threading
 call :suite tst_token_store

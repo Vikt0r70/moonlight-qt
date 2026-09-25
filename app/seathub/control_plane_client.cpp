@@ -922,3 +922,12 @@ void ControlPlaneClient::endSession(const QString& sessionId, Callback callback)
              + QStringLiteral("/end"),
          QByteArray(), true, callback);
 }
+
+void ControlPlaneClient::postSessionQuality(const QString& sessionId, const QJsonObject& report,
+                                            Callback callback)
+{
+    const QByteArray body = QJsonDocument(report).toJson(QJsonDocument::Compact);
+    send(QStringLiteral("POST"), QStringLiteral("/api/sessions/") + encodedPathSegment(sessionId)
+             + QStringLiteral("/quality"),
+         body, true, callback);
+}

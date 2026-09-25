@@ -444,6 +444,14 @@ public:
     /// already-ending or terminal session returns it unchanged.
     void endSession(const QString& sessionId, Callback callback);
 
+    /// `POST /api/sessions/{session_id}/quality` (3.1.0, D-17, Plan 15): the parsed end-of-stream
+    /// video-stats block (`stream_stats.h`'s `toQualityReport()`), posted once per session. The
+    /// server's own first-report-wins rule (`docs/spec/openapi.yaml`'s `SessionQuality`
+    /// description) makes a second POST for the same session harmless, so this client never needs
+    /// to suppress a retry itself; a failed POST is logged by the caller and not retried here -
+    /// Plan 30 adds the outbox that keeps it.
+    void postSessionQuality(const QString& sessionId, const QJsonObject& report, Callback callback);
+
 signals:
     /// The transport failed before any response existed. Distinct from a control-plane
     /// refusal so the UI can tell "we could not ask" from "the answer was no".
