@@ -56,6 +56,16 @@ struct VideoStats
     OptionalMetric decodeTimeMs;
     OptionalMetric queueTimeMs;
     OptionalMetric renderTimeMs;
+
+    /// WR-09 (code review 06.3-REVIEW-fork.md, second review pass): `Incoming frame rate from
+    /// network:`/`Decoding frame rate:` (`app/streaming/video/ffmpeg.cpp:791-796`, read-only),
+    /// parsed for `VideoStatsAggregator::aggregate()`'s own frame-weighting ONLY - neither field
+    /// is one of `SessionQualityReport`'s eight and neither is sent on the wire
+    /// (`toQualityReport()` does not reference either). Printed in the same conditional block as
+    /// `renderedFps` (gated on `stats.receivedFps > 0`), so a segment that carries one carries
+    /// all three.
+    OptionalMetric receivedFps;
+    OptionalMetric decodedFps;
 };
 
 /// Parses the block that follows the dashes line - `stringifyVideoStats()`'s own output, with
@@ -119,14 +129,23 @@ private:
 /// fullscreen toggle one minute before the end would report only that last minute).
 ///
 /// This collects every segment's block for the current session and combines them into one
-/// `VideoStats` at teardown. The printed block carries no frame count and no duration of its own
-/// (`stringifyVideoStats()`, `app/streaming/video/ffmpeg.cpp:700-856`, prints only rates,
-/// percentages and averages) so a segment's duration is measured here instead, as the wall-clock
-/// time between `start()` (or the previous segment) and this one - which is what "counts summed,
-/// rates recomputed from the summed counts and summed durations" (the ruling's own words) reduces
-/// to when the counts themselves are reconstructed as rate x duration. Every metric this session
-/// can combine that way is a duration-weighted average; `rttMs`/`rttVarianceMs` are excluded from
-/// that and reported from the longest segment instead (`aggregate()`'s own comment says why).
+/// `VideoStats` at teardown.
+///
+/// WR-09 (code review 06.3-REVIEW-fork.md, second review pass): the ruling's own words are
+/// "average times weighted by frames", and each averaged metric in the engine's own text IS a
+/// ratio over a frame count, not a plain rate over wall-clock time - `decodeTimeMs` is
+/// `totalDecodeTime / decodedFrames`, `queueTimeMs`/`renderTimeMs` are `/ renderedFrames`,
+/// `networkDroppedFramePct` is `/ totalFrames` (tracked here by `receivedFps`, the printed rate
+/// closest to it - `stringifyVideoStats()` prints no `totalFps` line at all) and
+/// `jitterDroppedFramePct` is `/ decodedFrames` (`app/streaming/video/ffmpeg.cpp:836-847`,
+/// read-only). The printed block carries no frame COUNT of its own, but it does carry the
+/// matching RATE for every one of those (`Incoming frame rate from network`/`Decoding frame
+/// rate`/`Rendering frame rate`, `:791-796`) - `VideoStats::receivedFps`/`decodedFps` above, and
+/// `renderedFps` itself - and `rate x durationMs` recovers the count a segment's own weight
+/// should be. `renderedFps` is the one metric here that is ITSELF a rate over wall-clock time,
+/// not a ratio over a frame count, so it keeps plain duration weighting - the two coincide
+/// exactly on a single segment either way. `rttMs`/`rttVarianceMs` are excluded from all of this
+/// and reported from the longest segment instead (`aggregate()`'s own comment says why).
 class VideoStatsAggregator
 {
 public:
@@ -158,13 +177,18 @@ public:
     bool hasSegments() const { return !m_segments.empty(); }
 
     /// One `VideoStats` describing the whole session so far: with a single segment, that
-    /// segment's own numbers, unchanged. With more than one, a duration-weighted average for
-    /// every metric except `rttMs`/`rttVarianceMs` - `stringifyVideoStats()` prints those from
-    /// `LiGetEstimatedRttInfo()`'s own instantaneous read at the moment the segment ended
-    /// (`app/streaming/video/ffmpeg.cpp:674`), a point sample despite the printed "Average"
-    /// label, so summing or weighting several of them would not describe anything real; they are
-    /// reported from the longest (by duration) segment instead. A metric absent from every
-    /// segment that held a duration stays absent, never defaulted to zero.
+    /// segment's own numbers, unchanged. With more than one (WR-09): `renderedFps` is a
+    /// duration-weighted average; `decodeTimeMs`/`jitterDroppedFramePct` are weighted by
+    /// `decodedFps x durationMs`, `networkDroppedFramePct` by `receivedFps x durationMs`, and
+    /// `queueTimeMs`/`renderTimeMs` by `renderedFps x durationMs` - each the frame count the
+    /// engine's own averaged metric is really a ratio over (this class's own header comment says
+    /// which is which and why). `rttMs`/`rttVarianceMs` are excluded from all of this -
+    /// `stringifyVideoStats()` prints those from `LiGetEstimatedRttInfo()`'s own instantaneous
+    /// read at the moment the segment ended (`app/streaming/video/ffmpeg.cpp:674`), a point
+    /// sample despite the printed "Average" label, so summing or weighting several of them would
+    /// not describe anything real; they are reported from the longest (by duration) segment
+    /// instead. A metric absent from every segment that held a weight stays absent, never
+    /// defaulted to zero.
     VideoStats aggregate() const;
 
 private:

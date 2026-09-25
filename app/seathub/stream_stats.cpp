@@ -34,6 +34,27 @@ const QRegularExpression& renderedFpsPattern()
     return re;
 }
 
+// WR-09 (code review 06.3-REVIEW-fork.md, second review pass): printed in the same conditional
+// block as `Rendering frame rate:` above (ffmpeg.cpp:791-796, gated on `stats.receivedFps > 0`) -
+// parsed for `VideoStatsAggregator::aggregate()`'s own frame-weighting only; neither line is one
+// of `SessionQualityReport`'s fields and neither is sent on the wire (`toQualityReport()` does
+// not reference `VideoStats::receivedFps`/`decodedFps` at all).
+const QRegularExpression& receivedFpsPattern()
+{
+    static const QRegularExpression re(
+        QStringLiteral("^Incoming frame rate from network: (\\d+(?:\\.\\d+)?) FPS$"),
+        QRegularExpression::MultilineOption);
+    return re;
+}
+
+const QRegularExpression& decodedFpsPattern()
+{
+    static const QRegularExpression re(
+        QStringLiteral("^Decoding frame rate: (\\d+(?:\\.\\d+)?) FPS$"),
+        QRegularExpression::MultilineOption);
+    return re;
+}
+
 const QRegularExpression& networkDroppedPattern()
 {
     static const QRegularExpression re(
@@ -102,6 +123,21 @@ bool parseVideoStatsBlock(const QString& block, VideoStats* out)
     QRegularExpressionMatch m = renderedFpsPattern().match(block);
     if (m.hasMatch()) {
         out->renderedFps = OptionalMetric::of(m.captured(1).toDouble());
+        matchedAnyLine = true;
+    }
+
+    // WR-09: not part of the report body (`toQualityReport()` never reads either), parsed only
+    // so `VideoStatsAggregator::aggregate()` can weight this segment's other metrics by the
+    // matching frame count.
+    m = receivedFpsPattern().match(block);
+    if (m.hasMatch()) {
+        out->receivedFps = OptionalMetric::of(m.captured(1).toDouble());
+        matchedAnyLine = true;
+    }
+
+    m = decodedFpsPattern().match(block);
+    if (m.hasMatch()) {
+        out->decodedFps = OptionalMetric::of(m.captured(1).toDouble());
         matchedAnyLine = true;
     }
 
@@ -216,7 +252,9 @@ namespace {
 
 // Duration-weighted average of one metric across every segment that held a value for it. A
 // segment with no duration (the clock never started, or restarted at 0) contributes nothing
-// rather than a divide-by-zero; a metric absent everywhere stays absent.
+// rather than a divide-by-zero; a metric absent everywhere stays absent. Correct only for a
+// metric that is itself a rate over wall-clock time (`renderedFps` - see `frameWeightedAverage()`
+// below for every other averaged metric, WR-09).
 OptionalMetric weightedAverage(const std::vector<VideoStatsAggregator::Segment>& segments,
                                 OptionalMetric VideoStats::*field)
 {
@@ -229,6 +267,38 @@ OptionalMetric weightedAverage(const std::vector<VideoStatsAggregator::Segment>&
         }
         weightedSum += metric.value * static_cast<double>(segment.durationMs);
         weightTotal += static_cast<double>(segment.durationMs);
+    }
+    if (weightTotal <= 0.0) {
+        return OptionalMetric::none();
+    }
+    return OptionalMetric::of(weightedSum / weightTotal);
+}
+
+// WR-09 (code review 06.3-REVIEW-fork.md, second review pass): `field` is a ratio over a frame
+// count in the engine's own text (`stream_stats.h`'s own class comment names which count for
+// which field); `fpsField` is the matching rate `stringifyVideoStats()` also prints for that same
+// segment, so `fpsField.value * durationMs` recovers that count. A segment missing either value,
+// or with no duration, contributes nothing - the same "absent, never defaulted to zero" rule
+// `weightedAverage()` follows, extended to a missing weight as well as a missing metric (a
+// segment cannot be weighted by a frame count it never printed).
+OptionalMetric frameWeightedAverage(const std::vector<VideoStatsAggregator::Segment>& segments,
+                                     OptionalMetric VideoStats::*field,
+                                     OptionalMetric VideoStats::*fpsField)
+{
+    double weightedSum = 0.0;
+    double weightTotal = 0.0;
+    for (const VideoStatsAggregator::Segment& segment : segments) {
+        const OptionalMetric& metric = segment.stats.*field;
+        const OptionalMetric& fps = segment.stats.*fpsField;
+        if (!metric.present || !fps.present || segment.durationMs <= 0) {
+            continue;
+        }
+        const double weight = fps.value * static_cast<double>(segment.durationMs);
+        if (weight <= 0.0) {
+            continue;
+        }
+        weightedSum += metric.value * weight;
+        weightTotal += weight;
     }
     if (weightTotal <= 0.0) {
         return OptionalMetric::none();
@@ -251,12 +321,22 @@ VideoStats VideoStatsAggregator::aggregate() const
         return m_segments.front().stats;
     }
 
+    // WR-09: `renderedFps` is itself a rate over wall-clock time, so it keeps plain duration
+    // weighting. Every other metric here is a ratio over a frame count in the engine's own text
+    // (`stream_stats.h`'s own class comment names which count for which), so each is weighted by
+    // the matching printed rate x this segment's duration instead - see
+    // `frameWeightedAverage()`'s own comment.
     out.renderedFps = weightedAverage(m_segments, &VideoStats::renderedFps);
-    out.networkDroppedFramePct = weightedAverage(m_segments, &VideoStats::networkDroppedFramePct);
-    out.jitterDroppedFramePct = weightedAverage(m_segments, &VideoStats::jitterDroppedFramePct);
-    out.decodeTimeMs = weightedAverage(m_segments, &VideoStats::decodeTimeMs);
-    out.queueTimeMs = weightedAverage(m_segments, &VideoStats::queueTimeMs);
-    out.renderTimeMs = weightedAverage(m_segments, &VideoStats::renderTimeMs);
+    out.networkDroppedFramePct =
+        frameWeightedAverage(m_segments, &VideoStats::networkDroppedFramePct, &VideoStats::receivedFps);
+    out.jitterDroppedFramePct =
+        frameWeightedAverage(m_segments, &VideoStats::jitterDroppedFramePct, &VideoStats::decodedFps);
+    out.decodeTimeMs =
+        frameWeightedAverage(m_segments, &VideoStats::decodeTimeMs, &VideoStats::decodedFps);
+    out.queueTimeMs =
+        frameWeightedAverage(m_segments, &VideoStats::queueTimeMs, &VideoStats::renderedFps);
+    out.renderTimeMs =
+        frameWeightedAverage(m_segments, &VideoStats::renderTimeMs, &VideoStats::renderedFps);
 
     // rtt_ms / rtt_variance_ms: a point sample, not a real average (see `aggregate()`'s own
     // header comment) - taken from the longest segment that actually held one, not combined. A
