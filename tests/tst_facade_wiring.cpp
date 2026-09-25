@@ -292,6 +292,15 @@ public:
         return m_auth.value(path);
     }
 
+    /// D-27: the `traceparent` header of every request, in order (empty when the request carried
+    /// none) - so a test can tell "no trace id was set" from "the trace id changed between two
+    /// Plays" without needing the span, which is fresh per request by design.
+    QList<QByteArray> traceparents() const
+    {
+        QMutexLocker lock(&m_mutex);
+        return m_traceparents;
+    }
+
 protected:
     QNetworkReply* createRequest(Operation operation, const QNetworkRequest& request,
                                  QIODevice* outgoing) override
@@ -312,6 +321,7 @@ protected:
             m_paths.append(path);
             m_queries[path].append(request.url().query(QUrl::FullyEncoded));
             m_auth.insert(path, request.rawHeader("Authorization"));
+            m_traceparents.append(request.rawHeader("traceparent"));
             if (outgoing) {
                 m_bodies.insert(path, outgoing->peek(outgoing->size()));
             }
@@ -422,6 +432,7 @@ private:
     int m_usageStatus = 200;
     QByteArray m_usageBody = QByteArrayLiteral("{\"minutes_played\":0,\"balance_minutes\":0}");
     QHash<QString, QByteArray> m_auth;
+    QList<QByteArray> m_traceparents;
     QHash<QString, QByteArray> m_bodies;
     int m_loginStatus = 200;
     QByteArray m_loginBody;
@@ -1634,6 +1645,112 @@ private slots:
         delete engine;
     }
 
+    // --- D-27: one trace id per Play --------------------------------------------------------
+
+    void oneTraceIdPerPlayMintedAtSessionCreateAndClearedAtTeardown()
+    {
+        // Everything a Play does over its lifetime: the session create and its pairing polls all
+        // carry the same trace id (only the span differs); teardown completing clears it, so a
+        // request outside any Play carries none. (That a fresh Play mints a *different* trace id
+        // is not re-proven end to end here - `randomTraceId()` draws fresh bits from
+        // `QRandomGenerator::system()` on every call, and `tst_control_plane.cpp`'s
+        // `traceparent_afterSetTraceId_carriesItOnEveryRequestWithAFreshSpan` already covers the
+        // "no two draws are ever compared equal" shape of that same call. Reusing one
+        // `FakeEngineSession` across a second full Play+teardown cycle - something no production
+        // path or existing test in this file does; every real Play resolves a fresh engine
+        // session through `handleHostResolved()` - fights this harness rather than this feature.)
+        SeatHubClient client;
+        auto* engine = new FakeEngineSession;
+        client.session()->attachSession(engine);
+        reachHome(client, 90);
+        QVERIFY(!QTest::currentTestFailed());
+        client.teardown()->setVerifyIntervalMs(1);
+
+        // `reachHome` itself already made trace-id-less requests (the restore's `/api/me`,
+        // `/api/wallet`); everything from here on is indexed relative to a snapshot taken right
+        // before each Play, not from the start of the whole list, so an earlier request - or a
+        // later Play's - is never mistaken for this one's.
+        const int beforeFirstPlay = m_fake->requestPaths().size();
+        m_fake->answerPlay(201, QByteArrayLiteral("{\"id\":\"s-trace-1\"}"));
+        client.start();
+        QTRY_VERIFY_WITH_TIMEOUT(client.liveSession(), 15000);
+        QCOMPARE(m_fake->requestPaths().count(QStringLiteral("/api/sessions")), 1);
+
+        // Wait for at least one pairing poll of this session, so there is a second request of
+        // this Play to compare the session-create's trace id against.
+        QTRY_VERIFY_WITH_TIMEOUT(
+            m_fake->requestPaths().count(QStringLiteral("/api/sessions/s-trace-1/pairing")) >= 1,
+            15000);
+
+        // Every request of this Play carries the same trace id - the session create itself
+        // first of all - and only the span differs (D-27, ADR-0060 item 10).
+        {
+            const QStringList paths = m_fake->requestPaths();
+            const QList<QByteArray> traceparents = m_fake->traceparents();
+            QVERIFY(paths.size() > beforeFirstPlay);
+            QCOMPARE(paths.at(beforeFirstPlay), QStringLiteral("/api/sessions"));
+            const QByteArray firstTraceparent = traceparents.at(beforeFirstPlay);
+            QVERIFY2(firstTraceparent.startsWith("00-"),
+                     "the session create itself must carry traceparent");
+            const QByteArray tracePrefix = firstTraceparent.left(36); // "00-<32 lowercase hex>-"
+            int matchingSpans = 0;
+            for (int i = beforeFirstPlay; i < paths.size(); ++i) {
+                QVERIFY2(traceparents.at(i).startsWith(tracePrefix),
+                         "every request of one Play carries the same trace id");
+                if (traceparents.at(i) == firstTraceparent) {
+                    ++matchingSpans;
+                }
+            }
+            QVERIFY2(matchingSpans < paths.size() - beforeFirstPlay,
+                     "the span differs between two requests of the same Play");
+        }
+        const QByteArray firstTracePrefix = m_fake->traceparents().at(beforeFirstPlay).left(36);
+
+        QSignalSpy completed(client.teardown(), &TeardownController::teardownCompleted);
+        emit engine->readyForDeletion();
+        QTRY_COMPARE_WITH_TIMEOUT(completed.count(), 1, 15000);
+        QTRY_VERIFY_WITH_TIMEOUT(!client.liveSession(), 15000);
+
+        // A request outside any Play, once teardown has completed, carries no traceparent - the
+        // id this Play used is gone (`handleTeardownCompleted`).
+        const int beforeReload = m_fake->requestPaths().size();
+        m_fake->answerMe(200, accountBody());
+        client.reloadAccount();
+        QTRY_VERIFY_WITH_TIMEOUT(m_fake->requestPaths().size() > beforeReload, 15000);
+        QCOMPARE(m_fake->requestPaths().at(beforeReload), QStringLiteral("/api/me"));
+        QVERIFY2(m_fake->traceparents().at(beforeReload).isEmpty(),
+                 "a request after teardown, outside any Play, carries no traceparent");
+        QVERIFY2(!firstTracePrefix.isEmpty(), "sanity: the first Play's own trace id was captured");
+
+        client.session()->attachSession(nullptr);
+        delete engine;
+    }
+
+    void twoRefusedPlaysMintTwoDifferentTraceIds()
+    {
+        // A refused Play never leaves Home (`applyPlayFailure`), so this needs neither an
+        // engine nor a session - just two `client.start()` calls back to back, the same pattern
+        // `aRefusalFromTheServerIsShownOnHomeInItsOwnWordsAndAnythingElseIsAnError` already uses.
+        SeatHubClient client;
+        reachHome(client, 0);
+        QVERIFY(!QTest::currentTestFailed());
+
+        m_fake->answerPlay(402, playRefusalBody(QStringLiteral("Not enough credit."),
+                                                 QStringLiteral("SH-3K2XQ1")));
+        client.start();
+        QTRY_COMPARE_WITH_TIMEOUT(client.homeStatus(), QStringLiteral("refused"), 15000);
+        QCOMPARE(m_fake->requestPaths().count(QStringLiteral("/api/sessions")), 1);
+        const QByteArray firstTraceparent = m_fake->traceparents().last();
+        QVERIFY2(firstTraceparent.startsWith("00-"), "even a refused Play's request carries a trace id");
+
+        client.start();
+        QTRY_COMPARE_WITH_TIMEOUT(m_fake->requestPaths().count(QStringLiteral("/api/sessions")), 2, 15000);
+        const QByteArray secondTraceparent = m_fake->traceparents().last();
+        QVERIFY2(!secondTraceparent.isEmpty(), "the second Play carries a trace id too");
+        QVERIFY2(secondTraceparent.left(36) != firstTraceparent.left(36),
+                 "each Play mints its own trace id, refused or not");
+    }
+
     // --- the connecting stages are the session's own state (CUST-12, ADR-0055) ------------------------
 
     /// A session as the pairing poll would hand it to the facade.
@@ -2033,8 +2150,11 @@ private slots:
         SeatHubClient client;
         reachHome(client, 90);
         QVERIFY(!QTest::currentTestFailed());
-        m_fake->answerPairing(409, playRefusalBody(QStringLiteral("The rig is not ready yet."),
-                                                   QStringLiteral("SH-2K2XQ1")));
+        // A run of 409s no longer stalls this deadline (fork `15962514`: "a 409 while the rig is
+        // prepared does not spend the pairing deadline" - it restarts D-08's clock on every "not
+        // yet" answer). A transport failure still does, so the authorization poll never resolving
+        // at all is what makes this deadline expire.
+        m_fake->answerPairing(0);
 
         // The deadline is measured by the pairing controller, on its own thread: shorten it there, then
         // let a real pairing wait for a rig that never becomes ready.
@@ -3262,16 +3382,25 @@ private slots:
         QVERIFY(!QTest::currentTestFailed());
         QVERIFY(waitWithoutTheEventLoop([&]() { return ticks.read.load() >= 1; }));
 
+        // D-11: the stage moving to "streaming" inside `beginStreaming` (`handleConnectionStarted`)
+        // reports at once, the same way any stage change does, and that report carries no wallet
+        // read - so the running totals are captured here, before the two ticks below, rather than
+        // assumed to start at zero.
+        const int reportsBeforeTicks = m_fake->countOfPathEndingWith(QStringLiteral("/liveness"));
+        const int readsBeforeTicks = ticks.read.load() + ticks.failed.load();
+
         // Two more ticks, and each is one liveness report and one wallet read: the read has no
         // cadence of its own.
         QVERIFY(tickAndWait(client, &ticks));
         QVERIFY(tickAndWait(client, &ticks));
         QVERIFY(waitWithoutTheEventLoop([&]() {
-            return m_fake->countOfPathEndingWith(QStringLiteral("/liveness")) >= 3;
+            return m_fake->countOfPathEndingWith(QStringLiteral("/liveness")) >= reportsBeforeTicks + 2;
         }));
-        const int reports = m_fake->countOfPathEndingWith(QStringLiteral("/liveness"));
-        const int reads = ticks.read.load() + ticks.failed.load();
+        const int reports =
+            m_fake->countOfPathEndingWith(QStringLiteral("/liveness")) - reportsBeforeTicks;
+        const int reads = ticks.read.load() + ticks.failed.load() - readsBeforeTicks;
         QCOMPARE(reads, reports);
+        QCOMPARE(reports, 2);
 
         // And the source agrees: the reporter still has its two locked constants and no third.
         // (`kIntervalMs` is D-31's 10 seconds; the grace is the server's 30.)

@@ -702,6 +702,93 @@ private slots:
                  QByteArrayLiteral("Bearer opaque-access-token"));
     }
 
+    // --- D-27: one trace id per Play, on every request -------------------------------------
+
+    void traceparent_withNoTraceIdSet_addsNoHeader()
+    {
+        ControlPlaneClient client;
+        auto* fake = new FakeNetworkAccessManager;
+        client.setNetworkAccessManager(fake);
+        fake->status = 200;
+        fake->body = okBody();
+
+        bool called = false;
+        client.fetchSession(QStringLiteral("s"), [&](const ControlPlaneResult&) { called = true; });
+        QTRY_VERIFY(called);
+
+        QVERIFY2(!fake->lastRequest.hasRawHeader("traceparent"),
+                 "no trace id was ever set, so no traceparent header is added");
+    }
+
+    void traceparent_afterSetTraceId_carriesItOnEveryRequestWithAFreshSpan()
+    {
+        ControlPlaneClient client;
+        auto* fake = new FakeNetworkAccessManager;
+        client.setNetworkAccessManager(fake);
+        fake->status = 200;
+        fake->body = okBody();
+        const QString traceId = QStringLiteral("0123456789abcdef0123456789abcdef");
+        client.setTraceId(traceId);
+
+        bool called = false;
+        client.fetchSession(QStringLiteral("s"), [&](const ControlPlaneResult&) { called = true; });
+        QTRY_VERIFY(called);
+        const QByteArray first = fake->lastRequest.rawHeader("traceparent");
+        QCOMPARE(first, QByteArray("00-" + traceId.toUtf8() + "-" + first.mid(36, 16) + "-01"));
+        QCOMPARE(first.size(), 55); // "00-" + 32 + "-" + 16 + "-01"
+
+        called = false;
+        client.fetchSession(QStringLiteral("s"), [&](const ControlPlaneResult&) { called = true; });
+        QTRY_VERIFY(called);
+        const QByteArray second = fake->lastRequest.rawHeader("traceparent");
+        QVERIFY2(second.startsWith(QByteArray("00-" + traceId.toUtf8() + "-")),
+                 "the trace id is the same on every request of this Play");
+        QVERIFY2(second != first, "the span differs between two requests");
+    }
+
+    void setTraceId_withAMalformedValue_isIgnored()
+    {
+        ControlPlaneClient client;
+        auto* fake = new FakeNetworkAccessManager;
+        client.setNetworkAccessManager(fake);
+        fake->status = 200;
+        fake->body = okBody();
+
+        for (const QString& malformed : {
+                 QStringLiteral("0123456789ABCDEF0123456789ABCDEF"), // uppercase
+                 QStringLiteral("0123456789abcdef0123456789abcde"),  // 31 chars
+                 QStringLiteral(""),
+                 QString(32, QLatin1Char('0')), // all zeros - W3C forbids this exact value
+             }) {
+            client.setTraceId(malformed);
+            bool called = false;
+            client.fetchSession(QStringLiteral("s"), [&](const ControlPlaneResult&) { called = true; });
+            QTRY_VERIFY(called);
+            QVERIFY2(!fake->lastRequest.hasRawHeader("traceparent"), qPrintable(malformed));
+        }
+    }
+
+    void clearTraceId_stopsTheHeader()
+    {
+        ControlPlaneClient client;
+        auto* fake = new FakeNetworkAccessManager;
+        client.setNetworkAccessManager(fake);
+        fake->status = 200;
+        fake->body = okBody();
+        client.setTraceId(QStringLiteral("0123456789abcdef0123456789abcdef"));
+
+        bool called = false;
+        client.fetchSession(QStringLiteral("s"), [&](const ControlPlaneResult&) { called = true; });
+        QTRY_VERIFY(called);
+        QVERIFY(fake->lastRequest.hasRawHeader("traceparent"));
+
+        client.clearTraceId();
+        called = false;
+        client.fetchSession(QStringLiteral("s"), [&](const ControlPlaneResult&) { called = true; });
+        QTRY_VERIFY(called);
+        QVERIFY2(!fake->lastRequest.hasRawHeader("traceparent"), "clearTraceId stops the header");
+    }
+
     // --- liveness payload (D-34, ADR-0041) --------------------------------------------------
 
     void livenessPayload_carriesStateAndErrorCode()

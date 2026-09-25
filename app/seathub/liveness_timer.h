@@ -1,5 +1,6 @@
 #pragma once
 
+#include <QJsonObject>
 #include <QObject>
 #include <QString>
 #include <QTimer>
@@ -67,24 +68,67 @@ public:
     explicit LivenessTimer(QObject* parent = nullptr);
 
     QString reportedState() const { return m_reportedState; }
+    /// D-11/3.1.0: SeatHub's own stage, one of the eight the contract names, or empty before
+    /// `start()` has ever run.
+    QString stage() const { return m_stage; }
     bool isRunning() const;
     int consecutiveFailures() const { return m_consecutiveFailures; }
     bool warnedSinceLastSuccess() const { return m_warned; }
 
     void setControlPlane(ControlPlaneClient* client);
     /// ADR-0041 `state`. "streaming" while the media path is up, "reconnecting" while the
-    /// session channel is down, "ending" once teardown has begun.
+    /// session channel is down, "ending" once teardown has begun. Unchanged since 1.6.0: only
+    /// the three documented values are ever sent, and nothing here sets it on `start()` any more
+    /// (D-11 moved `start()` to session begin, well before the media path exists) - the caller
+    /// sets it exactly where it always did (`handleConnectionStarted`).
     void setReportedState(const QString& state);
     /// ADR-0041 `error_code`: the `SH-XXXXXX` reference of the failure the client just had, or
     /// empty. A malformed value is dropped rather than sent (ADR-0008's alphabet).
     void setErrorCode(const QString& reference);
+    /// D-11/3.1.0: SeatHub's own stage - `preparing_rig`, `pairing`, `connecting`,
+    /// `first_frame`, `streaming`, `reconnecting`, `ending` or `failed`. A value outside that
+    /// list is ignored (never sent). A genuine change reports at once, ahead of the next tick,
+    /// so the server sees a stage transition the moment it happens rather than up to
+    /// `kIntervalMs` later.
+    void setStage(const QString& stage);
+    /// D-11: the engine's own stage name (`Limelight.h`'s `LiGetStageName()` family, e.g. "RTSP
+    /// handshake"), diagnostic only and never shown (D-51). A free string, no enum: upstream's
+    /// own names are "subject to change in future releases".
+    void setEngineStage(const QString& engineStage);
+    /// D-11: the stage-failure or termination error code. 0 is a real code
+    /// (`ML_ERROR_GRACEFUL_TERMINATION`), not "unset" - `hasEngineError()` says whether one has
+    /// ever been set on this timer.
+    void setEngineError(int code);
+    bool hasEngineError() const { return m_hasEngineError; }
+    int engineError() const { return m_engineError; }
+    /// D-11: the ports a stage failure named (`handleStageFailed`'s own string).
+    void setFailingPorts(const QString& failingPorts);
     /// Test seams. The behaviour is identical at any interval; the real one is D-31's 10000.
     void setIntervalMs(int milliseconds);
     void setGraceMs(int milliseconds);
 
-    /// Starts on session start and reports until `stop()`.
+    /// Starts on session start (D-11: at `beginSession`, not at the stream's first frame) and
+    /// reports until `stop()`. The first tick reports stage `preparing_rig` with no `state` key
+    /// (the state stays whatever it already was - idle unless a caller set it first).
     void start(const QString& sessionId);
     void stop();
+
+    /// D-11: a pre-engine failure with no engine code - a pairing timeout or refusal, or the
+    /// `m_session->start()` refusal. Sets stage `failed`, `engine_stage` to `engineStage`, and
+    /// sends no `engine_error` and no `failing_ports` (the contract reserves those for a real
+    /// platform code). Posts once, synchronously on this timer's own thread, before any pending
+    /// `stop()` takes effect.
+    void reportFailure(const QString& engineStage);
+    /// D-11: a stage failure, carrying the engine's own code and ports
+    /// (`handleStageFailed(stage, errorCode, failingPorts)`). Same posting guarantee as the
+    /// one-argument overload.
+    void reportFailure(const QString& engineStage, int engineError, const QString& failingPorts);
+
+    /// D-11/A-51: the engine's own termination code, as soon as it is known
+    /// (`Session::clConnectionTerminated`, relayed through Plan 15's log-tee sink - no engine
+    /// signal carries it directly). Sets `engine_error` and stage `ending` in one call and
+    /// reports at once, with the same posting guarantee as `reportFailure`.
+    void noteTermination(int code);
 
 signals:
     void reportedStateChanged();
@@ -116,6 +160,15 @@ private:
     /// True when the calling thread is the one this object lives on (or when it lives on no
     /// thread at all, which only happens after its thread has been destroyed).
     bool onOwnThread() const;
+    /// The current payload: `stage` (when set), `state` (when it is one of the three documented
+    /// values), `error_code` (when valid), `engine_stage`, `engine_error` and `failing_ports`
+    /// (each only when set). The one place that decides what a report carries.
+    QJsonObject buildPayload() const;
+    /// Posts `buildPayload()` at once, on this timer's own thread, with no wallet read. Used by
+    /// `setStage`, `reportFailure` and `noteTermination` for their "posts at once" guarantee;
+    /// `tick()` is the interval-driven path and reads the wallet alongside it. A no-op while no
+    /// session is attached (`m_sessionId` empty), the same guard `tick()` already uses.
+    void reportNow();
 
     ControlPlaneClient* m_client = nullptr;
     QTimer* m_timer = nullptr;
@@ -123,6 +176,13 @@ private:
     QString m_sessionId;
     QString m_reportedState;
     QString m_errorCode;
+    /// D-11/3.1.0: SeatHub's own stage. Set to `preparing_rig` by `start()`; empty only before
+    /// the first `start()`.
+    QString m_stage;
+    QString m_engineStage;
+    int m_engineError = 0;
+    bool m_hasEngineError = false;
+    QString m_failingPorts;
     int m_consecutiveFailures = 0;
     bool m_warned = false;
     int m_intervalMs = kIntervalMs;

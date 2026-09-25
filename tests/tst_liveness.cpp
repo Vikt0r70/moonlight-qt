@@ -177,6 +177,9 @@ private slots:
 
     void onlyTheThreeDocumentedStatesAreReportable()
     {
+        // D-11: `start()` no longer forces `state` to "streaming" (it now runs at session begin,
+        // well before the media path exists), so an invalid value set beforehand is simply left
+        // out of the wire payload rather than swapped for something valid.
         LivenessTimer timer;
         auto* client = new ControlPlaneClient(&timer);
         auto* fake = new FakeNetworkAccessManager;
@@ -188,8 +191,163 @@ private slots:
         timer.start(QString::fromLatin1(kSessionId));
 
         QTRY_VERIFY(!fake->postedBodies.isEmpty());
-        // Falls back to something valid in the enum rather than sending the invalid string.
-        QCOMPARE(timer.reportedState(), QStringLiteral("streaming"));
+        const QJsonObject payload = lastPostedObject(*fake);
+        QVERIFY(!payload.contains(QStringLiteral("state")));
+    }
+
+    // --- D-11/3.1.0: SeatHub's own stage, from session begin -------------------------------
+
+    void start_reportsPreparingRigWithNoStateKeyYet()
+    {
+        LivenessTimer timer;
+        auto* client = new ControlPlaneClient(&timer);
+        auto* fake = new FakeNetworkAccessManager;
+        fake->body = sessionBody();
+        client->setNetworkAccessManager(fake);
+        timer.setControlPlane(client);
+
+        timer.start(QString::fromLatin1(kSessionId));
+
+        QTRY_VERIFY(!fake->postedBodies.isEmpty());
+        const QJsonObject payload = lastPostedObject(*fake);
+        QCOMPARE(payload.value(QStringLiteral("stage")).toString(), QStringLiteral("preparing_rig"));
+        QVERIFY(!payload.contains(QStringLiteral("state")));
+    }
+
+    void setStage_reportsAtOnceOnAGenuineChange()
+    {
+        LivenessTimer timer;
+        auto* client = new ControlPlaneClient(&timer);
+        auto* fake = new FakeNetworkAccessManager;
+        fake->body = sessionBody();
+        client->setNetworkAccessManager(fake);
+        timer.setControlPlane(client);
+        // Long enough that only an immediate report - never the scheduled interval - could
+        // account for a new post inside this test's QTRY window.
+        timer.setIntervalMs(100000);
+
+        timer.start(QString::fromLatin1(kSessionId));
+        QTRY_VERIFY(!fake->postedBodies.isEmpty());
+        const int callsAfterStart = fake->calls;
+
+        timer.setStage(QStringLiteral("pairing"));
+        QTRY_VERIFY(fake->calls > callsAfterStart);
+        QCOMPARE(lastPostedObject(*fake).value(QStringLiteral("stage")).toString(),
+                 QStringLiteral("pairing"));
+
+        // The same stage again is not a change: no extra post.
+        const int callsAfterPairing = fake->calls;
+        timer.setStage(QStringLiteral("pairing"));
+        QTest::qWait(20);
+        QCOMPARE(fake->calls, callsAfterPairing);
+    }
+
+    void setStage_ignoresAStageOutsideThe3_1_0List()
+    {
+        LivenessTimer timer;
+        auto* client = new ControlPlaneClient(&timer);
+        auto* fake = new FakeNetworkAccessManager;
+        fake->body = sessionBody();
+        client->setNetworkAccessManager(fake);
+        timer.setControlPlane(client);
+        timer.setIntervalMs(100000);
+
+        timer.start(QString::fromLatin1(kSessionId));
+        QTRY_VERIFY(!fake->postedBodies.isEmpty());
+        const int callsAfterStart = fake->calls;
+
+        timer.setStage(QStringLiteral("bogus_stage"));
+        QTest::qWait(20);
+        QCOMPARE(fake->calls, callsAfterStart);
+        QCOMPARE(timer.stage(), QStringLiteral("preparing_rig"));
+    }
+
+    void reportFailure_withNoCode_omitsEngineErrorAndFailingPorts()
+    {
+        LivenessTimer timer;
+        auto* client = new ControlPlaneClient(&timer);
+        auto* fake = new FakeNetworkAccessManager;
+        fake->body = sessionBody();
+        client->setNetworkAccessManager(fake);
+        timer.setControlPlane(client);
+
+        timer.start(QString::fromLatin1(kSessionId));
+        QTRY_VERIFY(!fake->postedBodies.isEmpty());
+        const int callsBefore = fake->calls;
+
+        timer.reportFailure(QStringLiteral("pairing"));
+        QTRY_VERIFY(fake->calls > callsBefore);
+        const QJsonObject payload = lastPostedObject(*fake);
+        QCOMPARE(payload.value(QStringLiteral("stage")).toString(), QStringLiteral("failed"));
+        QCOMPARE(payload.value(QStringLiteral("engine_stage")).toString(), QStringLiteral("pairing"));
+        QVERIFY(!payload.contains(QStringLiteral("engine_error")));
+        QVERIFY(!payload.contains(QStringLiteral("failing_ports")));
+    }
+
+    void reportFailure_withACode_includesEngineErrorAndFailingPorts()
+    {
+        LivenessTimer timer;
+        auto* client = new ControlPlaneClient(&timer);
+        auto* fake = new FakeNetworkAccessManager;
+        fake->body = sessionBody();
+        client->setNetworkAccessManager(fake);
+        timer.setControlPlane(client);
+
+        timer.start(QString::fromLatin1(kSessionId));
+        QTRY_VERIFY(!fake->postedBodies.isEmpty());
+        const int callsBefore = fake->calls;
+
+        timer.reportFailure(QStringLiteral("RTSP handshake"), 10060, QStringLiteral("48010"));
+        QTRY_VERIFY(fake->calls > callsBefore);
+        const QJsonObject payload = lastPostedObject(*fake);
+        QCOMPARE(payload.value(QStringLiteral("stage")).toString(), QStringLiteral("failed"));
+        QCOMPARE(payload.value(QStringLiteral("engine_stage")).toString(),
+                 QStringLiteral("RTSP handshake"));
+        QCOMPARE(payload.value(QStringLiteral("engine_error")).toInt(), 10060);
+        QCOMPARE(payload.value(QStringLiteral("failing_ports")).toString(), QStringLiteral("48010"));
+    }
+
+    void noteTermination_reportsAtOnceAndAQueuedStopDoesNotSuppressIt()
+    {
+        LivenessTimer timer;
+        auto* client = new ControlPlaneClient(&timer);
+        auto* fake = new FakeNetworkAccessManager;
+        fake->body = sessionBody();
+        client->setNetworkAccessManager(fake);
+        timer.setControlPlane(client);
+
+        timer.start(QString::fromLatin1(kSessionId));
+        QTRY_VERIFY(!fake->postedBodies.isEmpty());
+        const int callsBefore = fake->calls;
+
+        timer.noteTermination(-100);
+        timer.stop(); // queued right after: must not suppress the termination post
+        QTRY_VERIFY(fake->calls > callsBefore);
+        const QJsonObject payload = lastPostedObject(*fake);
+        QCOMPARE(payload.value(QStringLiteral("stage")).toString(), QStringLiteral("ending"));
+        QCOMPARE(payload.value(QStringLiteral("engine_error")).toInt(), -100);
+    }
+
+    void noteTermination_zeroIsARealCodeNotAnAbsentOne()
+    {
+        // ML_ERROR_GRACEFUL_TERMINATION is 0. It must still appear in the payload, not be treated
+        // as "no code was ever set".
+        LivenessTimer timer;
+        auto* client = new ControlPlaneClient(&timer);
+        auto* fake = new FakeNetworkAccessManager;
+        fake->body = sessionBody();
+        client->setNetworkAccessManager(fake);
+        timer.setControlPlane(client);
+
+        timer.start(QString::fromLatin1(kSessionId));
+        QTRY_VERIFY(!fake->postedBodies.isEmpty());
+        const int callsBefore = fake->calls;
+
+        timer.noteTermination(0);
+        QTRY_VERIFY(fake->calls > callsBefore);
+        const QJsonObject payload = lastPostedObject(*fake);
+        QVERIFY(payload.contains(QStringLiteral("engine_error")));
+        QCOMPARE(payload.value(QStringLiteral("engine_error")).toInt(), 0);
     }
 
     void stop_endsReporting()

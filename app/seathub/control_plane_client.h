@@ -339,6 +339,14 @@ public:
     void setAccessToken(const QString& token);
     bool hasAccessToken() const { return !m_accessToken.isEmpty(); }
 
+    /// D-27: the W3C trace id this client stamps as `traceparent` on every request until
+    /// `clearTraceId()`. Must be 32 lowercase hex characters and not all zeros (W3C); anything
+    /// else is ignored, so a malformed value never reaches the wire and `send()` behaves exactly
+    /// as it did with no trace id set.
+    void setTraceId(const QString& traceId);
+    /// Stops sending `traceparent`.
+    void clearTraceId();
+
     /// Replaces the access manager. Exists so a test can drive every response path without a
     /// server; production never calls it.
     void setNetworkAccessManager(QNetworkAccessManager* manager);
@@ -420,9 +428,17 @@ public:
     void fetchSessionAuthorization(const QString& sessionId, Callback callback);
 
     /// The 10-second liveness report (D-31) carrying `state` and/or `error_code` (D-34,
-    /// ADR-0041). Both are optional; both empty is the pre-1.6.0 deadline extension.
+    /// ADR-0041). Both are optional; both empty is the pre-1.6.0 deadline extension. Kept for the
+    /// callers this exact shape still has (tests exercising the class directly); production
+    /// callers use the `QJsonObject` overload below.
     void postLiveness(const QString& sessionId, const QString& state,
                       const QString& errorCode, Callback callback);
+
+    /// Contract 3.1.0 (D-11): the full liveness body, built by the caller (`LivenessTimer::buildPayload`)
+    /// and posted verbatim - `stage`, `state`, `error_code`, `engine_stage`, `engine_error`,
+    /// `failing_ports`, each present only when the caller set it. An empty object is the same
+    /// pre-1.6.0 deadline extension the string overload sends for two empty strings.
+    void postLiveness(const QString& sessionId, const QJsonObject& payload, Callback callback);
 
     /// `POST /api/sessions/{session_id}/end`. Idempotent server-side: ending an
     /// already-ending or terminal session returns it unchanged.
@@ -443,4 +459,8 @@ private:
     QThread* m_thread = nullptr;
     QString m_baseUrl;
     QString m_accessToken;
+    /// D-27: read only inside `send()`, on the owning thread - never captured into the queued
+    /// re-invoke lambda `send()` already uses to marshal a foreign-thread call, so a `setTraceId`
+    /// that lands after the marshal but before `send()` actually runs is still picked up.
+    QString m_traceId;
 };

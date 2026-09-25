@@ -6,6 +6,7 @@
 #include <QNetworkAccessManager>
 #include <QNetworkReply>
 #include <QNetworkRequest>
+#include <QRandomGenerator>
 #include <QRegularExpression>
 #include <QThread>
 #include <QUrl>
@@ -25,6 +26,36 @@ const char* const kLivenessStates[] = { "streaming", "reconnecting", "ending" };
 // ADR-0008 / `Error.reference`, `ReferenceCode`, `liveness.error_code`. The alphabet
 // excludes I, L and O so a reference read off a screen is unambiguous.
 const char* kReferencePattern = "^SH-[0-9A-HJ-KM-NP-TV-Z]{6}$";
+
+// D-27: a W3C trace id - 32 lowercase hex characters, not all zeros
+// (https://www.w3.org/TR/trace-context/#trace-id).
+bool isValidTraceId(const QString& traceId)
+{
+    if (traceId.size() != 32) {
+        return false;
+    }
+    bool allZero = true;
+    for (const QChar ch : traceId) {
+        const ushort u = ch.unicode();
+        const bool isLowerHex = (u >= u'0' && u <= u'9') || (u >= u'a' && u <= u'f');
+        if (!isLowerHex) {
+            return false;
+        }
+        if (u != u'0') {
+            allZero = false;
+        }
+    }
+    return !allZero;
+}
+
+// A 16-hex-character value from `QRandomGenerator::system()`, zero-padded - used for both a
+// trace id's low half (when the caller wants one minted, `SeatHubClient::beginPlayRequest`) and
+// a `traceparent` span id (`ControlPlaneClient::send`, one per request).
+QString randomHex16()
+{
+    return QString::number(QRandomGenerator::system()->generate64(), 16)
+        .rightJustified(16, QLatin1Char('0'));
+}
 
 } // namespace
 
@@ -628,6 +659,19 @@ void ControlPlaneClient::setAccessToken(const QString& token)
     m_accessToken = token;
 }
 
+void ControlPlaneClient::setTraceId(const QString& traceId)
+{
+    if (!isValidTraceId(traceId)) {
+        return;
+    }
+    m_traceId = traceId;
+}
+
+void ControlPlaneClient::clearTraceId()
+{
+    m_traceId.clear();
+}
+
 void ControlPlaneClient::setNetworkAccessManager(QNetworkAccessManager* manager)
 {
     if (!manager || manager == m_network) {
@@ -711,6 +755,17 @@ void ControlPlaneClient::send(const QString& method, const QString& path, const 
 
     if (authenticated && !m_accessToken.isEmpty()) {
         request.setRawHeader("Authorization", QByteArrayLiteral("Bearer ") + m_accessToken.toUtf8());
+    }
+
+    // D-27: one trace id per Play, on every request of it. `m_traceId` is read here, on the
+    // owning thread the re-invoke above already marshalled onto - never captured into that
+    // lambda, so a `setTraceId`/`clearTraceId` racing the marshal is still picked up. The span
+    // id is fresh per request (`00-<trace>-<span>-01`, W3C's own form); the trace id is not.
+    if (!m_traceId.isEmpty()) {
+        request.setRawHeader("traceparent",
+                             QByteArrayLiteral("00-") + m_traceId.toUtf8()
+                                 + QByteArrayLiteral("-") + randomHex16().toUtf8()
+                                 + QByteArrayLiteral("-01"));
     }
 
     QNetworkReply* reply = nullptr;
@@ -849,6 +904,16 @@ void ControlPlaneClient::postLiveness(const QString& sessionId, const QString& s
     send(QStringLiteral("POST"), QStringLiteral("/api/sessions/") + encodedPathSegment(sessionId)
              + QStringLiteral("/liveness"),
          buildLiveness(state, errorCode), true, callback);
+}
+
+void ControlPlaneClient::postLiveness(const QString& sessionId, const QJsonObject& payload,
+                                     Callback callback)
+{
+    const QByteArray body =
+        payload.isEmpty() ? QByteArray() : QJsonDocument(payload).toJson(QJsonDocument::Compact);
+    send(QStringLiteral("POST"), QStringLiteral("/api/sessions/") + encodedPathSegment(sessionId)
+             + QStringLiteral("/liveness"),
+         body, true, callback);
 }
 
 void ControlPlaneClient::endSession(const QString& sessionId, Callback callback)

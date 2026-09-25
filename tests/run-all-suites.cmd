@@ -37,6 +37,9 @@ rem adding one line.
 rem
 rem Build logs land in `<suite>-build-out.txt` / `<suite>-qmake-out.txt`, results
 rem in `<suite>-out.txt`. All three name patterns are gitignored.
+rem   * Each suite that passes its ", 0 failed" check and exits 0 prints
+rem     `[SUITE OK] <name>`, which every 06.3 fork check greps by name and counts
+rem     against the `call :suite` lines above (I11-02).
 rem ===========================================================================
 setlocal enabledelayedexpansion
 
@@ -125,5 +128,8 @@ findstr /r /c:"^Totals:" "%~1-out.txt"
 if !RC! neq 0 (
     echo [NONZERO EXIT] %~1 exited !RC!
     set "FAILED=1"
+    goto :eof
 )
+
+echo [SUITE OK] %~1
 goto :eof
