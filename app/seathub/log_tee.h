@@ -69,16 +69,20 @@ public:
     /// object is destroyed - `LogTee`'s own sink list is process-global and outlives any one
     /// caller, exactly the way `SeatHubClient`'s destructor does it.
     ///
-    /// WR-10 (code review 06.3-REVIEW-fork.md, second review pass): called from inside a sink
-    /// that is itself running, on the thread that is dispatching it - the same re-entry
-    /// `dispatch()`'s own `thread_local` guard already detects for the Qt/SDL handler chain -
-    /// this is DEFERRED rather than applied immediately. Taking the same write lock `dispatch()`
-    /// is holding for reading, on the SAME thread, would deadlock that thread against itself
-    /// (`QReadWriteLock` is non-recursive: a thread already holding it for reading cannot also
-    /// take it for writing - Qt's own `QReadWriteLock::RecursionMode` documentation). The handle
-    /// returned here is still valid immediately (allocated up front, independent of the sink
-    /// list itself), and the sink is registered the moment the dispatch that is currently running
-    /// on this thread returns - see `dispatch()`'s own comment for exactly where.
+    /// A sink's contract (D-16, 06.3.1, area 1 of the design-review trigger, SEATHUB verdict F):
+    /// a sink never adds or removes sinks, never blocks and never logs. Calling `addSink()` from
+    /// inside a sink's own dispatch, on the thread dispatching it, is a programming error, not a
+    /// case this tee accepts and applies later - WR-10's original deferral, and the latent
+    /// use-after-free and misapplied-add findings it left open (WR-12, IN-12), are both gone with
+    /// it. It is refused loudly instead: `Q_ASSERT_X` in a debug build, and in a release build one
+    /// reason line (`"LogTee: addSink() called from inside a sink's dispatch"`) written through
+    /// whatever handler was installed before `install()` ran, and to stderr, then
+    /// `std::abort()`. `std::abort()`, not `qFatal()` - `qFatal()` is a fast-fail that crashpad's
+    /// filter never sees without the WER module (`06.3.1-RESEARCH-SPIKE-CRASHPAD.md` T15);
+    /// `abort()` raises `SIGABRT`, which crashpad's own handler does catch (T10, T10b) once
+    /// `SeatHubTelemetry::start()` installs it, so a misuse in a shipped build still reaches
+    /// Sentry with a precise stack instead of a silent use-after-free elsewhere. A sink that
+    /// keeps to its contract above never reaches this path at all.
     static SinkHandle addSink(Sink sink);
 
     /// Unregisters the sink `handle` named, and - WR-07, code review 06.3-REVIEW-fork.md - waits
@@ -90,16 +94,17 @@ public:
     /// copy just before this ran could still call a sink whose owner this call is meant to make
     /// safe to destroy. A handle already removed, or `0`, is a no-op.
     ///
-    /// WR-10 (code review 06.3-REVIEW-fork.md, second review pass): calling this from inside a
-    /// sink that is itself running, on the thread dispatching it, does NOT wait and does NOT
-    /// deadlock - it is deferred instead, exactly like `addSink()` above, and applied the moment
-    /// that dispatch returns. A previous revision of this comment claimed the same-thread
-    /// re-entry guard "stops that from reaching here at all"; it did not - that guard is checked
-    /// only inside `qtHandler()`/`sdlHandler()`, before either one ever calls `dispatch()`, and
-    /// neither `addSink()` nor `removeSink()` read it at all before this fix. Nothing in this
-    /// tree calls either function from inside a sink today (this defer path is currently dead
-    /// code, exercised only by its own test), but a future sink now gets a real guarantee instead
-    /// of a silent hang with no diagnostic.
+    /// Calling this from inside a sink that is itself running, on the thread dispatching it, is
+    /// the same programming error `addSink()` documents above, and is refused the same way
+    /// (`Q_ASSERT_X` in debug; a reason line naming `removeSink()`, then `std::abort()`, in
+    /// release). D-16 (06.3.1) replaced the previous fix here - deferring the removal until the
+    /// dispatch currently running on this thread returns - because that fix could not close
+    /// WR-12: an in-dispatch `removeSink()` used to return before the removal actually took
+    /// effect, so a LATER sink in the same dispatch, or another thread's dispatch running
+    /// concurrently, could still call a sink whose owner the caller believed was already gone.
+    /// Refusing outright keeps the one guarantee that matters instead: once `removeSink()`
+    /// returns, the sink is not running and will not run, on any thread, with no window where
+    /// that is not yet true.
     static void removeSink(SinkHandle handle);
 
     /// Test seam: forgets every registered sink. Does not touch the installed Qt/SDL handler
