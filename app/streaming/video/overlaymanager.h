@@ -125,6 +125,32 @@ public:
     // `tests/tst_overlay_injection.cpp`'s own file header).
     QByteArray filteredDebugText() const;
 
+    // SeatHub: D-28 exception (ADR-0045 amendment, 2026-09-26), see FORK-CHANGES.md.
+    //
+    // A pluggable text rasteriser. Wherever this class would rasterise a slot with SDL_ttf, it
+    // instead hands the slot's RAW text (never `filteredDebugText()` - CUST-17's per-line filter
+    // stays SeatHub's own concern), that slot's own `enabled` flag and its own `SDL_Color` to this
+    // callback, and publishes whatever ARGB8888 straight-alpha surface it returns through the
+    // same atomic swap `updateOverlaySurface()` uses. A returned surface is refused - freed here,
+    // nothing published - under exactly the rules `updateOverlaySurface()` already applies: a
+    // foreign pixel format, a surface that needs locking, or a publish while the slot is disabled.
+    //
+    // Called even while the slot is disabled, so the rasteriser learns the engine's text went
+    // away (`setOverlayState()` clears `text` to empty on disable, same as always) - the returned
+    // surface is still subject to the disabled-slot refusal above, so a disabled slot never
+    // actually publishes through this path either.
+    //
+    // With no rasteriser set, this class behaves byte-for-byte as it always has: the SDL_ttf
+    // path, `updateOverlaySurface()`, `clearSeatHubSurface()` and `setDebugLineFilter()` are
+    // unchanged.
+    typedef SDL_Surface* (*TextRasterizer)(OverlayType type, const char* text, bool enabled,
+                                           SDL_Color color, void* context);
+
+    // Sets the one rasteriser for every slot. Call once, before the stream runs; the same
+    // lock-free atomic-swap idiom `setDebugLineFilter()` already uses. Passing `nullptr` restores
+    // the SDL_ttf fallback path.
+    void setTextRasterizer(TextRasterizer rasterizer, void* context);
+
     void setOverlayRenderer(IOverlayRenderer* renderer);
 
 private:
@@ -164,6 +190,13 @@ private:
     // `mutable` because `filteredDebugText()` is logically const (it changes no externally
     // visible state) but reads this through the same atomic API the setter writes it with.
     mutable void* m_DebugLineFilter;
+
+    // SeatHub: D-28 exception (ADR-0045 amendment, 2026-09-26), see FORK-CHANGES.md. The
+    // pluggable text rasteriser and its caller-owned context, swapped the same lock-free way
+    // `m_DebugLineFilter` already is. `nullptr` on both means "no rasteriser set" - the SDL_ttf
+    // path stays exactly as it always has.
+    void* m_TextRasterizer;
+    void* m_TextRasterizerContext;
 };
 
 }
