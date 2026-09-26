@@ -21,6 +21,7 @@
 #include <QNetworkAccessManager>
 #include <QNetworkReply>
 #include <QNetworkRequest>
+#include <QScopeGuard>
 #include <QSemaphore>
 #include <QSignalSpy>
 #include <QTimer>
@@ -778,36 +779,116 @@ private slots:
         QCOMPARE(handshakes, 0);
     }
 
-    void seam_secondCallWhileOneIsInFlight_isRefused()
+    // -----------------------------------------------------------------------------------------
+    // 06.6-18/T-06.6-53: a new pair() while a stale handshake is still running abandons it rather
+    // than refusing - refusing would leave a customer's Try again stuck behind a handshake that
+    // will never resolve into their new session anyway. Upstream's own blocking call cannot be
+    // aborted, so the old one simply keeps its pool thread until it returns and finds nothing
+    // waiting for it: the seam's generation guard is what makes that harmless.
+    // -----------------------------------------------------------------------------------------
+
+    void aSupersededHandshakeResultIsDropped()
     {
         ProductionPairingSeam seam;
+        QSemaphore releaseA;
+        // Unconditional: an assertion below failing (RED, or a future regression) must not leave
+        // A's pool thread blocked forever - a leaked `releaseA.acquire()` hangs the whole binary at
+        // exit, not just this one test.
+        auto cleanup = qScopeGuard([&releaseA]() { releaseA.release(); });
+
+        int handshakes = 0;
+        seam.setHandshake([&releaseA, &handshakes](const PairingTarget&) {
+            ++handshakes;
+            if (handshakes == 1) {
+                // A's own handshake: blocks until the test releases it, well after B has already
+                // been reported.
+                releaseA.acquire();
+                return handshakeResult(true, QStringLiteral("late-a"));
+            }
+            // B's own handshake: nothing supersedes it, so it returns at once.
+            return handshakeResult(true, QStringLiteral("b-identity"));
+        });
+
+        PairingTarget targetA = pairingTarget();
+        targetA.sessionId = QStringLiteral("session-a");
+        PairingTarget targetB = pairingTarget();
+        targetB.sessionId = QStringLiteral("session-b");
+
+        SeamReport reportA;
+        SeamReport reportB;
+        seam.pair(targetA, recordInto(&reportA));
+
+        // Wait until A's handshake is actually inside the pool thread before B supersedes it -
+        // that is the state this behavior is about.
+        QTRY_COMPARE(handshakes, 1);
+        seam.pair(targetB, recordInto(&reportB));
+
+        // B is not refused "already in flight": its own handshake starts at once.
+        QTRY_COMPARE(handshakes, 2);
+        QTRY_COMPARE(reportB.count(), 1);
+        QCOMPARE(reportB.outcomes.first(), true);
+        QCOMPARE(reportB.identities.first(), QStringLiteral("b-identity"));
+
+        // A's handshake finally returns (the scope guard above releases it, exactly once - a
+        // second, explicit release here would double it). It gets no word: its generation is
+        // stale by the time it arrives, superseded by B's own `pair()` call.
+        cleanup.dismiss();
+        releaseA.release();
+        QTest::qWait(150);
+        QCOMPARE(reportA.count(), 0);
+    }
+
+    void theDeadlineBelongsToTheCurrentHandshake()
+    {
+        ProductionPairingSeam seam;
+        seam.setDeadlineMs(150);
+
         QSemaphore release;
+        // Unconditional, for the same reason as `aSupersededHandshakeResultIsDropped` above: two
+        // pool threads can be blocked here, and an early-failing assertion must not leave either
+        // of them stuck forever.
+        auto cleanup = qScopeGuard([&release]() { release.release(2); });
+
         int handshakes = 0;
         seam.setHandshake([&release, &handshakes](const PairingTarget&) {
             ++handshakes;
             release.acquire();
-            return handshakeResult(true, QStringLiteral("aa"));
+            return handshakeResult(true, QStringLiteral("late"));
         });
 
-        SeamReport first;
-        SeamReport second;
-        seam.pair(pairingTarget(), recordInto(&first));
+        PairingTarget targetA = pairingTarget();
+        targetA.sessionId = QStringLiteral("session-a");
+        PairingTarget targetB = pairingTarget();
+        targetB.sessionId = QStringLiteral("session-b");
 
-        // The handshake starts on a pool thread, so wait until it is actually inside it before
-        // the second call - that is the state the refusal is about.
+        SeamReport reportA;
+        SeamReport reportB;
+        seam.pair(targetA, recordInto(&reportA));
         QTRY_COMPARE(handshakes, 1);
-        seam.pair(pairingTarget(), recordInto(&second));
 
-        // One handshake at a time: two against the same rig would collide host-side and leave the
-        // caller holding two results for one session.
-        QCOMPARE(handshakes, 1);
-        QCOMPARE(second.count(), 1);
-        QCOMPARE(second.outcomes.first(), false);
-        QVERIFY(second.identities.first().isEmpty());
+        // A has used two thirds of its own 150 ms deadline - only 50 ms would remain on A's own
+        // clock - when B supersedes it.
+        QTest::qWait(100);
+        seam.pair(targetB, recordInto(&reportB));
+        QTRY_COMPARE(handshakes, 2);
 
-        release.release();
-        QTRY_COMPARE(first.count(), 1);
-        QCOMPARE(first.outcomes.first(), true);
+        // If the deadline still belonged to A, it would have fired about 50 ms after B started and
+        // failed B by now. It does not: B's own deadline is a fresh 150 ms counted from B's own
+        // `pair()` call, not from whatever remained of A's.
+        QTest::qWait(80);
+        QCOMPARE(reportB.count(), 0);
+
+        // B's own full deadline does still apply.
+        QTRY_VERIFY_WITH_TIMEOUT(reportB.count() == 1, 5000);
+        QCOMPARE(reportB.outcomes.first(), false);
+
+        // Neither blocked handshake gets a word after this: both are stale by the time they
+        // return. The scope guard above does the releasing, exactly once each.
+        cleanup.dismiss();
+        release.release(2);
+        QTest::qWait(100);
+        QCOMPARE(reportA.count(), 0);
+        QCOMPARE(reportB.count(), 1);
     }
 
     void fingerprint_ofACertificate_isItsSha256Hex()
