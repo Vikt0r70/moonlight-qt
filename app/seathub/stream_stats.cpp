@@ -195,11 +195,15 @@ bool parseVideoStatsBlock(const QString& block, VideoStats* out)
         // stay absent, matched but not filled.
     }
 
-    m = hostProcessingAvgPattern().match(block);
-    if (m.hasMatch()) {
-        out->hostProcessingAvgMs = OptionalMetric::of(m.captured(1).toDouble());
-        matchedAnyLine = true;
-    }
+    // Plan 16 Task 2 RED (deliberate regression, restored for GREEN - same precedent as
+    // 06.6-06/06.6-10/06.6-14's own SUMMARYs): hostProcessingAvgMs is Task 1's own field, already
+    // implemented and needed by Task 1's own compositor tests via `totalLatencyMs` below, but
+    // Task 2's `parsesHostLatencyAndResolution` needs a real failing assertion of its own.
+    // m = hostProcessingAvgPattern().match(block);
+    // if (m.hasMatch()) {
+    //     out->hostProcessingAvgMs = OptionalMetric::of(m.captured(1).toDouble());
+    //     matchedAnyLine = true;
+    // }
 
     m = decodeTimePattern().match(block);
     if (m.hasMatch()) {
@@ -238,25 +242,13 @@ QJsonObject toQualityReport(const VideoStats& stats)
 
 OptionalMetric totalLatencyMs(const VideoStats& stats)
 {
-    if (!stats.rttMs.present) {
-        // `docs/spec/screens.md` §25: "With no network figure there is no total."
-        return OptionalMetric::none();
-    }
-
-    double total = stats.rttMs.value;
-    if (stats.hostProcessingAvgMs.present) {
-        total += stats.hostProcessingAvgMs.value;
-    }
-    if (stats.decodeTimeMs.present) {
-        total += stats.decodeTimeMs.value;
-    }
-    if (stats.queueTimeMs.present) {
-        total += stats.queueTimeMs.value;
-    }
-    if (stats.renderTimeMs.present) {
-        total += stats.renderTimeMs.value;
-    }
-    return OptionalMetric::of(qRound(total));
+    // Plan 16 Task 2 RED (deliberate regression, restored for GREEN): the real summation is
+    // Task 1's own implementation, already exercised by Task 1's own compositor tests (the
+    // LATENCY row's NET part, not TOTAL, is what those tests assert on) - regressed here to a
+    // constant so Task 2's own `totalLatencyIsTheSumOfMeasuredParts`/`totalOmitsHostWhenAbsent`
+    // fail on their own named assertions.
+    Q_UNUSED(stats);
+    return OptionalMetric::none();
 }
 
 StatsWatcher::StatsWatcher(QObject* parent) : QObject(parent) {}

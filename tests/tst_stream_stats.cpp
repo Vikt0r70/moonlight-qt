@@ -416,6 +416,92 @@ private slots:
         QVERIFY(report.value(QStringLiteral("render_time_ms")).isNull());
     }
 
+    // --- Plan 16 Task 2: hostProcessingAvgMs, videoWidth/videoHeight, totalLatencyMs ----------
+    // Pinned against `ffmpeg.cpp`'s exact own formats (RESEARCH-FORK.md §5): "Host processing
+    // latency min/max/average: %.1f/%.1f/%.1f ms" and "Video stream: %dx%d %.2f FPS (Codec: %s)".
+
+    void parsesHostLatencyAndResolution()
+    {
+        VideoStats stats;
+        const bool matched = parseVideoStatsBlock(
+            QStringLiteral("Video stream: 1920x1080 59.94 FPS (Codec: H264)\n"
+                           "Host processing latency min/max/average: 1.0/3.0/2.0 ms\n"),
+            &stats);
+
+        QVERIFY(matched);
+        QVERIFY(stats.hostProcessingAvgMs.present);
+        QCOMPARE(stats.hostProcessingAvgMs.value, 2.0);
+        QVERIFY(stats.videoWidth.present);
+        QCOMPARE(stats.videoWidth.value, 1920.0);
+        QVERIFY(stats.videoHeight.present);
+        QCOMPARE(stats.videoHeight.value, 1080.0);
+    }
+
+    // The owner: "sum it and add it" - the total is the sum of every part Moonlight measures and
+    // prints (`docs/spec/screens.md` §25): the network round trip, the host processing average
+    // (when present), decode, queue and render, rounded to whole ms.
+    void totalLatencyIsTheSumOfMeasuredParts()
+    {
+        VideoStats stats;
+        stats.rttMs = OptionalMetric::of(12.0);
+        stats.hostProcessingAvgMs = OptionalMetric::of(2.0);
+        stats.decodeTimeMs = OptionalMetric::of(1.4);
+        stats.queueTimeMs = OptionalMetric::of(0.6);
+        stats.renderTimeMs = OptionalMetric::of(3.1);
+
+        const OptionalMetric total = totalLatencyMs(stats);
+        QVERIFY(total.present);
+        QCOMPARE(total.value, 19.0);
+    }
+
+    // A Sunshine host that does not report its own processing latency simply has that part
+    // omitted from the sum - never treated as zero, never blocking the other four parts.
+    void totalOmitsHostWhenAbsent()
+    {
+        VideoStats stats;
+        stats.rttMs = OptionalMetric::of(12.0);
+        stats.decodeTimeMs = OptionalMetric::of(1.4);
+        stats.queueTimeMs = OptionalMetric::of(0.6);
+        stats.renderTimeMs = OptionalMetric::of(3.1);
+
+        const OptionalMetric total = totalLatencyMs(stats);
+        QVERIFY(total.present);
+        QCOMPARE(total.value, 17.0);
+    }
+
+    // "Average network latency: N/A": with no round trip there is nothing to add the other parts
+    // to, so there is no total at all (`docs/spec/screens.md` §25: "With no network figure there
+    // is no total").
+    void noTotalWithoutNetwork()
+    {
+        VideoStats stats;
+        stats.hostProcessingAvgMs = OptionalMetric::of(2.0);
+        stats.decodeTimeMs = OptionalMetric::of(1.4);
+        stats.queueTimeMs = OptionalMetric::of(0.6);
+        stats.renderTimeMs = OptionalMetric::of(3.1);
+        // stats.rttMs left absent.
+
+        QVERIFY(!totalLatencyMs(stats).present);
+    }
+
+    // The three new parse-only fields are parse-only in fact, not just in name: the quality
+    // report the client sends to the control plane is byte-for-byte unchanged (contract 3.1.0's
+    // eight fields, nothing more).
+    void toQualityReportSendsNoNewField()
+    {
+        VideoStats stats;
+        stats.hostProcessingAvgMs = OptionalMetric::of(2.0);
+        stats.videoWidth = OptionalMetric::of(1920.0);
+        stats.videoHeight = OptionalMetric::of(1080.0);
+
+        const QJsonObject report = toQualityReport(stats);
+
+        QCOMPARE(report.size(), 8);
+        QVERIFY(!report.contains(QStringLiteral("host_processing_avg_ms")));
+        QVERIFY(!report.contains(QStringLiteral("video_width")));
+        QVERIFY(!report.contains(QStringLiteral("video_height")));
+    }
+
     // --- StatsWatcher ------------------------------------------------------------------------
 
     void statsWatcher_titleThenBlock_emitsParsedStats()
