@@ -24,6 +24,12 @@ TEMPLATE = app
 TARGET = tst_facade_wiring
 DESTDIR = $$OUT_PWD
 
+# tst_telemetry.pro also compiles app/seathub/telemetry.cpp, under DIFFERENT DEFINES (it alone
+# sets SEATHUB_TEST_ALLOW_LOOPBACK_DSN). See that .pro's own comment on OBJECTS_DIR/MOC_DIR for
+# why a shared, flat object directory silently reuses a stale object across the two projects.
+OBJECTS_DIR = obj-tst_facade_wiring
+MOC_DIR = obj-tst_facade_wiring
+
 INCLUDEPATH += $$PWD/.. $$PWD/../app
 
 win32 {

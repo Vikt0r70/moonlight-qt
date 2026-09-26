@@ -407,60 +407,101 @@ int closeCallCount()
 
 // --- identity (D-09, D-13, G.4) ------------------------------------------------------------
 //
-// Task 2 RED: stubbed (no-ops / defaults) so `tst_facade_wiring`'s new identity tests fail on
-// their own assertions rather than on the compiler - same precedent as Task 1's own RED commit.
+// Every setter/getter below is read and written only from `SeatHubClient`'s own (client) thread
+// (`seathub_client.cpp`'s call sites), so the plain `QString`/`bool` statics above need no
+// synchronization - unlike `s_logsEnabled`. The `sentry_*` calls are safe to make even when this
+// process never called `start()`/`startWith()` (as `tst_facade_wiring` never does): sentry-native
+// keeps its scope (`sentry_scope.c`'s `g_scope`) as a lazily-initialised global, independent of
+// `sentry_init()`, so every call here is a real, harmless write to that scope regardless of
+// whether a client/handler exists to ever flush it anywhere.
 
 void setUser(const QString& accountId)
 {
-    Q_UNUSED(accountId);
+    s_currentUserId = accountId;
+    s_signedIn = true;
+    const QByteArray idUtf8 = accountId.toUtf8();
+    sentry_set_user(sentry_value_new_user(idUtf8.constData(), nullptr, nullptr, nullptr));
+    sentry_set_tag("signed_in", "true");
 }
 
 void clearUser()
 {
+    s_currentUserId.clear();
+    s_signedIn = false;
+    sentry_remove_user();
+    sentry_set_tag("signed_in", "false");
 }
 
 void setSession(const QString& sessionId, const QString& hostId)
 {
-    Q_UNUSED(sessionId);
-    Q_UNUSED(hostId);
+    s_currentSessionId = sessionId;
+    s_currentHostId = hostId;
+
+    const QByteArray sessionUtf8 = sessionId.toUtf8();
+    sentry_set_tag("session_id", sessionUtf8.constData());
+    sentry_set_attribute("session_id",
+                          sentry_value_new_attribute(sentry_value_new_string(sessionUtf8.constData()), nullptr));
+
+    if (hostId.isEmpty()) {
+        // `beginSession()` calls this before the session names a rig - nothing to set yet, and
+        // nothing stale from an earlier session should linger either.
+        sentry_remove_tag("host_id");
+        sentry_remove_attribute("host_id");
+    }
+    else {
+        const QByteArray hostUtf8 = hostId.toUtf8();
+        sentry_set_tag("host_id", hostUtf8.constData());
+        sentry_set_attribute("host_id",
+                              sentry_value_new_attribute(sentry_value_new_string(hostUtf8.constData()), nullptr));
+    }
 }
 
 void clearSession()
 {
+    s_currentSessionId.clear();
+    s_currentHostId.clear();
+    sentry_remove_tag("session_id");
+    sentry_remove_attribute("session_id");
+    sentry_remove_tag("host_id");
+    sentry_remove_attribute("host_id");
 }
 
 void setTrace(const QString& traceId)
 {
-    Q_UNUSED(traceId);
+    s_currentTraceId = traceId;
+    const QByteArray traceUtf8 = traceId.toUtf8();
+    sentry_set_trace(traceUtf8.constData(), nullptr);
 }
 
 void clearTrace()
 {
+    s_currentTraceId.clear();
+    sentry_start_new_trace();
 }
 
 QString currentUserId()
 {
-    return QString();
+    return s_currentUserId;
 }
 
 QString currentSessionId()
 {
-    return QString();
+    return s_currentSessionId;
 }
 
 QString currentHostId()
 {
-    return QString();
+    return s_currentHostId;
 }
 
 QString currentTraceId()
 {
-    return QString();
+    return s_currentTraceId;
 }
 
 bool signedIn()
 {
-    return false;
+    return s_signedIn;
 }
 
 } // namespace SeatHubTelemetry

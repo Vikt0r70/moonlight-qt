@@ -4320,6 +4320,11 @@ private slots:
         const int telemetryBefore = m_fake->countOfPathEndingWith(QStringLiteral("/api/me/telemetry"));
         const int beforePlay = m_fake->requestPaths().size();
 
+        // The rig stays "not ready" (409) rather than failing pairing outright (the default 404):
+        // this Play's trace id must still be in place a moment later, which a failed pairing
+        // would already have cleared (`clearThisPlaysTraceIdAfterAnyQueuedLivenessReport()`).
+        m_fake->answerPairing(409, playRefusalBody(QStringLiteral("The rig is not ready yet."),
+                                                   QStringLiteral("SH-2K2XQ1")));
         m_fake->answerPlay(201, QByteArrayLiteral("{\"id\":\"s-telemetry-play\"}"));
         client.start();
         QTRY_VERIFY_WITH_TIMEOUT(client.liveSession(), 15000);
@@ -4342,6 +4347,10 @@ private slots:
         reachHome(client, 90);
         QVERIFY(!QTest::currentTestFailed());
 
+        // Kept pending (409), not failed (the default 404): the trace id this Play minted must
+        // still be current when sign-out clears it, not already cleared by a failed pairing.
+        m_fake->answerPairing(409, playRefusalBody(QStringLiteral("The rig is not ready yet."),
+                                                   QStringLiteral("SH-2K2XQ1")));
         m_fake->answerPlay(201, QByteArrayLiteral("{\"id\":\"s-signout\"}"));
         client.start();
         QTRY_VERIFY_WITH_TIMEOUT(client.liveSession(), 15000);

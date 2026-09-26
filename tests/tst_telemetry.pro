@@ -24,6 +24,15 @@ TEMPLATE = app
 TARGET = tst_telemetry
 DESTDIR = $$OUT_PWD
 
+# tst_facade_wiring.pro also compiles app/seathub/telemetry.cpp, under DIFFERENT DEFINES (this
+# project alone sets SEATHUB_TEST_ALLOW_LOOPBACK_DSN, below). Both projects' object/moc files
+# otherwise land flat in tests/ (default OBJECTS_DIR/MOC_DIR), where a naive mtime-based
+# incremental build cannot tell one project's telemetry.obj from the other's and silently reuses
+# whichever is newer - losing the loopback override with no build error. A private directory per
+# suite keeps the two from ever colliding.
+OBJECTS_DIR = obj-tst_telemetry
+MOC_DIR = obj-tst_telemetry
+
 INCLUDEPATH += $$PWD/.. $$PWD/../app
 
 win32 {
