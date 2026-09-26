@@ -15,7 +15,9 @@
 #include <QFile>
 #include <QFontDatabase>
 #include <QFontInfo>
+#include <QFontMetricsF>
 #include <QImage>
+#include <QList>
 #include <QRect>
 #include <QRgb>
 #include <QStringList>
@@ -155,6 +157,123 @@ private slots:
         const OsdTimeLeft timeLeft{false, 9, false};
         const QImage image = renderOsdBottom(1920, 1080, QString(), 0, timeLeft);
         QVERIFY(image.isNull());
+    }
+
+    // D-14: `13, 15, 20 and 30 px at 720, 1080, 1440 and 2160`; the outline and status-line floors
+    // (`06.6-RESEARCH-FORK.md` §2).
+    void sizesScaleWithWindowHeight()
+    {
+        QCOMPARE(osdSizesFor(720).valuePx, 13);
+        QCOMPARE(osdSizesFor(1080).valuePx, 15);
+        QCOMPARE(osdSizesFor(1440).valuePx, 20);
+        QCOMPARE(osdSizesFor(2160).valuePx, 30);
+
+        QCOMPARE(osdSizesFor(1080).outlinePx, 1.5);
+        QVERIFY(osdSizesFor(1).outlinePx >= 1.0);
+        QVERIFY(osdSizesFor(2160).outlinePx > 1.5);
+
+        QCOMPARE(osdSizesFor(1080).statusPx, 36);
+        QVERIFY(osdSizesFor(1).statusPx >= 13);
+    }
+
+    void unitIsSmallerThanValue()
+    {
+        for (const int height : {720, 1080, 1440, 2160}) {
+            const OsdSizes sizes = osdSizesFor(height);
+            QVERIFY(sizes.unitPx < sizes.valuePx);
+        }
+    }
+
+    // `ui.md` §7: stats labels in `--osd-label`, the resolution row's label in
+    // `--osd-label-media`, values and units in `--osd-value`.
+    void statsLabelsAreOrangeValuesWhite()
+    {
+        const QList<OsdStatsRow> rows{
+            OsdStatsRow{QStringLiteral("FPS"), false,
+                       {OsdValuePart{QString(), QStringLiteral("59.9"), QStringLiteral("fps")}}},
+            OsdStatsRow{QStringLiteral("RES"), true,
+                       {OsdValuePart{QString(), QStringLiteral("1920x1080"), QString()}}},
+        };
+        const QImage image = renderOsdStats(rows, 1080);
+        QVERIFY(!image.isNull());
+
+        const OsdSizes sizes = osdSizesFor(1080);
+        const QRect row1(0, 0, sizes.statsMargin + sizes.labelColumn, sizes.statsMargin + sizes.rowHeight);
+        const QRect row1Value(sizes.statsMargin + sizes.labelColumn, 0,
+                              image.width() - (sizes.statsMargin + sizes.labelColumn),
+                              sizes.statsMargin + sizes.rowHeight);
+        const QRect row2(0, sizes.statsMargin + sizes.rowHeight, sizes.statsMargin + sizes.labelColumn,
+                         sizes.rowHeight + sizes.statsMargin);
+
+        QVERIFY(regionHasPixelNear(image, row1, qRgb(0xFF, 0x9A, 0x2E)));
+        QVERIFY(regionHasPixelNear(image, row1Value, qRgb(0xFF, 0xFF, 0xFF)));
+        QVERIFY(regionHasPixelNear(image, row2, qRgb(0x2D, 0xD4, 0xBF)));
+    }
+
+    // A grouped row (LATENCY's `NET`/`TOTAL`) draws every part, so it is wider than a row with
+    // just one.
+    void latencyRowCarriesTwoParts()
+    {
+        const OsdStatsRow singlePart{
+            QStringLiteral("LATENCY"), false,
+            {OsdValuePart{QString(), QStringLiteral("31"), QStringLiteral("ms")}}};
+        const OsdStatsRow twoParts{
+            QStringLiteral("LATENCY"), false,
+            {OsdValuePart{QStringLiteral("NET"), QStringLiteral("12"), QStringLiteral("ms")},
+             OsdValuePart{QStringLiteral("TOTAL"), QStringLiteral("31"), QStringLiteral("ms")}}};
+
+        const QImage singleImage = renderOsdStats({singlePart}, 1080);
+        const QImage twoImage = renderOsdStats({twoParts}, 1080);
+        QVERIFY(!singleImage.isNull());
+        QVERIFY(!twoImage.isNull());
+        QVERIFY(twoImage.width() > singleImage.width());
+    }
+
+    // OD-04: with every toggle off, the caller passes an empty row list and nothing is drawn, even
+    // if the stats hotkey shows the slot.
+    void nothingDrawnWithEveryRowOff()
+    {
+        const QImage image = renderOsdStats({}, 1080);
+        QVERIFY(image.isNull());
+    }
+
+    // D-13: Moonlight's own status lines keep the engine's wording and colour, with no outline.
+    void engineLineInSlotColour()
+    {
+        const OsdTimeLeft none{false, 0, false};
+        const QImage image = renderOsdBottom(1920, 1080, QStringLiteral("Poor connection to PC"),
+                                             0xFFCC0000, none);
+        QVERIFY(!image.isNull());
+
+        const QRect leftHalf(0, 0, image.width() / 2, image.height());
+        QVERIFY(regionHasPixelNear(image, leftHalf, qRgb(0xCC, 0x00, 0x00)));
+        QVERIFY(!regionHasNearBlackPixel(image, leftHalf));
+    }
+
+    // D-13/§6: when both are present they compose into one bitmap - the engine's line stays
+    // bottom-left, Time left stays bottom-right.
+    void engineLineAndTimeLeftCompose()
+    {
+        const OsdTimeLeft timeLeft{true, 4, true};
+        const QImage image = renderOsdBottom(1920, 1080, QStringLiteral("Poor connection to PC"),
+                                             0xFFCC0000, timeLeft);
+        QVERIFY(!image.isNull());
+
+        const QRect leftHalf(0, 0, image.width() / 2, image.height());
+        const QRect rightHalf(image.width() / 2, 0, image.width() - (image.width() / 2), image.height());
+        QVERIFY(regionHasPixelNear(image, leftHalf, qRgb(0xCC, 0x00, 0x00)));
+        QVERIFY(regionHasPixelNear(image, rightHalf, qRgb(0xEF, 0x44, 0x44)));
+    }
+
+    // `ui.md` §4: digits never jitter - every one of them has the same horizontal advance.
+    void digitsAreTabular()
+    {
+        const QFontMetricsF metrics(osdFont(15));
+        const qreal zeroAdvance = metrics.horizontalAdvance(QStringLiteral("0"));
+        const QString digits = QStringLiteral("123456789");
+        for (const QChar digit : digits) {
+            QCOMPARE(metrics.horizontalAdvance(QString(digit)), zeroAdvance);
+        }
     }
 };
 

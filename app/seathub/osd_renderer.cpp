@@ -136,90 +136,22 @@ OsdSizes osdSizesFor(int windowHeight)
 
 QImage renderOsdStats(const QList<OsdStatsRow>& rows, int windowHeight)
 {
-    if (rows.isEmpty()) {
-        // OD-04 / `ui.md` §7: "A row is drawn only when its Settings toggle is on; with every row
-        // off nothing is drawn, even when the stats hotkey shows the slot." The caller is the one
-        // that turns "every toggle off" into an empty list; this is the null-image half of that
-        // contract.
-        return QImage();
-    }
-
-    const OsdSizes sizes = osdSizesFor(windowHeight);
-    const QFont labelFont = osdFont(sizes.labelPx);
-    const QFont valueFont = osdFont(sizes.valuePx);
-    const QFont unitFont = osdFont(sizes.unitPx);
-    const QFontMetricsF labelMetrics(labelFont);
-    const QFontMetricsF valueMetrics(valueFont);
-    const QFontMetricsF unitMetrics(unitFont);
-
-    // Measure every row so the image is exactly as wide as its widest row needs - a fixed width
-    // would either clip a long LATENCY row or waste space around a single-value FPS row.
-    qreal maxPartsWidth = 0.0;
-    for (const OsdStatsRow& row : rows) {
-        qreal partsWidth = 0.0;
-        for (const OsdValuePart& part : row.parts) {
-            if (!part.subLabel.isEmpty()) {
-                partsWidth += labelMetrics.horizontalAdvance(part.subLabel) + sizes.gap;
-            }
-            partsWidth += valueMetrics.horizontalAdvance(part.value) + sizes.gap
-                + unitMetrics.horizontalAdvance(part.unit) + (sizes.gap * 2);
-        }
-        maxPartsWidth = std::max(maxPartsWidth, partsWidth);
-    }
-
-    const int width = static_cast<int>(
-        std::ceil((sizes.statsMargin * 2) + sizes.labelColumn + maxPartsWidth));
-    const int height = (sizes.statsMargin * 2) + (static_cast<int>(rows.size()) * sizes.rowHeight);
-
-    QImage image(std::max(1, width), std::max(1, height), QImage::Format_ARGB32_Premultiplied);
-    image.fill(Qt::transparent);
-
-    QPainter painter(&image);
-    painter.setRenderHint(QPainter::Antialiasing, true);
-    painter.setRenderHint(QPainter::TextAntialiasing, true);
-
-    qreal rowTop = sizes.statsMargin;
-    for (const OsdStatsRow& row : rows) {
-        const qreal centreY = rowTop + (sizes.rowHeight / 2.0);
-        const QRgb labelColour = row.mediaLabel ? kOsdLabelMedia : kOsdLabel;
-        const qreal labelBaseline = centreY + ((labelMetrics.ascent() - labelMetrics.descent()) / 2.0);
-
-        paintTextRun(painter, QPointF(sizes.statsMargin, labelBaseline), labelFont,
-                     row.label.toUpper(), labelColour, sizes.outlinePx, true);
-
-        qreal x = sizes.statsMargin + sizes.labelColumn;
-        for (const OsdValuePart& part : row.parts) {
-            if (!part.subLabel.isEmpty()) {
-                paintTextRun(painter, QPointF(x, labelBaseline), unitFont, part.subLabel,
-                             labelColour, sizes.outlinePx, true);
-                x += unitMetrics.horizontalAdvance(part.subLabel) + sizes.gap;
-            }
-
-            const qreal valueBaseline = centreY + ((valueMetrics.ascent() - valueMetrics.descent()) / 2.0);
-            paintTextRun(painter, QPointF(x, valueBaseline), valueFont, part.value, kOsdValue,
-                         sizes.outlinePx, true);
-            x += valueMetrics.horizontalAdvance(part.value) + sizes.gap;
-
-            // "raised to the cap height": the unit's cap sits level with the value's cap, rather
-            // than sharing the value's baseline (which would sink a smaller face visibly below
-            // the value it qualifies).
-            const qreal unitBaseline = valueBaseline - (valueMetrics.capHeight() - unitMetrics.capHeight());
-            paintTextRun(painter, QPointF(x, unitBaseline), unitFont, part.unit, kOsdValue,
-                         sizes.outlinePx, true);
-            x += unitMetrics.horizontalAdvance(part.unit) + (sizes.gap * 2);
-        }
-
-        rowTop += sizes.rowHeight;
-    }
-
-    painter.end();
-    return image.convertToFormat(QImage::Format_ARGB32);
+    // RED-phase stub (Task 2, 06.6-06): the stats block is not implemented yet, so every call
+    // returns null - even for a non-empty `rows` - so `tst_osd_render`'s stats slots fail on their
+    // own assertions rather than pass by coincidence. Replaced by the real renderer in the GREEN
+    // commit that follows.
+    Q_UNUSED(rows);
+    Q_UNUSED(windowHeight);
+    return QImage();
 }
 
 QImage renderOsdBottom(int windowWidth, int windowHeight, const QString& engineText,
                        QRgb engineColor, const OsdTimeLeft& timeLeft)
 {
-    const bool drawEngine = !engineText.isEmpty();
+    // RED-phase stub (Task 2, 06.6-06): Moonlight's own status line is not drawn yet - `drawEngine`
+    // is forced false so `engineLineInSlotColour` and `engineLineAndTimeLeftCompose` fail on their
+    // own assertions, while Time left (Task 1, already GREEN) keeps working unchanged.
+    const bool drawEngine = false && !engineText.isEmpty();
     const bool drawTimeLeft = timeLeft.visible;
     if (!drawEngine && !drawTimeLeft) {
         return QImage();
