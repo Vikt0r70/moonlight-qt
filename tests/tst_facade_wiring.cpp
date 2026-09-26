@@ -82,9 +82,17 @@
 // built), and both report the fail-closed answer their production counterparts document for
 // exactly this situation.
 
+// 06.6-18 (T-06.6-52): `create()` always returns null below, so a real engine can never be
+// observed as attached in this binary - but whether `handleHostResolved()` even REACHED `create()`
+// is exactly what a stale, session-mismatched host must never do. This counts calls so a test can
+// tell "dropped before create()" from "reached create() and failed closed the ordinary way" - the
+// two things `handleHostResolved()`'s session-id check must tell apart.
+int g_engineCreateCalls = 0;
+
 MoonlightEngineSession* MoonlightEngineSession::create(const PairedHostPtr&, QObject* parent)
 {
     Q_UNUSED(parent);
+    ++g_engineCreateCalls;
     // The production factory returns null when the host is not a `MoonlightPairedHost` or its
     // application list does not name a single application, and the caller then fails closed
     // instead of substituting a stub. Returning null here is that same answer: no host is paired
@@ -2979,6 +2987,50 @@ private slots:
         emit client.pairing()->pairingFailed(SeatHubFailure::local(QStringLiteral("second")));
         QTest::qWait(200);
         QCOMPARE(m_fake->requestPaths().count(QStringLiteral("/api/sessions/s-stages/end")), 1);
+    }
+
+    // --- D-05/C4a: a late pairing result cannot hijack the customer's next session (06.6-18) --------
+
+    void aLateHostFromACancelledSessionIsIgnored()
+    {
+        SeatHubClient client;
+        beginStagedSession(client);
+        QVERIFY(!QTest::currentTestFailed());
+
+        // "Cancelled": the same D-05/C3 path Cancel-before-the-engine uses (06.6-23). `m_sessionId`
+        // is left attached to `s-stages` by `interrupt()` itself (it never clears it) until a fresh
+        // Play attaches a different one, exactly the window a late host from the old handshake would
+        // otherwise land in.
+        client.interrupt();
+        client.beginSession(QStringLiteral("s-fresh"));
+
+        const int before = g_engineCreateCalls;
+        const bool invoked = QMetaObject::invokeMethod(
+            &client, "handleHostResolved", Q_ARG(QString, QStringLiteral("s-stages")),
+            Q_ARG(PairedHostPtr, std::make_shared<PairedHost>()));
+        QVERIFY2(invoked, "handleHostResolved must accept the session id it is resolving for");
+
+        // The stale session's own late host never reaches the engine seam at all - it is dropped
+        // before `MoonlightEngineSession::create()` is ever called, not merely failed closed the
+        // ordinary way once there.
+        QCOMPARE(g_engineCreateCalls, before);
+    }
+
+    void aHostForTheAttachedSessionIsUsed()
+    {
+        SeatHubClient client;
+        beginStagedSession(client);
+        QVERIFY(!QTest::currentTestFailed());
+
+        const int before = g_engineCreateCalls;
+        const bool invoked = QMetaObject::invokeMethod(
+            &client, "handleHostResolved", Q_ARG(QString, QStringLiteral("s-stages")),
+            Q_ARG(PairedHostPtr, std::make_shared<PairedHost>()));
+        QVERIFY2(invoked, "handleHostResolved must accept the session id it is resolving for");
+
+        // A host resolved for the session actually attached is used as today: the facade goes on to
+        // try building the engine from it.
+        QCOMPARE(g_engineCreateCalls, before + 1);
     }
 
     // --- D-05/C3: Cancel before the engine ends the session and goes Home (06.6-23) ----------------
