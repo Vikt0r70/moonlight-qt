@@ -50,6 +50,7 @@
 #include "seathub/seathub_client.h"
 #include "seathub/session_lifecycle.h"
 #include "seathub/settings_bridge.h"
+#include "seathub/telemetry.h"
 #include "seathub/update_feed_client.h"
 
 #if defined(Q_OS_WIN32)
@@ -359,6 +360,11 @@ int main(int argc, char *argv[])
 #ifdef Q_OS_WIN32
     // Create a crash dump when we crash on Windows
     SetUnhandledExceptionFilter(UnhandledExceptionHandler);
+    // SeatHub (ADR-0044 amendment, 06.3.1 D-02): crash reporting and log shipping start here.
+    // crashpad's filter replaces upstream's above (last caller wins); if it fails, restore upstream's.
+    if (!SeatHubTelemetry::start()) {
+        SetUnhandledExceptionFilter(UnhandledExceptionHandler);
+    }
 #endif
 
 #ifdef LOG_TO_FILE
