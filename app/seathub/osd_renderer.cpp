@@ -122,7 +122,12 @@ OsdSizes osdSizesFor(int windowHeight)
     // "unit suffix: round(0.6 * value px), raised to the cap height" - the 0.6 factor keeps it
     // smaller than the value at every size in range (D-14's "units are smaller than values").
     sizes.unitPx = std::max(1, static_cast<int>(std::lround(0.6 * sizes.valuePx)));
-    sizes.rowHeight = derivedPx(18.0, u);
+    // A-73 (`docs/spec/ui.md` §7, `06.6-DECISION-OSD-LABEL-COLUMN.md`, 2026-09-26): tied to the
+    // drawn label size rather than scaled independently, so the row never sits shorter than the
+    // text it holds - the old `derivedPx(18.0, u)` gave 12px rows against the 13px text floor at
+    // 720p. `round(labelPx * 18 / 15)` is the 1080p ratio of the two old bases: it keeps 18px at
+    // 1080 and grows to 16px at 720, not 12.
+    sizes.rowHeight = qRound(sizes.labelPx * 18.0 / 15.0);
     sizes.gap = derivedPx(8.0, u);
     sizes.statsMargin = derivedPx(16.0, u);
     sizes.timeLeftInset = derivedPx(24.0, u);
@@ -135,12 +140,24 @@ OsdSizes osdSizesFor(int windowHeight)
 
 int osdLabelColumn(const QList<OsdStatsRow>& rows, int windowHeight)
 {
-    // TEMP RED stub (A-73): reproduces the old fixed-56px-at-1080 base so every pre-existing test
-    // still passes unchanged while `labelNeverReachesItsValue`/`rowsNeverOverlapAt720` fail for
-    // real (RED_EVIDENCE_OK). Replaced with the measured column in the GREEN commit.
-    Q_UNUSED(rows);
-    const qreal u = windowHeight > 0 ? (static_cast<qreal>(windowHeight) / 1080.0) : 0.0;
-    return derivedPx(56.0, u);
+    // A-73 (`docs/spec/ui.md` §7, `06.6-DECISION-OSD-LABEL-COLUMN.md`): no base of its own -
+    // as wide as the widest label actually drawn (uppercase, in the face and size it is drawn in),
+    // plus the gap, so no label reaches the value column at any window height. Replaces the old
+    // fixed `derivedPx(56.0, u)` base carried over from `OVERLAY.md`'s pre-Open-Sans proposal,
+    // which LATENCY overflowed at every size (the 06.6-06 picture sheet observation).
+    if (rows.isEmpty()) {
+        return 0;
+    }
+
+    const OsdSizes sizes = osdSizesFor(windowHeight);
+    const QFontMetricsF labelMetrics(osdFont(sizes.labelPx));
+
+    qreal widest = 0.0;
+    for (const OsdStatsRow& row : rows) {
+        widest = std::max(widest, labelMetrics.horizontalAdvance(row.label.toUpper()));
+    }
+
+    return static_cast<int>(std::ceil(widest)) + sizes.gap;
 }
 
 QImage renderOsdStats(const QList<OsdStatsRow>& rows, int windowHeight)
