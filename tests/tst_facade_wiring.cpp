@@ -2872,6 +2872,46 @@ private slots:
         QCOMPARE(client.failure().value(QStringLiteral("error")).toString(), QStringLiteral("no rig is assigned"));
     }
 
+    // A-68 / D-06 reversal, contract 3.3.0 (ADR-0064): a Play sends no quality field at all, and
+    // an authorization that carries one anyway is parsed and ignored - the customer's saved
+    // Settings are the only decider of stream quality.
+    void playSendsNoQualityAndAppliesNone()
+    {
+        SeatHubClient client;
+        reachHome(client, 90);
+        QVERIFY(!QTest::currentTestFailed());
+
+        // The customer's saved Settings, deliberately not any of "1080p120"'s own values, so an
+        // accidental application would be unmistakable.
+        QVERIFY(client.settings()->setValue(QStringLiteral("width"), 2560));
+        QVERIFY(client.settings()->setValue(QStringLiteral("height"), 1440));
+        QVERIFY(client.settings()->setValue(QStringLiteral("fps"), 30));
+
+        // An authorization that carries a quality profile - parsed, and never applied. `pairing_pin`
+        // is left absent so the controller keeps polling rather than reaching for an engine seam
+        // this test never sets up (matching `theClientsOwnPairingDeadlineIsAStallToo`'s own
+        // technique for the same reason).
+        QJsonObject authBody;
+        authBody.insert(QStringLiteral("session_id"), QStringLiteral("s-quality"));
+        authBody.insert(QStringLiteral("quality_profile"), QStringLiteral("1080p120"));
+        m_fake->answerPairing(200, QJsonDocument(authBody).toJson(QJsonDocument::Compact));
+        m_fake->answerPlay(201, QByteArrayLiteral("{\"id\":\"s-quality\"}"));
+
+        client.start();
+
+        QTRY_VERIFY_WITH_TIMEOUT(
+            m_fake->requestPaths().contains(QStringLiteral("/api/sessions")), 15000);
+        QCOMPARE(m_fake->bodyFor(QStringLiteral("/api/sessions")), QByteArrayLiteral("{}"));
+
+        QTRY_VERIFY_WITH_TIMEOUT(
+            m_fake->requestPaths().contains(QStringLiteral("/api/sessions/s-quality/pairing")), 15000);
+
+        // The saved values stand, exactly as set - nothing applied "1080p120".
+        QCOMPARE(client.settings()->getValue(QStringLiteral("width")).toInt(), 2560);
+        QCOMPARE(client.settings()->getValue(QStringLiteral("height")).toInt(), 1440);
+        QCOMPARE(client.settings()->getValue(QStringLiteral("fps")).toInt(), 30);
+    }
+
     void anEngineFailureBeforeTheStreamStartsIsAStallAtTheSecondStage()
     {
         auto* engine = new FakeEngineSession;

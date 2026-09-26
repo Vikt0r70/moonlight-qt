@@ -597,6 +597,27 @@ private slots:
         QVERIFY2(auth.pairingPin.isEmpty(), "a null pairing_pin is not a PIN");
     }
 
+    // A-68 / D-06 reversal, contract 3.3.0 (ADR-0064): `quality_profile` is optional and
+    // nullable on `SessionAuthorization` now that nothing reads it - null and absent must both
+    // still parse.
+    void authorizationWithNullQualityParses()
+    {
+        QJsonObject withNull;
+        withNull.insert(QStringLiteral("session_id"), QStringLiteral("aaaabbbb-cccc-dddd-eeee-ffff00001111"));
+        withNull.insert(QStringLiteral("quality_profile"), QJsonValue::Null);
+
+        SessionAuthorization authWithNull;
+        QVERIFY(SessionAuthorization::parse(withNull, &authWithNull));
+        QVERIFY2(authWithNull.qualityProfile.isEmpty(), "a null quality_profile parses as empty");
+
+        QJsonObject withoutKey;
+        withoutKey.insert(QStringLiteral("session_id"), QStringLiteral("aaaabbbb-cccc-dddd-eeee-ffff00001111"));
+
+        SessionAuthorization authWithoutKey;
+        QVERIFY(SessionAuthorization::parse(withoutKey, &authWithoutKey));
+        QVERIFY2(authWithoutKey.qualityProfile.isEmpty(), "an absent quality_profile parses as empty");
+    }
+
     void liveness_postsToTheDocumentedRouteWithStateAndErrorCode()
     {
         ControlPlaneClient client;
@@ -932,11 +953,6 @@ private slots:
                                                QStringLiteral("123456"))).object();
         QCOMPARE(verify.value(QStringLiteral("code")).toString(), QStringLiteral("123456"));
 
-        const QJsonObject create = QJsonDocument::fromJson(
-            ControlPlaneClient::buildSessionCreate(QStringLiteral("1080p120"))).object();
-        QCOMPARE(create.value(QStringLiteral("quality_profile")).toString(),
-                 QStringLiteral("1080p120"));
-
         const QJsonObject login = QJsonDocument::fromJson(
             ControlPlaneClient::buildLogin(QStringLiteral("someone@example.com"),
                                            QStringLiteral("a password"))).object();
@@ -944,6 +960,16 @@ private slots:
                  QStringLiteral("someone@example.com"));
         QCOMPARE(login.value(QStringLiteral("password")).toString(), QStringLiteral("a password"));
         QCOMPARE(login.size(), 2);
+    }
+
+    // A-68 / D-06 reversal, contract 3.3.0 (ADR-0064): `SessionCreateRequest` carries no quality
+    // field at all - the customer's saved Settings are the only decider of stream quality.
+    void sessionCreateBodyIsEmpty()
+    {
+        // RED (06.6-19): called against the pre-change signature (still one QString argument) -
+        // GREEN narrows `buildSessionCreate()` to take no argument at all (mechanical, matching
+        // 06.6-15's precedent for `allocate()`'s own signature narrowing).
+        QCOMPARE(ControlPlaneClient::buildSessionCreate(QString()), QByteArrayLiteral("{}"));
     }
 
     // --- Phase 5 plan 02: the launch, balance, sign-out and password routes ------------------
@@ -1241,7 +1267,7 @@ private slots:
         client.logout(done);
         client.fetchMe(done);
         client.fetchWallet(done);
-        client.requestSession(QStringLiteral("1080p60"), done);
+        client.requestSession(QStringLiteral("1080p60"), done); // RED (06.6-19): GREEN narrows this to no argument
         client.fetchSession(QStringLiteral("s"), done);
         client.fetchSessionAuthorization(QStringLiteral("s"), done);
         client.postLiveness(QStringLiteral("s"), QStringLiteral("streaming"), QString(), done);
