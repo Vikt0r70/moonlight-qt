@@ -1073,6 +1073,26 @@ void SeatHubClient::retry()
 
 void SeatHubClient::interrupt()
 {
+    // D-05/C3: before the engine runs - the rig being prepared, or pairing -
+    // `SessionLifecycle::interrupt()` is a no-op: there is no active engine to push the quit key
+    // to (`session_lifecycle.cpp:131-140`). Without this branch a Cancel press here did nothing
+    // until an engine eventually attached, which is exactly the "stuck behind a dead session"
+    // shape T-06.6-49 exists to close. Cancel is not a failure, so this never raises one: it
+    // cancels pairing, stops liveness, ends the session through C2's one path with `failed:
+    // false` (C6: no charge either way, the server's call to make), and returns Home at once -
+    // not once the network answers (`screens.md` §24).
+    if (!m_session->active()) {
+        onClientThread(m_pairing, [this]() { m_pairing->cancel(); });
+        m_liveness->stop();
+        endAttachedSessionBeforeStream(false);
+        m_sessionChannel->close();
+        resetConnecting();
+        setHomeStatus(QString::fromLatin1(kHomeReady));
+        setAppState(!m_signedIn ? QString::fromLatin1(kStateSignedOut)
+                                : QString::fromLatin1(kStateHome));
+        return;
+    }
+
     // D-02: the local stop. The engine's own quit keystroke does the stopping; the control-plane
     // teardown runs from `handleReadyForDeletion()`, because the documented order is
     // stop the stream, destroy the SDL window, and only then close the session server-side.
