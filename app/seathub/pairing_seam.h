@@ -127,10 +127,10 @@ signals:
     void hostResolved(const QString& sessionId, const PairedHostPtr& host);
 
 private slots:
-    void handleHandshakeResult(const PairingHandshakeResult& result);
+    void handleHandshakeResult(quint64 generation, const PairingHandshakeResult& result);
 
 private:
-    void finish(const PairingHandshakeResult& result);
+    void finish(quint64 generation, const PairingHandshakeResult& result);
 
     PairingHandshake m_handshake;
     std::function<void(bool, const QString&, const QString&)> m_done;
@@ -140,4 +140,11 @@ private:
     /// The session id of the `pair()` call this object is currently running or last ran
     /// (06.6-18/T-06.6-52). Set at the top of `pair()`, read back in `finish()` to tag `hostResolved`.
     QString m_sessionId;
+    /// Bumped by every `pair()` call (06.6-18/T-06.6-53). A handshake's completion carries the
+    /// generation it started with; `finish()` drops one whose generation no longer matches
+    /// `m_generation` - it belongs to a handshake a later `pair()` call has since superseded, and
+    /// upstream's own blocking call cannot be aborted, so the old one is left to simply run out on
+    /// its pool thread. The deadline timer needs no generation of its own: `pair()` restarts the
+    /// same `QTimer`, so it is always counting down for whichever handshake is current.
+    quint64 m_generation = 0;
 };
