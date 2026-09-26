@@ -607,10 +607,8 @@ QVariant SettingsBridge::getSavedValue(const QString& key) const
 
 QVariant SettingsBridge::getValue(const QString& key) const
 {
-    const auto it = m_overrides.constFind(key);
-    if (it != m_overrides.constEnd()) {
-        return it.value();
-    }
+    // A-68 / D-06 reversal: there is no session-override mechanism any more - the saved value is
+    // always the value in force.
     return getSavedValue(key);
 }
 
@@ -1085,58 +1083,6 @@ QString SettingsBridge::warningKeyFor(const QString& engineText)
     return {};
 }
 
-// ------------------------------------------------------------------ session overrides
-
-void SettingsBridge::applySessionOverride(const QString& qualityProfile)
-{
-    m_overrides.clear();
-
-    // `openapi.yaml` §QualityProfile is a closed enum of three identifiers, matched by equality
-    // (ADR-0011). Each names a resolution and a frame rate; the profile says nothing about
-    // bitrate, codec, HDR or audio, so nothing else is overridden - the customer's saved
-    // choices stand for those.
-    int width = 0;
-    int height = 0;
-    int fps = 0;
-    if (qualityProfile == QLatin1String("1080p60")) {
-        width = 1920;
-        height = 1080;
-        fps = 60;
-    }
-    else if (qualityProfile == QLatin1String("1080p75")) {
-        width = 1920;
-        height = 1080;
-        fps = 75;
-    }
-    else if (qualityProfile == QLatin1String("1080p120")) {
-        width = 1920;
-        height = 1080;
-        fps = 120;
-    }
-    else {
-        qCWarning(seathubSettings) << "unrecognized quality profile, no overrides applied:"
-                                   << qualityProfile;
-        emit sessionOverridesChanged();
-        return;
-    }
-
-    m_overrides.insert(QStringLiteral("width"), width);
-    m_overrides.insert(QStringLiteral("height"), height);
-    m_overrides.insert(QStringLiteral("fps"), fps);
-
-    qCInfo(seathubSettings) << "applied in-memory overrides for" << qualityProfile;
-    emit sessionOverridesChanged();
-}
-
-void SettingsBridge::clearSessionOverrides()
-{
-    if (m_overrides.isEmpty()) {
-        return;
-    }
-    m_overrides.clear();
-    emit sessionOverridesChanged();
-}
-
 // ------------------------------------------------------------------ lifecycle hooks
 
 bool SettingsBridge::writable() const
@@ -1147,11 +1093,6 @@ bool SettingsBridge::writable() const
 bool SettingsBridge::sessionActive() const
 {
     return m_streaming;
-}
-
-bool SettingsBridge::hasSessionOverrides() const
-{
-    return !m_overrides.isEmpty();
 }
 
 void SettingsBridge::setStreamingActive(bool active)
@@ -1185,10 +1126,7 @@ void SettingsBridge::noteConnectionStarted()
 
 void SettingsBridge::noteSessionFinished()
 {
-    // D-37: the overrides belonged to that launch. The saved values were never touched, so
-    // clearing them restores exactly what the customer had.
-    clearSessionOverrides();
-
+    // A-68 / D-06 reversal: there is no session override to clear any more.
     if (m_connectionStarted || !m_warningSentences.isEmpty()) {
         m_connectionStarted = false;
         m_warningSentences.clear();

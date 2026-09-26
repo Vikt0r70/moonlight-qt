@@ -40,7 +40,6 @@ private slots:
     void statsDefaultsAreFpsLatencyResolution();
     void statsTogglesDefaultOffAndTheDerivedOptionFollowsInBothDirections();
     void enabledStatsLabelsListsOnlyTheOnesTurnedOnInTheEnginesOwnOrder();
-    void sessionOverridesAreInMemoryOnly();
     void settingsShowTheSavedValuesOnly();
     void theOverrideMechanismIsGone();
     void negotiatedResultsAreExposedOnlyAfterConnectionStarted();
@@ -440,34 +439,6 @@ void TstSettingsBridge::enabledStatsLabelsListsOnlyTheOnesTurnedOnInTheEnginesOw
 
     QVERIFY(m_bridge->setStatsToggle(QStringLiteral("statsRenderingFrameRate"), false));
     QVERIFY(m_bridge->enabledStatsLabels().isEmpty());
-}
-
-void TstSettingsBridge::sessionOverridesAreInMemoryOnly()
-{
-    QVERIFY(m_bridge->setValue(QStringLiteral("fps"), 60));
-    QVERIFY(!m_bridge->hasSessionOverrides());
-
-    // D-37 / WR-05: the control plane's per-session profile is applied in memory for that launch.
-    m_bridge->applySessionOverride(QStringLiteral("1080p120"));
-    QVERIFY(m_bridge->hasSessionOverrides());
-    QCOMPARE(m_bridge->getValue(QStringLiteral("width")).toInt(), 1920);
-    QCOMPARE(m_bridge->getValue(QStringLiteral("height")).toInt(), 1080);
-    QCOMPARE(m_bridge->getValue(QStringLiteral("fps")).toInt(), 120);
-
-    // The saved values are untouched, and the settings page can tell the two apart.
-    QCOMPARE(m_bridge->getSavedValue(QStringLiteral("fps")).toInt(), 60);
-    QCOMPARE(StreamingPreferences::get()->fps, 60);
-    QSettings settings;
-    QCOMPARE(settings.value(QStringLiteral("fps")).toInt(), 60);
-
-    // Nothing about the override can escape into the preference object, not even a write of the
-    // same value through the ordinary path.
-    QVERIFY(!m_bridge->effectiveValues().isEmpty());
-    QCOMPARE(m_bridge->effectiveValues().value(QStringLiteral("fps")).toInt(), 120);
-
-    m_bridge->clearSessionOverrides();
-    QVERIFY(!m_bridge->hasSessionOverrides());
-    QCOMPARE(m_bridge->getValue(QStringLiteral("fps")).toInt(), 60);
 }
 
 // A-68 / D-06 reversal (RESEARCH-QUALITY.md § 3 item 2): Settings are the one place the

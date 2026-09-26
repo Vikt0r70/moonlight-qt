@@ -2461,8 +2461,8 @@ void SeatHubClient::handleAuthorizationGranted()
 {
     // A-68 / D-06 reversal: the control plane's `quality_profile` is no longer applied to
     // anything - the customer's saved Settings are the only decider of stream quality. The
-    // override mechanism this slot used to call (`SettingsBridge::applySessionOverride`) is
-    // removed entirely (06.6-19 Task 2).
+    // session-override mechanism this slot used to call into (`SettingsBridge`) is removed
+    // entirely (06.6-19 Task 2).
 
     // D-11: a real authorization means the rig has a pairing target - the session has moved past
     // the 409 "not ready yet" polls that are `preparing_rig`, whether or not a PIN has arrived yet.
