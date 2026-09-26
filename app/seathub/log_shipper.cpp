@@ -174,7 +174,15 @@ void LogSpool::append(const ShippedLine& newLine)
     QSaveFile file(m_path);
     if (file.open(QIODevice::WriteOnly)) {
         file.write(out);
-        file.commit();
+        if (!file.commit()) {
+            // WR-02: the only on-disk persistence path this design relies on for "lines wait until
+            // sign-in succeeds" (D-14) - log on a failed atomic rename (disk full, permission
+            // denied, an antivirus lock) so a silently dropped spool write leaves a trail.
+            qCWarning(seathubLogShipper) << "could not commit the log spool write to" << m_path;
+        }
+    }
+    else {
+        qCWarning(seathubLogShipper) << "could not open the log spool for writing:" << m_path;
     }
 }
 
