@@ -23,6 +23,7 @@
 #include <QCoreApplication>
 #include <QDateTime>
 #include <QDir>
+#include <QElapsedTimer>
 #include <QFile>
 #include <QFileInfo>
 #include <QJsonDocument>
@@ -34,8 +35,12 @@
 #include <QTemporaryDir>
 #include <QVector>
 
+#include <atomic>
+#include <condition_variable>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
+#include <thread>
 
 // This file defines `main()` below. `<SDL.h>` otherwise `#define`s `main` to `SDL_main` - the
 // same fix `tst_log_tee.cpp` uses for the same reason (log_tee.cpp needs SDL2).
@@ -171,6 +176,9 @@ private slots:
         // Resets every per-run counter and the queue; the sink registration itself is left alone
         // (LogShipper never removes its own sink - D-16's contract, mirrored in log_shipper.cpp).
         LogShipper::instance().stop();
+        // CR-02: a test that shortened pauseHandOff()'s bounded wait must not leak that override
+        // into a later, unrelated test.
+        LogShipper::instance().setPauseTimeoutForTests(-1);
     }
 
     // --- the tracer: hold, then drain in order with the original time and session -------------
@@ -427,6 +435,110 @@ private slots:
 
         LogShipper::instance().resumeHandOff();
         QTRY_COMPARE_WITH_TIMEOUT(stub.countMatching(marker), 1, 5000);
+    }
+
+    // --- CR-02 regression: pauseHandOff()'s notify no longer races a lost wakeup -----------------
+
+    void pauseHandOffReturnsPromptlyOnceAnInFlightHandOffFinishes()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+
+        std::mutex blockMutex;
+        std::condition_variable blockCv;
+        bool release = false;
+        std::atomic<bool> entered{ false };
+        auto handOff = [&](const ShippedLine&) {
+            entered.store(true);
+            std::unique_lock<std::mutex> lock(blockMutex);
+            blockCv.wait(lock, [&] { return release; });
+            return true;
+        };
+
+        // Declared LAST (see the comment on StopShipperOnScopeExit above the class) so its own
+        // destructor - which joins the worker - runs FIRST on every exit path, before the
+        // blockMutex/blockCv/release/entered locals the worker's captured lambda references go
+        // away.
+        StopShipperOnScopeExit stopGuard;
+
+        LogShipper::instance().setSpoolDirectoryForTests(dir.path());
+        LogShipper::instance().start(handOff);
+        LogShipper::instance().setCanShip(true);
+
+        qInfo() << "pause-race-marker";
+        QTRY_VERIFY_WITH_TIMEOUT(entered.load(), 5000);
+
+        QElapsedTimer timer;
+        timer.start();
+        std::thread pauser([] { LogShipper::instance().pauseHandOff(); });
+
+        // Give pauseHandOff() a moment to actually reach its own wait before the in-flight
+        // hand-off finishes - the exact interleaving CR-02 is about (the notify racing the
+        // waiter's own lock-check-block sequence).
+        QTest::qWait(200);
+        {
+            std::lock_guard<std::mutex> lock(blockMutex);
+            release = true;
+        }
+        blockCv.notify_all();
+
+        pauser.join();
+        QVERIFY2(timer.elapsed() < 2000,
+                 "pauseHandOff() did not return promptly once the in-flight hand-off finished - "
+                 "this is CR-02's lost-wakeup regression, or its bounded-timeout fallback firing "
+                 "when it should not have to");
+
+        LogShipper::instance().resumeHandOff();
+    }
+
+    void pauseHandOffProceedsAfterItsBoundedTimeoutWhenAHandOffNeverFinishes()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+
+        std::mutex blockMutex;
+        std::condition_variable blockCv;
+        bool release = false;
+        std::atomic<bool> entered{ false };
+        auto handOff = [&](const ShippedLine&) {
+            entered.store(true);
+            // "Wedged": only unblocks once the test itself releases it, well after
+            // pauseHandOff()'s own bounded wait below has already timed out and returned.
+            std::unique_lock<std::mutex> lock(blockMutex);
+            blockCv.wait(lock, [&] { return release; });
+            return true;
+        };
+
+        StopShipperOnScopeExit stopGuard; // see the comment above - destructs FIRST.
+
+        // CR-02: shortens pauseHandOff()'s bounded wait (production: 5000ms) so this test does
+        // not have to wait the full 5s to prove the fallback fires.
+        LogShipper::instance().setPauseTimeoutForTests(300);
+        LogShipper::instance().setSpoolDirectoryForTests(dir.path());
+        LogShipper::instance().start(handOff);
+        LogShipper::instance().setCanShip(true);
+
+        qInfo() << "pause-timeout-marker";
+        QTRY_VERIFY_WITH_TIMEOUT(entered.load(), 5000);
+
+        QElapsedTimer timer;
+        timer.start();
+        LogShipper::instance().pauseHandOff(); // the hand-off above is still wedged right now.
+        const qint64 elapsed = timer.elapsed();
+        QVERIFY2(elapsed >= 250,
+                 "pauseHandOff() returned before its own bounded timeout could have fired");
+        QVERIFY2(elapsed < 2000,
+                 "pauseHandOff() did not proceed after its bounded timeout - CR-02's fallback "
+                 "did not fire and the calling thread was left hanging");
+
+        // Let the wedged hand-off finish so the worker (and StopShipperOnScopeExit's stop() call)
+        // can actually join cleanly.
+        {
+            std::lock_guard<std::mutex> lock(blockMutex);
+            release = true;
+        }
+        blockCv.notify_all();
+        LogShipper::instance().resumeHandOff();
     }
 
     // --- a leftover spool file from a dead process is adopted and drained -----------------------

@@ -7,6 +7,7 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QJsonValue>
+#include <QLoggingCategory>
 #include <QRegularExpression>
 #include <QSaveFile>
 #include <QStandardPaths>
@@ -34,6 +35,15 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+
+// CR-02 (and WR-01/WR-02, later fixes in this same file): every qCWarning() call this fix set
+// adds runs on this class's own worker thread only (LogSpool's methods are only ever called from
+// LogShipper's worker - the header's own comment - and pauseHandOff()'s timeout warning runs on
+// whatever thread calls it, same as any other log line this codebase emits from the client
+// thread). The worker thread is guarded against feeding its own qCWarning() calls back into
+// LogShipper's queue by `s_onWorkerThread` (below), so none of these calls can recurse into this
+// sink.
+Q_LOGGING_CATEGORY(seathubLogShipper, "seathub.log_shipper")
 
 namespace {
 
@@ -307,7 +317,23 @@ public:
     {
         handOffPaused.store(true);
         std::unique_lock<std::mutex> lock(pauseMutex);
-        pauseCv.wait(lock, [this] { return !inHandOff.load(); });
+        const int overrideMs = pauseTimeoutMsOverride.load();
+        const std::chrono::milliseconds timeout = overrideMs >= 0
+            ? std::chrono::milliseconds(overrideMs)
+            : std::chrono::milliseconds(5000);
+        const bool resumed
+            = pauseCv.wait_for(lock, timeout, [this] { return !inHandOff.load(); });
+        if (!resumed) {
+            // CR-02: a bounded fallback, matching drainBeforeSignOut()'s own pattern - never hang
+            // the calling (client) thread forever, whether the in-flight hand-off is merely slow
+            // or genuinely wedged (a stuck HandOff callback). Proceeding "as if resumed" is safe:
+            // the caller (adoptFirstDsn()'s re-init) only needs the WORKER to stop calling the OLD
+            // handOffFn before it closes the SDK, and handOffPaused is already true regardless of
+            // whether this wait itself was ever satisfied.
+            qCWarning(seathubLogShipper)
+                << "pauseHandOff() timed out after" << timeout.count()
+                << "ms waiting for an in-flight hand-off to finish; proceeding as if resumed";
+        }
     }
 
     void resumeHandOff()
@@ -352,6 +378,8 @@ public:
     }
 
     qint64 shippedBytesForTests() const { return shippedBytes.load(); }
+
+    void setPauseTimeoutForTests(int milliseconds) { pauseTimeoutMsOverride.store(milliseconds); }
 
 private:
     void sink(LogLevel level, int /*category*/, int /*priority*/, const QString& text)
@@ -516,13 +544,24 @@ private:
     {
         inHandOff.store(true);
         const bool ok = handOffFn ? handOffFn(line) : false;
-        inHandOff.store(false);
-        pauseCv.notify_all();
+        {
+            // CR-02: publish `inHandOff = false` and notify while holding the SAME mutex
+            // `pauseHandOff()` locks before checking its own predicate/blocking - per the
+            // condition-variable contract (a modification must be published under the mutex the
+            // waiter uses to correctly serialize against its own lock-check-block sequence), a
+            // notify that does not hold this mutex can race a waiter between its predicate check
+            // and the actual wait, losing the notification. Holding `pauseMutex` here closes that
+            // race outright, independent of the bounded-wait fallback above.
+            std::lock_guard<std::mutex> lock(pauseMutex);
+            inHandOff.store(false);
+            pauseCv.notify_all();
+        }
         return ok;
     }
 
     HandOff handOffFn;
     LogTee::SinkHandle sinkHandle = 0;
+    std::atomic<int> pauseTimeoutMsOverride{ -1 };
 
     std::atomic<bool> accepting{ false };
     std::atomic<bool> canShip{ false };
@@ -624,6 +663,11 @@ void LogShipper::holdWorkerForTests(bool hold)
 qint64 LogShipper::shippedBytesForTests() const
 {
     return m_impl->shippedBytesForTests();
+}
+
+void LogShipper::setPauseTimeoutForTests(int milliseconds)
+{
+    m_impl->setPauseTimeoutForTests(milliseconds);
 }
 
 QString LogShipper::scrub(const QString& text)

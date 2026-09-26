@@ -142,7 +142,10 @@ public:
     /// `pauseHandOff()`/`resumeHandOff()` so no line is ever hand-off'd to an SDK instance that is
     /// mid-close or mid-init (SEATHUB § E.3 step 5). Synchronous: does not return until any
     /// hand-off already in flight on the worker thread has finished, so the pause is real by the
-    /// time the caller proceeds to close the SDK.
+    /// time the caller proceeds to close the SDK - OR until a bounded wait (production: 5000ms,
+    /// CR-02) elapses, whichever comes first. The bounded wait is a fallback for a hand-off that
+    /// never finishes (a wedged `HandOff` callback); it is logged when it fires. Calling code
+    /// proceeds either way - never blocks the calling (client) thread forever.
     void pauseHandOff();
     /// Reverses `pauseHandOff()`. A no-op, harmlessly, if the worker was never started.
     void resumeHandOff();
@@ -192,6 +195,10 @@ public:
     /// Test-only: bytes actually handed to the stub `HandOff` so far this run (Task 1's 8 MiB cap
     /// test measures what the stub received, since the queue itself can drop lines first).
     qint64 shippedBytesForTests() const;
+    /// Test-only: overrides `pauseHandOff()`'s bounded wait (production: 5000ms, the CR-02 fix)
+    /// so a test proving the timeout fallback does not have to wait the full 5s. A negative value
+    /// (the default) means "use the production timeout".
+    void setPauseTimeoutForTests(int milliseconds);
 
 private:
     LogShipper();
