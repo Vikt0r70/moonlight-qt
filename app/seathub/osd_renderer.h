@@ -51,7 +51,6 @@ struct OsdSizes
     int labelPx;
     int unitPx;
     int rowHeight;
-    int labelColumn;
     int gap;
     int statsMargin;
     int timeLeftInset;
@@ -89,6 +88,13 @@ struct OsdTimeLeft
     qint64 minutes;
     bool critical;
 };
+
+/// The stats block's label column width (`docs/spec/ui.md` §7, A-73,
+/// `06.6-DECISION-OSD-LABEL-COLUMN.md`): it has no base of its own. It is as wide as the widest
+/// label in `rows`, measured uppercase in the face and size it is drawn in
+/// (`osdFont(osdSizesFor(windowHeight).labelPx)`), plus the gap - so every value starts at one x
+/// and no label reaches it at any `windowHeight`. An empty `rows` list returns 0.
+int osdLabelColumn(const QList<OsdStatsRow>& rows, int windowHeight);
 
 /// Renders the top-left stats block for `rows` at the size class `windowHeight` selects. A null
 /// image with an empty `rows` list (OD-04: nothing is drawn once every row is off).

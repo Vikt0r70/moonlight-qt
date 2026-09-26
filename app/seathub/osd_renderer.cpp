@@ -123,7 +123,6 @@ OsdSizes osdSizesFor(int windowHeight)
     // smaller than the value at every size in range (D-14's "units are smaller than values").
     sizes.unitPx = std::max(1, static_cast<int>(std::lround(0.6 * sizes.valuePx)));
     sizes.rowHeight = derivedPx(18.0, u);
-    sizes.labelColumn = derivedPx(56.0, u);
     sizes.gap = derivedPx(8.0, u);
     sizes.statsMargin = derivedPx(16.0, u);
     sizes.timeLeftInset = derivedPx(24.0, u);
@@ -132,6 +131,16 @@ OsdSizes osdSizesFor(int windowHeight)
     // rounded-then-floored integer form the text sizes use.
     sizes.outlinePx = std::max(1.0, 1.5 * u);
     return sizes;
+}
+
+int osdLabelColumn(const QList<OsdStatsRow>& rows, int windowHeight)
+{
+    // TEMP RED stub (A-73): reproduces the old fixed-56px-at-1080 base so every pre-existing test
+    // still passes unchanged while `labelNeverReachesItsValue`/`rowsNeverOverlapAt720` fail for
+    // real (RED_EVIDENCE_OK). Replaced with the measured column in the GREEN commit.
+    Q_UNUSED(rows);
+    const qreal u = windowHeight > 0 ? (static_cast<qreal>(windowHeight) / 1080.0) : 0.0;
+    return derivedPx(56.0, u);
 }
 
 QImage renderOsdStats(const QList<OsdStatsRow>& rows, int windowHeight)
@@ -145,6 +154,7 @@ QImage renderOsdStats(const QList<OsdStatsRow>& rows, int windowHeight)
     }
 
     const OsdSizes sizes = osdSizesFor(windowHeight);
+    const int labelColumn = osdLabelColumn(rows, windowHeight);
     const QFont labelFont = osdFont(sizes.labelPx);
     const QFont valueFont = osdFont(sizes.valuePx);
     const QFont unitFont = osdFont(sizes.unitPx);
@@ -168,7 +178,7 @@ QImage renderOsdStats(const QList<OsdStatsRow>& rows, int windowHeight)
     }
 
     const int width = static_cast<int>(
-        std::ceil((sizes.statsMargin * 2) + sizes.labelColumn + maxPartsWidth));
+        std::ceil((sizes.statsMargin * 2) + labelColumn + maxPartsWidth));
     const int height = (sizes.statsMargin * 2) + (static_cast<int>(rows.size()) * sizes.rowHeight);
 
     QImage image(std::max(1, width), std::max(1, height), QImage::Format_ARGB32_Premultiplied);
@@ -187,7 +197,7 @@ QImage renderOsdStats(const QList<OsdStatsRow>& rows, int windowHeight)
         paintTextRun(painter, QPointF(sizes.statsMargin, labelBaseline), labelFont,
                      row.label.toUpper(), labelColour, sizes.outlinePx, true);
 
-        qreal x = sizes.statsMargin + sizes.labelColumn;
+        qreal x = sizes.statsMargin + labelColumn;
         for (const OsdValuePart& part : row.parts) {
             if (!part.subLabel.isEmpty()) {
                 paintTextRun(painter, QPointF(x, labelBaseline), unitFont, part.subLabel,

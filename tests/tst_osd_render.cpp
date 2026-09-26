@@ -26,6 +26,8 @@
 #include <QRgb>
 #include <QStringList>
 
+#include <cmath>
+
 #include "seathub/osd_renderer.h"
 
 namespace {
@@ -246,11 +248,15 @@ private slots:
         QVERIFY(!image.isNull());
 
         const OsdSizes sizes = osdSizesFor(1080);
-        const QRect row1(0, 0, sizes.statsMargin + sizes.labelColumn, sizes.statsMargin + sizes.rowHeight);
-        const QRect row1Value(sizes.statsMargin + sizes.labelColumn, 0,
-                              image.width() - (sizes.statsMargin + sizes.labelColumn),
+        // A-73: the label column is derived (`osdLabelColumn`), not `sizes.labelColumn` - that
+        // field is gone (`06.6-DECISION-OSD-LABEL-COLUMN.md`). This follows the rule change; the
+        // test is not bent to pass.
+        const int labelColumn = osdLabelColumn(rows, 1080);
+        const QRect row1(0, 0, sizes.statsMargin + labelColumn, sizes.statsMargin + sizes.rowHeight);
+        const QRect row1Value(sizes.statsMargin + labelColumn, 0,
+                              image.width() - (sizes.statsMargin + labelColumn),
                               sizes.statsMargin + sizes.rowHeight);
-        const QRect row2(0, sizes.statsMargin + sizes.rowHeight, sizes.statsMargin + sizes.labelColumn,
+        const QRect row2(0, sizes.statsMargin + sizes.rowHeight, sizes.statsMargin + labelColumn,
                          sizes.rowHeight + sizes.statsMargin);
 
         QVERIFY(regionHasPixelNear(image, row1, qRgb(0xFF, 0x9A, 0x2E)));
@@ -275,6 +281,105 @@ private slots:
         QVERIFY(!singleImage.isNull());
         QVERIFY(!twoImage.isNull());
         QVERIFY(twoImage.width() > singleImage.width());
+    }
+
+    // A-73 (`docs/spec/ui.md` §7, `06.6-DECISION-OSD-LABEL-COLUMN.md`): the label column has no
+    // base of its own - it is as wide as the widest label actually drawn, so LATENCY (the widest
+    // of the default block) never reaches into the value column at any window height, unlike the
+    // old fixed 56px-at-1080 base the 06.6-06 picture sheet caught overflowing.
+    void labelNeverReachesItsValue()
+    {
+        QVERIFY(registerOsdFonts());
+
+        const QList<OsdStatsRow> rows{
+            OsdStatsRow{QStringLiteral("RES"), true,
+                       {OsdValuePart{QString(), QStringLiteral("1920x1080"), QString()}}},
+            OsdStatsRow{QStringLiteral("FPS"), false,
+                       {OsdValuePart{QString(), QStringLiteral("59.9"), QStringLiteral("fps")}}},
+            OsdStatsRow{QStringLiteral("LATENCY"), false,
+                       {OsdValuePart{QStringLiteral("NET"), QStringLiteral("12"), QStringLiteral("ms")},
+                        OsdValuePart{QStringLiteral("TOTAL"), QStringLiteral("31"), QStringLiteral("ms")}}},
+        };
+
+        for (const int height : {720, 1080, 1440, 2160}) {
+            const QImage image = renderOsdStats(rows, height);
+            QVERIFY(!image.isNull());
+
+            const OsdSizes sizes = osdSizesFor(height);
+            const QFontMetricsF labelMetrics(osdFont(sizes.labelPx));
+            const int latencyAdvance = static_cast<int>(
+                std::ceil(labelMetrics.horizontalAdvance(QStringLiteral("LATENCY"))));
+            const int labelColumn = osdLabelColumn(rows, height);
+
+            // Arithmetic: the derived column is always at least as wide as the widest label plus
+            // the gap - no new pixel value, just the measured text.
+            QVERIFY(labelColumn >= latencyAdvance + sizes.gap);
+
+            // Pixel: at least one fully transparent 1px-wide column lies strictly between the
+            // widest label's own right edge and where the value column starts, i.e. no label
+            // glyph reaches into the value column.
+            const int labelRightEdge = sizes.statsMargin + latencyAdvance;
+            const int valueX = sizes.statsMargin + labelColumn;
+            bool foundGap = false;
+            for (int x = labelRightEdge; x < valueX; ++x) {
+                const QRect column(x, 0, 1, image.height());
+                if (regionIsFullyTransparent(image, column)) {
+                    foundGap = true;
+                    break;
+                }
+            }
+            QVERIFY(foundGap);
+        }
+    }
+
+    // A-73 (same decision, the row-height half): the row height is tied to the drawn label size
+    // (`round(labelPx * 18 / 15)`), not scaled independently, so a 13px text floor at 720p never
+    // sits inside a shorter row than the text itself - the 06.6-06 picture sheet's other observed
+    // overlap (rows touching, not just LATENCY/NET).
+    void rowsNeverOverlapAt720()
+    {
+        QVERIFY(registerOsdFonts());
+
+        const QList<OsdStatsRow> rows{
+            OsdStatsRow{QStringLiteral("RES"), true,
+                       {OsdValuePart{QString(), QStringLiteral("1920x1080"), QString()}}},
+            OsdStatsRow{QStringLiteral("FPS"), false,
+                       {OsdValuePart{QString(), QStringLiteral("59.9"), QStringLiteral("fps")}}},
+            OsdStatsRow{QStringLiteral("LATENCY"), false,
+                       {OsdValuePart{QStringLiteral("NET"), QStringLiteral("12"), QStringLiteral("ms")},
+                        OsdValuePart{QStringLiteral("TOTAL"), QStringLiteral("31"), QStringLiteral("ms")}}},
+        };
+
+        const QImage image = renderOsdStats(rows, 720);
+        QVERIFY(!image.isNull());
+
+        // A scanline is "occupied" if any pixel on it is not fully transparent. Each row's own
+        // glyphs should form one contiguous run of occupied scanlines; if two consecutive rows'
+        // pixels touch (share a scanline), they collapse into a single run and the run count
+        // drops below the row count - exactly the visual overlap this test exists to catch.
+        QList<bool> occupied;
+        occupied.reserve(image.height());
+        for (int y = 0; y < image.height(); ++y) {
+            bool anyOpaque = false;
+            for (int x = 0; x < image.width(); ++x) {
+                if (qAlpha(image.pixel(x, y)) != 0) {
+                    anyOpaque = true;
+                    break;
+                }
+            }
+            occupied.append(anyOpaque);
+        }
+
+        int runs = 0;
+        bool wasOccupied = false;
+        for (const bool isOccupied : occupied) {
+            if (isOccupied && !wasOccupied) {
+                ++runs;
+            }
+            wasOccupied = isOccupied;
+        }
+
+        QCOMPARE(runs, rows.size());
     }
 
     // OD-04: with every toggle off, the caller passes an empty row list and nothing is drawn, even
