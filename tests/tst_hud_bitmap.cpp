@@ -1223,6 +1223,59 @@ private slots:
         // Different sentences, so different widths - the longer one is the two-minute line.
         QVERIFY(opaqueRuns(two, 28).last().first < opaqueRuns(ten, 28).last().first);
     }
+
+    // ---------------------------------------------------------------------------------------
+    // Plan 14 (D-09/D-11/D-13): the compositor Time left path. [Decided by executor, owner to
+    // review]: `OverlayManager` holds one surface per slot, so the compositor owns it outright
+    // once it has anything to draw - see `hud_overlay.h`'s own class comment for the full rule
+    // these two tests are the RED/GREEN proof of.
+    // ---------------------------------------------------------------------------------------
+
+    // A fresh wallet read at or below ten minutes reaches the compositor and shows up through the
+    // same publisher the legacy strip uses - on the next tick, not immediately
+    // (`noteCreditMinutes()` only records the state; `tick()` decides the slot's frame each
+    // cycle).
+    void nineMinutesReadShowsTimeLeft()
+    {
+        HudHarness harness;
+        harness.hud().beginSession();
+        harness.hud().noteCreditMinutes(9);
+        harness.hud().tick();
+
+        QVERIFY2(!harness.hud().compositor().composedBottom().isNull(),
+                 "a nine-minute fresh read must make the compositor visible");
+
+        const QImage frame = harness.frames().last();
+        // The compositor's own default window size (1920x1080, D-14) - not the legacy strip's
+        // content-sized width - is what proves this frame came from `composedBottom()`, not the
+        // superseded `renderFrame()`.
+        QCOMPARE(frame.width(), 1920);
+
+        // Tolerance 0, not `countColour()`'s default of 6: the legacy card's own sentence colour
+        // (Tokens.foregroundDefault, 0xFAFAFA) is within a tolerance of 6 of pure white and would
+        // pass this check vacuously if it accidentally matched the superseded card instead of the
+        // compositor's own `kOsdValue` (0xFFFFFFFF exactly).
+        const QImage rightHalf = frame.copy(frame.width() / 2, 0, frame.width() / 2, frame.height());
+        QVERIFY2(countColour(rightHalf, qRgb(0xFF, 0xFF, 0xFF), 0) > 0,
+                 "Time left's white value pixels must be on the right, drawn through the compositor");
+
+        harness.hud().endSession();
+    }
+
+    // The pre-stream seed never shows Time left (D-16): `seedCreditMinutes()` never touches the
+    // compositor - only a fresh read (`noteCreditMinutes()`) does.
+    void seedNeverShows()
+    {
+        HudHarness harness;
+        harness.hud().beginSession();
+        harness.hud().seedCreditMinutes(9);
+        harness.hud().tick();
+
+        QVERIFY2(harness.hud().compositor().composedBottom().isNull(),
+                 "the seed alone must not make the compositor visible");
+
+        harness.hud().endSession();
+    }
 };
 
 QTEST_MAIN(TestHudBitmap)

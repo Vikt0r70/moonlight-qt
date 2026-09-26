@@ -100,6 +100,16 @@ void MoonlightEngineSession::setDebugLineFilter(const QStringList&)
 {
 }
 
+// Plan 14 (D-09/D-13): the same unreachable-by-construction reasoning as `setDebugLineFilter()`
+// above - `create()` always returns null, so `handleHostResolved()` never reaches a real
+// `MoonlightEngineSession` to call `setTextRasterizer()` on. Defined only so this translation
+// unit links without pulling in the real engine (Rule 3, `<shared_tree_rules>`: not in Plan 14's
+// own `files_modified`, added the same way 06.3-15 and 06.3-30 added their own link-only stubs
+// here - see those plans' SUMMARYs).
+void MoonlightEngineSession::setTextRasterizer(Overlay::OverlayManager::TextRasterizer, void*)
+{
+}
+
 PairingHandshakeResult runUpstreamPairingHandshake(const PairingTarget&)
 {
     PairingHandshakeResult result;

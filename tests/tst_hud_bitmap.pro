@@ -34,11 +34,21 @@ win32 {
 
 DEFINES += FORK_ROOT=\\\"$$PWD/..\\\"
 
+# Plan 14 (D-09/D-11/D-13): `HudOverlay` now owns an `OsdCompositor` and publishes its
+# `composedBottom()` through the same publisher, so this suite needs the compositor, the pure
+# renderer it draws with, and the bundled Open Sans font resource - the same three
+# `tst_overlay_injection.pro` already links for the same reason.
+RESOURCES += ../app/seathub/fonts.qrc
+
 # `duration_text.cpp` is the one formatter every client surface uses (FLOW-09); the HUD's `Credit
 # left` calls it rather than making a second one, so this project has to link it.
 SOURCES += tst_hud_bitmap.cpp \
     ../app/seathub/hud_overlay.cpp \
-    ../app/seathub/duration_text.cpp
+    ../app/seathub/duration_text.cpp \
+    ../app/seathub/osd_compositor.cpp \
+    ../app/seathub/osd_renderer.cpp
 
 HEADERS += ../app/seathub/hud_overlay.h \
-    ../app/seathub/duration_text.h
+    ../app/seathub/duration_text.h \
+    ../app/seathub/osd_compositor.h \
+    ../app/seathub/osd_renderer.h

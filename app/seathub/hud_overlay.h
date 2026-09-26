@@ -15,10 +15,23 @@
 #include <functional>
 #include <mutex>
 
+// Plan 14 (D-09/D-11/D-13): the compositor this class now owns and publishes through.
+#include "osd_compositor.h"
+
 // The SeatHub in-session HUD: the D-56 Phase 3 subset (session duration timer + the End session
 // affordance), with the D-04 auto-hide, and since Phase 5 (CUST-15, D-21) the customer's remaining
 // credit and the two low-balance warning cards. Connection quality is Moonlight's own stats text,
 // not drawn here.
+//
+// Since Plan 14 (D-09/D-11/D-13) this class also owns one `OsdCompositor` (`compositor()`),
+// registered by `SeatHubClient` as the engine's text rasteriser. [Decided by executor, owner to
+// review, Plan 14]: `OverlayManager` holds exactly one surface per overlay slot, so two publishes
+// in the same cycle never coexist on screen - the second only replaces the first. Every publish
+// site here (`publishNow()`) therefore checks the compositor first: whenever it has anything to
+// draw (Time left visible, or an engine status line recorded, D-13), it owns the slot outright -
+// no strip, no card, no sentence or End-session hint beside it (D-11/D-12/D-20) - and only when it
+// has nothing does the legacy strip/card path below run. Plan 22 removes that legacy path and
+// applies the owner's full Time-left appear/disappear rule; until then both paths exist together.
 //
 // The HUD is not QML. `ADR-0045` records why: the Qt window is hidden for the whole session
 // (D-01), so `QQuickItem::grabToImage()` is structurally impossible, and the engine already
@@ -166,8 +179,22 @@ public:
     static int stripHeight();
     static qint64 autoHideMs();
 
+    /// D-09/D-11/D-13 (Plan 14): the compositor `SeatHubClient` registers as the engine's text
+    /// rasteriser (`&OsdCompositor::rasterize`, with this object's address as its context) and
+    /// feeds window-size and stats-label state to. See this class's own header comment for the
+    /// one-publish-per-slot rule every publish site here follows once it has anything to draw.
+    OsdCompositor& compositor() { return m_compositor; }
+
 private:
     void publishFrame(bool strip);
+    /// The compositor's own owned-surface publish (the same CR-03 pattern `publishFrame()` uses),
+    /// for whichever caller decided `composed` is what should be on screen this cycle.
+    void publishComposedFrame(const QImage& composed);
+    /// The one publish decision every site (`tick()`, `noteCreditMinutes()`, `seedCreditMinutes()`,
+    /// `setReconnecting()`) routes through: the compositor owns the slot outright when it has
+    /// anything to draw, else the legacy strip/card frame with `wantStrip` as `renderFrame()`'s own
+    /// `strip` argument.
+    void publishNow(bool wantStrip);
     void hideStrip();
     qint64 nowMs() const;
     /// The width the next frame is placed against: the pinned one, else what the window events
@@ -208,4 +235,8 @@ private:
     int m_twoFiredCount = 0;
     Card m_card = Card::None;
     qint64 m_tenShownAtMs = 0;
+
+    // D-09/D-11/D-13 (Plan 14): thread-safe on its own (a mutex-guarded `State`, per its own
+    // header comment) - no extra locking needed here.
+    OsdCompositor m_compositor;
 };

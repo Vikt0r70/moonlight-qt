@@ -55,6 +55,8 @@ SOURCES += \
     ../app/seathub/engine_termination.cpp \
     ../app/seathub/quality_outbox.cpp \
     ../app/seathub/hud_overlay.cpp \
+    ../app/seathub/osd_compositor.cpp \
+    ../app/seathub/osd_renderer.cpp \
     ../app/seathub/error_map.cpp \
     ../app/seathub/settings_bridge.cpp \
     ../app/seathub/update_feed_client.cpp \
@@ -88,6 +90,8 @@ HEADERS += \
     ../app/seathub/engine_termination.h \
     ../app/seathub/quality_outbox.h \
     ../app/seathub/hud_overlay.h \
+    ../app/seathub/osd_compositor.h \
+    ../app/seathub/osd_renderer.h \
     ../app/seathub/error_map.h \
     ../app/seathub/settings_bridge.h \
     ../app/seathub/update_feed_client.h \
@@ -98,3 +102,8 @@ HEADERS += \
 
 # The facade exposes the bundled country list, which is read from the binary (Phase 5 plan 06).
 RESOURCES += ../app/seathub/countries.qrc
+
+# Plan 14 (D-09/D-15): `SeatHubClient`'s constructor calls `registerOsdFonts()` and
+# `handleHostResolved()` registers `OsdCompositor::rasterize` as the engine's text rasteriser, so
+# this suite needs the compositor, the pure renderer, and the bundled Open Sans font resource.
+RESOURCES += ../app/seathub/fonts.qrc

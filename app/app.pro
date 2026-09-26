@@ -238,6 +238,8 @@ SOURCES += \
     seathub/engine_termination.cpp \
     seathub/quality_outbox.cpp \
     seathub/telemetry.cpp \
+    seathub/osd_renderer.cpp \
+    seathub/osd_compositor.cpp \
     streaming/streamutils.cpp \
     backend/autoupdatechecker.cpp \
     path.cpp \
@@ -306,6 +308,8 @@ HEADERS += \
     seathub/engine_termination.h \
     seathub/quality_outbox.h \
     seathub/telemetry.h \
+    seathub/osd_renderer.h \
+    seathub/osd_compositor.h \
     streaming/video/decoder.h \
     streaming/streamutils.h \
     backend/autoupdatechecker.h \
@@ -517,7 +521,8 @@ wayland {
 RESOURCES += \
     resources.qrc \
     qml.qrc \
-    seathub/countries.qrc
+    seathub/countries.qrc \
+    seathub/fonts.qrc
 
 # No TRANSLATIONS. ADR-0043 retires every language toggle on every surface, and the 27 locale
 # files listed here were the retired Moonlight client's translations - reachable only through

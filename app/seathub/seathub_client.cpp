@@ -14,6 +14,7 @@
 #include "duration_text.h"
 #include "engine_termination.h"
 #include "log_tee.h"
+#include "osd_compositor.h"
 #include "quality_outbox.h"
 #include "region.h"
 #include "session_lifecycle.h"
@@ -280,6 +281,14 @@ SeatHubClient::SeatHubClient(QObject* parent)
     // same process (as `tst_facade_wiring.cpp` does, once per test) is a no-op
     // (`LogTee::install()`'s own header comment).
     LogTee::install();
+
+    // D-09/D-15 (Plan 14): the bundled Open Sans SemiBold, registered once here - never from
+    // `app/main.cpp`, which 06.3.1 edits (RESEARCH-FORK.md §3, Pitfall 12) - so every path that
+    // constructs a facade (production, and `tst_facade_wiring.cpp`, once per test) has the font
+    // registered before `handleHostResolved()` ever sets the compositor as the engine's
+    // rasteriser. Idempotent (`registerOsdFonts()`'s own header comment); a failure only degrades
+    // to Qt's own fallback face, logged there, not fatal here.
+    registerOsdFonts();
 
     // A-51: the engine's own termination code, read from `Session::clConnectionTerminated`'s log
     // line (`engine_termination.h`'s own header comment says why this is the one route to it)
@@ -2153,6 +2162,22 @@ void SeatHubClient::handleHostResolved(const PairedHostPtr& host)
     // filtered path - never a second "show everything" one - so with nothing chosen the hotkey
     // draws nothing, which is the owner's OD-04 answer (05-01-SUMMARY) over the alternative.
     engine->setDebugLineFilter(m_settings->enabledStatsLabels());
+
+    // D-09/D-13 (Plan 14): the HUD's own `OsdCompositor` becomes the engine's text rasteriser
+    // here, at the same one construction point `setDebugLineFilter()` above just used - before
+    // `run()` (started from `handlePairingCompleted()`) ever lets the engine write a status line.
+    // `setTextRasterizer()` is a thin forward (`MoonlightEngineSession`'s own header comment); the
+    // instance is the same one `HudOverlay::tick()` publishes `composedBottom()` from
+    // (`m_hud.compositor()`), so both draw from the one recorded state (`osd_compositor.h`'s own
+    // header comment).
+    engine->setTextRasterizer(&OsdCompositor::rasterize, &m_hud.compositor());
+
+    // D-26 (Plan 14): the compositor's own stats-label choice, set alongside the filter above.
+    // Plan 16 is what actually draws the stats block through it. There is only this one call
+    // site today - settings are read-only while a stream is active (T-05-52, same reason
+    // `setDebugLineFilter()`'s own comment above gives), so nothing refreshes this mid-stream; a
+    // future refresh site would set both together, the same as here.
+    m_hud.compositor().setEnabledStatsLabels(m_settings->enabledStatsLabels());
 
     m_engineSession = engine;
     m_session->attachSession(engine);

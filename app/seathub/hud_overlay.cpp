@@ -51,6 +51,15 @@ constexpr int kTickMs = 1000;
 // screens.md §25: the HUD "auto-hides after 4s, reappears on input".
 constexpr qint64 kAutoHideMs = 4000;
 
+// D-11/D-20 (Plan 14): the compositor's own Time left thresholds, drawn from a fresh wallet read
+// only (`noteCreditMinutes()`). Named separately from `HudOverlay::kWarnMinutes`/
+// `kCriticalMinutes` above even though the first happens to share 10 with them: those are the
+// legacy strip/card thresholds (`timing.md`'s old "10 min, then 2 min" row) that Plan 22 retires;
+// these are D-11's own values (10, then critical at 5) and the two systems are not the same rule
+// merely because one number coincides.
+constexpr qint64 kTimeLeftThresholdMinutes = 10;
+constexpr qint64 kTimeLeftCriticalMinutes = 5;
+
 // The End session affordance. `End session` is copy.md's own label (its glossary forbids "Quit"
 // and "Stop"); the key combination is the D-02 binding stated as a binding, not as prose. The
 // affordance is not a clickable control in Phase 3 - ADR-0045 records why (a click target inside
@@ -226,6 +235,33 @@ void drawAlertGlyph(QPainter& painter, bool critical, qreal left, qreal centreY,
     // The exclamation mark: a stem and a dot.
     painter.drawLine(QPointF(centre.x(), centre.y() - 3.0), QPointF(centre.x(), centre.y() + 1.0));
     painter.drawPoint(QPointF(centre.x(), centre.y() + 3.5));
+}
+
+// CR-03 (ADR-0045): the surface owns its pixels - a fresh allocation and a byte-for-byte row
+// copy, never a view onto `image`'s own buffer. Shared by `publishFrame()` (the legacy strip/card
+// image) and `publishComposedFrame()` (Plan 14's compositor image) - `OsdCompositor`'s own private
+// `toOwnedArgbSurface()` is the same pattern, kept here rather than exposed because this class
+// already owned this exact code before the compositor existed.
+SDL_Surface* toOwnedArgbSurface(const QImage& image)
+{
+    if (image.isNull()) {
+        return nullptr;
+    }
+
+    SDL_Surface* surface = SDL_CreateRGBSurfaceWithFormat(0, image.width(), image.height(), 32,
+                                                          SDL_PIXELFORMAT_ARGB8888);
+    if (surface == nullptr) {
+        return nullptr;
+    }
+
+    const int rowBytes = image.width() * 4;
+    SDL_LockSurface(surface);
+    for (int y = 0; y < image.height(); ++y) {
+        memcpy(static_cast<uchar*>(surface->pixels) + (y * surface->pitch),
+               image.constScanLine(y), static_cast<size_t>(rowBytes));
+    }
+    SDL_UnlockSurface(surface);
+    return surface;
 }
 
 bool isUserInput(Uint32 type)
@@ -538,22 +574,42 @@ void HudOverlay::publishFrame(bool strip)
     // `QImage::Format_ARGB32` and `SDL_PIXELFORMAT_ARGB8888` are both 0xAARRGGBB words with
     // straight (non-premultiplied) alpha - `renderStripAt()` converts back from the premultiplied
     // format it paints in - so each row copies exactly, byte for byte.
-    SDL_Surface* surface = SDL_CreateRGBSurfaceWithFormat(0, image.width(), image.height(), 32,
-                                                          SDL_PIXELFORMAT_ARGB8888);
+    SDL_Surface* surface = toOwnedArgbSurface(image);
     if (surface == nullptr) {
         qCWarning(seathubHud) << "could not allocate the HUD bitmap:" << SDL_GetError();
         return;
     }
 
-    const int rowBytes = image.width() * 4;
-    SDL_LockSurface(surface);
-    for (int y = 0; y < image.height(); ++y) {
-        memcpy(static_cast<uchar*>(surface->pixels) + (y * surface->pitch),
-               image.constScanLine(y), static_cast<size_t>(rowBytes));
+    m_publisher(surface);
+}
+
+void HudOverlay::publishComposedFrame(const QImage& composed)
+{
+    if (!m_publisher || composed.isNull()) {
+        return;
     }
-    SDL_UnlockSurface(surface);
+
+    SDL_Surface* surface = toOwnedArgbSurface(composed);
+    if (surface == nullptr) {
+        qCWarning(seathubHud) << "could not allocate the OSD compositor bitmap:" << SDL_GetError();
+        return;
+    }
 
     m_publisher(surface);
+}
+
+void HudOverlay::publishNow(bool wantStrip)
+{
+    // See this class's own header comment: the compositor owns the slot outright whenever it has
+    // anything to draw, since `OverlayManager` holds exactly one surface per slot and a second
+    // publish in the same cycle only replaces the first.
+    const QImage composed = m_compositor.composedBottom();
+    if (!composed.isNull()) {
+        publishComposedFrame(composed);
+        return;
+    }
+
+    publishFrame(wantStrip);
 }
 
 void HudOverlay::hideStrip()
@@ -585,6 +641,10 @@ void HudOverlay::beginSession()
         m_card = Card::None;
         m_tenShownAtMs = 0;
     }
+    // A new session starts with Time left invisible too (D-11: the pre-stream floor is 15
+    // minutes, A-33 #24, so a real session never starts with it visible; reset defensively so a
+    // reused `HudOverlay` cannot carry a previous session's Time left into this one).
+    m_compositor.setTimeLeft({false, 0, false});
     if (!m_displayWidthPinned.load()) {
         // A new session is a new window; whatever the last one measured is not this one's.
         m_displayWidth.store(0);
@@ -612,7 +672,7 @@ void HudOverlay::beginSession()
     }
 
     m_visible.store(true);
-    publishFrame(true);
+    publishNow(true);
     m_publishedVisible.store(true);
 
     // SDL's timer thread, not a QTimer: the streaming loop suspends Qt processing for the whole
@@ -665,7 +725,7 @@ void HudOverlay::setReconnecting(bool reconnecting)
     // are both documented as callable off the main thread (see the class comment), and the flag
     // itself is an atomic.
     if (m_sessionActive.load()) {
-        publishFrame(true);
+        publishNow(true);
     }
 }
 
@@ -678,9 +738,14 @@ void HudOverlay::seedCreditMinutes(qint64 minutes)
         std::lock_guard<std::mutex> lock(m_warnMutex);
         m_credit = minutes;
     }
+    // D-11/D-16: the seed sets nothing on the compositor (`noteCreditMinutes()` is the only
+    // caller of `setTimeLeft()`), so this can only publish the legacy strip - unless a prior
+    // fresh read this session already made Time left visible, in which case the compositor still
+    // owns the slot (`publishNow()`'s own rule).
+    //
     // Shown at once when the strip is up; a hidden strip shows it the next time it returns.
     if (m_sessionActive.load() && m_visible.load()) {
-        publishFrame(true);
+        publishNow(true);
     }
 }
 
@@ -691,6 +756,19 @@ void HudOverlay::noteCreditMinutes(qint64 minutes)
     if (minutes < 0 || !m_sessionActive.load()) {
         return;
     }
+
+    // D-11/D-16/D-20 (Plan 14; Plan 22 applies the owner's full appear/disappear rule): a fresh
+    // read at or below ten minutes is what the compositor draws Time left from - critical (red)
+    // at or below five. `seedCreditMinutes()` never reaches here, so the pre-stream seed never
+    // shows it (D-16, `screens.md` §25 "at stream start the HUD shows it" is the legacy strip's
+    // own separate credit readout, unaffected). This does not clear Time left when the balance
+    // rises back above ten - that appear/disappear rule is Plan 22's, not this one's.
+    // TEMPORARY RED REGRESSION (Plan 14 Task 1, TDD): disabled for the RED run so
+    // `nineMinutesReadShowsTimeLeft` fails on its own named assertion rather than passing
+    // vacuously. Restored verbatim for GREEN - see 06.6-14-SUMMARY.md Deviations.
+    // if (minutes <= kTimeLeftThresholdMinutes) {
+    //     m_compositor.setTimeLeft({true, minutes, minutes <= kTimeLeftCriticalMinutes});
+    // }
 
     bool changed = false;
     {
@@ -724,14 +802,20 @@ void HudOverlay::noteCreditMinutes(qint64 minutes)
     }
 
     if (!changed) {
+        // The legacy card state did not change, but `setTimeLeft()` above may just have made the
+        // compositor visible for the first time this session; that surfaces on the next tick
+        // (`nineMinutesReadShowsTimeLeft`'s own contract), not immediately from here.
         return;
     }
 
     // Straight away rather than on the next heartbeat: a card is a warning, and this read may be
     // the last one before the balance runs out. Nothing to publish while the strip is hidden and no
-    // card is up - the value shows the next time the strip does.
+    // card is up - the value shows the next time the strip does. Routed through `publishNow()`
+    // (not `publishFrame()` directly) so a threshold that fires the legacy card at the same
+    // instant Time left becomes visible does not flash the superseded card's sentence for up to a
+    // second before the next tick corrects it.
     if (m_visible.load() || activeCard() != Card::None) {
-        publishFrame(m_visible.load());
+        publishNow(m_visible.load());
         m_publishedVisible.store(true);
     }
 }
@@ -827,18 +911,26 @@ void HudOverlay::tick()
     expireTenMinuteCard(now);
     const bool cardShown = activeCard() != Card::None;
 
-    if (wanted || cardShown) {
+    // [Decided by executor, owner to review, Plan 14]: computed once, then used for both the
+    // publish-vs-hide decision below and (via `publishNow()`) the actual publish itself, so the
+    // two agree on whether the compositor has anything to draw this tick. See this class's own
+    // header comment for the one-publish-per-slot rule this implements.
+    const bool compositorVisible = !m_compositor.composedBottom().isNull();
+
+    if (compositorVisible || wanted || cardShown) {
         // Re-published every tick while anything is visible, not only when the second changes: the
         // renderer keeps the last texture it was handed, so one publish a second is what keeps the
         // timer on screen current, and re-publishing also repairs a texture lost to a swapchain
-        // recreation. With the strip hidden and a card up, the frame carries the card alone.
-        publishFrame(wanted);
+        // recreation. With the strip hidden and a card up, the frame carries the card alone; with
+        // the compositor visible, it owns the slot outright (`publishNow()`'s own rule) and the
+        // legacy strip/card frame this tick would otherwise have built is never even rendered.
+        publishNow(wanted);
     }
     else if (m_publishedVisible.load()) {
         hideStrip();
     }
 
-    m_publishedVisible.store(wanted || cardShown);
+    m_publishedVisible.store(compositorVisible || wanted || cardShown);
 }
 
 Uint32 SDLCALL HudOverlay::onTimer(Uint32, void* param)
