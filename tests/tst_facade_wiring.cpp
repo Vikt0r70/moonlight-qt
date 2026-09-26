@@ -3090,6 +3090,86 @@ private slots:
             m_fake->requestPaths().contains(QStringLiteral("/api/sessions/s-fresh/pairing")), 15000);
     }
 
+    // --- D-05/C4/C7: Play ends a never-streamed attached session first, same as Try again ---------
+
+    void playAfterANeverStreamedSessionEndsItFirst()
+    {
+        SeatHubClient client;
+        beginStagedSession(client);
+        QVERIFY(!QTest::currentTestFailed());
+        client.teardown()->setVerifyIntervalMs(1);
+
+        // C2's own end attempt cannot reach the server (C7): the session stays attached and its
+        // teardown claim is released, ready for the next attempt to ask again.
+        m_fake->answerEnd(0);
+        emit client.pairing()->pairingFailed(SeatHubFailure::local(QStringLiteral("failed")));
+        QTRY_VERIFY_WITH_TIMEOUT(
+            m_fake->requestPaths().contains(QStringLiteral("/api/sessions/s-stages/end")), 15000);
+        QCOMPARE(m_fake->requestPaths().count(QStringLiteral("/api/sessions/s-stages/end")), 1);
+        QVERIFY(!client.retryBusy());
+
+        // Back to home, then Play - not Try again. This is C4's second half.
+        client.dismissError();
+        QCOMPARE(client.appState(), QStringLiteral("home"));
+
+        m_fake->answerEnd(200);
+        m_fake->answerSession(QStringLiteral("s-stages"), QStringLiteral("ENDING"));
+        client.start();
+        QVERIFY2(client.retryBusy(), "Play ends the never-streamed session first (C4/C7)");
+        QCOMPARE(m_fake->requestPaths().count(QStringLiteral("/api/sessions/s-stages/end")), 2);
+
+        // While the old session is still ENDING, no fresh Play has gone out.
+        QTest::qWait(100);
+        QCOMPARE(m_fake->requestPaths().count(QStringLiteral("/api/sessions")), 0);
+
+        // The old session reaches CANCELLED: the wait ends and a fresh Play goes out.
+        m_fake->answerPlay(201, QByteArrayLiteral("{\"id\":\"s-fresh\"}"));
+        m_fake->answerSession(QStringLiteral("s-stages"), QStringLiteral("CANCELLED"));
+
+        QTRY_VERIFY_WITH_TIMEOUT(!client.retryBusy(), 15000);
+        QTRY_COMPARE_WITH_TIMEOUT(m_fake->requestPaths().count(QStringLiteral("/api/sessions")), 1,
+                                  15000);
+        QCOMPARE(client.appState(), QStringLiteral("connecting"));
+        QTRY_VERIFY_WITH_TIMEOUT(
+            m_fake->requestPaths().contains(QStringLiteral("/api/sessions/s-fresh/pairing")), 15000);
+    }
+
+    void tryAgainShowsBusyUntilTheOldSessionEnds()
+    {
+        SeatHubClient client;
+        beginStagedSession(client);
+        QVERIFY(!QTest::currentTestFailed());
+        client.teardown()->setVerifyIntervalMs(1);
+        m_fake->answerSession(QStringLiteral("s-stages"), QStringLiteral("ENDING"));
+
+        emit client.pairing()->pairingFailed(SeatHubFailure::local(QStringLiteral("failed")));
+        QVERIFY(client.connectFailed());
+        // C2's own end for the pairing failure must actually have reached the network thread
+        // before `retry()` runs, or the count below observes zero requests by pure timing luck
+        // rather than proving anything about `retry()` itself.
+        QTRY_VERIFY_WITH_TIMEOUT(
+            m_fake->requestPaths().contains(QStringLiteral("/api/sessions/s-stages/end")), 15000);
+        QCOMPARE(m_fake->requestPaths().count(QStringLiteral("/api/sessions/s-stages/end")), 1);
+
+        client.retry();
+        QVERIFY2(client.retryBusy(), "Try again shows busy from the very first press");
+        QCOMPARE(m_fake->requestPaths().count(QStringLiteral("/api/sessions/s-stages/end")), 1);
+
+        // A second Try again press while the old session is still ending must post nothing.
+        client.retry();
+        QVERIFY(client.retryBusy());
+        QCOMPARE(m_fake->requestPaths().count(QStringLiteral("/api/sessions/s-stages/end")), 1);
+        QCOMPARE(m_fake->requestPaths().count(QStringLiteral("/api/sessions")), 0);
+
+        // The old session reaches its terminal read: the busy state clears and a fresh Play goes out.
+        m_fake->answerPlay(201, QByteArrayLiteral("{\"id\":\"s-fresh-2\"}"));
+        m_fake->answerSession(QStringLiteral("s-stages"), QStringLiteral("CANCELLED"));
+
+        QTRY_VERIFY_WITH_TIMEOUT(!client.retryBusy(), 15000);
+        QTRY_COMPARE_WITH_TIMEOUT(m_fake->requestPaths().count(QStringLiteral("/api/sessions")), 1,
+                                  15000);
+    }
+
     // `TeardownController::cancel()` (what `signOut()` calls) emits neither `teardownCompleted` nor
     // `teardownFailed` - a `retry()` wait abandoned by a sign-out must still clear `retryBusy`
     // itself, or the NEXT, unrelated session's ordinary teardown would find it still set and fire
