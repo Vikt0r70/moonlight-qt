@@ -767,6 +767,7 @@ private slots:
     void theHostSpeakerRowIsPresentAndEditableAtUpstreamsDefault();
     void theStreamingBannerAndNegotiatedFallbackStillRenderOnTheRebuiltPage();
     void noSettingsPageStringCarriesTheUpstreamBrand();
+    void theSettingsPageShowsTheLogsAndCrashReportsDisclosureSentence();
     void customResolutionSelectionRevealsAndPersistsTheWidthHeightFields();
     void customFrameRateSelectionRevealsAndPersistsTheFpsField();
     void aStoredCustomResolutionOrFrameRateShowsItsFieldsOnLoad();
@@ -3238,6 +3239,31 @@ void TstUiScreens::noSettingsPageStringCarriesTheUpstreamBrand()
         QVERIFY2(!text.contains(QStringLiteral("Moonlight")),
                  qPrintable(QStringLiteral("a rendered string carries the upstream brand: ") + text));
     }
+}
+
+// D-14, ADR-0063, screens.md § 27 permitted change 4: the one plain-text disclosure sentence
+// under the page title - no switch, no link, verbatim from copy.md § Settings.
+void TstUiScreens::theSettingsPageShowsTheLogsAndCrashReportsDisclosureSentence()
+{
+    SettingsFixture fixture;
+    QQuickStyle::setStyle(QStringLiteral("Basic"));
+    QQmlEngine engine;
+    registerTokenSingletons(&engine);
+
+    QString error;
+    QScopedPointer<QObject> root(instantiateSettingsPage(&engine, fixture.client, &error));
+    QVERIFY2(root, qPrintable(error));
+
+    bool found = false;
+    for (QObject* item : textItems(root.data())) {
+        if (item->property("text").toString()
+            == QStringLiteral(
+                "SeatHub sends diagnostic logs and crash reports to SevenHills so we can fix problems.")) {
+            found = true;
+            break;
+        }
+    }
+    QVERIFY2(found, "the Settings page must show the logs/crash-reports disclosure sentence");
 }
 
 void TstUiScreens::customResolutionSelectionRevealsAndPersistsTheWidthHeightFields()
