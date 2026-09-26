@@ -1673,10 +1673,11 @@ private slots:
         QCOMPARE(client.appState(), QStringLiteral("home"));
     }
 
-    // D-05/C2: a failed step before the stream starts ends the session at once rather than leaving
-    // it attached for Play to find later. This test used to be named the other way around
+    // D-05/C2/C5: a session that never streamed is never "live" (Resume is not offered for it),
+    // and a failed step before the stream starts ends it at once rather than leaving it attached
+    // for Play to find later. This test used to be named the other way around
     // ("...IsLiveAndPlayResumesItInsteadOfAskingForAnother") when the pre-D-05 contract left a
-    // failed session attached and resumable; D-05 replaces that.
+    // failed, never-streamed session attached and resumable; D-05 replaces that.
     void aSessionThatFailsBeforeStreamingIsEndedAndPlayStartsAFreshOne()
     {
         SeatHubClient client;
@@ -1689,6 +1690,7 @@ private slots:
         // A session is attached (Play's allocation returned it), but it never streams: the rig has
         // no answer in this test, so pairing fails - and D-05/C2 ends the session at once.
         client.beginSession(QStringLiteral("session-live"));
+        QVERIFY2(!client.liveSession(), "a session that has not streamed is never live (C5)");
         QTRY_VERIFY_WITH_TIMEOUT(client.connectFailed(), 15000);
         QCOMPARE(client.appState(), QStringLiteral("connecting"));
         QVERIFY2(!client.liveSession(), "a pre-stream failure ends the session (C2)");

@@ -559,8 +559,10 @@ private:
     /// never be left stale by a path that forgot to say so.
     void setAttachedSession(const QString& sessionId);
     void setAttachedSessionEnded(bool ended);
-    /// Recomputes `m_liveSession` from the two and says so when it changed.
+    /// Recomputes `m_liveSession` from the three and says so when it changed.
     void updateLiveSession();
+    /// The one writer of `m_retryBusy`.
+    void setRetryBusy(bool busy);
     /// D-05/C2: the one pre-stream end path. Marks the attached session ended and, if this
     /// session's teardown has not already been claimed (the guard is per-session and shared with
     /// `handleReadyForDeletion()`), runs it with `failed` forwarded to `endSession()`. A no-op
@@ -808,8 +810,15 @@ private:
     /// True once the control plane has reported `m_sessionId` terminal. A session that is over is not
     /// one Home offers to resume, even while its teardown has not finished.
     bool m_sessionEnded = false;
+    /// C1 (D-05): true once `handleConnectionStarted()` has run for `m_sessionId` - the session
+    /// reached ACTIVE on this client's side. Cleared in `setAttachedSession()` whenever a
+    /// genuinely new session id is attached; kept across a Resume of the same id (`start()`'s own
+    /// `beginSession(m_sessionId)` call re-attaches the same id, which is not a change). Gates
+    /// both `updateLiveSession()` (C5: Resume only after ACTIVE) and `retry()` (C4: never resume
+    /// a session that did not stream).
+    bool m_streamStarted = false;
     bool m_liveSession = false;
-    /// D-05/C4: see the `retryBusy` Q_PROPERTY. RED (06.6-17 Task 2): not wired to anything yet.
+    /// D-05/C4: see the `retryBusy` Q_PROPERTY.
     bool m_retryBusy = false;
     /// What pairing returned about this client: the SHA-256 fingerprint of its own certificate,
     /// which is the identity a host-side reader of Sunshine's client list can match to this

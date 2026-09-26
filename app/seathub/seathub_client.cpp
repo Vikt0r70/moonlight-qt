@@ -668,6 +668,12 @@ void SeatHubClient::setSignedIn(bool signedIn)
 
 void SeatHubClient::setAttachedSession(const QString& sessionId)
 {
+    // C1: a genuinely new session id starts with no stream yet. Re-attaching the SAME id - the
+    // Resume branch of `start()` calling `beginSession(m_sessionId)` - is not a change and must
+    // not clear a flag `handleConnectionStarted()` already set for it.
+    if (sessionId != m_sessionId) {
+        m_streamStarted = false;
+    }
     m_sessionId = sessionId;
     if (sessionId.isEmpty()) {
         m_sessionEnded = false;
@@ -683,13 +689,24 @@ void SeatHubClient::setAttachedSessionEnded(bool ended)
 
 void SeatHubClient::updateLiveSession()
 {
-    const bool live = !m_sessionId.isEmpty() && !m_sessionEnded;
+    // C5: Resume is offered only for a session that reached ACTIVE on this client's side - a
+    // pre-stream session is never one Home resumes, even before anything has ended it.
+    const bool live = !m_sessionId.isEmpty() && !m_sessionEnded && m_streamStarted;
     if (m_liveSession == live) {
         return;
     }
     qCInfo(seathubClient) << "live session" << m_liveSession << "->" << live;
     m_liveSession = live;
     emit liveSessionChanged();
+}
+
+void SeatHubClient::setRetryBusy(bool busy)
+{
+    if (m_retryBusy == busy) {
+        return;
+    }
+    m_retryBusy = busy;
+    emit retryBusyChanged();
 }
 
 void SeatHubClient::endAttachedSessionBeforeStream(bool failed)
@@ -875,6 +892,17 @@ void SeatHubClient::start()
         return;
     }
 
+    // D-05/C4: `retry()`'s own end-then-fresh-Play sequence is in flight (the old session is still
+    // being torn down). Home's own view stays "ready" for the wait's duration - it is not
+    // "connecting" or "streaming" yet - so without this guard a second Play pressed during the
+    // wait would post its own `POST /api/sessions` and `beginSession()` a second session, which
+    // the old session's own `handleTeardownCompleted()` (arriving after) would then tear back down
+    // as if it were the one that never streamed. `retryBusy` is exactly "a fresh Play is already
+    // promised"; a second one here would only race it.
+    if (m_retryBusy) {
+        return;
+    }
+
     // Play is the control plane's allocation (`POST /api/sessions`, D-35). Without an access
     // token there is nothing to allocate with, so there is nothing to stream: a stream is always
     // the object of an allocated session. This used to run the Plan 03-02 tracer instead, which is
@@ -1023,6 +1051,23 @@ void SeatHubClient::retry()
     }
 
     setAppState(QString::fromLatin1(kStateHome));
+
+    // D-05/C4: Try again is always a fresh Play, never a Resume of a session that did not stream.
+    // A session still attached here must be ended first - idempotent if a pre-stream failure
+    // already started it (C2) - and its teardown must reach a terminal state before the new Play
+    // goes out, or the POST can race the "one nonterminal session per customer" rule and be
+    // refused 409 (`openapi.yaml` `AllocationRefused`, `USER_HAS_NONTERMINAL_SESSION`).
+    if (!m_sessionId.isEmpty() && !m_streamStarted) {
+        setRetryBusy(true);
+        if (m_teardownGuard.markStarted()) {
+            m_teardown->teardown(m_sessionId, m_clientUuid, false);
+        }
+        // else: a pre-stream failure already claimed this session's teardown (C2) and it is
+        // already running - just wait for it. `handleTeardownCompleted()`/`handleTeardownFailed()`
+        // notice `m_retryBusy` and continue (or stop) from there.
+        return;
+    }
+
     start();
 }
 
@@ -1337,6 +1382,11 @@ void SeatHubClient::signOut()
     m_horizon->disarm();
     onClientThread(m_pairing, [this]() { m_pairing->cancel(); });
     m_teardown->cancel();
+    // D-05/C4: `TeardownController::cancel()` emits neither `teardownCompleted` nor
+    // `teardownFailed`, so a `retry()` wait abandoned by a sign-out would otherwise never clear -
+    // leaving the NEXT, unrelated session's ordinary teardown to find the flag still set and fire
+    // an unrequested `beginPlayRequest()` for a customer who is no longer signed in.
+    setRetryBusy(false);
 
     // The server's revoke goes out first - it is the only thing that makes "signed out" true for
     // anyone who has copied the credential. The request reads the credential when it runs, which
@@ -1706,6 +1756,11 @@ void SeatHubClient::handleConnectionStarted()
     m_settings->noteConnectionStarted();
     advanceConnectStage(kStageStreamingNow);
     setAppState(QString::fromLatin1(kStateStreaming));
+
+    // C1 (D-05): the session reached ACTIVE on this client's side - from here Home may offer
+    // Resume (C5), and Try again must never treat this session as one to end and replace (C4).
+    m_streamStarted = true;
+    updateLiveSession();
 
     // The HUD is begun before liveness starts, because the reads liveness makes feed it:
     // `beginSession()` resets Time left's own state (D-11), so a wallet read that beat it would
@@ -2552,6 +2607,18 @@ void SeatHubClient::handleTeardownCompleted(const SessionInfo& finalSession)
     emit billingChanged();
     emit sessionWarningChanged();
 
+    // D-05/C4: `retry()`'s own end-then-fresh-Play sequence was waiting on exactly this teardown -
+    // the old session is gone, so the fresh Play goes out now, instead of the ordinary "land back
+    // on Home" handling below (which would otherwise treat this the way an ordinary finished
+    // session is treated, when the customer never actually watched one happen). This must run
+    // after every clear above (trace id, telemetry session, the attached session itself) so the
+    // fresh Play's own trace id is not the one wiped.
+    if (m_retryBusy) {
+        setRetryBusy(false);
+        beginPlayRequest();
+        return;
+    }
+
     // Only leave the view if the customer is not looking at a failure: a teardown that succeeded says
     // nothing about the failure the error screen - or a stalled connecting view - is already showing.
     if (m_appState != QLatin1String(kStateError) && !m_connectFailed) {
@@ -2577,6 +2644,14 @@ void SeatHubClient::handleTeardownFailed(const SeatHubFailure& failure)
     // D-09: the session (and whatever rig it named) is over - a crash after this point carries
     // neither in its tags.
     SeatHubTelemetry::clearSession();
+
+    // C7: no retry loop is added here, but the NEXT Try again (or Play) must still be able to ask
+    // for a fresh `/end` rather than finding this session's teardown claim already spent - reset
+    // the guard the same way a completed teardown does. `m_sessionId` itself is left attached: the
+    // session is still the server's to end, and a customer who tries again gets exactly the "end
+    // it, then a fresh Play" sequence C4 already describes.
+    m_teardownGuard.reset();
+    setRetryBusy(false);
 
     // STREAM-10: the rig-side disable/remove/verify did not complete, or something was left
     // stored on this PC. Reporting success would tell the customer the opposite of what is true,
