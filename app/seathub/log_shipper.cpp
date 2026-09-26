@@ -445,6 +445,13 @@ private:
             std::lock_guard<std::mutex> lock(queueMutex);
             if (queue.size() >= static_cast<size_t>(LogShipper::kQueueLines)) {
                 queue.pop_front();
+                // WR-04: the popped line was already counted by an earlier fetch_add() below, on
+                // ITS OWN push - but it will now never reach run()'s processLine() (only the
+                // lines still in the queue do). Compensate here, or drainBeforeSignOut()'s target
+                // (captured against this same counter) can never again be satisfied by
+                // processedSequence once even a single line has ever been dropped by this cap -
+                // permanently desynchronizing the two counters for the rest of the process's life.
+                enqueueSequence.fetch_sub(1);
             }
             queue.push_back(std::move(line));
             enqueueSequence.fetch_add(1);
