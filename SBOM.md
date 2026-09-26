@@ -175,6 +175,25 @@ client executable, and one data file.
 - **Taken from:** the MSVC redistributable directory, not from the build tree — the build tree's
   copies are unsigned and repackaging them would break the signature that makes them trustworthy.
 
+### Open Sans
+
+- **Version:** v3.003
+- **License:** SIL Open Font License 1.1 (no Reserved Font Name)
+- **Source:** https://github.com/googlefonts/opensans at commit
+  `bd7e37632246368c60fdcbd374dbf9bad11969b6`
+- **File:** `OpenSans-SemiBold.ttf`, unmodified, compiled into the client as a Qt resource
+  (`app/seathub/fonts/OFL.txt`/`OpenSans-SemiBold.ttf`, registered via `seathub/fonts.qrc`,
+  06.6-06/06.6-14) and read by the pluggable text rasteriser `OsdRenderer` implements (D-15/D-17,
+  the one font for every SeatHub-drawn overlay).
+- **Ships as:** compiled into `SeatHub.exe` (the Qt resource), with its licence text shipped
+  separately at `licenses\OpenSans-OFL.txt` in the deploy folder (D-15; `scripts/build-seathub.ps1`
+  copies it from `app/seathub/fonts/OFL.txt` and the deploy-folder check requires it).
+
+Pre-existing gap, not widened by this entry: upstream's own `ModeSeven.ttf` (the SDL_ttf fallback
+`OverlayManager` still falls back to when no rasteriser is set, `overlaymanager.cpp`'s
+`Path::readDataFile("ModeSeven.ttf")`) has never had its own SBOM row since this file was written
+in 03-06; it is not this plan's asset and this plan does not add, remove or modify it.
+
 ## Statically linked into SeatHub.exe
 
 These have no DLL of their own; they are compiled into the client. Verified by their absence from
