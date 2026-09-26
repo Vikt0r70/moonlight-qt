@@ -24,3 +24,10 @@ tests/*.moc
 tests/moc_*
 tests/qrc_*
 tests/*-out.txt
+# Plan 15: tst_telemetry.pro and tst_facade_wiring.pro both compile app/seathub/telemetry.cpp,
+# each under its own DEFINES (tst_telemetry.pro alone widens acceptDsn() for its loopback-DSN
+# tests) - the flat `tests/*.obj` pattern above left both projects sharing one `telemetry.obj` in
+# the same directory, and a naive mtime-based incremental build (jom) had no way to tell that the
+# object on disk was compiled under the OTHER project's flags, silently reusing a stale one and
+# losing the loopback override. Each of the two suites' OBJECTS_DIR/MOC_DIR keeps its own.
+tests/obj-*/

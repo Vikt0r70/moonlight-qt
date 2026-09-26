@@ -28,6 +28,10 @@ QtObject {
   readonly property color destructiveForegroundDefault: "#1f0a0a"
   readonly property color focusDefault: "#fafafa"
   readonly property var glowLiveDefault: "0 0 0 1px rgba(16,185,129,.35), 0 0 24px rgba(16,185,129,.18)"
+  readonly property color osdLabelDefault: "#ff9a2e"
+  readonly property color osdLabelMediaDefault: "#2dd4bf"
+  readonly property color osdValueDefault: "#ffffff"
+  readonly property color osdOutlineDefault: Qt.rgba(0, 0, 0, 0.85)
   readonly property var durationFastDefault: "120ms"
   readonly property var durationBaseDefault: "180ms"
   readonly property var durationSlowDefault: "260ms"

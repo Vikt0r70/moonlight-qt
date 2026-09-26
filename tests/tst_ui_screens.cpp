@@ -767,6 +767,7 @@ private slots:
     void theHostSpeakerRowIsPresentAndEditableAtUpstreamsDefault();
     void theStreamingBannerAndNegotiatedFallbackStillRenderOnTheRebuiltPage();
     void noSettingsPageStringCarriesTheUpstreamBrand();
+    void theSettingsPageShowsTheLogsAndCrashReportsDisclosureSentence();
     void customResolutionSelectionRevealsAndPersistsTheWidthHeightFields();
     void customFrameRateSelectionRevealsAndPersistsTheFpsField();
     void aStoredCustomResolutionOrFrameRateShowsItsFieldsOnLoad();
@@ -3135,16 +3136,22 @@ void TstUiScreens::theStatsGroupRendersOneToggleAndTheyDefaultOff()
     }
     QVERIFY2(sawGroupTitle, "the stats group title must be upstream's own label");
 
-    // D-23/OD-03: one toggle per line, eleven of them, each off by default. Found through the
-    // real (visual) item tree, not `QObject::findChildren` - see `statsCheckBoxFor`'s comment
-    // for why a Repeater's own delegates are invisible to that walk.
+    // D-23/OD-03: one toggle per line, eleven of them. D-10 (Plan 16, `06.6-16-PLAN.md`) ticks
+    // three of them by default (RES/FPS/LATENCY, "the essentials any person understands"); the
+    // other eight are off. Found through the real (visual) item tree, not
+    // `QObject::findChildren` - see `statsCheckBoxFor`'s comment for why a Repeater's own
+    // delegates are invisible to that walk.
     const QStringList keys = fixture.bridge->statsToggleKeys();
     QCOMPARE(keys.size(), 11);
     const QHash<QString, QObject*> boxes = statsCheckBoxesByKey(root.data(), fixture.bridge);
     QCOMPARE(boxes.size(), 11);
+    const QStringList onByDefault = { QStringLiteral("statsVideoStream"),
+                                      QStringLiteral("statsRenderingFrameRate"),
+                                      QStringLiteral("statsNetworkLatency") };
     for (auto it = boxes.constBegin(); it != boxes.constEnd(); ++it) {
-        QVERIFY2(!it.value()->property("checked").toBool(),
-                 qPrintable(QStringLiteral("stats toggle must default off: ") + it.key()));
+        const bool expectedChecked = onByDefault.contains(it.key());
+        QVERIFY2(it.value()->property("checked").toBool() == expectedChecked,
+                 qPrintable(QStringLiteral("stats toggle default mismatch: ") + it.key()));
     }
 
     // Each toggle's own label is Moonlight's own line text (`copy.md` § Settings), with no
@@ -3232,6 +3239,31 @@ void TstUiScreens::noSettingsPageStringCarriesTheUpstreamBrand()
         QVERIFY2(!text.contains(QStringLiteral("Moonlight")),
                  qPrintable(QStringLiteral("a rendered string carries the upstream brand: ") + text));
     }
+}
+
+// D-14, ADR-0063, screens.md § 27 permitted change 4: the one plain-text disclosure sentence
+// under the page title - no switch, no link, verbatim from copy.md § Settings.
+void TstUiScreens::theSettingsPageShowsTheLogsAndCrashReportsDisclosureSentence()
+{
+    SettingsFixture fixture;
+    QQuickStyle::setStyle(QStringLiteral("Basic"));
+    QQmlEngine engine;
+    registerTokenSingletons(&engine);
+
+    QString error;
+    QScopedPointer<QObject> root(instantiateSettingsPage(&engine, fixture.client, &error));
+    QVERIFY2(root, qPrintable(error));
+
+    bool found = false;
+    for (QObject* item : textItems(root.data())) {
+        if (item->property("text").toString()
+            == QStringLiteral(
+                "SeatHub sends diagnostic logs and crash reports to SevenHills so we can fix problems.")) {
+            found = true;
+            break;
+        }
+    }
+    QVERIFY2(found, "the Settings page must show the logs/crash-reports disclosure sentence");
 }
 
 void TstUiScreens::customResolutionSelectionRevealsAndPersistsTheWidthHeightFields()

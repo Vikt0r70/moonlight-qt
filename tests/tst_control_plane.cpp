@@ -91,6 +91,11 @@ public:
     QString lastQuery;
     QByteArray lastMethod;
     QNetworkRequest lastRequest;
+    /// The body the last request carried, as it went on the wire - empty for a GET or a POST with
+    /// no body. Most tests assert request shape through the static builders instead; this exists
+    /// for the one case (`endSession`'s `failed` flag) where what matters is what actually left
+    /// this class, not what a builder function returns in isolation.
+    QByteArray lastBody;
     /// Every path asked for, in order - for the assertion that a route was never built.
     QStringList paths;
 
@@ -104,11 +109,7 @@ protected:
         paths.append(lastPath);
         lastRequest = request;
         lastMethod = outgoingData ? QByteArrayLiteral("POST") : QByteArrayLiteral("GET");
-        if (outgoingData) {
-            // Drain the body so the caller's write completes; the content is asserted through
-            // the static builders instead.
-            outgoingData->readAll();
-        }
+        lastBody = outgoingData ? outgoingData->readAll() : QByteArray();
         return new FakeReply(status, body, this);
     }
 };
@@ -596,6 +597,27 @@ private slots:
         QVERIFY2(auth.pairingPin.isEmpty(), "a null pairing_pin is not a PIN");
     }
 
+    // A-68 / D-06 reversal, contract 3.3.0 (ADR-0064): `quality_profile` is optional and
+    // nullable on `SessionAuthorization` now that nothing reads it - null and absent must both
+    // still parse.
+    void authorizationWithNullQualityParses()
+    {
+        QJsonObject withNull;
+        withNull.insert(QStringLiteral("session_id"), QStringLiteral("aaaabbbb-cccc-dddd-eeee-ffff00001111"));
+        withNull.insert(QStringLiteral("quality_profile"), QJsonValue::Null);
+
+        SessionAuthorization authWithNull;
+        QVERIFY(SessionAuthorization::parse(withNull, &authWithNull));
+        QVERIFY2(authWithNull.qualityProfile.isEmpty(), "a null quality_profile parses as empty");
+
+        QJsonObject withoutKey;
+        withoutKey.insert(QStringLiteral("session_id"), QStringLiteral("aaaabbbb-cccc-dddd-eeee-ffff00001111"));
+
+        SessionAuthorization authWithoutKey;
+        QVERIFY(SessionAuthorization::parse(withoutKey, &authWithoutKey));
+        QVERIFY2(authWithoutKey.qualityProfile.isEmpty(), "an absent quality_profile parses as empty");
+    }
+
     void liveness_postsToTheDocumentedRouteWithStateAndErrorCode()
     {
         ControlPlaneClient client;
@@ -627,7 +649,7 @@ private slots:
         fake->body = okBody();
 
         bool called = false;
-        client.endSession(QStringLiteral("aaaabbbb-cccc-dddd-eeee-ffff00001111"),
+        client.endSession(QStringLiteral("aaaabbbb-cccc-dddd-eeee-ffff00001111"), false,
                           [&](const ControlPlaneResult& result) {
                               QVERIFY(result.ok);
                               called = true;
@@ -636,6 +658,45 @@ private slots:
 
         QCOMPARE(fake->lastPath,
                  QStringLiteral("/api/sessions/aaaabbbb-cccc-dddd-eeee-ffff00001111/end"));
+    }
+
+    // D-05/D-23, contract 3.3.0: `SessionEndRequest`'s optional `{"failed": true}`.
+    void endBodyCarriesFailedOnlyWhenAsked()
+    {
+        // The request-shape rule, asserted without a socket first (the same pattern
+        // `buildLiveness`/`buildSessionCreate` already establish for this class).
+        QCOMPARE(ControlPlaneClient::buildEndRequest(true), QByteArrayLiteral("{\"failed\":true}"));
+        QVERIFY2(ControlPlaneClient::buildEndRequest(false).isEmpty(),
+                 "endSession(..., false) must build no body at all");
+
+        ControlPlaneClient client;
+        auto* fake = new FakeNetworkAccessManager;
+        client.setNetworkAccessManager(fake);
+        fake->status = 202;
+        fake->body = okBody();
+
+        bool called = false;
+        client.endSession(QStringLiteral("aaaabbbb-cccc-dddd-eeee-ffff00001111"), true,
+                          [&](const ControlPlaneResult& result) {
+                              QVERIFY(result.ok);
+                              called = true;
+                          });
+        QTRY_VERIFY(called);
+        QCOMPARE(fake->lastBody, QByteArrayLiteral("{\"failed\":true}"));
+        QCOMPARE(fake->lastRequest.header(QNetworkRequest::ContentTypeHeader).toString(),
+                 QStringLiteral("application/json"));
+
+        called = false;
+        client.endSession(QStringLiteral("aaaabbbb-cccc-dddd-eeee-ffff00001111"), false,
+                          [&](const ControlPlaneResult& result) {
+                              QVERIFY(result.ok);
+                              called = true;
+                          });
+        QTRY_VERIFY(called);
+        // `send()`'s own empty-body rule: no body posts the literal `{}`, which the server reads
+        // as "not failed" (`06.6-07-SUMMARY.md` D3) - never `{"failed":true}` left over from the
+        // call above.
+        QCOMPARE(fake->lastBody, QByteArrayLiteral("{}"));
     }
 
     void sessionFetch_parsesTheSessionSchema()
@@ -892,11 +953,6 @@ private slots:
                                                QStringLiteral("123456"))).object();
         QCOMPARE(verify.value(QStringLiteral("code")).toString(), QStringLiteral("123456"));
 
-        const QJsonObject create = QJsonDocument::fromJson(
-            ControlPlaneClient::buildSessionCreate(QStringLiteral("1080p120"))).object();
-        QCOMPARE(create.value(QStringLiteral("quality_profile")).toString(),
-                 QStringLiteral("1080p120"));
-
         const QJsonObject login = QJsonDocument::fromJson(
             ControlPlaneClient::buildLogin(QStringLiteral("someone@example.com"),
                                            QStringLiteral("a password"))).object();
@@ -904,6 +960,13 @@ private slots:
                  QStringLiteral("someone@example.com"));
         QCOMPARE(login.value(QStringLiteral("password")).toString(), QStringLiteral("a password"));
         QCOMPARE(login.size(), 2);
+    }
+
+    // A-68 / D-06 reversal, contract 3.3.0 (ADR-0064): `SessionCreateRequest` carries no quality
+    // field at all - the customer's saved Settings are the only decider of stream quality.
+    void sessionCreateBodyIsEmpty()
+    {
+        QCOMPARE(ControlPlaneClient::buildSessionCreate(), QByteArrayLiteral("{}"));
     }
 
     // --- Phase 5 plan 02: the launch, balance, sign-out and password routes ------------------
@@ -1201,11 +1264,11 @@ private slots:
         client.logout(done);
         client.fetchMe(done);
         client.fetchWallet(done);
-        client.requestSession(QStringLiteral("1080p60"), done);
+        client.requestSession(done);
         client.fetchSession(QStringLiteral("s"), done);
         client.fetchSessionAuthorization(QStringLiteral("s"), done);
         client.postLiveness(QStringLiteral("s"), QStringLiteral("streaming"), QString(), done);
-        client.endSession(QStringLiteral("s"), done);
+        client.endSession(QStringLiteral("s"), false, done);
         client.fetchSessionList(QString(), 15, done);
         client.fetchWalletHistory(QString(), 15, done);
         client.fetchTopupNotices(QString(), 15, done);

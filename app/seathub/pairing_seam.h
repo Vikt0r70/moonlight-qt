@@ -111,25 +111,40 @@ public:
                                  const QString& engineError)> done) override;
 
 signals:
-    /// The host the handshake resolved, emitted immediately before `done(true, ...)` on the one
-    /// success path and never on a failure.
+    /// The host the handshake resolved, tagged with the session id of the `pair()` call it answers
+    /// (06.6-18/T-06.6-52), emitted immediately before `done(true, ...)` on the one success path and
+    /// never on a failure.
+    ///
+    /// The tag is what lets a listener refuse a host that resolved for a session that is no longer
+    /// attached - cancelled, or superseded by a fresh Play or Try again - rather than attaching an
+    /// engine (and starting a stream) for the wrong session.
     ///
     /// A signal rather than a getter because the two ends live on different threads: this object is
     /// moved to the network thread (`SeatHubClient::startNetworkThreads()`) while the object that
     /// builds the engine session belongs to the Qt main thread. `PairedHostPtr` is a
     /// `shared_ptr`, so the queued connection that carries it keeps the record alive on both sides
     /// until both are done with it.
-    void hostResolved(const PairedHostPtr& host);
+    void hostResolved(const QString& sessionId, const PairedHostPtr& host);
 
 private slots:
-    void handleHandshakeResult(const PairingHandshakeResult& result);
+    void handleHandshakeResult(quint64 generation, const PairingHandshakeResult& result);
 
 private:
-    void finish(const PairingHandshakeResult& result);
+    void finish(quint64 generation, const PairingHandshakeResult& result);
 
     PairingHandshake m_handshake;
     std::function<void(bool, const QString&, const QString&)> m_done;
     QTimer* m_deadline = nullptr;
     int m_deadlineMs = kDeadlineMs;
     bool m_pending = false;
+    /// The session id of the `pair()` call this object is currently running or last ran
+    /// (06.6-18/T-06.6-52). Set at the top of `pair()`, read back in `finish()` to tag `hostResolved`.
+    QString m_sessionId;
+    /// Bumped by every `pair()` call (06.6-18/T-06.6-53). A handshake's completion carries the
+    /// generation it started with; `finish()` drops one whose generation no longer matches
+    /// `m_generation` - it belongs to a handshake a later `pair()` call has since superseded, and
+    /// upstream's own blocking call cannot be aborted, so the old one is left to simply run out on
+    /// its pool thread. The deadline timer needs no generation of its own: `pair()` restarts the
+    /// same `QTimer`, so it is always counting down for whichever handshake is current.
+    quint64 m_generation = 0;
 };

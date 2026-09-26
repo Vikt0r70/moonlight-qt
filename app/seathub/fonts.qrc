@@ -1,0 +1,6 @@
+<RCC>
+    <qresource prefix="/seathub/fonts">
+        <file alias="OpenSans-SemiBold.ttf">fonts/OpenSans-SemiBold.ttf</file>
+        <file alias="OFL.txt">fonts/OFL.txt</file>
+    </qresource>
+</RCC>

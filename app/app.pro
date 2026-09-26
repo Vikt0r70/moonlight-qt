@@ -55,6 +55,13 @@ win32 {
     # (D-30, app/seathub/token_store.cpp).
     LIBS += crypt32.lib
 
+    # SeatHub: sentry-native with the crashpad backend (06.3.1 D-02, ADR-0044 amendment),
+    # built by scripts/build-seathub.ps1 into build/sentry-native-<ver>/install.
+    SEATHUB_SENTRY_DIR = $$(SEATHUB_SENTRY_DIR)
+    isEmpty(SEATHUB_SENTRY_DIR): SEATHUB_SENTRY_DIR = $$PWD/../build/sentry-native-0.17.1/install
+    INCLUDEPATH += $$SEATHUB_SENTRY_DIR/include
+    LIBS += -L$$SEATHUB_SENTRY_DIR/lib -lsentry
+
     # Work around a conflict with math.h inclusion between SDL and Qt 6
     DEFINES += _USE_MATH_DEFINES
 }
@@ -227,9 +234,13 @@ SOURCES += \
     seathub/moonlight_engine_session.cpp \
     seathub/stub_engine_session.cpp \
     seathub/log_tee.cpp \
+    seathub/log_shipper.cpp \
     seathub/stream_stats.cpp \
     seathub/engine_termination.cpp \
     seathub/quality_outbox.cpp \
+    seathub/telemetry.cpp \
+    seathub/osd_renderer.cpp \
+    seathub/osd_compositor.cpp \
     streaming/streamutils.cpp \
     backend/autoupdatechecker.cpp \
     path.cpp \
@@ -294,9 +305,14 @@ HEADERS += \
     seathub/stream_window_name.h \
     seathub/stub_engine_session.h \
     seathub/log_tee.h \
+    seathub/log_shipper.h \
     seathub/stream_stats.h \
     seathub/engine_termination.h \
     seathub/quality_outbox.h \
+    seathub/telemetry.h \
+    seathub/osd_renderer.h \
+    seathub/osd_compositor.h \
+    seathub/stats_catalogue.h \
     streaming/video/decoder.h \
     streaming/streamutils.h \
     backend/autoupdatechecker.h \
@@ -508,7 +524,8 @@ wayland {
 RESOURCES += \
     resources.qrc \
     qml.qrc \
-    seathub/countries.qrc
+    seathub/countries.qrc \
+    seathub/fonts.qrc
 
 # No TRANSLATIONS. ADR-0043 retires every language toggle on every surface, and the 27 locale
 # files listed here were the retired Moonlight client's translations - reachable only through

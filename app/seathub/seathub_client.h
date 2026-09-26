@@ -154,6 +154,13 @@ class SeatHubClient : public QObject
     /// resume-after-restart row). The connecting reads of `handleSessionState` do not set it.
     Q_PROPERTY(bool liveSession READ liveSession NOTIFY liveSessionChanged)
 
+    /// D-05/C4: true while `retry()`'s own end-then-fresh-Play sequence is running - the session
+    /// attached here never streamed, so it is being ended first and this is waiting for that
+    /// teardown to reach a terminal state before asking for a new one. False the rest of the
+    /// time, including for an ordinary Resume (`liveSession`) or a Play from Home with nothing
+    /// attached. The view shows its busy state (as `Play` already does) while this holds.
+    Q_PROPERTY(bool retryBusy READ retryBusy NOTIFY retryBusyChanged)
+
     /// The last session's end reason as the sentence `docs/spec/copy.md` §Session end reasons
     /// gives it, or empty. Styled text: the minute count in it is wrapped in the mono family,
     /// because every number with a unit is mono (copy.md §5). The bare enum never reaches QML.
@@ -272,6 +279,7 @@ public:
     bool animationEffects() const { return m_animationEffects; }
     bool signedIn() const { return m_signedIn; }
     bool liveSession() const { return m_liveSession; }
+    bool retryBusy() const { return m_retryBusy; }
     bool inProfile() const { return m_inProfile; }
     SessionListModel* sessionHistory() const { return m_sessionHistory; }
     CreditHistoryModel* creditHistory() const { return m_creditHistory; }
@@ -403,9 +411,10 @@ public:
     Q_INVOKABLE void reloadAccount();
 
     /// Attach a control-plane session to this client: the real path, as opposed to the tracer's
-    /// stubbed stage sequence. Starts the session channel, runs silent pairing, and hands the
-    /// session authorization's `quality_profile` to the settings bridge as an in-memory override
-    /// for this launch only (D-37, WR-05).
+    /// stubbed stage sequence. Attaches the session id, starts liveness (D-11) and runs silent
+    /// pairing; the session's own channel is NOT opened here (the control plane serves no such
+    /// route - ADR-0055). Applies no quality override (A-68/D-06 reversal, 06.6-19) - the
+    /// customer's saved Settings are the only decider of stream quality.
     ///
     /// The access token must already have been set on the control-plane client by a successful
     /// sign-in. Nothing here reads it, returns it, or logs it.
@@ -440,6 +449,7 @@ signals:
     void balanceChanged();
     void signedInChanged();
     void liveSessionChanged();
+    void retryBusyChanged();
     void inProfileChanged();
     void totalsChanged();
     void accountStatusChanged();
@@ -492,17 +502,24 @@ private slots:
     void handlePairingCompleted(const QString& clientUuid);
     void handlePairingFailed(const SeatHubFailure& failure);
 
-    /// The control plane authorized the session, and with which quality profile. Applies the
-    /// profile to the settings bridge as an in-memory override for this launch only (D-37, WR-05).
-    void handleAuthorizationGranted(const QString& qualityProfile);
+    /// The control plane authorized the session. No quality profile is applied (A-68, D-06
+    /// reversal: the customer's saved Settings are the only decider of stream quality) - this
+    /// slot only advances the liveness stage to "pairing" (D-11). The signal itself carries no
+    /// argument once nothing reads one (`PairingController::authorizationGranted()`).
+    void handleAuthorizationGranted();
 
     /// The host the handshake paired with, emitted by `ProductionPairingSeam` on its success path
-    /// only. Builds the engine session from it and attaches it, so that by the time
-    /// `handlePairingCompleted` runs there is something for `start()` to drive.
+    /// only, tagged with the session id it paired for (06.6-18/T-06.6-52). A `sessionId` that no
+    /// longer matches the attached session - superseded by a fresh Play or Try again while this
+    /// handshake was still in flight - or that matches but whose session has already ended -
+    /// Cancel before the engine attaches one, which never changes `m_sessionId` - is dropped before
+    /// anything else runs: no engine is built and no stream starts for the wrong or cancelled
+    /// session. Otherwise builds the engine session from the host and attaches it, so that by the
+    /// time `handlePairingCompleted` runs there is something for `start()` to drive.
     ///
     /// Queued, not direct: the seam lives on the network thread and this slot builds a Qt object
     /// tree that belongs to the facade's thread.
-    void handleHostResolved(const PairedHostPtr& host);
+    void handleHostResolved(const QString& sessionId, const PairedHostPtr& host);
 
     /// One of the profile's reads was answered 401: the credential is no longer valid. Cleared, and
     /// the customer lands on sign-in (`screens.md` §27), exactly as a sign-out that could not reach
@@ -550,8 +567,29 @@ private:
     /// never be left stale by a path that forgot to say so.
     void setAttachedSession(const QString& sessionId);
     void setAttachedSessionEnded(bool ended);
-    /// Recomputes `m_liveSession` from the two and says so when it changed.
+    /// Recomputes `m_liveSession` from the three and says so when it changed.
     void updateLiveSession();
+    /// The one writer of `m_retryBusy`.
+    void setRetryBusy(bool busy);
+    /// D-05/C2: the one pre-stream end path. Marks the attached session ended and, if this
+    /// session's teardown has not already been claimed (the guard is per-session and shared with
+    /// `handleReadyForDeletion()`), runs it with `failed` forwarded to `endSession()`. A no-op
+    /// with no control-plane session attached (`inControlPlaneSession()` false) - there is
+    /// nothing to end. Called by `handlePairingFailed()` and the no-engine branch of
+    /// `handlePairingCompleted()`, both with `failed = true`, after their existing failure report
+    /// and liveness stop and before the trace id is cleared - the failure report and the `/end`
+    /// this queues are both marshalled onto the network thread in that order, so the server
+    /// records the stage before the cancel (RESEARCH-FORK C2).
+    void endAttachedSessionBeforeStream(bool failed);
+    /// D-05/C4/C7: shared by `retry()` and `start()` - a session still attached here that never
+    /// streamed is ended first (idempotent if C2 already started it), with `retryBusy` held until
+    /// the wait resolves, before a fresh Play goes out. Returns false (and starts nothing) with no
+    /// session attached, or one that already streamed - the ordinary Resume/Play branches then
+    /// decide. Covers both Try again (a session that failed before streaming) and Play from Home
+    /// (C7: the same session's earlier `/end` that could not reach the server offline) with the
+    /// one sequence, so neither path can race the "one nonterminal session per customer" rule
+    /// (409 `USER_HAS_NONTERMINAL_SESSION`, `openapi.yaml`).
+    bool endAttachedSessionBeforePlay();
     /// Applies the answer to the launch-time `GET /api/me` (see `restoreSession()`).
     void applyRestoreResult(const ControlPlaneResult& result);
     /// Applies an answer to `GET /api/wallet`. `epoch` is the credential generation the read was
@@ -789,7 +827,16 @@ private:
     /// True once the control plane has reported `m_sessionId` terminal. A session that is over is not
     /// one Home offers to resume, even while its teardown has not finished.
     bool m_sessionEnded = false;
+    /// C1 (D-05): true once `handleConnectionStarted()` has run for `m_sessionId` - the session
+    /// reached ACTIVE on this client's side. Cleared in `setAttachedSession()` whenever a
+    /// genuinely new session id is attached; kept across a Resume of the same id (`start()`'s own
+    /// `beginSession(m_sessionId)` call re-attaches the same id, which is not a change). Gates
+    /// both `updateLiveSession()` (C5: Resume only after ACTIVE) and `retry()` (C4: never resume
+    /// a session that did not stream).
+    bool m_streamStarted = false;
     bool m_liveSession = false;
+    /// D-05/C4: see the `retryBusy` Q_PROPERTY.
+    bool m_retryBusy = false;
     /// What pairing returned about this client: the SHA-256 fingerprint of its own certificate,
     /// which is the identity a host-side reader of Sunshine's client list can match to this
     /// client's record. It is the only thing that identifies this client - never the rig's name,

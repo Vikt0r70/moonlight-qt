@@ -37,6 +37,10 @@
 var SEATHUB_TITLE = "SeatHub Setup";                        // config.xml <Title>
 var SEATHUB_MAINTENANCE_TOOL = "SeatHubMaintenanceTool.exe"; // config.xml <MaintenanceToolName> + .exe
 var SEATHUB_CLIENT = "SeatHub.exe";                          // config.xml <RunProgram>
+// 06.3.1 D-02: sentry-native's out-of-process crashpad handler, shipped beside SeatHub.exe. It
+// outlives the client by about 1 s (sends the last pending report, then exits - SPIKE T8a/T8b), so
+// it must be waited for too, or a still-running handler locks its own exe during the purge below.
+var SEATHUB_CRASH_HANDLER = "crashpad_handler.exe";
 var SEATHUB_REMOVED_KEY = "SeatHubPreviousInstallRemoved";
 var SEATHUB_TOOL_WAIT_SECONDS = 30;
 
@@ -95,7 +99,14 @@ function seathubRemovePreviousInstall(targetDir)
 {
     var tool = seathubJoin(targetDir, SEATHUB_MAINTENANCE_TOOL);
 
-    if (!seathubStopClient(seathubJoin(targetDir, SEATHUB_CLIENT)))
+    if (!seathubStopClient(seathubJoin(targetDir, SEATHUB_CLIENT), SEATHUB_CLIENT, false))
+        return false;
+
+    // The crash handler outlives SeatHub.exe by about 1 s (comment at the constant above), so it
+    // is waited for right after the client, on the same ladder, before the purge below runs.
+    // `pathScopedKill=true` (CR-03): crashpad_handler.exe is a name other vendors' own crash
+    // handlers share - never kill it by bare image name.
+    if (!seathubStopClient(seathubJoin(targetDir, SEATHUB_CRASH_HANDLER), SEATHUB_CRASH_HANDLER, true))
         return false;
 
     // The purge replays installscript.qs's registerPathForUninstallation(tokenDir, wipe=true),
@@ -118,7 +129,21 @@ function seathubRemovePreviousInstall(targetDir)
 
 // The in-app updater quits SeatHub on its own, but a hand-run setup may find it open, and open
 // files make the purge leave the folder behind.
-function seathubStopClient(client)
+// `imageName` is the bare filename taskkill's /IM wants (SEATHUB_CLIENT only - see `pathScopedKill`
+// below); `client` is the full path isProcessRunning()/killProcess() key on. They used to be the
+// same hardcoded constant, which meant this function could only ever wait for SeatHub.exe; naming
+// both explicitly is what makes it reusable for the crash handler too (06.3.1 D-02).
+// `pathScopedKill`: CR-03 fix. `SEATHUB_CLIENT` ("SeatHub.exe") is specific enough that a
+// system-wide `taskkill /IM` was low risk when it was the only caller. `crashpad_handler.exe` is
+// the upstream, unmodified binary name every application bundling sentry-native/crashpad ships -
+// this phase's own SPIKE research (06.3.1-RESEARCH-SPIKE-CRASHPAD.md § 6.1) found, from a real
+// registry read on the target class of machine, that Discord, two games and a screen-recording
+// tool already register their own `crashpad_handler.exe` on that exact machine. A blind `/IM` kill
+// for the crash handler's elevated fallback would forcibly terminate one of THOSE unrelated
+// processes as a side effect of installing or updating SeatHub. Callers pass `true` for the crash
+// handler (path-scoped only, see `seathubKillProcessByPath()`) and `false` for `SeatHub.exe`
+// (unchanged - the existing, already-low-risk `/IM` fallback).
+function seathubStopClient(client, imageName, pathScopedKill)
 {
     // scripting-installer.html: isProcessRunning(name) is case-insensitive on Windows;
     // killProcess(absoluteFilePath) - "true if a process with absoluteFilePath could be killed or
@@ -137,14 +162,55 @@ function seathubStopClient(client)
     if (!installer.isProcessRunning(client))
         return true;
 
-    // Still running: most likely an elevated SeatHub (RunProgram starts it from the elevated
-    // setup) that a non-elevated setup cannot stop. Stop it through the elevated server instead.
+    // Still running: most likely an elevated process (RunProgram starts SeatHub from the elevated
+    // setup, and crashpad_handler.exe is spawned by SeatHub) that a non-elevated setup cannot stop.
+    // Stop it through the elevated server instead.
     seathubLog(client + " is still running; stopping it with elevated rights");
     if (!installer.hasAdminRights() && !seathubGainAdminRights())
         return false;
-    installer.execute(seathubSystemTool("taskkill.exe"), ["/F", "/IM", SEATHUB_CLIENT], "");
+
+    if (pathScopedKill) {
+        // CR-03: never kill by bare image name here - only the process whose own image path is
+        // inside this install (`client`, already an absolute path). If the scoped kill cannot even
+        // be run (no PowerShell, an unexpected script failure), skip the kill entirely rather than
+        // fall back to an unscoped `taskkill /IM` - the existing wait/ladder above already gave
+        // this process every other chance to stop, and the uninstall/update still proceeds (or
+        // fails cleanly at the purge step below) exactly as it did before this elevated fallback
+        // existed.
+        if (!seathubKillProcessByPath(client))
+            seathubLog("could not confirm the path-scoped kill ran for " + client + "; skipping it");
+    }
+    else {
+        installer.execute(seathubSystemTool("taskkill.exe"), ["/F", "/IM", imageName], "");
+    }
+
     if (installer.isProcessRunning(client)) {
         seathubLog(client + " could not be stopped");
+        return false;
+    }
+    return true;
+}
+
+// CR-03: stops only the process at `fullPath` - never by bare image name (see `seathubStopClient`'s
+// own comment on `pathScopedKill`). Returns false only when the scoped kill could not even be
+// attempted (so the caller skips it rather than widen to an unscoped kill); a script that ran but
+// matched nothing (the target already exited, or was never this machine's own SeatHub install) is
+// still a successful attempt.
+function seathubKillProcessByPath(fullPath)
+{
+    var baseName = seathubLeaf(fullPath).replace(/\.exe$/i, "");
+    var escapedPath = fullPath.replace(/'/g, "''");
+    // Get-Process -Name (no extension) finds every process with this image name on the machine;
+    // Where-Object narrows that to the one whose own .Path matches this install's exact file -
+    // -ErrorAction SilentlyContinue on both cmdlets means "no match" is not a script error.
+    var script = "Get-Process -Name '" + baseName + "' -ErrorAction SilentlyContinue | "
+        + "Where-Object { $_.Path -eq '" + escapedPath + "' } | "
+        + "Stop-Process -Force -ErrorAction SilentlyContinue";
+    var powershell = seathubJoin(installer.environmentVariable("SystemRoot"),
+        "System32/WindowsPowerShell/v1.0/powershell.exe");
+    var result = installer.execute(powershell, ["-NoProfile", "-NonInteractive", "-Command", script], "");
+    if (result.length < 2) {
+        seathubLog("could not run the path-scoped kill for " + fullPath);
         return false;
     }
     return true;

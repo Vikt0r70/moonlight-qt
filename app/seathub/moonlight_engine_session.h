@@ -4,9 +4,12 @@
 // pairing handshake resolved and one of the applications that host serves.
 //
 // This is the only header in `app/seathub/` that reaches into `app/backend/`, and
-// `moonlight_engine_session.cpp` is the only translation unit that reaches into
-// `app/streaming/`. Everything else about the fork boundary is unchanged: no engine file is
-// edited to construct, attach or drive the session.
+// `moonlight_engine_session.cpp` is the only translation unit that constructs, attaches to or
+// drives the engine itself (`Session`). Since Plan 14 this header also includes
+// `streaming/video/overlaymanager.h` for one typedef (`setTextRasterizer()`'s own comment says
+// why) - a type-only reach, the same as `osd_compositor.h` already does. Everything else about
+// the fork boundary is unchanged: no engine file is edited to construct, attach or drive the
+// session.
 
 #include <QByteArray>
 #include <QByteArrayView>
@@ -15,6 +18,25 @@
 #include <QVector>
 
 #include "engine_session.h"
+
+// D-09/D-13 (ADR-0045 amended 2026-09-26, Plan 14): `setTextRasterizer()` below needs
+// `Overlay::OverlayManager::TextRasterizer` in its own signature (the caller passes
+// `&OsdCompositor::rasterize` with no cast), so this header now also reaches into
+// `app/streaming/` for that one typedef - `osd_compositor.h` (Plan 10) already does the same for
+// the same reason. `moonlight_engine_session.cpp` remains the only translation unit that
+// constructs, attaches to or drives the engine itself; this include is type-only.
+//
+// `overlaymanager.h` pulls in unprotected `<SDL.h>`, which `#define`s `main` to `SDL_main` unless
+// something defines `SDL_MAIN_HANDLED` first (`app/main.cpp`'s own reasoning; `hud_overlay.h`
+// guards itself the same way for the same reason). Since `seathub_client.h` includes this header,
+// and `tst_facade_wiring.cpp` includes `seathub_client.h` without its own SDL guard, an
+// unprotected include here silently renamed `QTEST_MAIN`'s own `main()` to `SDL_main` and broke
+// the link (`LNK2019: unresolved external symbol main`) - fixed by guarding here, exactly as
+// `hud_overlay.h` already does, so every includer is protected transitively.
+#ifndef SDL_MAIN_HANDLED
+#define SDL_MAIN_HANDLED
+#endif
+#include "streaming/video/overlaymanager.h"
 
 class NvApp;
 class NvComputer;
@@ -95,6 +117,13 @@ public:
     /// `run()` starts the stream; the compositor reads the filter fresh on its own next
     /// rasterise, so calling this before the engine ever writes a stats line is enough.
     void setDebugLineFilter(const QStringList& enabledLabels);
+
+    /// D-09/D-13 (ADR-0045 amended 2026-09-26): a thin forward to the attached engine's own
+    /// compositor (`OverlayManager::setTextRasterizer()`, the D-28 exception) - this class holds
+    /// no rasterising logic of its own, the same idiom as `setDebugLineFilter()` above. Safe to
+    /// call before `run()` starts the stream; the manager swaps the rasteriser lock-free, the
+    /// same way it swaps the debug-line filter.
+    void setTextRasterizer(Overlay::OverlayManager::TextRasterizer rasterizer, void* context);
 
 private:
     PairedHostPtr m_host;

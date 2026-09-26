@@ -92,7 +92,13 @@ public:
     /// Run the client half of teardown for `sessionId`. `clientUuid` is the exact Sunshine
     /// client UUID pairing returned; it is not used to address Sunshine, only to identify which
     /// pairing this teardown is about in the log and in the session record.
-    Q_INVOKABLE void teardown(const QString& sessionId, const QString& clientUuid);
+    ///
+    /// `failed` (D-05/D-23) is forwarded verbatim to `ControlPlaneClient::endSession()`: `true`
+    /// records `CONNECT_FAILED` on a pre-ACTIVE session (a pairing failure, or a paired session
+    /// with no engine attached); the default `false` is every other end, including the ordinary
+    /// end of a session that streamed.
+    Q_INVOKABLE void teardown(const QString& sessionId, const QString& clientUuid,
+                              bool failed = false);
     /// Abandon a teardown in flight (a second End press, or sign-out).
     Q_INVOKABLE void cancel();
 

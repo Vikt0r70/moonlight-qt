@@ -24,6 +24,12 @@ TEMPLATE = app
 TARGET = tst_facade_wiring
 DESTDIR = $$OUT_PWD
 
+# tst_telemetry.pro also compiles app/seathub/telemetry.cpp, under DIFFERENT DEFINES (it alone
+# sets SEATHUB_TEST_ALLOW_LOOPBACK_DSN). See that .pro's own comment on OBJECTS_DIR/MOC_DIR for
+# why a shared, flat object directory silently reuses a stale object across the two projects.
+OBJECTS_DIR = obj-tst_facade_wiring
+MOC_DIR = obj-tst_facade_wiring
+
 INCLUDEPATH += $$PWD/.. $$PWD/../app
 
 win32 {
@@ -31,6 +37,18 @@ win32 {
     # shell32: ShellExecuteW, the update feed client's elevated installer launch (D-42).
     LIBS += -L$$PWD/../libs/windows/lib/x64 -lSDL2 -lcrypt32 -lshell32
 }
+
+# Plan 15 (Task 2): `seathub_client.cpp` now calls `SeatHubTelemetry::*` (`telemetry.h`), so this
+# suite links the real `telemetry.cpp` - the same sentry-native include/lib lines as app/app.pro
+# and tst_telemetry.pro (06.3.1 D-02). This suite never calls `SeatHubTelemetry::start()` (nothing
+# in the facade's own construction or the tests below does), so the SDK is never initialised here:
+# every `sentry_*` call `telemetry.cpp` makes is a safe no-op against sentry-native's own lazily-
+# initialised global scope (`sentry_scope.c`'s `g_scope`, independent of `sentry_init()`) - real
+# linking, no stub.
+SEATHUB_SENTRY_DIR = $$(SEATHUB_SENTRY_DIR)
+isEmpty(SEATHUB_SENTRY_DIR): SEATHUB_SENTRY_DIR = $$PWD/../build/sentry-native-0.17.1/install
+INCLUDEPATH += $$SEATHUB_SENTRY_DIR/include
+LIBS += -L$$SEATHUB_SENTRY_DIR/lib -lsentry
 
 SOURCES += \
     tst_facade_wiring.cpp \
@@ -51,15 +69,20 @@ SOURCES += \
     ../app/seathub/liveness_timer.cpp \
     ../app/seathub/authorized_through_timer.cpp \
     ../app/seathub/log_tee.cpp \
+    ../app/seathub/log_shipper.cpp \
+    ../app/seathub/telemetry.cpp \
     ../app/seathub/stream_stats.cpp \
     ../app/seathub/engine_termination.cpp \
     ../app/seathub/quality_outbox.cpp \
     ../app/seathub/hud_overlay.cpp \
+    ../app/seathub/osd_compositor.cpp \
+    ../app/seathub/osd_renderer.cpp \
     ../app/seathub/error_map.cpp \
     ../app/seathub/settings_bridge.cpp \
     ../app/seathub/update_feed_client.cpp \
     ../app/seathub/agent_config.cpp \
     ../app/settings/streamingpreferences.cpp \
+    ../app/path.cpp \
     ../app/wm.cpp
 
 # `streamingpreferences.h` is listed so qmake runs moc on it: without its own meta-object the
@@ -84,17 +107,28 @@ HEADERS += \
     ../app/seathub/liveness_timer.h \
     ../app/seathub/authorized_through_timer.h \
     ../app/seathub/log_tee.h \
+    ../app/seathub/log_shipper.h \
+    ../app/seathub/telemetry.h \
     ../app/seathub/stream_stats.h \
     ../app/seathub/engine_termination.h \
     ../app/seathub/quality_outbox.h \
     ../app/seathub/hud_overlay.h \
+    ../app/seathub/osd_compositor.h \
+    ../app/seathub/osd_renderer.h \
+    ../app/seathub/stats_catalogue.h \
     ../app/seathub/error_map.h \
     ../app/seathub/settings_bridge.h \
     ../app/seathub/update_feed_client.h \
     ../app/seathub/agent_config.h \
     ../app/seathub/seathub_version.h \
     ../app/settings/streamingpreferences.h \
+    ../app/path.h \
     ../app/utils.h
 
 # The facade exposes the bundled country list, which is read from the binary (Phase 5 plan 06).
 RESOURCES += ../app/seathub/countries.qrc
+
+# Plan 14 (D-09/D-15): `SeatHubClient`'s constructor calls `registerOsdFonts()` and
+# `handleHostResolved()` registers `OsdCompositor::rasterize` as the engine's text rasteriser, so
+# this suite needs the compositor, the pure renderer, and the bundled Open Sans font resource.
+RESOURCES += ../app/seathub/fonts.qrc

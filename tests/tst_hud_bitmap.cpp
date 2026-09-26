@@ -302,9 +302,6 @@ int countColour(const QImage& image, QRgb rgb, int tolerance = 6)
     return count;
 }
 
-constexpr QRgb kWarnRgb = 0xFFF59E0B;        // Tokens.warnDefault
-constexpr QRgb kDestructiveRgb = 0xFFEF4444; // Tokens.destructiveDefault
-
 // The runs of non-transparent pixels along one row, as [first, last] column pairs. The strip and
 // the card are each an opaque filled panel, so the row through their middle is two runs when they
 // are apart and one when they touch.
@@ -460,257 +457,90 @@ private slots:
     // Proof (c): the HUD producer.
     // ---------------------------------------------------------------------------------------
 
-    // The strip is a full-height HUD band, opaque only where the card is. Everything the renderer
-    // blends with `SRC_ALPHA`/`INV_SRC_ALPHA` depends on that: transparent padding must really be
-    // transparent, or the HUD would paint a bar across the video.
-    void hudStripCoversTheCardAndNothingElse()
-    {
-        HudOverlay hud;
-        const QImage strip = hud.renderStripAt(0, 0);
-
-        QCOMPARE(strip.height(), HudOverlay::stripHeight());
-        QCOMPARE(int(strip.format()), int(QImage::Format_ARGB32));
-        QVERIFY2(strip.width() > 200 && strip.width() < 900,
-                 "the card should be content-sized and fit a 720p stream window");
-
-        // Corners are outside the card: fully transparent, no colour left behind.
-        const QList<QPoint> corners = {QPoint(0, 0), QPoint(strip.width() - 1, 0),
-                                       QPoint(0, strip.height() - 1),
-                                       QPoint(strip.width() - 1, strip.height() - 1)};
-        for (const QPoint& point : corners) {
-            QCOMPARE(qAlpha(strip.pixel(point)), 0);
-        }
-
-        // The middle is the card: opaque.
-        QCOMPARE(qAlpha(strip.pixel(strip.width() / 2, strip.height() / 2)), 255);
-
-        int opaque = 0;
-        for (int y = 0; y < strip.height(); y++) {
-            for (int x = 0; x < strip.width(); x++) {
-                if (qAlpha(strip.pixel(x, y)) == 255) {
-                    opaque++;
-                }
-            }
-        }
-        QVERIFY2(opaque > 500, "the card should be a real surface, not a sliver");
-    }
-
-    // D-56's timer, at the boundaries where a duration display usually breaks.
-    void hudTimerShowsHoursMinutesSeconds()
-    {
-        const QList<QPair<qint64, QString>> cases = {
-            {0, QStringLiteral("00:00:00")},
-            {59, QStringLiteral("00:00:59")},
-            {60, QStringLiteral("00:01:00")},
-            {3600, QStringLiteral("01:00:00")},
-            {3661, QStringLiteral("01:01:01")},
-            {86399, QStringLiteral("23:59:59")},
-        };
-
-        for (const auto& testCase : cases) {
-            HudHarness harness;
-            harness.hud().beginSession();
-            harness.advance(testCase.first * 1000);
-            harness.hud().tick();
-
-            QCOMPARE(harness.hud().elapsedSeconds(), testCase.first);
-            QCOMPARE(harness.hud().timerText(), testCase.second);
-            harness.hud().endSession();
-        }
-
-        // Fixed width, so the card does not reflow when the first hour lands.
-        QCOMPARE(HudOverlay::stripHeight(), 56);
-        QCOMPARE(HudOverlay::autoHideMs(), 4000);
-    }
-
-    // The timer is actually drawn, not just tracked: an unrendered value would pass the test
-    // above while showing a customer a frozen clock.
-    void hudTimerTextChangesTheStripPixels()
-    {
-        HudOverlay hud;
-        const QImage atZero = hud.renderStripAt(0, 0);
-        const QImage atNinetyNine = hud.renderStripAt(99, 0);
-
-        QCOMPARE(atZero.size(), atNinetyNine.size());
-
-        int differing = 0;
-        for (int y = 0; y < atZero.height(); y++) {
-            for (int x = 0; x < atZero.width(); x++) {
-                if (atZero.pixel(x, y) != atNinetyNine.pixel(x, y)) {
-                    differing++;
-                }
-            }
-        }
-        QVERIFY2(differing > 20, "the timer did not reach the bitmap");
-    }
-
-    // ADR-0045's positioning technique: the overlay is drawn 1:1 in swapchain pixels from the
-    // bottom-left anchor, so the card's position comes from the bytes, not from the surface size.
-    // Padding the strip to a display width must therefore leave the card byte-identical - which
-    // is what makes it safe to composite without knowing the stream window's size.
-    void hudStripWidthFollowsTheRequestedDisplayWidth()
-    {
-        HudOverlay hud;
-        const QImage content = hud.renderStripAt(0, 0);
-        const int cardWidth = content.width();
-
-        for (int displayWidth : {1280, 1920, 2560}) {
-            const QImage padded = hud.renderStripAt(0, displayWidth);
-            QCOMPARE(padded.width(), displayWidth);
-            QCOMPARE(padded.height(), content.height());
-
-            for (int y = 0; y < padded.height(); y++) {
-                QCOMPARE(memcmp(padded.constScanLine(y), content.constScanLine(y),
-                                size_t(cardWidth) * 4),
-                         0);
-            }
-
-            // The padding is invisible, not black: it must not darken the video behind it.
-            for (int x = cardWidth; x < padded.width(); x += 37) {
-                QCOMPARE(qAlpha(padded.pixel(x, padded.height() / 2)), 0);
-            }
-        }
-    }
-
-    // The renderers blend with SRC_ALPHA/INV_SRC_ALPHA and a bare texture sample, so the bitmap
-    // has to carry *straight* alpha. A premultiplied edge would double-darken against the video.
-    void hudEdgePixelsCarryStraightAlpha()
-    {
-        HudOverlay hud;
-        const QImage strip = hud.renderStripAt(0, 0);
-
-        // Every colour the producer draws is a solid one, so with straight alpha a partially
-        // covered pixel keeps its colour and only its alpha falls. Two legitimate sets exist and
-        // nothing else may appear:
-        //
-        //  1. a light token - the six-colour palette's lighter entries - which an alpha-scaled
-        //     (premultiplied) buffer would have darkened in proportion to its alpha;
-        //  2. the card's own greys, anywhere between the fill #141414 and the border #404040,
-        //     because the border is stroked over the fill and its antialiased edge is a mix of
-        //     the two.
-        //
-        // The second set exists precisely because it is ambiguous at high alpha: a premultiplied
-        // border pixel at alpha 222 reads #383838, which is inside the fill-to-border range. That
-        // case is not what this test can catch - `hudStripCoversTheCardAndNothingElse` catches the
-        // convention structurally instead, by requiring the image to be `QImage::Format_ARGB32`,
-        // the straight format. What the colour walk below adds is the cases where premultiplication
-        // is unmistakable: a light token at partial alpha. A #fafafa glyph edge at alpha 128 would
-        // arrive as #7d7d7d, and the muted #a3a3a3 the same - neither is in either set.
-        const QList<QColor> lightTokens = {QColor(0xfa, 0xfa, 0xfa),
-                                           QColor(0xa3, 0xa3, 0xa3),
-                                           QColor(0x10, 0xb9, 0x81)};
-        const auto isLightToken = [&lightTokens](const QRgb pixel) {
-            for (const QColor& colour : lightTokens) {
-                if (qAbs(qRed(pixel) - colour.red()) <= 4
-                    && qAbs(qGreen(pixel) - colour.green()) <= 4
-                    && qAbs(qBlue(pixel) - colour.blue()) <= 4) {
-                    return true;
-                }
-            }
-            return false;
-        };
-        const auto isCardGrey = [](const QRgb pixel) {
-            return qRed(pixel) >= 0x14 - 4 && qRed(pixel) <= 0x40 + 4
-                   && qGreen(pixel) >= 0x14 - 4 && qGreen(pixel) <= 0x40 + 4
-                   && qBlue(pixel) >= 0x14 - 4 && qBlue(pixel) <= 0x40 + 4;
-        };
-
-        int edgePixels = 0;
-        int translucentEdges = 0;
-        for (int y = 0; y < strip.height(); y++) {
-            for (int x = 0; x < strip.width(); x++) {
-                const QRgb pixel = strip.pixel(x, y);
-                const int alpha = qAlpha(pixel);
-                if (alpha == 0 || alpha == 255) {
-                    continue;
-                }
-
-                edgePixels++;
-
-                QVERIFY2(isLightToken(pixel) || isCardGrey(pixel),
-                         qPrintable(QStringLiteral("edge pixel (%1,%2) alpha %3 has colour %4 -"
-                                                   " premultiplied, not straight")
-                                        .arg(x).arg(y).arg(alpha)
-                                        .arg(QColor(pixel).name())));
-
-                // The positive evidence, and the reason this walk is not vacuous: below alpha 64
-                // an alpha-scaled card grey falls out of the range above entirely - a border
-                // pixel premultiplied at alpha 27 reads #070707, and the fill at alpha 23 reads
-                // #020202. Both are far below the #10 floor. A pixel this translucent that is
-                // still the card's own colour proves the buffer is straight, because there is no
-                // other way to produce it.
-                if (alpha < 64) {
-                    translucentEdges++;
-                }
-            }
-        }
-
-        QVERIFY2(edgePixels > 0, "the rounded card should be antialiased");
-        QVERIFY2(translucentEdges > 0,
-                 "no pixel was translucent enough for premultiplication to be distinguishable -"
-                 " this walk proved nothing about the alpha convention");
-    }
-
-    // The HUD's colours, metrics and faces are not invented: every one of them is named in a
-    // comment in `hud_overlay.cpp` as the token it mirrors, and this test reads the generated
-    // token files to hold that claim. If a token file changes, this fails and the HUD has to
-    // change with it.
+    // D-20: Time left's red is `Tokens.destructiveDefault`, pinned mechanically so a change to
+    // the generated token file cannot drift silently from `osd_renderer.cpp`'s own
+    // `kOsdDestructive` constant (its own comment names this exact property).
     void hudUsesTheGeneratedDesignTokens()
     {
         const QString tokens = readForkFile(QStringLiteral("app/gui/Tokens.qml"));
-        const QString metrics = readForkFile(QStringLiteral("app/gui/Metrics.qml"));
         QVERIFY2(!tokens.isEmpty(), "app/gui/Tokens.qml could not be read - is FORK_ROOT right?");
-        QVERIFY2(!metrics.isEmpty(), "app/gui/Metrics.qml could not be read - is FORK_ROOT right?");
 
-        const QList<QPair<QString, QString>> tokenValues = {
-            {QStringLiteral("surface1Default"), QStringLiteral("#141414")},         // card fill
-            {QStringLiteral("borderStrongDefault"), QStringLiteral("#404040")},     // card border
-            {QStringLiteral("foregroundDefault"), QStringLiteral("#fafafa")},       // timer, labels
-            {QStringLiteral("foregroundMutedDefault"), QStringLiteral("#a3a3a3")},  // eyebrow
-            {QStringLiteral("successDefault"), QStringLiteral("#10b981")},          // live dot
-            {QStringLiteral("borderDefault"), QStringLiteral("#262626")},           // hairline
-            {QStringLiteral("warnDefault"), QStringLiteral("#f59e0b")},             // credit at 10, its card
-            {QStringLiteral("destructiveDefault"), QStringLiteral("#ef4444")},      // credit at 2, its card
-            {QStringLiteral("fontSansDefault"), QStringLiteral("Inter")},
-            {QStringLiteral("fontMonoDefault"), QStringLiteral("Geist Mono")},
+        QVERIFY2(tokens.contains(QStringLiteral("destructiveDefault: \"#ef4444\"")),
+                 "Tokens.qml no longer declares destructiveDefault: \"#ef4444\"");
+    }
+
+    // Plan 06.6-20 (D-17/D-20): every OSD colour token the generated Tokens.qml declares matches
+    // the constant `osd_renderer.h` compiles in - so a design-token regen (or a hand-edit of the
+    // generated file, which must never happen) cannot drift silently from what the renderer
+    // actually draws. `hudUsesTheGeneratedDesignTokens` above already pins `destructiveDefault`;
+    // this pins the other four osd-prefixed tokens the renderer also reads.
+    void osdColoursAreTheGeneratedTokens()
+    {
+        const QString tokens = readForkFile(QStringLiteral("app/gui/Tokens.qml"));
+        QVERIFY2(!tokens.isEmpty(), "app/gui/Tokens.qml could not be read - is FORK_ROOT right?");
+
+        auto hex = [](QRgb rgb) {
+            return QStringLiteral("#%1").arg(rgb & 0xFFFFFFu, 6, 16, QLatin1Char('0'));
         };
 
-        for (const auto& token : tokenValues) {
-            const QString expected = token.first + QStringLiteral(": \"") + token.second
-                                     + QLatin1Char('"');
-            QVERIFY2(tokens.contains(expected),
-                     qPrintable(QStringLiteral("Tokens.qml no longer declares %1").arg(expected)));
-        }
+        QVERIFY2(tokens.contains(QStringLiteral("osdLabelDefault: \"%1\"").arg(hex(kOsdLabel))),
+                 qPrintable(QStringLiteral("Tokens.qml's osdLabelDefault must be %1 (kOsdLabel)")
+                                .arg(hex(kOsdLabel))));
+        QVERIFY2(tokens.contains(
+                     QStringLiteral("osdLabelMediaDefault: \"%1\"").arg(hex(kOsdLabelMedia))),
+                 qPrintable(QStringLiteral("Tokens.qml's osdLabelMediaDefault must be %1 (kOsdLabelMedia)")
+                                .arg(hex(kOsdLabelMedia))));
+        QVERIFY2(tokens.contains(QStringLiteral("osdValueDefault: \"%1\"").arg(hex(kOsdValue))),
+                 qPrintable(QStringLiteral("Tokens.qml's osdValueDefault must be %1 (kOsdValue)")
+                                .arg(hex(kOsdValue))));
+        QVERIFY2(tokens.contains(QStringLiteral("osdOutlineDefault: Qt.rgba(0, 0, 0, 0.85)")),
+                 "Tokens.qml's osdOutlineDefault must be the generator's Qt.rgba(0, 0, 0, 0.85) "
+                 "form (kOsdOutline: black, 0.85 alpha)");
+        QVERIFY2(tokens.contains(QStringLiteral("destructiveDefault: \"%1\"").arg(hex(kOsdDestructive))),
+                 qPrintable(QStringLiteral("Tokens.qml's destructiveDefault must be %1 (kOsdDestructive)")
+                                .arg(hex(kOsdDestructive))));
+    }
 
-        // The numeric companion: Metrics.qml derives its numbers from the generated tokens
-        // rather than keeping a second copy of them (audit F15). This replaces the older
-        // "the literals are still declared" check with the stronger one - a value that stops
-        // being derived is exactly the drift this test exists to catch. `tst_ui_screens`
-        // additionally loads the singleton and asserts the parsed numbers.
-        for (const QString& derived : {QStringLiteral("s2: tokenPx(Tokens.step2)"),
-                                       QStringLiteral("s4: tokenPx(Tokens.step4)"),
-                                       QStringLiteral("s5: tokenPx(Tokens.step5)"),
-                                       QStringLiteral("radiusLg: tokenPx(Tokens.lgDefault)"),
-                                       QStringLiteral("fontLabel: tokenRem(Tokens.scaleLabelSize)"),
-                                       QStringLiteral("fontSm: tokenRem(Tokens.scaleSmSize)")}) {
-            QVERIFY2(metrics.contains(derived),
-                     qPrintable(QStringLiteral("Metrics.qml no longer derives %1").arg(derived)));
-        }
+    // Plan 06.6-20 (D-17/D-20): Time left's own two colours - the white reminder and the red final
+    // state - are exactly the tokens `osdColoursAreTheGeneratedTokens` just pinned above, not some
+    // other white or red the renderer might drift to independently.
+    void timeLeftColoursAreTheTokens()
+    {
+        HudHarness harness;
+        harness.hud().beginSession();
+
+        harness.hud().noteCreditMinutes(10);
+        harness.hud().tick();
+        const QImage reminder = harness.frames().last();
+        QVERIFY2(countColour(reminder, kOsdValue, 0) > 0,
+                 "the ten-minute reminder's fill must be osdValueDefault");
+        QCOMPARE(countColour(reminder, kOsdDestructive, 0), 0);
+
+        harness.hud().noteCreditMinutes(5);
+        harness.hud().tick();
+        const QImage redFrame = harness.frames().last();
+        QVERIFY2(countColour(redFrame, kOsdDestructive, 0) > 0,
+                 "the five-minute final state's fill must be destructiveDefault");
+        QCOMPARE(countColour(redFrame, kOsdValue, 0), 0);
+
+        harness.hud().endSession();
     }
 
     // The published surface is what `OverlayManager::updateOverlaySurface()` accepts and what
     // `notifyOverlayUpdated()` uploads without asserting - the same three guards proof (a)
-    // asserts on a synthetic image, now asserted on the HUD's real output.
+    // asserts on a synthetic image, now asserted on Time left's real output.
     void hudPublishesASurfaceTheRendererAccepts()
     {
         HudHarness harness;
         harness.hud().beginSession();
+        harness.hud().noteCreditMinutes(9);
+        harness.hud().tick();
 
         QVERIFY(harness.frames().size() >= 1);
         QCOMPARE(harness.formats().last(), int(SDL_PIXELFORMAT_ARGB8888));
         QVERIFY2(!harness.mustLock().last(), "the renderer asserts a surface that needs no locking");
 
-        const QImage expected = harness.hud().renderStripAt(0, 0);
+        const QImage expected = harness.hud().compositor().composedBottom();
         const QImage published = harness.frames().last();
         QCOMPARE(published.size(), expected.size());
         for (int y = 0; y < expected.height(); y++) {
@@ -726,10 +556,8 @@ private slots:
     //
     // `D3D11VARenderer` uploads inside `notifyOverlayUpdated()`, but `SdlRenderer` declares no
     // `notifyOverlayUpdated()` at all - it inherits the base class's no-op - and takes the bitmap
-    // in `renderOverlay()` on its next frame. The old `publishStrip()` handed over a view onto the
-    // `QImage` it had just drawn into and let that image die on return, so a software-decoding
-    // session (`SdlRenderer`) read freed memory. This test is that renderer: it keeps the surface
-    // the publisher returns, reads it afterwards, and only then frees it.
+    // in `renderOverlay()` on its next frame. This test is that renderer: it keeps the surface the
+    // publisher returns, reads it afterwards, and only then frees it.
     void hudSurfaceOutlivesThePublisherCall()
     {
         SDL_Surface* handedOver = nullptr;
@@ -750,17 +578,19 @@ private slots:
         });
 
         hud.beginSession();
+        hud.noteCreditMinutes(9);
+        hud.tick();
         QVERIFY(publishes >= 1);
         QVERIFY(handedOver != nullptr);
 
-        // The structural half of the guarantee: a real allocation, not a view onto a buffer the
-        // HUD owns (SDL_PREALLOC is exactly "surface->pixels is not owned by this surface").
+        // The structural half of the guarantee: a real allocation, not a view onto a buffer this
+        // class owns (SDL_PREALLOC is exactly "surface->pixels is not owned by this surface").
         QVERIFY2((handedOver->flags & SDL_PREALLOC) == 0,
-                 "the HUD must hand over a surface that owns its pixels");
+                 "the surface must own its pixels");
 
-        // And the observable half: the pixels are still the strip, read after `publishStrip()`
-        // returned and with the `QImage` it drew into long gone.
-        const QImage expected = hud.renderStripAt(0, 0);
+        // And the observable half: the pixels are still Time left's, read after the publisher
+        // call returned and with the `QImage` it drew into long gone.
+        const QImage expected = hud.compositor().composedBottom();
         QCOMPARE(handedOver->w, expected.width());
         QCOMPARE(handedOver->h, expected.height());
         QCOMPARE(handedOver->format->format, SDL_PIXELFORMAT_ARGB8888);
@@ -776,452 +606,455 @@ private slots:
         hud.endSession();
     }
 
-    // D-04/screens.md §25: auto-hide after 4 s, reappear on input. The heartbeat is what makes the
-    // timer advance at all, and hiding must not disable the overlay in a way that blocks the
-    // engine's own use of the same slot (the poor-connection warning).
-    void hudAutoHidesAfterFourSecondsAndReturnsOnInput()
-    {
-        if (SDL_InitSubSystem(SDL_INIT_EVENTS) != 0) {
-            QSKIP("SDL's events subsystem is unavailable, so the input watch cannot be installed");
-        }
-        QVERIFY(SDL_WasInit(SDL_INIT_EVENTS) != 0);
+    // ---------------------------------------------------------------------------------------
+    // Plan 22 (D-11/D-16/D-20/D-21): the owner's Time-left rule, in full - the one-minute white
+    // reminder, red from five to the end, the top-up re-run, and whole minutes only. Replaces the
+    // CUST-15 low-balance warning cards this section used to pin (`hud_overlay.cpp`'s own comment
+    // on Plan 14's separate D-11 thresholds already said as much: "Plan 22 retires" them).
+    // ---------------------------------------------------------------------------------------
 
+    // D-11/D-16: the first fresh read at or below ten minutes shows white for exactly one minute
+    // on the injected (monotonic) clock, then hides on the very next tick.
+    void reminderShowsOneMinuteThenGoes()
+    {
         HudHarness harness;
         harness.hud().beginSession();
-        QVERIFY2(harness.hud().isVisible(), "the HUD must be up as soon as the session connects");
 
-        // A tick inside the window keeps it up.
+        harness.hud().noteCreditMinutes(10);
+        harness.hud().tick();
+        QVERIFY2(!harness.hud().compositor().composedBottom().isNull(),
+                 "a ten-minute fresh read must show the reminder");
+        QImage frame = harness.frames().last();
+        QVERIFY2(countColour(frame, kOsdValue, 0) > 0, "the reminder is white");
+        QCOMPARE(countColour(frame, kOsdDestructive, 0), 0);
+
+        // One second short of the minute, on the clock the test owns: still up.
+        harness.advance(HudOverlay::kReminderMs - 1000);
+        harness.hud().tick();
+        QVERIFY2(!harness.hud().compositor().composedBottom().isNull(),
+                 "the reminder must still be up one second before its minute is up");
+
+        // The minute is up: gone on the very next tick.
         harness.advance(1000);
         harness.hud().tick();
-        QVERIFY(harness.hud().isVisible());
-        QCOMPARE(harness.hides(), 0);
-
-        // Past the window with no input, it hides.
-        harness.advance(HudOverlay::autoHideMs());
-        harness.hud().tick();
-        QVERIFY2(!harness.hud().isVisible(), "the HUD should have auto-hidden");
-        QCOMPARE(harness.hides(), 1);
-
-        // Input brings it back.
-        harness.hud().noteActivity();
-        harness.hud().tick();
-        QVERIFY2(harness.hud().isVisible(), "input should have brought the HUD back");
-        QCOMPARE(harness.hides(), 1);
-
-        // Ending the session hides it for good, and does not count as an auto-hide.
-        harness.hud().endSession();
-        QVERIFY(!harness.hud().isVisible());
-        QVERIFY(harness.hides() >= 2);
-
-        SDL_QuitSubSystem(SDL_INIT_EVENTS);
-    }
-
-    // ---------------------------------------------------------------------------------------
-    // Phase 5 plan 10 (CUST-15): the remaining credit and the two low-balance warning cards.
-    // ---------------------------------------------------------------------------------------
-
-    // The numbers and the sentences are the spec's, and the two colours the HUD adds are tokens.
-    // `timing.md` "Low-balance warnings: 10 min, then 2 min" and its two card-lifetime rows;
-    // `copy.md` "In session" for the sentences, dash included (U+2014).
-    void thresholdsLifetimesAndSentencesAreTheSpecs()
-    {
-        QCOMPARE(HudOverlay::kWarnMinutes, qint64(10));
-        QCOMPARE(HudOverlay::kCriticalMinutes, qint64(2));
-        QCOMPARE(HudOverlay::kTenMinuteCardMs, qint64(15000));
-
-        QCOMPARE(HudOverlay::warningText(HudOverlay::Card::TenMinutes),
-                 QString(QStringLiteral("10 minutes left.")));
-        QCOMPARE(HudOverlay::warningText(HudOverlay::Card::TwoMinutes),
-                 QString(QStringLiteral("2 minutes left ") + QChar(0x2014)
-                         + QStringLiteral(" find a save point.")));
-        QVERIFY(HudOverlay::warningText(HudOverlay::Card::None).isEmpty());
-
-        // Nothing about topping up, and nothing that pressures: how much time is left, and no more.
-        for (const HudOverlay::Card card : {HudOverlay::Card::TenMinutes,
-                                            HudOverlay::Card::TwoMinutes}) {
-            const QString text = HudOverlay::warningText(card).toLower();
-            QVERIFY(!text.contains(QStringLiteral("top up")));
-            QVERIFY(!text.contains(QStringLiteral("buy")));
-            QVERIFY(!text.contains(QStringLiteral("hurry")));
-        }
-    }
-
-    // The credit readout, at each side of each threshold. The value is the one duration format and
-    // the colour and glyph come from the balance: nothing at 11, warn at 10 and 3, destructive at 2
-    // and 0. Counting opaque pixels of a token colour proves the value was drawn in it, not that a
-    // property was set.
-    void creditReadoutChangesColourExactlyAtTheThresholds()
-    {
-        struct Case { qint64 minutes; bool warn; bool destructive; };
-        const Case cases[] = { { 135, false, false }, { 61, false, false }, { 11, false, false },
-                               { 10, true, false },   { 3, true, false },   { 2, false, true },
-                               { 0, false, true } };
-
-        for (const Case& c : cases) {
-            HudOverlay hud;
-            hud.seedCreditMinutes(c.minutes);
-            const QImage strip = hud.renderStripAt(0, 0);
-
-            const int warnPixels = countColour(strip, kWarnRgb);
-            const int destructivePixels = countColour(strip, kDestructiveRgb);
-            QVERIFY2((warnPixels > 20) == c.warn,
-                     qPrintable(QStringLiteral("%1 min: warn pixels %2").arg(c.minutes).arg(warnPixels)));
-            QVERIFY2((destructivePixels > 20) == c.destructive,
-                     qPrintable(QStringLiteral("%1 min: destructive pixels %2")
-                                    .arg(c.minutes).arg(destructivePixels)));
-            // And exclusively: the strip never shows both treatments at once.
-            QVERIFY(!(warnPixels > 20 && destructivePixels > 20));
-        }
-    }
-
-    // A balance that is not known draws nothing for it - no label, no zero - and the strip is then
-    // exactly what it was before Phase 5; one that is known makes the strip wider, and a different
-    // value is a different picture.
-    void creditReadoutIsDrawnOnlyOnceOneIsKnownAndFollowsItsValue()
-    {
-        HudOverlay unknown;
-        HudOverlay known;
-        known.seedCreditMinutes(135);
-        HudOverlay other;
-        other.seedCreditMinutes(136);
-
-        const QImage without = unknown.renderStripAt(5, 0);
-        const QImage with = known.renderStripAt(5, 0);
-        QVERIFY2(with.width() > without.width(), "the credit group must add to the strip");
-        QCOMPARE(with.height(), without.height());
-
-        // Ignored, not zero: a negative is not a balance.
-        HudOverlay negative;
-        negative.seedCreditMinutes(-1);
-        QCOMPARE(negative.creditMinutes(), qint64(-1));
-        QCOMPARE(negative.renderStripAt(5, 0).width(), without.width());
-
-        QCOMPARE(known.creditMinutes(), qint64(135));
-        QCOMPARE(other.renderStripAt(5, 0).size(), with.size());
-        int differing = 0;
-        const QImage otherStrip = other.renderStripAt(5, 0);
-        for (int y = 0; y < with.height(); y++) {
-            for (int x = 0; x < with.width(); x++) {
-                if (with.pixel(x, y) != otherStrip.pixel(x, y)) {
-                    differing++;
-                }
-            }
-        }
-        QVERIFY2(differing > 10, "the credit value did not reach the bitmap");
-    }
-
-    // The ten-minute card: it appears when a read first reaches ten minutes, sits at the bottom
-    // right of a frame as wide as the stream window, and goes after its 15 seconds - not 14.
-    void theTenMinuteCardShowsForItsLifetimeAndThenGoes()
-    {
-        HudHarness harness;
-        harness.hud().setDisplayWidth(1280);
-        harness.hud().beginSession();
-        harness.hud().noteCreditMinutes(11);
-        QCOMPARE(int(harness.hud().activeCard()), int(HudOverlay::Card::None));
-
-        harness.hud().noteCreditMinutes(10);
-        QCOMPARE(int(harness.hud().activeCard()), int(HudOverlay::Card::TenMinutes));
-        QCOMPARE(harness.hud().warningsFired(HudOverlay::Card::TenMinutes), 1);
-        QVERIFY(harness.hud().isCardShown());
-
-        // On the screen at once, not on the next heartbeat: a frame as wide as the window whose
-        // right edge is the card's warn-coloured border, with the strip still at the left.
-        QImage frame = harness.frames().last();
-        QCOMPARE(frame.width(), 1280);
-        QCOMPARE(frame.height(), HudOverlay::stripHeight());
-        QCOMPARE(qAlpha(frame.pixel(1279, frame.height() / 2)), 255);
-        QVERIFY(countColour(frame, kWarnRgb) > 100);
-        QCOMPARE(countColour(frame, kDestructiveRgb), 0);
-        const auto runs = opaqueRuns(frame, frame.height() / 2);
-        QCOMPARE(runs.size(), 2);
-        QCOMPARE(runs.last().second, 1279);
-
-        // Still there just inside its lifetime, gone at it.
-        harness.advance(HudOverlay::kTenMinuteCardMs - 1);
-        harness.hud().tick();
-        QCOMPARE(int(harness.hud().activeCard()), int(HudOverlay::Card::TenMinutes));
-        frame = harness.frames().last();
-        QCOMPARE(frame.width(), 1280);
-
-        harness.advance(1);
-        harness.hud().tick();
-        QCOMPARE(int(harness.hud().activeCard()), int(HudOverlay::Card::None));
-        QVERIFY(!harness.hud().isCardShown());
-        frame = harness.frames().last();
-        QVERIFY2(frame.width() < 1280, "with the card gone the frame is the strip alone again");
-        QCOMPARE(opaqueRuns(frame, frame.height() / 2).size(), 1);
-        QCOMPARE(frame.size(), harness.hud().renderStripAt(0, 0).size());
-        // The credit readout is still there, warn-coloured, at ten minutes: only the card went.
-        QVERIFY(countColour(frame, kWarnRgb) > 20);
-
-        // Once per session: reading ten again, or nine, does not bring it back.
-        harness.hud().noteCreditMinutes(10);
-        harness.hud().noteCreditMinutes(9);
-        QCOMPARE(int(harness.hud().activeCard()), int(HudOverlay::Card::None));
-        QCOMPARE(harness.hud().warningsFired(HudOverlay::Card::TenMinutes), 1);
+        QVERIFY2(harness.hud().compositor().composedBottom().isNull(),
+                 "the reminder must hide once its one-minute window has passed");
 
         harness.hud().endSession();
     }
 
-    // The two-minute card: it replaces the ten-minute one, stays however long the session runs,
-    // and goes only when the session ends.
-    void theTwoMinuteCardReplacesTheTenAndStaysUntilTheSessionEnds()
+    // D-11/D-20: the first fresh read at or below five minutes shows red and stays red through
+    // every later read down to and including `0 min` - it never reverts to hidden or white on its
+    // own, only a top-up above it can move it (`topUpResetsAndReruns`).
+    void redFromFiveToTheEnd()
     {
         HudHarness harness;
-        harness.hud().setDisplayWidth(1280);
         harness.hud().beginSession();
 
-        harness.hud().noteCreditMinutes(10);
-        QCOMPARE(int(harness.hud().activeCard()), int(HudOverlay::Card::TenMinutes));
+        harness.hud().noteCreditMinutes(5);
+        harness.hud().tick();
+        QVERIFY2(countColour(harness.frames().last(), kOsdDestructive, 0) > 0,
+                 "five minutes shows red");
 
-        // Replaced, not stacked: one card at a time, and the ten-minute colours are gone from it.
-        harness.hud().noteCreditMinutes(2);
-        QCOMPARE(int(harness.hud().activeCard()), int(HudOverlay::Card::TwoMinutes));
-        QCOMPARE(harness.hud().warningsFired(HudOverlay::Card::TwoMinutes), 1);
-        QImage frame = harness.frames().last();
-        QCOMPARE(frame.width(), 1280);
-        QCOMPARE(opaqueRuns(frame, frame.height() / 2).size(), 2);
-        const QList<QPair<int, int>> runs = opaqueRuns(frame, frame.height() / 2);
-        const QRect cardRect(runs.last().first, 0, runs.last().second - runs.last().first + 1,
-                             frame.height());
-        const QImage card = frame.copy(cardRect);
-        QVERIFY(countColour(card, kDestructiveRgb) > 100);
-        QCOMPARE(countColour(card, kWarnRgb), 0);
-
-        // An hour on, a wallet read a minute later: still there. Not on a clock of its own.
-        for (int i = 0; i < 6; ++i) {
-            harness.advance(10 * 60 * 1000);
+        for (const qint64 minutes : {qint64(4), qint64(3), qint64(0)}) {
+            harness.hud().noteCreditMinutes(minutes);
             harness.hud().tick();
-            harness.hud().noteCreditMinutes(1);
-            QCOMPARE(int(harness.hud().activeCard()), int(HudOverlay::Card::TwoMinutes));
-        }
-        QCOMPARE(harness.frames().last().width(), 1280);
-        QCOMPARE(harness.hud().warningsFired(HudOverlay::Card::TwoMinutes), 1);
-        QCOMPARE(harness.hud().warningsFired(HudOverlay::Card::TenMinutes), 1);
-
-        // The session ends: the card goes with it.
-        harness.hud().endSession();
-        QCOMPARE(int(harness.hud().activeCard()), int(HudOverlay::Card::None));
-        QVERIFY(harness.hides() >= 1);
-    }
-
-    // A session that begins with less than a threshold's worth of credit fires only the lower
-    // card - and the higher one cannot fire later on the way down from a top-up.
-    void aSessionStartingUnderTwoMinutesFiresOnlyTheLowerCard()
-    {
-        HudHarness harness;
-        harness.hud().setDisplayWidth(1280);
-        harness.hud().beginSession();
-
-        harness.hud().noteCreditMinutes(1);
-        QCOMPARE(int(harness.hud().activeCard()), int(HudOverlay::Card::TwoMinutes));
-        QCOMPARE(harness.hud().warningsFired(HudOverlay::Card::TwoMinutes), 1);
-        QCOMPARE(harness.hud().warningsFired(HudOverlay::Card::TenMinutes), 0);
-
-        harness.hud().noteCreditMinutes(30);   // topped up mid-stream
-        harness.hud().noteCreditMinutes(9);    // and down again
-        QCOMPARE(harness.hud().warningsFired(HudOverlay::Card::TenMinutes), 0);
-        QCOMPARE(harness.hud().warningsFired(HudOverlay::Card::TwoMinutes), 1);
-        QCOMPARE(int(harness.hud().activeCard()), int(HudOverlay::Card::TwoMinutes));
-
-        harness.hud().endSession();
-    }
-
-    // The same, starting between the two: the ten-minute card, and then the two-minute one later.
-    void aSessionStartingBetweenTheThresholdsFiresBothInOrder()
-    {
-        HudHarness harness;
-        harness.hud().setDisplayWidth(1280);
-        harness.hud().beginSession();
-
-        harness.hud().noteCreditMinutes(7);
-        QCOMPARE(int(harness.hud().activeCard()), int(HudOverlay::Card::TenMinutes));
-        harness.advance(20000);
-        harness.hud().tick();
-        QCOMPARE(int(harness.hud().activeCard()), int(HudOverlay::Card::None));
-        harness.hud().noteCreditMinutes(2);
-        QCOMPARE(int(harness.hud().activeCard()), int(HudOverlay::Card::TwoMinutes));
-        QCOMPARE(harness.hud().warningsFired(HudOverlay::Card::TenMinutes), 1);
-        QCOMPARE(harness.hud().warningsFired(HudOverlay::Card::TwoMinutes), 1);
-
-        // A new session is a new set of thresholds.
-        harness.hud().beginSession();
-        QCOMPARE(int(harness.hud().activeCard()), int(HudOverlay::Card::None));
-        QCOMPARE(harness.hud().warningsFired(HudOverlay::Card::TenMinutes), 0);
-        QCOMPARE(harness.hud().warningsFired(HudOverlay::Card::TwoMinutes), 0);
-        QCOMPARE(harness.hud().creditMinutes(), qint64(-1));
-        harness.hud().noteCreditMinutes(7);
-        QCOMPARE(int(harness.hud().activeCard()), int(HudOverlay::Card::TenMinutes));
-
-        harness.hud().endSession();
-    }
-
-    // Missing data fires nothing (CUST-15 empty edge). The only thing a failed read does is not
-    // arrive; what does arrive that is not a balance, or that is only the pre-stream seed, is
-    // shown or ignored but never turned into a warning.
-    void noWarningFiresOnMissingDataOrOnASeed()
-    {
-        HudHarness harness;
-        harness.hud().setDisplayWidth(1280);
-        harness.hud().beginSession();
-
-        harness.hud().noteCreditMinutes(-1);
-        QCOMPARE(harness.hud().creditMinutes(), qint64(-1));
-
-        // The last balance read before the stream: on the strip, and no card, however low it is.
-        harness.hud().seedCreditMinutes(1);
-        QCOMPARE(harness.hud().creditMinutes(), qint64(1));
-        QCOMPARE(int(harness.hud().activeCard()), int(HudOverlay::Card::None));
-        QCOMPARE(harness.hud().warningsFired(HudOverlay::Card::TenMinutes), 0);
-        QCOMPARE(harness.hud().warningsFired(HudOverlay::Card::TwoMinutes), 0);
-        QVERIFY(harness.frames().last().width() < 1280);
-
-        // A later tick with nothing new changes nothing either.
-        harness.advance(10000);
-        harness.hud().tick();
-        QCOMPARE(int(harness.hud().activeCard()), int(HudOverlay::Card::None));
-
-        // And the seed did not use up the threshold: the first real read of it still fires.
-        harness.hud().noteCreditMinutes(1);
-        QCOMPARE(int(harness.hud().activeCard()), int(HudOverlay::Card::TwoMinutes));
-
-        harness.hud().endSession();
-    }
-
-    // A read that arrives outside a session arms nothing for the next one.
-    void aReadOutsideASessionFiresNothing()
-    {
-        HudHarness harness;
-        harness.hud().setDisplayWidth(1280);
-
-        harness.hud().noteCreditMinutes(1);
-        QCOMPARE(int(harness.hud().activeCard()), int(HudOverlay::Card::None));
-        QCOMPARE(harness.hud().warningsFired(HudOverlay::Card::TwoMinutes), 0);
-        QCOMPARE(harness.frames().size(), 0);
-
-        harness.hud().beginSession();
-        QCOMPARE(int(harness.hud().activeCard()), int(HudOverlay::Card::None));
-        harness.hud().endSession();
-    }
-
-    // The cards do not auto-hide with the strip. With the strip gone after four seconds of no
-    // input, a warning card is still published - alone, at the right, with nothing where the strip
-    // was - and it is not hidden until the session ends.
-    void aWarningCardOutlivesTheStripsAutoHide()
-    {
-        if (SDL_InitSubSystem(SDL_INIT_EVENTS) != 0) {
-            QSKIP("SDL's events subsystem is unavailable, so the input watch cannot be installed");
+            QVERIFY2(!harness.hud().compositor().composedBottom().isNull(),
+                     qPrintable(QStringLiteral("%1 min must still be shown").arg(minutes)));
+            QVERIFY2(countColour(harness.frames().last(), kOsdDestructive, 0) > 0,
+                     qPrintable(QStringLiteral("%1 min must stay red").arg(minutes)));
         }
 
-        HudHarness harness;
-        harness.hud().setDisplayWidth(1280);
-        harness.hud().beginSession();
-        harness.hud().noteCreditMinutes(2);
-        QCOMPARE(int(harness.hud().activeCard()), int(HudOverlay::Card::TwoMinutes));
+        harness.hud().endSession();
+    }
 
-        harness.advance(HudOverlay::autoHideMs());
+    // D-11: a jump straight past the reminder band (eleven to four) shows red at once - Critical
+    // wins from any state, and the one-minute white reminder is never shown retroactively.
+    void jumpElevenToFourGoesRed()
+    {
+        HudHarness harness;
+        harness.hud().beginSession();
+
+        harness.hud().noteCreditMinutes(11);
         harness.hud().tick();
-        QVERIFY2(!harness.hud().isVisible(), "the strip should have auto-hidden");
-        QVERIFY(harness.hud().isCardShown());
-        QCOMPARE(harness.hides(), 0);
+        QVERIFY2(harness.hud().compositor().composedBottom().isNull(),
+                 "eleven minutes shows nothing");
+
+        harness.hud().noteCreditMinutes(4);
+        harness.hud().tick();
+        const QImage frame = harness.frames().last();
+        QVERIFY2(!frame.isNull(), "four minutes must be drawn");
+        QVERIFY2(countColour(frame, kOsdDestructive, 0) > 0, "four minutes is red");
+        QCOMPARE(countColour(frame, kOsdValue, 0), 0);
+
+        harness.hud().endSession();
+    }
+
+    // D-21: a fresh read above the previous one is a top-up. Time left goes away and the rule
+    // above runs again on the new balance: a genuine descent to ten still shows the reminder, a
+    // top-up into 6-10 shows it again, and a top-up that itself lands at or below five shows red
+    // at once rather than the reminder.
+    void topUpResetsAndReruns()
+    {
+        HudHarness harness;
+        harness.hud().beginSession();
+
+        // Red at four.
+        harness.hud().noteCreditMinutes(4);
+        harness.hud().tick();
+        QVERIFY(countColour(harness.frames().last(), kOsdDestructive, 0) > 0);
+
+        // A rise to thirty is a top-up: Time left goes away.
+        harness.hud().noteCreditMinutes(30);
+        harness.hud().tick();
+        QVERIFY2(harness.hud().compositor().composedBottom().isNull(),
+                 "a top-up above the reminder band must hide Time left");
+
+        // A genuine descent (not a top-up) back to ten shows the white reminder again.
+        harness.hud().noteCreditMinutes(10);
+        harness.hud().tick();
+        QVERIFY2(countColour(harness.frames().last(), kOsdValue, 0) > 0,
+                 "a descent to ten shows the reminder");
+
+        // Let that reminder's minute run out, then descend further with no top-up: it must not
+        // re-fire on its own (armed once per top-up-or-session, not once per read).
+        harness.advance(HudOverlay::kReminderMs);
+        harness.hud().tick();
+        QVERIFY2(harness.hud().compositor().composedBottom().isNull(), "the reminder expired");
+        harness.hud().noteCreditMinutes(7);
+        harness.hud().tick();
+        QVERIFY2(harness.hud().compositor().composedBottom().isNull(),
+                 "a further descent alone must not re-fire the reminder");
+
+        // A top-up into 6-10 shows the reminder again.
+        harness.hud().noteCreditMinutes(8);
+        harness.hud().tick();
+        QVERIFY2(countColour(harness.frames().last(), kOsdValue, 0) > 0,
+                 "a top-up into the 6-10 range shows the reminder again");
+
+        // A top-up that still lands at or below five (e.g. a small refund from a deeper balance)
+        // shows red at once, never the white reminder first: rules 1 and 2 both apply to the same
+        // read (the literal re-run).
+        harness.hud().noteCreditMinutes(2);
+        harness.hud().tick();
+        harness.hud().noteCreditMinutes(4);   // a rise from 2 - still a top-up, still critical
+        harness.hud().tick();
+        const QImage frame = harness.frames().last();
+        QVERIFY2(countColour(frame, kOsdDestructive, 0) > 0,
+                 "a top-up landing at or below five shows red at once");
+        QCOMPARE(countColour(frame, kOsdValue, 0), 0);
+
+        harness.hud().endSession();
+    }
+
+    // D-16: Time left is drawn in whole minutes, with no internal seconds countdown - the frame
+    // stays byte-identical across ticks unless a new fresh read arrives.
+    void wholeMinutesOnly()
+    {
+        HudHarness harness;
+        harness.hud().beginSession();
+
+        harness.hud().noteCreditMinutes(9);
+        harness.hud().tick();
+        const QImage first = harness.frames().last();
+        QVERIFY(!first.isNull());
+
+        for (int i = 0; i < 5; ++i) {
+            harness.advance(1000);
+            harness.hud().tick();
+            QCOMPARE(harness.frames().last(), first);
+        }
+
+        harness.hud().endSession();
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Plan 14 (D-09/D-11/D-13): the compositor Time left path. [Decided by executor, owner to
+    // review]: `OverlayManager` holds one surface per slot, so the compositor owns it outright
+    // once it has anything to draw - see `hud_overlay.h`'s own class comment for the full rule
+    // these two tests are the RED/GREEN proof of.
+    // ---------------------------------------------------------------------------------------
+
+    // A fresh wallet read at or below ten minutes reaches the compositor and shows up through the
+    // same publisher the legacy strip uses - on the next tick, not immediately
+    // (`noteCreditMinutes()` only records the state; `tick()` decides the slot's frame each
+    // cycle).
+    void nineMinutesReadShowsTimeLeft()
+    {
+        HudHarness harness;
+        harness.hud().beginSession();
+        harness.hud().noteCreditMinutes(9);
+        harness.hud().tick();
+
+        QVERIFY2(!harness.hud().compositor().composedBottom().isNull(),
+                 "a nine-minute fresh read must make the compositor visible");
 
         const QImage frame = harness.frames().last();
-        QCOMPARE(frame.width(), 1280);
-        const auto runs = opaqueRuns(frame, frame.height() / 2);
-        QCOMPARE(runs.size(), 1);            // the card alone: nothing where the strip was
-        QCOMPARE(runs.first().second, 1279); // flush to the right edge
-        QVERIFY(runs.first().first > 640);
+        // The compositor's own default window size (1920x1080, D-14) - not the legacy strip's
+        // content-sized width - is what proves this frame came from `composedBottom()`, not the
+        // superseded `renderFrame()`.
+        QCOMPARE(frame.width(), 1920);
 
-        // Input brings the strip back beside it; the card is unchanged.
-        harness.hud().noteActivity();
-        harness.hud().tick();
-        QVERIFY(harness.hud().isVisible());
-        QCOMPARE(opaqueRuns(harness.frames().last(), 28).size(), 2);
+        // Tolerance 0, not `countColour()`'s default of 6: the legacy card's own sentence colour
+        // (Tokens.foregroundDefault, 0xFAFAFA) is within a tolerance of 6 of pure white and would
+        // pass this check vacuously if it accidentally matched the superseded card instead of the
+        // compositor's own `kOsdValue` (0xFFFFFFFF exactly).
+        const QImage rightHalf = frame.copy(frame.width() / 2, 0, frame.width() / 2, frame.height());
+        QVERIFY2(countColour(rightHalf, qRgb(0xFF, 0xFF, 0xFF), 0) > 0,
+                 "Time left's white value pixels must be on the right, drawn through the compositor");
 
         harness.hud().endSession();
-        QVERIFY(harness.hides() >= 1);
-        QVERIFY(!harness.hud().isCardShown());
+    }
+
+    // The pre-stream seed never shows Time left (D-16): `seedCreditMinutes()` never touches the
+    // compositor - only a fresh read (`noteCreditMinutes()`) does.
+    void seedNeverShows()
+    {
+        HudHarness harness;
+        harness.hud().beginSession();
+        harness.hud().seedCreditMinutes(9);
+        harness.hud().tick();
+
+        QVERIFY2(harness.hud().compositor().composedBottom().isNull(),
+                 "the seed alone must not make the compositor visible");
+
+        harness.hud().endSession();
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Plan 14 Task 2 (D-14, D-13, ADR-0045 risk 3): sized to the window, republished every
+    // second, and never wiping Moonlight's own message.
+    // ---------------------------------------------------------------------------------------
+
+    // D-14: the compositor learns the stream window's real size from the same SDL window-size
+    // event `syncCompositorWindowSize()`'s own fallback poll would otherwise wait for - never a
+    // direct call into the compositor from anywhere but `HudOverlay` itself.
+    void sizesFollowTheWindow()
+    {
+        if (SDL_InitSubSystem(SDL_INIT_EVENTS) != 0) {
+            QSKIP("SDL's events subsystem is unavailable, so the window-size watch cannot be installed");
+        }
+
+        HudHarness harness;
+        harness.hud().beginSession();
+        harness.hud().noteCreditMinutes(9);
+        harness.hud().tick();
+        const int heightAt1080 = harness.frames().last().height();
+        QVERIFY(heightAt1080 > 0);
+
+        // The real production path is a window-size event, not a direct call into the compositor -
+        // `SeatHubClient` never calls `OsdCompositor::setWindowSize()` itself.
+        SDL_Event resize;
+        SDL_zero(resize);
+        resize.type = SDL_WINDOWEVENT;
+        resize.window.event = SDL_WINDOWEVENT_SIZE_CHANGED;
+        resize.window.data1 = 2560;
+        resize.window.data2 = 1440;
+        QVERIFY(SDL_PushEvent(&resize) >= 0);
+
+        harness.hud().tick();
+        const int heightAt1440 = harness.frames().last().height();
+
+        QVERIFY2(heightAt1440 > heightAt1080,
+                 "Time left's glyphs must be taller at 1440p than at 1080p (D-14's size table)");
+
+        harness.hud().endSession();
         SDL_QuitSubSystem(SDL_INIT_EVENTS);
     }
 
-    // UI Considerations, "HUD warning card" overflow row: the two-minute card renders fully inside
-    // the frame, bottom right, at a 1280x720 stream and at a 3840x2160 one, and does not run into
-    // the strip. The frame is the window's width and one strip high: the card's bottom edge is the
-    // frame's bottom edge and its right edge is the frame's right edge.
-    void theTwoMinuteCardIsFullyInsideTheFrameAtBothStreamSizes()
+    // Every tick republishes while Time left is shown, not only when a value changes - the
+    // renderer keeps the last texture it was handed, and this is also what repairs a texture lost
+    // to a swapchain recreation (ADR-0045 risk 3).
+    void republishesEveryTickWhileVisible()
     {
-        for (const int width : {1280, 3840}) {
-            HudOverlay hud;
-            hud.seedCreditMinutes(2);
-            const QImage frame = hud.renderFrame(37, width, true, HudOverlay::Card::TwoMinutes);
+        HudHarness harness;
+        harness.hud().beginSession();
+        harness.hud().noteCreditMinutes(9);
+        harness.hud().tick();
+        const int countAfterFirstTick = harness.frames().size();
+        QVERIFY(countAfterFirstTick > 0);
 
-            QCOMPARE(frame.width(), width);
-            QCOMPARE(frame.height(), HudOverlay::stripHeight());
-
-            const int middle = frame.height() / 2;
-            const auto runs = opaqueRuns(frame, middle);
-            QCOMPARE(runs.size(), 2);                 // the strip, a gap, the card
-            QCOMPARE(runs.first().first, 0);          // the strip at the left
-            QCOMPARE(runs.last().second, width - 1);  // the card flush right, inside the frame
-            QVERIFY(runs.last().first > runs.first().second + 8);
-
-            // Fully inside vertically: the card's border reaches the last row and stays opaque
-            // there, and the frame is no taller than one row of cards.
-            const int cardMiddle = (runs.last().first + runs.last().second) / 2;
-            QCOMPARE(qAlpha(frame.pixel(cardMiddle, 0)), 255);
-            QCOMPARE(qAlpha(frame.pixel(cardMiddle, frame.height() - 1)), 255);
-
-            // The card is the two-minute one: destructive border and glyph, and it fits its text
-            // (about a third of the smaller window, not a slab).
-            const QImage cardImage = frame.copy(runs.last().first, 0,
-                                                runs.last().second - runs.last().first + 1,
-                                                frame.height());
-            QVERIFY(countColour(cardImage, kDestructiveRgb) > 100);
-            QVERIFY(cardImage.width() > 200 && cardImage.width() < 500);
-        }
-    }
-
-    // With no stream width known (nothing has told the HUD, no window is focused) a warning is
-    // still on the screen: beside the strip, or alone at the left when the strip is hidden. A card
-    // in the wrong place beats none.
-    void withNoWidthKnownACardIsDrawnBesideTheStripNotDropped()
-    {
-        HudOverlay hud;
-        hud.seedCreditMinutes(10);
-        const QImage beside = hud.renderFrame(3, 0, true, HudOverlay::Card::TenMinutes);
-        const QImage strip = hud.renderStripAt(3, 0);
-        QVERIFY(beside.width() > strip.width());
-        QCOMPARE(opaqueRuns(beside, beside.height() / 2).size(), 2);
-        QCOMPARE(opaqueRuns(beside, beside.height() / 2).last().second, beside.width() - 1);
-
-        const QImage alone = hud.renderFrame(3, 0, false, HudOverlay::Card::TenMinutes);
-        QCOMPARE(opaqueRuns(alone, alone.height() / 2).size(), 1);
-        QCOMPARE(opaqueRuns(alone, alone.height() / 2).first().first, 0);
-        QVERIFY(countColour(alone, kWarnRgb) > 100);
-    }
-
-    // A frame that carries no card is the strip and nothing but: the two card levels differ from
-    // each other only by their colour and glyph, and both are drawn from the copy deck's sentence.
-    void theTwoCardsDifferInColourAndInGlyphAndNotInPlacement()
-    {
-        HudOverlay hud;
-        const QImage ten = hud.renderFrame(0, 1280, false, HudOverlay::Card::TenMinutes);
-        const QImage two = hud.renderFrame(0, 1280, false, HudOverlay::Card::TwoMinutes);
-
-        QVERIFY(countColour(ten, kWarnRgb) > 100);
-        QCOMPARE(countColour(ten, kDestructiveRgb), 0);
-        QVERIFY(countColour(two, kDestructiveRgb) > 100);
-        QCOMPARE(countColour(two, kWarnRgb), 0);
-
-        // Both flush to the right edge and one row high.
-        for (const QImage* image : {&ten, &two}) {
-            QCOMPARE(image->width(), 1280);
-            QCOMPARE(opaqueRuns(*image, 28).last().second, 1279);
+        for (int i = 0; i < 3; ++i) {
+            harness.advance(1000);
+            harness.hud().tick();
         }
 
-        // Different sentences, so different widths - the longer one is the two-minute line.
-        QVERIFY(opaqueRuns(two, 28).last().first < opaqueRuns(ten, 28).last().first);
+        QCOMPARE(harness.frames().size(), countAfterFirstTick + 3);
+
+        harness.hud().endSession();
+    }
+
+    // Moonlight's own `CONN_STATUS_OKAY` disables the whole slot
+    // (`session.cpp`/`overlaymanager.cpp`'s `setOverlayState(type, false)`); `HudOverlay` never
+    // learns this happened, and does not need to - its own next tick republishes unconditionally,
+    // and `publishOverlaySurface()` re-enables the slot before every publish
+    // (`moonlight_engine_session.cpp`'s own `setOverlayState(..., true)` ahead of
+    // `updateOverlaySurface()`), so Time left returns within the second regardless.
+    void timeLeftReturnsAfterTheEngineDisablesTheSlot()
+    {
+        HudHarness harness;
+        harness.hud().beginSession();
+        harness.hud().noteCreditMinutes(9);
+        harness.hud().tick();
+        QVERIFY(harness.frames().size() > 0);
+
+        // Simulate the engine's own disable path reaching the compositor's rasteriser directly -
+        // the same call `OverlayManager::notifyOverlayUpdated()` makes when a rasteriser is
+        // registered (Plan 10's own hook). This does not touch `HudOverlay`'s Time-left state at
+        // all; it only proves the disable cannot reach `HudOverlay`'s own tick.
+        SDL_Color engineColor = {0xCC, 0x00, 0x00, 0xFF};
+        SDL_Surface* disabled = OsdCompositor::rasterize(Overlay::OverlayStatusUpdate, "",
+                                                         /*enabled=*/false, engineColor,
+                                                         &harness.hud().compositor());
+        QVERIFY2(disabled == nullptr, "a disabled rasterise call must return nothing to publish");
+
+        harness.advance(1000);
+        harness.hud().tick();
+
+        const QImage frame = harness.frames().last();
+        QVERIFY2(!frame.isNull(), "Time left must return on the very next tick");
+        const QImage rightHalf = frame.copy(frame.width() / 2, 0, frame.width() / 2, frame.height());
+        QVERIFY2(countColour(rightHalf, qRgb(0xFF, 0xFF, 0xFF), 0) > 0,
+                 "Time left's white value pixels must still be there after the simulated disable");
+
+        harness.hud().endSession();
+    }
+
+    // The `publishOverlaySurface(nullptr)` pitfall (RESEARCH-FORK.md §6): hiding Time left must
+    // not wipe a status line the engine wrote while it was up. With an engine line recorded, the
+    // slot stays enabled and showing that line - never the clear-and-disable path; with none, the
+    // existing clear-and-disable path runs exactly as it always did.
+    void hidingTimeLeftKeepsTheEngineLine()
+    {
+        HudHarness harness;
+        harness.hud().beginSession();
+
+        // Nothing shown yet: no credit read at all, and Time left starts hidden every session.
+        harness.hud().tick();
+        QVERIFY2(harness.hud().compositor().composedBottom().isNull(), "nothing is shown yet");
+        const int hidesBeforeEngineLine = harness.hides();
+
+        // Simulate the engine writing "Poor connection to PC" - the compositor's own recorded
+        // state (Plan 10), reached the same way the real hook reaches it.
+        SDL_Color engineColor = {0xCC, 0x00, 0x00, 0xFF};
+        SDL_Surface* published = OsdCompositor::rasterize(Overlay::OverlayStatusUpdate,
+                                                          "Poor connection to PC", /*enabled=*/true,
+                                                          engineColor, &harness.hud().compositor());
+        QVERIFY2(published != nullptr, "the engine line alone must render something");
+        SDL_FreeSurface(published);
+
+        const int framesBefore = harness.frames().size();
+        harness.hud().tick();
+
+        QVERIFY2(harness.frames().size() > framesBefore,
+                 "the engine line must reach a fresh publish on the very next tick");
+        QVERIFY2(harness.hides() == hidesBeforeEngineLine,
+                 "an engine line must keep the slot enabled, never the clear-and-disable path");
+        QVERIFY2(!harness.frames().last().isNull(), "the engine line must still be published");
+
+        // With no engine line and nothing else to show, the existing clear path runs.
+        SDL_Surface* cleared = OsdCompositor::rasterize(Overlay::OverlayStatusUpdate, "",
+                                                        /*enabled=*/false, engineColor,
+                                                        &harness.hud().compositor());
+        QVERIFY2(cleared == nullptr, "a disabled, textless rasterise call must return nothing");
+        QVERIFY2(harness.hud().compositor().composedBottom().isNull(),
+                 "with no engine line and no Time left, the compositor has nothing to draw");
+        harness.hud().tick();
+        QVERIFY2(harness.hides() > hidesBeforeEngineLine,
+                 "with nothing left to show, the existing clear-and-disable path must run");
+
+        harness.hud().endSession();
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Plan 22 Task 2 (D-12): the old HUD removed - strip, auto-hide, cards, the End-session hint
+    // and the reconnect line all gone; only Time left and the engine's own status line remain.
+    // ---------------------------------------------------------------------------------------
+
+    // No published frame ever carries anything beyond what `OsdCompositor::composedBottom()`
+    // itself draws (Time left, an engine status line, or both), and the source defines none of
+    // the removed pieces at all, by name - not merely unreachable.
+    void noShortcutHintNoStripNoReconnectLine()
+    {
+        const QString cpp = readForkFile(QStringLiteral("app/seathub/hud_overlay.cpp"));
+        const QString header = readForkFile(QStringLiteral("app/seathub/hud_overlay.h"));
+        QVERIFY2(!cpp.isEmpty(), "hud_overlay.cpp could not be read - is FORK_ROOT right?");
+        QVERIFY2(!header.isEmpty(), "hud_overlay.h could not be read - is FORK_ROOT right?");
+        const QString source = cpp + header;
+
+        for (const QString& literal : {
+                 QStringLiteral("\"Credit left\""),
+                 QStringLiteral("find a save point"),
+                 QStringLiteral("Connection lost"),
+                 QStringLiteral("\"End session\""),
+                 QStringLiteral("Ctrl+Alt+Shift+Q"),
+                 QStringLiteral("\"LIVE\""),
+                 QStringLiteral("\"Elapsed\""),
+             }) {
+            QVERIFY2(!source.contains(literal),
+                     qPrintable(QStringLiteral("hud_overlay still contains the removed literal %1")
+                                    .arg(literal)));
+        }
+        for (const QString& symbol : {
+                 QStringLiteral("enum class Card"), QStringLiteral("activeCard"),
+                 QStringLiteral("warningsFired"), QStringLiteral("isCardShown"),
+                 QStringLiteral("renderStripAt"), QStringLiteral("setReconnecting"),
+                 QStringLiteral("noteActivity"), QStringLiteral("autoHideMs"),
+                 QStringLiteral("stripHeight"), QStringLiteral("isVisible"),
+                 QStringLiteral("kAutoHideMs"), QStringLiteral("m_reconnecting"),
+                 QStringLiteral("displayWidth"),
+             }) {
+            QVERIFY2(!source.contains(symbol),
+                     qPrintable(QStringLiteral("hud_overlay still defines %1").arg(symbol)));
+        }
+
+        // The runtime half: a whole simulated session (reads descending from 30 to 0, a top-up,
+        // and a reconnect-shaped engine status write) - every actual publish is exactly what the
+        // compositor itself drew, never anything more.
+        HudHarness harness;
+        harness.hud().beginSession();
+
+        for (int minutes = 30; minutes >= 0; --minutes) {
+            const int framesBefore = harness.frames().size();
+            harness.hud().noteCreditMinutes(minutes);
+            harness.hud().tick();
+            const QImage expected = harness.hud().compositor().composedBottom();
+            if (!expected.isNull()) {
+                QVERIFY(harness.frames().size() > framesBefore);
+                QCOMPARE(harness.frames().last(), expected);
+            }
+        }
+
+        // A top-up (D-21): still nothing beyond the compositor's own output.
+        harness.hud().noteCreditMinutes(20);
+        harness.hud().tick();
+        QVERIFY2(harness.hud().compositor().composedBottom().isNull(),
+                 "a top-up above ten hides Time left");
+
+        // A reconnect-shaped engine status write (D-13's own path, never `HudOverlay`'s removed
+        // reconnect line).
+        SDL_Color engineColor = {0xCC, 0x00, 0x00, 0xFF};
+        SDL_Surface* engineFrame = OsdCompositor::rasterize(Overlay::OverlayStatusUpdate,
+                                                            "Poor connection to PC", /*enabled=*/true,
+                                                            engineColor, &harness.hud().compositor());
+        QVERIFY(engineFrame != nullptr);
+        SDL_FreeSurface(engineFrame);
+        harness.hud().tick();
+        QCOMPARE(harness.frames().last(), harness.hud().compositor().composedBottom());
+
+        harness.hud().endSession();
+    }
+
+    // D-12: the End-session shortcut hint is gone from the overlay, but the binding itself is
+    // untouched - `main.qml`'s own `Shortcut` still calls `interrupt()` on the same combination.
+    void theEngineQuitBindingIsUntouched()
+    {
+        const QString mainQml = readForkFile(QStringLiteral("app/gui/main.qml"));
+        QVERIFY2(!mainQml.isEmpty(), "app/gui/main.qml could not be read - is FORK_ROOT right?");
+        QVERIFY2(mainQml.contains(QStringLiteral("\"Ctrl+Alt+Shift+Q\"")),
+                 "main.qml no longer binds the in-stream quit sequence");
+        QVERIFY2(mainQml.contains(QStringLiteral("seatHub.interrupt()")),
+                 "the quit shortcut no longer calls interrupt()");
     }
 };
 

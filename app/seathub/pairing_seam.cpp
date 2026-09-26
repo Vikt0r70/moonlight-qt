@@ -29,24 +29,28 @@ class HandshakeTask : public QObject, public QRunnable
     Q_OBJECT
 
 public:
-    HandshakeTask(PairingHandshake handshake, PairingTarget target)
-        : m_handshake(std::move(handshake)), m_target(std::move(target))
+    HandshakeTask(PairingHandshake handshake, PairingTarget target, quint64 generation)
+        : m_handshake(std::move(handshake)), m_target(std::move(target)), m_generation(generation)
     {
     }
 
     void run() override
     {
-        // The target - including the PIN - is captured by value and destroyed with this task.
-        // Nothing copies it anywhere else, and nothing logs it.
-        emit finished(m_handshake(m_target));
+        // The target - including the PIN - is captured by value and destroyed with this task. The
+        // generation travels with the result so a `pair()` call that has since superseded this one
+        // (T-06.6-53) can be told apart from the current one - upstream's own blocking call cannot
+        // be aborted, so this task keeps running to completion regardless; only its result's fate
+        // changes. Nothing copies the target anywhere else, and nothing logs it.
+        emit finished(m_generation, m_handshake(m_target));
     }
 
 signals:
-    void finished(PairingHandshakeResult result);
+    void finished(quint64 generation, PairingHandshakeResult result);
 
 private:
     PairingHandshake m_handshake;
     PairingTarget m_target;
+    quint64 m_generation;
 };
 
 } // namespace
@@ -83,7 +87,9 @@ ProductionPairingSeam::ProductionPairingSeam(QObject* parent)
         PairingHandshakeResult timedOut;
         timedOut.engineError = QStringLiteral("the pairing handshake did not finish inside %1 ms")
                                    .arg(m_deadlineMs);
-        finish(timedOut);
+        // 06.6-18/T-06.6-53: this timer is restarted by every `pair()` call, so whenever it fires
+        // it is timing out whichever handshake is current - `m_generation` always names that one.
+        finish(m_generation, timedOut);
     });
 }
 
@@ -102,15 +108,6 @@ void ProductionPairingSeam::setDeadlineMs(int milliseconds)
 void ProductionPairingSeam::pair(const PairingTarget& target,
                                  std::function<void(bool, const QString&, const QString&)> done)
 {
-    if (m_pending) {
-        // One handshake at a time. Two at once against the same rig would collide on the host
-        // side - Sunshine refuses a second pairing session for the same client id with a 409
-        // (`add_authorized_client` / `insert_pair_session`) - and the caller would have two
-        // results for one session. Refusing is the fail-closed answer.
-        done(false, QString(), QStringLiteral("a pairing handshake is already in flight"));
-        return;
-    }
-
     if (target.hostAddress.isEmpty() || target.pairingPin.isEmpty()) {
         // Nothing to pair against, or nothing to pair with. The controller already refuses an
         // empty PIN before it calls this seam, so this is a boundary check on a public entry
@@ -125,25 +122,41 @@ void ProductionPairingSeam::pair(const PairingTarget& target,
         return;
     }
 
+    // 06.6-18/T-06.6-53: a `pair()` call while an earlier one is still in flight is a fresh Play
+    // or Try again for a different session - it is abandoned, not refused. Refusing here would
+    // leave that customer stuck behind a handshake that can never resolve into their new session
+    // anyway. Upstream's own blocking call cannot be aborted, so the old one keeps its pool thread
+    // until it returns and finds nothing waiting for it: the generation bump below is what makes
+    // that safe.
+    ++m_generation;
+    const quint64 generation = m_generation;
+
     m_pending = true;
+    // 06.6-18/T-06.6-52: recorded before the handshake starts, so a late `hostResolved` always
+    // carries the session it actually paired for, whatever this object's caller does meanwhile.
+    m_sessionId = target.sessionId;
     m_done = std::move(done);
+    // Restarts the timer if one was already running (for the handshake this call just superseded) -
+    // it now counts down 90 s from THIS `pair()` call, not from whatever remained of the old one.
     m_deadline->start(m_deadlineMs);
 
-    HandshakeTask* task = new HandshakeTask(m_handshake, target);
+    HandshakeTask* task = new HandshakeTask(m_handshake, target, generation);
     connect(task, &HandshakeTask::finished, this, &ProductionPairingSeam::handleHandshakeResult);
     QThreadPool::globalInstance()->start(task);
 }
 
-void ProductionPairingSeam::handleHandshakeResult(const PairingHandshakeResult& result)
+void ProductionPairingSeam::handleHandshakeResult(quint64 generation, const PairingHandshakeResult& result)
 {
-    finish(result);
+    finish(generation, result);
 }
 
-void ProductionPairingSeam::finish(const PairingHandshakeResult& result)
+void ProductionPairingSeam::finish(quint64 generation, const PairingHandshakeResult& result)
 {
-    if (!m_pending) {
-        // The deadline already spoke - or this is a late result from a handshake whose lease was
-        // revoked. `done` is called exactly once per `pair()`, which is the whole contract.
+    if (!m_pending || generation != m_generation) {
+        // Either the deadline already spoke for the current generation, or this generation is
+        // stale: a later `pair()` call has superseded the handshake it belongs to (T-06.6-53), or
+        // this is a very late result from a handshake whose lease was revoked. `done` is called
+        // exactly once per `pair()`, which is the whole contract - a stale generation gets nothing.
         return;
     }
 
@@ -175,8 +188,10 @@ void ProductionPairingSeam::finish(const PairingHandshakeResult& result)
     qCInfo(seathubPairingSeam) << "upstream pairing handshake completed";
 
     // The host travels first: the engine session is built from it, and a listener that acted on
-    // `done` before this arrived would be building a session from nothing.
-    emit hostResolved(result.host);
+    // `done` before this arrived would be building a session from nothing. Tagged with the session
+    // this handshake paired for (06.6-18/T-06.6-52), so a listener whose attached session has since
+    // moved on can tell a live result from a stale one.
+    emit hostResolved(m_sessionId, result.host);
 
     done(true, result.clientIdentity, QString());
 }

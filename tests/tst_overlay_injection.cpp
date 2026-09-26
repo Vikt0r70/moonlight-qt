@@ -23,6 +23,9 @@
 
 #include <QtTest>
 
+#include <atomic>
+#include <thread>
+
 // Don't let SDL hook our main function: Qt Test already provides one (the same reason and the
 // same fix as `app/main.cpp`). Without this, `QTEST_MAIN` expands to `SDL_main` and the link
 // fails with "unresolved external symbol main".
@@ -30,6 +33,7 @@
 #include <SDL.h>
 
 #include "streaming/video/overlaymanager.h"
+#include "seathub/osd_compositor.h"
 
 namespace {
 
@@ -68,6 +72,69 @@ Uint32 pixelAt(const SDL_Surface* surface, int x, int y)
     const auto* row = reinterpret_cast<const Uint32*>(
         static_cast<const Uint8*>(surface->pixels) + y * surface->pitch);
     return row[x];
+}
+
+// Plan 10 (D-09, ADR-0045 amended 2026-09-26): tolerates anti-aliasing at a glyph's edges - "is
+// this colour present" is a nearness test, not an equality test, the same rule
+// `tst_osd_render.cpp`'s own `regionHasPixelNear()` documents.
+bool surfaceRegionHasPixelNear(const SDL_Surface* surface, int x0, int y0, int x1, int y1,
+                               Uint8 r, Uint8 g, Uint8 b, int tolerance = 24)
+{
+    for (int y = y0; y < y1; ++y) {
+        for (int x = x0; x < x1; ++x) {
+            const Uint32 pixel = pixelAt(surface, x, y);
+            const Uint8 a = static_cast<Uint8>((pixel >> 24) & 0xFF);
+            if (a == 0) {
+                continue;
+            }
+            const Uint8 pr = static_cast<Uint8>((pixel >> 16) & 0xFF);
+            const Uint8 pg = static_cast<Uint8>((pixel >> 8) & 0xFF);
+            const Uint8 pb = static_cast<Uint8>(pixel & 0xFF);
+            if (qAbs(int(pr) - int(r)) <= tolerance && qAbs(int(pg) - int(g)) <= tolerance
+                && qAbs(int(pb) - int(b)) <= tolerance) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// Plan 10, Task 1: a rasteriser that records exactly what it was called with, so
+// `rasterizerReceivesRawTextEnabledAndColour` can assert on the hook's own arguments directly -
+// independent of `OsdCompositor`, which is exercised separately below.
+struct RecordedRasterizerCall
+{
+    Overlay::OverlayType type;
+    QByteArray text;
+    bool enabled;
+    SDL_Color color;
+};
+
+QList<RecordedRasterizerCall> g_recordedRasterizerCalls;
+
+SDL_Surface* recordingRasterizer(Overlay::OverlayType type, const char* text, bool enabled,
+                                 SDL_Color color, void* context)
+{
+    Q_UNUSED(context);
+    g_recordedRasterizerCalls.append(
+        RecordedRasterizerCall{ type, QByteArray(text != nullptr ? text : ""), enabled, color });
+    return nullptr;
+}
+
+// Plan 10, Task 2: a rasteriser that always returns a valid surface in a pixel format
+// `OverlayManager` does not accept, so the hook's own refusal rule (not `OsdCompositor`'s) is
+// what is under test.
+SDL_Surface* foreignFormatRasterizer(Overlay::OverlayType, const char*, bool, SDL_Color, void*)
+{
+    return SDL_CreateRGBSurfaceWithFormat(0, 8, 8, 32, SDL_PIXELFORMAT_RGBA8888);
+}
+
+// Plan 10, Task 2: a rasteriser that always returns a valid ARGB8888 surface - proves that a
+// disabled slot is refused by the hook even when the rasteriser itself returns something the
+// renderer would otherwise accept.
+SDL_Surface* fixedArgbRasterizer(Overlay::OverlayType, const char*, bool, SDL_Color, void*)
+{
+    return SDL_CreateRGBSurfaceWithFormat(0, 8, 8, 32, SDL_PIXELFORMAT_ARGB8888);
 }
 
 // Phase 5 plan 12 (CUST-17/D-23/D-26): the eleven lines Moonlight 6.1.0's own
@@ -491,6 +558,286 @@ private slots:
         manager.setOverlayState(Overlay::OverlayDebug, true);
 
         QVERIFY(manager.filteredDebugText().isEmpty());
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // Plan 10 (D-09, D-13, ADR-0045 amended 2026-09-26): the pluggable text rasteriser this plan
+    // adds to `overlaymanager.{h,cpp}`, and SeatHub's `OsdCompositor` behind it.
+    // ------------------------------------------------------------------------------------------
+
+    void rasterizerReceivesRawTextEnabledAndColour()
+    {
+        g_recordedRasterizerCalls.clear();
+
+        Overlay::OverlayManager manager;
+        MockOverlayRenderer renderer;
+        manager.setOverlayRenderer(&renderer);
+        manager.setTextRasterizer(&recordingRasterizer, nullptr);
+
+        // A filter that excludes everything: if the hook handed the FILTERED text to the
+        // rasteriser (as the SDL_ttf path's `filteredDebugText()` would), the recorded text below
+        // would be empty. It must be the raw text instead (D-10's total latency needs lines the
+        // customer may not have ticked; see `filteredDebugText()`'s own header comment).
+        manager.setDebugLineFilter({});
+        manager.setOverlayState(Overlay::OverlayDebug, true);
+        manager.updateOverlayText(Overlay::OverlayDebug, kAllDebugLinesRaw);
+
+        QVERIFY(!g_recordedRasterizerCalls.isEmpty());
+        const RecordedRasterizerCall debugCall = g_recordedRasterizerCalls.last();
+        QCOMPARE(static_cast<int>(debugCall.type), static_cast<int>(Overlay::OverlayDebug));
+        QCOMPARE(debugCall.text, QByteArray(kAllDebugLinesRaw));
+        QVERIFY(debugCall.enabled);
+        QCOMPARE(debugCall.color.r, static_cast<Uint8>(0xD0));
+        QCOMPARE(debugCall.color.g, static_cast<Uint8>(0xD0));
+        QCOMPARE(debugCall.color.b, static_cast<Uint8>(0x00));
+        QCOMPARE(debugCall.color.a, static_cast<Uint8>(0xFF));
+
+        g_recordedRasterizerCalls.clear();
+        manager.setOverlayState(kType, true);
+        manager.updateOverlayText(kType, "Poor connection to PC");
+
+        QVERIFY(!g_recordedRasterizerCalls.isEmpty());
+        const RecordedRasterizerCall statusCall = g_recordedRasterizerCalls.last();
+        QCOMPARE(static_cast<int>(statusCall.type), static_cast<int>(kType));
+        QCOMPARE(statusCall.text, QByteArray("Poor connection to PC"));
+        QVERIFY(statusCall.enabled);
+        QCOMPARE(statusCall.color.r, static_cast<Uint8>(0xCC));
+        QCOMPARE(statusCall.color.g, static_cast<Uint8>(0x00));
+        QCOMPARE(statusCall.color.b, static_cast<Uint8>(0x00));
+        QCOMPARE(statusCall.color.a, static_cast<Uint8>(0xFF));
+    }
+
+    // RESEARCH-FORK.md §1.3 "Why the hook goes before the re-assert branch": that branch
+    // (`:321` before this plan) returns early whenever a SeatHub bitmap is remembered, which
+    // would otherwise hide D-13's message for as long as Time left stays published. With the
+    // rasteriser called first, the engine's own text always reaches it.
+    void engineTextReachesTheHookWhileASeatHubBitmapIsRemembered()
+    {
+        g_recordedRasterizerCalls.clear();
+
+        Overlay::OverlayManager manager;
+        MockOverlayRenderer renderer;
+        manager.setOverlayRenderer(&renderer);
+        manager.setTextRasterizer(&recordingRasterizer, nullptr);
+        manager.setOverlayState(kType, true);
+
+        SDL_Surface* bitmap = makeBitmap(64, 24, 0xFF112233);
+        QVERIFY(bitmap != nullptr);
+        QVERIFY(manager.updateOverlaySurface(kType, bitmap));
+
+        g_recordedRasterizerCalls.clear();
+        manager.updateOverlayText(kType, "Poor connection to PC");
+
+        QVERIFY(!g_recordedRasterizerCalls.isEmpty());
+        QCOMPARE(g_recordedRasterizerCalls.last().text, QByteArray("Poor connection to PC"));
+    }
+
+    // D-13: Moonlight's own status line, drawn by SeatHub in the slot's own colour, bottom-left.
+    void compositorDrawsTheEngineLineInItsSlotColour()
+    {
+        OsdCompositor compositor;
+        const SDL_Color red{ 0xCC, 0x00, 0x00, 0xFF };
+
+        SDL_Surface* surface = OsdCompositor::rasterize(kType, "Poor connection to PC", true, red,
+                                                         &compositor);
+        QVERIFY(surface != nullptr);
+        QCOMPARE(surface->format->format, static_cast<Uint32>(SDL_PIXELFORMAT_ARGB8888));
+        QVERIFY(!SDL_MUSTLOCK(surface));
+
+        QVERIFY(surfaceRegionHasPixelNear(surface, 0, 0, surface->w / 2, surface->h,
+                                          0xCC, 0x00, 0x00));
+
+        SDL_FreeSurface(surface);
+    }
+
+    // With no `setTextRasterizer()` call ever made on this manager, the text path behaves exactly
+    // as it did before this plan added the hook - the no-font-linked early return every other test
+    // in this file already relies on (see this file's own header).
+    void noHookKeepsTodaysPath()
+    {
+        Overlay::OverlayManager manager;
+        MockOverlayRenderer renderer;
+        manager.setOverlayRenderer(&renderer);
+        manager.setOverlayState(kType, true);
+        const int afterEnable = renderer.calls;
+
+        manager.updateOverlayText(kType, "Poor connection to PC");
+
+        QCOMPARE(renderer.calls, afterEnable);
+        QVERIFY(manager.getUpdatedOverlaySurface(kType) == nullptr);
+    }
+
+    // Plan 10, Task 2: a returned surface in a pixel format the renderer cannot take, or a valid
+    // surface for a slot that is disabled, is refused (freed, nothing published) - the same rule
+    // `updateOverlaySurface()` already applies, now also enforced on the rasteriser's own path.
+    void rasterizerRefusesAForeignSurface()
+    {
+        {
+            Overlay::OverlayManager manager;
+            MockOverlayRenderer renderer;
+            manager.setOverlayRenderer(&renderer);
+            manager.setTextRasterizer(&foreignFormatRasterizer, nullptr);
+            manager.setOverlayState(kType, true);
+
+            manager.updateOverlayText(kType, "Poor connection to PC");
+
+            QVERIFY(manager.getUpdatedOverlaySurface(kType) == nullptr);
+        }
+        {
+            Overlay::OverlayManager manager;
+            MockOverlayRenderer renderer;
+            manager.setOverlayRenderer(&renderer);
+            manager.setTextRasterizer(&fixedArgbRasterizer, nullptr);
+            manager.setOverlayState(kType, true);
+
+            // Disabling calls notifyOverlayUpdated() (state changed) with `enabled == false`; the
+            // rasteriser still returns a valid ARGB8888 surface, and the hook must refuse it.
+            manager.setOverlayState(kType, false);
+
+            QVERIFY(manager.getUpdatedOverlaySurface(kType) == nullptr);
+        }
+    }
+
+    // This test project links no ModeSeven.ttf/SDL_ttf font resource at all (see this file's own
+    // header) - the rasteriser path never touches TTF, so publishing succeeds regardless.
+    void rasterizerRunsWithoutFontData()
+    {
+        OsdCompositor compositor;
+        Overlay::OverlayManager manager;
+        MockOverlayRenderer renderer;
+        manager.setOverlayRenderer(&renderer);
+        manager.setTextRasterizer(&OsdCompositor::rasterize, &compositor);
+        manager.setOverlayState(kType, true);
+
+        manager.updateOverlayText(kType, "Poor connection to PC");
+
+        SDL_Surface* taken = manager.getUpdatedOverlaySurface(kType);
+        QVERIFY(taken != nullptr);
+        SDL_FreeSurface(taken);
+    }
+
+    // The engine clears `text` to empty before calling this class's own text path on disable
+    // (`setOverlayState(false)`); the compositor's own recorded engine text must reflect that, so
+    // a later composition draws Time left alone rather than the stale line.
+    void disablingTheSlotClearsTheRecordedEngineText()
+    {
+        OsdCompositor compositor;
+        Overlay::OverlayManager manager;
+        MockOverlayRenderer renderer;
+        manager.setOverlayRenderer(&renderer);
+        manager.setTextRasterizer(&OsdCompositor::rasterize, &compositor);
+        manager.setOverlayState(kType, true);
+        manager.updateOverlayText(kType, "Poor connection to PC");
+
+        SDL_Surface* withEngineText = manager.getUpdatedOverlaySurface(kType);
+        QVERIFY(withEngineText != nullptr);
+        SDL_FreeSurface(withEngineText);
+
+        manager.setOverlayState(kType, false);
+
+        QVERIFY(compositor.composedBottom().isNull());
+
+        const OsdTimeLeft timeLeft{ true, 4, false };
+        compositor.setTimeLeft(timeLeft);
+        const QImage composed = compositor.composedBottom();
+        const QImage expected = renderOsdBottom(1920, 1080, QString(), 0, timeLeft);
+        QCOMPARE(composed, expected);
+    }
+
+    // Reentrancy (RESEARCH-FORK.md §1.3 "Threads"): the hook runs on the decoder thread, the SDL
+    // main thread and moonlight-common-c's connection-status callback thread. `rasterize()` must
+    // be safe called concurrently from several threads while `setTimeLeft()`/`setWindowSize()`
+    // mutate state on another - every surface returned is well-formed or null, and nothing
+    // crashes.
+    void compositorIsReentrant()
+    {
+        OsdCompositor compositor;
+        std::atomic<bool> sawBadSurface{ false };
+
+        auto rasterizeWorker = [&]() {
+            for (int i = 0; i < 200; ++i) {
+                const SDL_Color colours[] = { { 0xCC, 0x00, 0x00, 0xFF }, { 0xD0, 0xD0, 0x00, 0xFF } };
+                SDL_Surface* s = OsdCompositor::rasterize(kType, "Poor connection to PC", true,
+                                                          colours[i % 2], &compositor);
+                if (s != nullptr) {
+                    if (s->format->format != SDL_PIXELFORMAT_ARGB8888 || SDL_MUSTLOCK(s)) {
+                        sawBadSurface.store(true);
+                    }
+                    SDL_FreeSurface(s);
+                }
+            }
+        };
+
+        auto stateWorker = [&]() {
+            for (int i = 0; i < 200; ++i) {
+                compositor.setTimeLeft(OsdTimeLeft{ (i % 2) == 0, i % 20, (i % 3) == 0 });
+                compositor.setWindowSize(1280 + (i % 4) * 100, 720 + (i % 4) * 100);
+            }
+        };
+
+        std::thread t1(rasterizeWorker);
+        std::thread t2(rasterizeWorker);
+        std::thread t3(rasterizeWorker);
+        std::thread t4(stateWorker);
+
+        t1.join();
+        t2.join();
+        t3.join();
+        t4.join();
+
+        QVERIFY(!sawBadSurface.load());
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // Plan 16 (D-08, D-10, D-26): the compositor's `OverlayDebug` branch - the stats block, drawn
+    // from the raw text of the customer's ticked rows only, in `06.6-DECISION-OSD-LABEL-COLUMN.md`'s
+    // own colours (`#FF9A2E` labels, `#2DD4BF` for the resolution row's label).
+    // ------------------------------------------------------------------------------------------
+
+    // With RES, FPS and LATENCY ticked, the compositor draws all three rows from the raw text -
+    // both label colours are present. With only FPS ticked, the drawn surface is shorter (one row
+    // instead of three), proving the rows drawn really do follow the ticked labels, not every
+    // parsed line.
+    void statsAreDrawnFromTheRawTextOfTickedRows()
+    {
+        OsdCompositor compositor;
+        const SDL_Color yellow{ 0xD0, 0xD0, 0x00, 0xFF };
+
+        compositor.setEnabledStatsLabels({ QStringLiteral("Video stream"),
+                                           QStringLiteral("Rendering frame rate"),
+                                           QStringLiteral("Average network latency") });
+
+        SDL_Surface* threeRows = OsdCompositor::rasterize(Overlay::OverlayDebug, kAllDebugLinesRaw,
+                                                          true, yellow, &compositor);
+        QVERIFY(threeRows != nullptr);
+        QCOMPARE(threeRows->format->format, static_cast<Uint32>(SDL_PIXELFORMAT_ARGB8888));
+        QVERIFY(!SDL_MUSTLOCK(threeRows));
+        QVERIFY(surfaceRegionHasPixelNear(threeRows, 0, 0, threeRows->w, threeRows->h,
+                                          0xFF, 0x9A, 0x2E));
+        QVERIFY(surfaceRegionHasPixelNear(threeRows, 0, 0, threeRows->w, threeRows->h,
+                                          0x2D, 0xD4, 0xBF));
+
+        compositor.setEnabledStatsLabels({ QStringLiteral("Rendering frame rate") });
+        SDL_Surface* oneRow = OsdCompositor::rasterize(Overlay::OverlayDebug, kAllDebugLinesRaw,
+                                                       true, yellow, &compositor);
+        QVERIFY(oneRow != nullptr);
+        QVERIFY(oneRow->h < threeRows->h);
+
+        SDL_FreeSurface(threeRows);
+        SDL_FreeSurface(oneRow);
+    }
+
+    // OD-04, now SeatHub's own rule (RESEARCH-FORK.md §5): with every row unticked, nothing is
+    // drawn, even though the slot itself is enabled and the raw text carries every line.
+    void nothingDrawnWithEveryRowOff()
+    {
+        OsdCompositor compositor;
+        const SDL_Color yellow{ 0xD0, 0xD0, 0x00, 0xFF };
+        compositor.setEnabledStatsLabels({});
+
+        SDL_Surface* surface = OsdCompositor::rasterize(Overlay::OverlayDebug, kAllDebugLinesRaw,
+                                                         true, yellow, &compositor);
+        QVERIFY(surface == nullptr);
     }
 };
 
