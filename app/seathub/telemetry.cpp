@@ -513,7 +513,23 @@ bool signedIn()
 
 void maybeTestCrash()
 {
-    // RED (Task 3): real switch lands in the GREEN commit.
+    if (s_testCrashChecked) {
+        return;
+    }
+    s_testCrashChecked = true;
+
+    const QByteArray value = qgetenv("SEATHUB_TEST_CRASH");
+    if (value == "1") {
+        sentry_crash();
+    }
+    else if (value == "fastfail") {
+        __fastfail(FAST_FAIL_FATAL_APP_EXIT);
+    }
+    else if (value == "qfatal") {
+        qFatal("SeatHub test crash (SEATHUB_TEST_CRASH=qfatal)");
+    }
+    // else: unset, empty, or any other value - ignored (D-10: nothing shown to the customer,
+    // and nothing here is a reason to crash a real customer's run).
 }
 
 } // namespace SeatHubTelemetry
