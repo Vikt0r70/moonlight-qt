@@ -469,6 +469,63 @@ private slots:
                  "Tokens.qml no longer declares destructiveDefault: \"#ef4444\"");
     }
 
+    // Plan 06.6-20 (D-17/D-20): every OSD colour token the generated Tokens.qml declares matches
+    // the constant `osd_renderer.h` compiles in - so a design-token regen (or a hand-edit of the
+    // generated file, which must never happen) cannot drift silently from what the renderer
+    // actually draws. `hudUsesTheGeneratedDesignTokens` above already pins `destructiveDefault`;
+    // this pins the other four osd-prefixed tokens the renderer also reads.
+    void osdColoursAreTheGeneratedTokens()
+    {
+        const QString tokens = readForkFile(QStringLiteral("app/gui/Tokens.qml"));
+        QVERIFY2(!tokens.isEmpty(), "app/gui/Tokens.qml could not be read - is FORK_ROOT right?");
+
+        auto hex = [](QRgb rgb) {
+            return QStringLiteral("#%1").arg(rgb & 0xFFFFFFu, 6, 16, QLatin1Char('0'));
+        };
+
+        QVERIFY2(tokens.contains(QStringLiteral("osdLabelDefault: \"%1\"").arg(hex(kOsdLabel))),
+                 qPrintable(QStringLiteral("Tokens.qml's osdLabelDefault must be %1 (kOsdLabel)")
+                                .arg(hex(kOsdLabel))));
+        QVERIFY2(tokens.contains(
+                     QStringLiteral("osdLabelMediaDefault: \"%1\"").arg(hex(kOsdLabelMedia))),
+                 qPrintable(QStringLiteral("Tokens.qml's osdLabelMediaDefault must be %1 (kOsdLabelMedia)")
+                                .arg(hex(kOsdLabelMedia))));
+        QVERIFY2(tokens.contains(QStringLiteral("osdValueDefault: \"%1\"").arg(hex(kOsdValue))),
+                 qPrintable(QStringLiteral("Tokens.qml's osdValueDefault must be %1 (kOsdValue)")
+                                .arg(hex(kOsdValue))));
+        QVERIFY2(tokens.contains(QStringLiteral("osdOutlineDefault: Qt.rgba(0, 0, 0, 0.85)")),
+                 "Tokens.qml's osdOutlineDefault must be the generator's Qt.rgba(0, 0, 0, 0.85) "
+                 "form (kOsdOutline: black, 0.85 alpha)");
+        QVERIFY2(tokens.contains(QStringLiteral("destructiveDefault: \"%1\"").arg(hex(kOsdDestructive))),
+                 qPrintable(QStringLiteral("Tokens.qml's destructiveDefault must be %1 (kOsdDestructive)")
+                                .arg(hex(kOsdDestructive))));
+    }
+
+    // Plan 06.6-20 (D-17/D-20): Time left's own two colours - the white reminder and the red final
+    // state - are exactly the tokens `osdColoursAreTheGeneratedTokens` just pinned above, not some
+    // other white or red the renderer might drift to independently.
+    void timeLeftColoursAreTheTokens()
+    {
+        HudHarness harness;
+        harness.hud().beginSession();
+
+        harness.hud().noteCreditMinutes(10);
+        harness.hud().tick();
+        const QImage reminder = harness.frames().last();
+        QVERIFY2(countColour(reminder, kOsdValue, 0) > 0,
+                 "the ten-minute reminder's fill must be osdValueDefault");
+        QCOMPARE(countColour(reminder, kOsdDestructive, 0), 0);
+
+        harness.hud().noteCreditMinutes(5);
+        harness.hud().tick();
+        const QImage redFrame = harness.frames().last();
+        QVERIFY2(countColour(redFrame, kOsdDestructive, 0) > 0,
+                 "the five-minute final state's fill must be destructiveDefault");
+        QCOMPARE(countColour(redFrame, kOsdValue, 0), 0);
+
+        harness.hud().endSession();
+    }
+
     // The published surface is what `OverlayManager::updateOverlaySurface()` accepts and what
     // `notifyOverlayUpdated()` uploads without asserting - the same three guards proof (a)
     // asserts on a synthetic image, now asserted on Time left's real output.
