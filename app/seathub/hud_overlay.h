@@ -8,6 +8,7 @@
 #endif
 #include <SDL.h>
 
+#include <QElapsedTimer>
 #include <QImage>
 #include <QString>
 
@@ -70,13 +71,17 @@
 class HudOverlay
 {
 public:
-    // `docs/spec/timing.md`: "Low-balance warnings: 10 min, then 2 min", and the two card
-    // lifetimes (the ten-minute card for 15 seconds, the two-minute card until the session ends).
-    // The balance element (`BalancePill.qml`) reads the same two numbers from the same spec row;
-    // `tst_hud_bitmap` pins them here so a change of the row has to change this file too.
-    static constexpr qint64 kWarnMinutes = 10;
-    static constexpr qint64 kCriticalMinutes = 2;
-    static constexpr qint64 kTenMinuteCardMs = 15000;
+    // `docs/spec/timing.md`: "In-stream Time left, reminder" (a fresh read at or below 10 minutes,
+    // shown white for one minute), "In-stream Time left, final" (a fresh read at or below 5
+    // minutes, red to the end) and the top-up row (D-11, D-16, D-20, D-21). Plan 22 retires the
+    // CUST-15 low-balance-card thresholds this class used to carry under the names
+    // `kWarnMinutes`/`kCriticalMinutes`/`kTenMinuteCardMs`, and Plan 14's own separate
+    // `kTimeLeftThresholdMinutes`/`kTimeLeftCriticalMinutes` (`hud_overlay.cpp`), into these three:
+    // one source for 10, 5 and 60000 from here on. `tst_hud_bitmap` pins them here so a change of
+    // the spec row has to change this file too.
+    static constexpr qint64 kReminderMinutes = 10;
+    static constexpr qint64 kStaysMinutes = 5;
+    static constexpr qint64 kReminderMs = 60000;
 
     /// Which low-balance card is on screen. At most one: the two-minute card replaces the
     /// ten-minute one.
@@ -186,6 +191,18 @@ public:
     OsdCompositor& compositor() { return m_compositor; }
 
 private:
+    /// D-11/D-16/D-20/D-21 (Plan 22), driven by fresh reads (`noteCreditMinutes()`) and the
+    /// monotonic tick (`tick()`): `Hidden` (above the reminder), `Reminder` (white, for
+    /// `kReminderMs`), `Rested` (reminder spent, still above `kStaysMinutes`) and `Critical` (red,
+    /// from `kStaysMinutes` to the end of the session). See `applyTimeLeftReading()`.
+    enum class TimeLeftState { Hidden, Reminder, Rested, Critical };
+
+    /// Evaluates one fresh read against the state machine above (`06.6-RESEARCH-FORK.md` §6's
+    /// transition table) and publishes the result to `m_compositor.setTimeLeft()`. Called from
+    /// `noteCreditMinutes()` only - `seedCreditMinutes()` never reaches here (D-16: the pre-stream
+    /// seed never shows Time left).
+    void applyTimeLeftReading(qint64 minutes);
+
     void publishFrame(bool strip);
     /// The compositor's own owned-surface publish (the same CR-03 pattern `publishFrame()` uses),
     /// for whichever caller decided `composed` is what should be on screen this cycle.
@@ -244,6 +261,21 @@ private:
     int m_twoFiredCount = 0;
     Card m_card = Card::None;
     qint64 m_tenShownAtMs = 0;
+
+    // D-11/D-16/D-20/D-21 (Plan 22): Time left's own state, guarded by `m_warnMutex` for the same
+    // reason the legacy warning fields above are - it changes on a fresh read from the liveness
+    // thread and is read from `tick()` on the timer thread.
+    TimeLeftState m_timeLeftState = TimeLeftState::Hidden;
+    bool m_reminderFired = false;
+    qint64 m_reminderStartedMs = 0;
+    /// The last fresh read this session, or -1 before the first one (never set by
+    /// `seedCreditMinutes()` - only a fresh read can be "the previous one" for the top-up rule).
+    qint64 m_prevReading = -1;
+
+    // The default clock (`nowMs()`, with none injected): a monotonic clock, not wall time, so a
+    // system clock change cannot shorten or stretch the one-minute reminder window (T-06.6-61).
+    // Started once, at construction; a test that cares injects its own clock via `setClock()`.
+    QElapsedTimer m_monotonicClock;
 
     // D-09/D-11/D-13 (Plan 14): thread-safe on its own (a mutex-guarded `State`, per its own
     // header comment) - no extra locking needed here.

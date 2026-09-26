@@ -4,7 +4,6 @@
 
 #include <QColor>
 #include <QCoreApplication>
-#include <QDateTime>
 #include <QFont>
 #include <QFontMetricsF>
 #include <QLoggingCategory>
@@ -50,15 +49,6 @@ constexpr int kTickMs = 1000;
 
 // screens.md §25: the HUD "auto-hides after 4s, reappears on input".
 constexpr qint64 kAutoHideMs = 4000;
-
-// D-11/D-20 (Plan 14): the compositor's own Time left thresholds, drawn from a fresh wallet read
-// only (`noteCreditMinutes()`). Named separately from `HudOverlay::kWarnMinutes`/
-// `kCriticalMinutes` above even though the first happens to share 10 with them: those are the
-// legacy strip/card thresholds (`timing.md`'s old "10 min, then 2 min" row) that Plan 22 retires;
-// these are D-11's own values (10, then critical at 5) and the two systems are not the same rule
-// merely because one number coincides.
-constexpr qint64 kTimeLeftThresholdMinutes = 10;
-constexpr qint64 kTimeLeftCriticalMinutes = 5;
 
 // The End session affordance. `End session` is copy.md's own label (its glossary forbids "Quit"
 // and "Stop"); the key combination is the D-02 binding stated as a binding, not as prose. The
@@ -189,15 +179,15 @@ QFont cardFont()
 }
 
 // The colour a credit value carries: normal above ten minutes, warn at ten or fewer, destructive at
-// two or fewer. Nothing here is the client's own number - the thresholds are `timing.md`'s, through
-// `HudOverlay`'s two constants - and the glyph is drawn wherever this is not the normal colour, so
-// colour is never the only signal (`ui.md` 12).
+// five or fewer. Nothing here is the client's own number - the thresholds are `timing.md`'s,
+// through `HudOverlay`'s two constants - and the glyph is drawn wherever this is not the normal
+// colour, so colour is never the only signal (`ui.md` 12).
 QRgb creditColour(qint64 minutes)
 {
-    if (minutes <= HudOverlay::kCriticalMinutes) {
+    if (minutes <= HudOverlay::kStaysMinutes) {
         return kTextDestructive;
     }
-    if (minutes <= HudOverlay::kWarnMinutes) {
+    if (minutes <= HudOverlay::kReminderMinutes) {
         return kWarn;
     }
     return kTextPrimary;
@@ -289,7 +279,13 @@ bool isUserInput(Uint32 type)
 
 } // namespace
 
-HudOverlay::HudOverlay() = default;
+HudOverlay::HudOverlay()
+{
+    // The default monotonic clock (`nowMs()`, with no `setClock()` injected) - started once here,
+    // never restarted, so `elapsed()` is a stable "ms since this object was constructed" for the
+    // whole process lifetime.
+    m_monotonicClock.start();
+}
 
 HudOverlay::~HudOverlay()
 {
@@ -323,7 +319,8 @@ qint64 HudOverlay::nowMs() const
     if (m_clock) {
         return m_clock();
     }
-    return QDateTime::currentMSecsSinceEpoch();
+    // D-11/T-06.6-61: monotonic, not wall time (see the header's own comment on `m_monotonicClock`).
+    return m_monotonicClock.elapsed();
 }
 
 QString HudOverlay::timerText() const
@@ -360,7 +357,7 @@ QImage HudOverlay::renderFrame(qint64 elapsedSeconds, int displayWidth, bool sho
     const bool hasCredit = credit >= 0;
     const QString creditLabel = hudTr(kCreditLabel);
     const QString creditText = hasCredit ? durationText(credit) : QString();
-    const bool creditAlert = hasCredit && credit <= kWarnMinutes;
+    const bool creditAlert = hasCredit && credit <= kReminderMinutes;
 
     const QString timer = formatDuration(elapsedSeconds);
     const QString live = hudTr(kLiveLabel);
@@ -488,13 +485,13 @@ QImage HudOverlay::renderFrame(qint64 elapsedSeconds, int displayWidth, bool sho
             if (hasCredit) {
                 // `Credit left` (`copy.md` "In session"), the wallet balance in the duration
                 // format: warn-coloured with a glyph at ten minutes or fewer, destructive with a
-                // different glyph at two or fewer. A glyph as well as a colour, always.
+                // different glyph at five or fewer. A glyph as well as a colour, always.
                 x += kGroupGap;
                 x = drawLabel(painter, mutedFont, kTextMuted, creditLabel, x, centreY);
                 x += kGap;
                 const QRgb creditRgb = creditColour(credit);
                 if (creditAlert) {
-                    drawAlertGlyph(painter, credit <= kCriticalMinutes, x, centreY, creditRgb);
+                    drawAlertGlyph(painter, credit <= kStaysMinutes, x, centreY, creditRgb);
                     x += kGlyphSize + kGap;
                 }
                 x = drawLabel(painter, timerFont, creditRgb, creditText, x, centreY);
@@ -640,6 +637,12 @@ void HudOverlay::beginSession()
         m_twoFiredCount = 0;
         m_card = Card::None;
         m_tenShownAtMs = 0;
+        // D-11/D-21 (Plan 22): a new session has no previous fresh read, so the first one this
+        // session can never be read as a top-up, and its own reminder can fire fresh.
+        m_timeLeftState = TimeLeftState::Hidden;
+        m_reminderFired = false;
+        m_reminderStartedMs = 0;
+        m_prevReading = -1;
     }
     // A new session starts with Time left invisible too (D-11: the pre-stream floor is 15
     // minutes, A-33 #24, so a real session never starts with it visible; reset defensively so a
@@ -709,9 +712,15 @@ void HudOverlay::endSession()
     m_visible.store(false);
     {
         // The two-minute card stays "until the session ends" (`timing.md`); this is that end.
+        // Time left (Critical) stays until the same end (D-11); this clears both.
         std::lock_guard<std::mutex> lock(m_warnMutex);
         m_card = Card::None;
+        m_timeLeftState = TimeLeftState::Hidden;
+        m_reminderFired = false;
+        m_reminderStartedMs = 0;
+        m_prevReading = -1;
     }
+    m_compositor.setTimeLeft({false, 0, false});
 }
 
 void HudOverlay::setReconnecting(bool reconnecting)
@@ -749,6 +758,53 @@ void HudOverlay::seedCreditMinutes(qint64 minutes)
     }
 }
 
+void HudOverlay::applyTimeLeftReading(qint64 minutes)
+{
+    bool visible = false;
+    bool critical = false;
+    {
+        std::lock_guard<std::mutex> lock(m_warnMutex);
+
+        // D-21: a fresh read above the previous one is a top-up. Time left goes away, and both
+        // rules below then run again on this same read (the re-run) - the only way "goes away" is
+        // observable, since the rule is stated on the balance alone. The very first fresh read of
+        // a session (`m_prevReading < 0`) is never a top-up: there is nothing yet to have risen
+        // above.
+        if (m_prevReading >= 0 && minutes > m_prevReading) {
+            m_timeLeftState = TimeLeftState::Hidden;
+            m_reminderFired = false;
+        }
+        m_prevReading = minutes;
+
+        if (minutes <= kStaysMinutes) {
+            // D-11/D-20: Critical from any state, cutting a running reminder short (11 straight to
+            // 4 goes red at once; a top-up landing at or below five shows red at once too).
+            m_timeLeftState = TimeLeftState::Critical;
+            m_reminderFired = true;
+        }
+        else if (minutes <= kReminderMinutes && !m_reminderFired) {
+            // D-11: the first fresh read at or below ten minutes, once per armed period.
+            m_timeLeftState = TimeLeftState::Reminder;
+            m_reminderFired = true;
+            m_reminderStartedMs = nowMs();
+        }
+        // Otherwise the state stays exactly as it was: `Hidden` above the reminder with nothing
+        // fired yet, or `Reminder`/`Rested` already decided by an earlier read this armed period.
+
+        visible = m_timeLeftState == TimeLeftState::Reminder
+            || m_timeLeftState == TimeLeftState::Critical;
+        critical = m_timeLeftState == TimeLeftState::Critical;
+    }
+
+    // In `Reminder`/`Critical` the number updates to this read; hidden otherwise (D-16: whole
+    // minutes only, so 0 rather than the stale value is the only sane thing to publish while
+    // nothing is shown).
+    // RED (06.6-22 task 1): deliberately not wired yet - see the GREEN commit.
+    // m_compositor.setTimeLeft({visible, visible ? minutes : 0, critical});
+    Q_UNUSED(visible);
+    Q_UNUSED(critical);
+}
+
 void HudOverlay::noteCreditMinutes(qint64 minutes)
 {
     // Not a balance, or not a session: nothing to show and nothing to arm. A read that lands after
@@ -757,15 +813,10 @@ void HudOverlay::noteCreditMinutes(qint64 minutes)
         return;
     }
 
-    // D-11/D-16/D-20 (Plan 14; Plan 22 applies the owner's full appear/disappear rule): a fresh
-    // read at or below ten minutes is what the compositor draws Time left from - critical (red)
-    // at or below five. `seedCreditMinutes()` never reaches here, so the pre-stream seed never
-    // shows it (D-16, `screens.md` §25 "at stream start the HUD shows it" is the legacy strip's
-    // own separate credit readout, unaffected). This does not clear Time left when the balance
-    // rises back above ten - that appear/disappear rule is Plan 22's, not this one's.
-    if (minutes <= kTimeLeftThresholdMinutes) {
-        m_compositor.setTimeLeft({true, minutes, minutes <= kTimeLeftCriticalMinutes});
-    }
+    // D-11/D-16/D-20/D-21 (Plan 22): the owner's full Time-left appear/disappear rule, evaluated
+    // on every fresh read - `seedCreditMinutes()` never reaches here, so the pre-stream seed never
+    // shows it (D-16). This is the only caller of `applyTimeLeftReading()`.
+    applyTimeLeftReading(minutes);
 
     bool changed = false;
     {
@@ -775,10 +826,11 @@ void HudOverlay::noteCreditMinutes(qint64 minutes)
             changed = true;
         }
 
-        // `timing.md`: ten minutes, then two, each once per session. A balance that is already
-        // under two when the first read arrives fires only the lower card - the higher one is
-        // marked spent with it, so it can never show later on the way down from a top-up.
-        if (minutes <= kCriticalMinutes) {
+        // `timing.md`: ten minutes, then five (Plan 22; `HudOverlay::kReminderMinutes`/
+        // `kStaysMinutes` above), each once per session. A balance that is already at or below the
+        // lower threshold when the first read arrives fires only the lower card - the higher one
+        // is marked spent with it, so it can never show later on the way down from a top-up.
+        if (minutes <= kStaysMinutes) {
             if (!m_twoFired) {
                 m_twoFired = true;
                 m_tenFired = true;
@@ -787,7 +839,7 @@ void HudOverlay::noteCreditMinutes(qint64 minutes)
                 changed = true;
             }
         }
-        else if (minutes <= kWarnMinutes) {
+        else if (minutes <= kReminderMinutes) {
             if (!m_tenFired) {
                 m_tenFired = true;
                 ++m_tenFiredCount;
@@ -846,7 +898,7 @@ int HudOverlay::warningsFired(Card card) const
 bool HudOverlay::expireTenMinuteCard(qint64 now)
 {
     std::lock_guard<std::mutex> lock(m_warnMutex);
-    if (m_card == Card::TenMinutes && now - m_tenShownAtMs >= kTenMinuteCardMs) {
+    if (m_card == Card::TenMinutes && now - m_tenShownAtMs >= kReminderMs) {
         m_card = Card::None;
         return true;
     }
@@ -928,6 +980,22 @@ void HudOverlay::tick()
     // this current already; this call is the fallback for whenever nothing has told the
     // compositor yet.
     syncCompositorWindowSize();
+
+    // D-11 (Plan 22): the Reminder window closes on the monotonic tick, not on the next fresh read
+    // - a customer whose balance stops changing (no further liveness read arrives, or it repeats
+    // the same value) must still see the one-minute reminder disappear on schedule.
+    bool reminderExpired = false;
+    {
+        std::lock_guard<std::mutex> lock(m_warnMutex);
+        if (m_timeLeftState == TimeLeftState::Reminder
+            && (now - m_reminderStartedMs) >= kReminderMs) {
+            m_timeLeftState = TimeLeftState::Rested;
+            reminderExpired = true;
+        }
+    }
+    if (reminderExpired) {
+        m_compositor.setTimeLeft({false, 0, false});
+    }
 
     const bool wanted = !m_autoHide.load() || (now - m_lastActivityMs.load()) < kAutoHideMs;
     m_visible.store(wanted);
