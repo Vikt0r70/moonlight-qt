@@ -154,6 +154,13 @@ class SeatHubClient : public QObject
     /// resume-after-restart row). The connecting reads of `handleSessionState` do not set it.
     Q_PROPERTY(bool liveSession READ liveSession NOTIFY liveSessionChanged)
 
+    /// D-05/C4: true while `retry()`'s own end-then-fresh-Play sequence is running - the session
+    /// attached here never streamed, so it is being ended first and this is waiting for that
+    /// teardown to reach a terminal state before asking for a new one. False the rest of the
+    /// time, including for an ordinary Resume (`liveSession`) or a Play from Home with nothing
+    /// attached. The view shows its busy state (as `Play` already does) while this holds.
+    Q_PROPERTY(bool retryBusy READ retryBusy NOTIFY retryBusyChanged)
+
     /// The last session's end reason as the sentence `docs/spec/copy.md` §Session end reasons
     /// gives it, or empty. Styled text: the minute count in it is wrapped in the mono family,
     /// because every number with a unit is mono (copy.md §5). The bare enum never reaches QML.
@@ -272,6 +279,7 @@ public:
     bool animationEffects() const { return m_animationEffects; }
     bool signedIn() const { return m_signedIn; }
     bool liveSession() const { return m_liveSession; }
+    bool retryBusy() const { return m_retryBusy; }
     bool inProfile() const { return m_inProfile; }
     SessionListModel* sessionHistory() const { return m_sessionHistory; }
     CreditHistoryModel* creditHistory() const { return m_creditHistory; }
@@ -440,6 +448,7 @@ signals:
     void balanceChanged();
     void signedInChanged();
     void liveSessionChanged();
+    void retryBusyChanged();
     void inProfileChanged();
     void totalsChanged();
     void accountStatusChanged();
@@ -800,6 +809,8 @@ private:
     /// one Home offers to resume, even while its teardown has not finished.
     bool m_sessionEnded = false;
     bool m_liveSession = false;
+    /// D-05/C4: see the `retryBusy` Q_PROPERTY. RED (06.6-17 Task 2): not wired to anything yet.
+    bool m_retryBusy = false;
     /// What pairing returned about this client: the SHA-256 fingerprint of its own certificate,
     /// which is the identity a host-side reader of Sunshine's client list can match to this
     /// client's record. It is the only thing that identifies this client - never the rig's name,

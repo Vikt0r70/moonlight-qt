@@ -2979,6 +2979,98 @@ private slots:
         QCOMPARE(m_fake->requestPaths().count(QStringLiteral("/api/sessions/s-stages/end")), 1);
     }
 
+    // --- D-05/C4/C5: Try again is always a fresh Play; Resume only after the stream started --------
+
+    void tryAgainIsAFreshPlay()
+    {
+        SeatHubClient client;
+        beginStagedSession(client);
+        QVERIFY(!QTest::currentTestFailed());
+        client.teardown()->setVerifyIntervalMs(1);
+        // The old session's own teardown (from the pairing failure, C2) must still be in flight
+        // when `retry()` runs, or this never observes `retryBusy` - it would just find the session
+        // already gone.
+        m_fake->answerSession(QStringLiteral("s-stages"), QStringLiteral("ENDING"));
+
+        emit client.pairing()->pairingFailed(SeatHubFailure::local(QStringLiteral("failed")));
+        QVERIFY(client.connectFailed());
+
+        client.retry();
+        QVERIFY2(client.retryBusy(), "Try again waits for the old session's own teardown (C4)");
+        QVERIFY(!client.connectFailed());
+
+        // While the old session is still ENDING, no fresh Play has gone out.
+        QTest::qWait(100);
+        QVERIFY(client.retryBusy());
+        QCOMPARE(m_fake->requestPaths().count(QStringLiteral("/api/sessions")), 0);
+
+        // A second Play pressed during the wait must not race the one `retry()` already promised -
+        // it would otherwise post a second `POST /api/sessions`, which the old session's own
+        // teardown (arriving after) would then tear back down as though it had never streamed.
+        client.start();
+        QCOMPARE(m_fake->requestPaths().count(QStringLiteral("/api/sessions")), 0);
+        QVERIFY(client.retryBusy());
+
+        // The old session reaches CANCELLED (D-05/D-23): the wait ends and a fresh Play goes out.
+        m_fake->answerPlay(201, QByteArrayLiteral("{\"id\":\"s-fresh\"}"));
+        m_fake->answerSession(QStringLiteral("s-stages"), QStringLiteral("CANCELLED"));
+
+        QTRY_VERIFY_WITH_TIMEOUT(!client.retryBusy(), 15000);
+        QTRY_COMPARE_WITH_TIMEOUT(m_fake->requestPaths().count(QStringLiteral("/api/sessions")), 1,
+                                  15000);
+        QCOMPARE(client.appState(), QStringLiteral("connecting"));
+        QVERIFY2(!client.liveSession(), "the fresh session has not streamed yet (C5)");
+        // Pairing polls the NEW session, never the old one again - proof this was a fresh Play,
+        // never the Resume branch (which would have addressed "s-stages").
+        QTRY_VERIFY_WITH_TIMEOUT(
+            m_fake->requestPaths().contains(QStringLiteral("/api/sessions/s-fresh/pairing")), 15000);
+    }
+
+    // `TeardownController::cancel()` (what `signOut()` calls) emits neither `teardownCompleted` nor
+    // `teardownFailed` - a `retry()` wait abandoned by a sign-out must still clear `retryBusy`
+    // itself, or the NEXT, unrelated session's ordinary teardown would find it still set and fire
+    // an unrequested fresh Play for a customer who is no longer signed in.
+    void signOutDuringTheWaitClearsRetryBusy()
+    {
+        SeatHubClient client;
+        beginStagedSession(client);
+        QVERIFY(!QTest::currentTestFailed());
+        m_fake->answerSession(QStringLiteral("s-stages"), QStringLiteral("ENDING"));
+
+        emit client.pairing()->pairingFailed(SeatHubFailure::local(QStringLiteral("failed")));
+        client.retry();
+        QVERIFY(client.retryBusy());
+
+        client.signOut();
+        QVERIFY2(!client.retryBusy(), "a sign-out mid-wait must not leave the flag stuck");
+        QTRY_COMPARE_WITH_TIMEOUT(client.appState(), QStringLiteral("signed_out"), 15000);
+    }
+
+    void resumeOnlyAfterStreamStarted()
+    {
+        auto* engine = new FakeEngineSession;
+        {
+            SeatHubClient client;
+            client.session()->attachSession(engine);
+            beginStagedSession(client);
+            QVERIFY(!QTest::currentTestFailed());
+
+            QVERIFY2(!client.liveSession(),
+                     "a session that has not streamed is not offered for resume (C5)");
+
+            emit engine->connectionStarted();
+            QCOMPARE(client.appState(), QStringLiteral("streaming"));
+            QVERIFY2(client.liveSession(), "a session that streamed is offered for resume (C5)");
+
+            // C1: a Resume of the SAME session id must not clear the streamed flag.
+            client.beginSession(QStringLiteral("s-stages"));
+            QVERIFY2(client.liveSession(), "resuming the same session keeps it live (C1)");
+
+            client.session()->attachSession(nullptr);
+        }
+        delete engine;
+    }
+
     void backToHomeLeavesTheStalledViewAndForgetsIt()
     {
         SeatHubClient client;
