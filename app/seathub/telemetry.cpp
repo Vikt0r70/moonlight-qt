@@ -249,13 +249,44 @@ bool initSentry(const SeatHubTelemetry::Options& options)
 /// ... always from the handout, for every client").
 void adoptFirstDsn(const QString& dsn, const QString& environment)
 {
+    // WR-05: kept so a failed re-init below can retry with the options this process's FIRST,
+    // already-working init used.
+    const SeatHubTelemetry::Options previousOptions = s_lastOptions;
+
     sentry_close();
     ++s_closeCount;
-    SeatHubTelemetry::Options options = s_lastOptions;
+    SeatHubTelemetry::Options options = previousOptions;
     options.dsn = dsn;
     options.environment = environment;
     s_started = initSentry(options);
     s_lastOptions = options;
+
+    if (!s_started) {
+        // WR-05 fix: read directly from the vendored `crashpad_client_win.cc`,
+        // `CrashpadClient::StartHandler()` calls `RegisterHandlers()` - which installs
+        // crashpad's OWN exception filter via `SetUnhandledExceptionFilter()` - UNCONDITIONALLY,
+        // before it ever checks whether the new handler process actually launched. That means a
+        // failed re-init does not merely fail to gain the new DSN: it replaces the FIRST,
+        // previously-working crashpad filter/handler with a broken one, in the SPIKE's own T14
+        // failure state (every crash from this point self-terminates with `0xFFFF7001` and writes
+        // nothing anywhere) - worse off than before this re-init was ever attempted. Unlike
+        // `app/main.cpp`'s own T14 fallback, `telemetry.cpp` has no access to upstream's filter
+        // function from here, so the best available recovery is a single retry with the SAME
+        // options the first (successful) init used - restoring a working, if DSN-less, handler
+        // rather than leaving this process with none for the rest of its life. This costs one
+        // more `RegisterHandlers()`/`StartHandler()` call, harmless if it also fails (the process
+        // ends up no worse than the state this whole branch is already in).
+        qCWarning(seathubTelemetry) << "the first-DSN re-init failed to start crashpad's handler; "
+                                        "retrying once with the previous (working) options rather "
+                                        "than leave this process with no crash capture at all";
+        s_started = initSentry(previousOptions);
+        s_lastOptions = previousOptions;
+        if (!s_started) {
+            qCWarning(seathubTelemetry) << "the crash-capture recovery retry also failed; this "
+                                            "process has no crashpad handler for the rest of its "
+                                            "life";
+        }
+    }
 
     // CR-01 fix: `sentry_close()`'s own scope cleanup (verified against the vendored
     // `sentry_scope.c`'s `sentry__scope_cleanup()`) wipes every `sentry_set_user`/
