@@ -312,6 +312,7 @@ HEADERS += \
     seathub/telemetry.h \
     seathub/osd_renderer.h \
     seathub/osd_compositor.h \
+    seathub/stats_catalogue.h \
     streaming/video/decoder.h \
     streaming/streamutils.h \
     backend/autoupdatechecker.h \

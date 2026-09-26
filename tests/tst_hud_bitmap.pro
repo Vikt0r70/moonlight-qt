@@ -58,4 +58,5 @@ HEADERS += ../app/seathub/hud_overlay.h \
     ../app/seathub/duration_text.h \
     ../app/seathub/osd_compositor.h \
     ../app/seathub/osd_renderer.h \
-    ../app/seathub/stream_stats.h
+    ../app/seathub/stream_stats.h \
+    ../app/seathub/stats_catalogue.h

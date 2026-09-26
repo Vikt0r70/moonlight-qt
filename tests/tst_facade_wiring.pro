@@ -115,6 +115,7 @@ HEADERS += \
     ../app/seathub/hud_overlay.h \
     ../app/seathub/osd_compositor.h \
     ../app/seathub/osd_renderer.h \
+    ../app/seathub/stats_catalogue.h \
     ../app/seathub/error_map.h \
     ../app/seathub/settings_bridge.h \
     ../app/seathub/update_feed_client.h \
