@@ -435,6 +435,12 @@ public:
     /// `GET /api/me`. Authenticated. `Account`.
     void fetchMe(Callback callback);
 
+    /// `GET /api/me/telemetry` (06.3.1 D-01, contract 3.2.0). Authenticated. `TelemetryConfig`:
+    /// the Sentry DSN this account's SeatHub should use, or null when telemetry is off. A 401
+    /// answers like any other authenticated call - `SeatHubTelemetry::applyHandout` is never
+    /// reached, so the caller's cached DSN stays exactly as it was (D-18 SV-C3).
+    void fetchTelemetry(Callback callback);
+
     /// `GET /api/wallet`. Authenticated. `Wallet`.
     void fetchWallet(Callback callback);
 

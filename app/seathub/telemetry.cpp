@@ -257,16 +257,49 @@ bool start()
 
 std::optional<Handout> parseHandout(const QJsonObject& body)
 {
-    // RED (Task 1): real parsing lands in the GREEN commit.
-    Q_UNUSED(body);
-    return std::nullopt;
+    // C.3 rule 3: `environment` and `logs` must both be present, or this handout is malformed and
+    // changes nothing already cached/applied.
+    if (!body.contains(QStringLiteral("environment")) || !body.contains(QStringLiteral("logs"))) {
+        return std::nullopt;
+    }
+
+    const QJsonValue environmentValue = body.value(QStringLiteral("environment"));
+    const QJsonValue logsValue = body.value(QStringLiteral("logs"));
+    if (!environmentValue.isString() || !logsValue.isBool()) {
+        return std::nullopt;
+    }
+
+    Handout handout;
+    handout.environment = environmentValue.toString();
+    handout.logs = logsValue.toBool();
+
+    // `dsn` absent, JSON `null`, or an empty string all read as the same empty QString (C.3 rule
+    // 3: "off" and "an older server that never sent the field" are never told apart, on purpose).
+    const QJsonValue dsnValue = body.value(QStringLiteral("dsn"));
+    handout.dsn = dsnValue.isString() ? dsnValue.toString() : QString();
+
+    return handout;
 }
 
 bool acceptDsn(const QString& dsn)
 {
-    // RED (Task 1): real acceptance rule lands in the GREEN commit.
-    Q_UNUSED(dsn);
-    return false;
+    const QUrl url(dsn);
+    if (!url.isValid() || url.host().isEmpty()) {
+        return false;
+    }
+
+#ifdef SEATHUB_TEST_ALLOW_LOOPBACK_DSN
+    // Compile-time only, and only in tst_telemetry.pro (never app.pro): widens this rule to also
+    // accept unencrypted loopback, which is what a test's own fake Sentry listener has to use.
+    // T-06.3.1-41's mitigation is unaffected in any build that ships - this branch does not exist
+    // in one.
+    if (url.scheme() == QLatin1String("http") && url.host() == QLatin1String("127.0.0.1")) {
+        return true;
+    }
+#endif
+
+    return url.scheme() == QLatin1String("https")
+        && url.host().endsWith(QLatin1String(".ingest.de.sentry.io"));
 }
 
 QString cachePath()
@@ -320,8 +353,32 @@ void deleteCache()
 
 void applyHandout(const Handout& handout)
 {
-    // RED (Task 1): real cache/re-init logic lands in the GREEN commit.
-    Q_UNUSED(handout);
+    if (!handout.dsn.isEmpty() && !acceptDsn(handout.dsn)) {
+        // Never the DSN itself (T-06.3.1-41) - only the fact that one was rejected.
+        qCWarning(seathubTelemetry) << "rejected a telemetry handout: the DSN failed the "
+                                       "acceptance rule (scheme/host check)";
+        return;
+    }
+
+    if (handout.dsn.isEmpty()) {
+        // C.3 rule 3: off, cached as off. `sentry_close()` is never called here (C.1 fact 7) -
+        // crash capture keeps whatever URL this run already has.
+        deleteCache();
+        s_logsEnabled = false;
+        return;
+    }
+
+    writeCache(handout);
+    s_logsEnabled = handout.logs;
+
+    // C.3 rule 2: only a process that started with no DSN ever re-inits, and only once, on the
+    // very first handout it ever applies. A later handout in the same run (a rotation, or this
+    // same handout re-delivered) only rewrote the cache above - it takes effect at the next
+    // launch, via `start()`'s cache read.
+    if (started() && s_startedWithNoDsn && !s_adoptedFirstDsn) {
+        adoptFirstDsn(handout.dsn, handout.environment);
+        s_adoptedFirstDsn = true;
+    }
 }
 
 bool logsEnabled()

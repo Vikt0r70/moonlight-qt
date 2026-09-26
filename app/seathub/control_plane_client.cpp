@@ -911,6 +911,11 @@ void ControlPlaneClient::fetchMe(Callback callback)
     send(QStringLiteral("GET"), QStringLiteral("/api/me"), QByteArray(), true, callback);
 }
 
+void ControlPlaneClient::fetchTelemetry(Callback callback)
+{
+    send(QStringLiteral("GET"), QStringLiteral("/api/me/telemetry"), QByteArray(), true, callback);
+}
+
 void ControlPlaneClient::fetchWallet(Callback callback)
 {
     send(QStringLiteral("GET"), QStringLiteral("/api/wallet"), QByteArray(), true, callback);
