@@ -62,6 +62,8 @@ set "QT_QPA_PLATFORM_PLUGIN_PATH=%QT%\plugins"
 
 set "FAILED="
 
+if not "%~1"=="" goto :one
+
 call :suite tst_control_plane
 call :suite tst_engine_seam
 call :suite tst_error_map
@@ -79,6 +81,7 @@ call :suite tst_ui_screens
 call :suite tst_update_feed
 call :suite tst_facade_wiring
 call :suite tst_d28_boundary
+call :suite tst_osd_render
 
 if defined FAILED goto :failed
 
@@ -90,6 +93,19 @@ exit /b 0
 echo SOME_SUITES_FAILED
 popd
 exit /b 1
+
+rem ---------------------------------------------------------------------------
+rem A single named suite (the optional first argument): the same :suite routine
+rem and the same FAILED check, so the caller gets one line and one exit code.
+rem ---------------------------------------------------------------------------
+:one
+    call :suite %~1
+    if defined FAILED (
+        popd
+        exit /b 1
+    )
+    popd
+    exit /b 0
 
 rem ---------------------------------------------------------------------------
 rem One suite: qmake, jom, run, and read the suite's own Totals line.
