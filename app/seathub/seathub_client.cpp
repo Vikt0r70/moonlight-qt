@@ -125,6 +125,7 @@ int connectStageForState(const QString& state)
 // screen renders after a session ends (audit E10). `%1` is the session's real `minutes_billed` -
 // copy.md: "the client substitutes the session's real `minutes_billed`".
 const char* kEndCustomerEnded = "You ended the session. Unused minutes stay in your account.";
+const char* kEndConnectFailed = "The stream didn't start. You were not charged.";
 const char* kEndHostLost =
     "We lost contact with this rig, so the session ended. You were charged for %1 minutes.";
 const char* kEndClientSilent =
@@ -163,6 +164,7 @@ QString endReasonSentence(const QString& endReason, int minutesBilled, bool styl
     };
     static const ReasonLine kLines[] = {
         { "CUSTOMER_ENDED", kEndCustomerEnded },
+        { "CONNECT_FAILED", kEndConnectFailed },
         { "HOST_LOST", kEndHostLost },
         { "CLIENT_SILENT", kEndClientSilent },
         { "CONNECT_TIMEOUT", kEndConnectTimeout },
