@@ -121,6 +121,22 @@ SDL_Surface* recordingRasterizer(Overlay::OverlayType type, const char* text, bo
     return nullptr;
 }
 
+// Plan 10, Task 2: a rasteriser that always returns a valid surface in a pixel format
+// `OverlayManager` does not accept, so the hook's own refusal rule (not `OsdCompositor`'s) is
+// what is under test.
+SDL_Surface* foreignFormatRasterizer(Overlay::OverlayType, const char*, bool, SDL_Color, void*)
+{
+    return SDL_CreateRGBSurfaceWithFormat(0, 8, 8, 32, SDL_PIXELFORMAT_RGBA8888);
+}
+
+// Plan 10, Task 2: a rasteriser that always returns a valid ARGB8888 surface - proves that a
+// disabled slot is refused by the hook even when the rasteriser itself returns something the
+// renderer would otherwise accept.
+SDL_Surface* fixedArgbRasterizer(Overlay::OverlayType, const char*, bool, SDL_Color, void*)
+{
+    return SDL_CreateRGBSurfaceWithFormat(0, 8, 8, 32, SDL_PIXELFORMAT_ARGB8888);
+}
+
 // Phase 5 plan 12 (CUST-17/D-23/D-26): the eleven lines Moonlight 6.1.0's own
 // `stringifyVideoStats()` writes (`git show v6.1.0:app/streaming/video/ffmpeg.cpp`), verbatim
 // including each line's own trailing colon, in the engine's own output order - the "single list
@@ -651,9 +667,126 @@ private slots:
         QVERIFY(manager.getUpdatedOverlaySurface(kType) == nullptr);
     }
 
-    // Plan 10, Task 2's own tests (rasterizerRefusesAForeignSurface, rasterizerRunsWithoutFontData,
-    // disablingTheSlotClearsTheRecordedEngineText, compositorIsReentrant) are added by Task 2,
-    // once Task 1's own RED/GREEN cycle is committed - see this plan's own task split.
+    // Plan 10, Task 2: a returned surface in a pixel format the renderer cannot take, or a valid
+    // surface for a slot that is disabled, is refused (freed, nothing published) - the same rule
+    // `updateOverlaySurface()` already applies, now also enforced on the rasteriser's own path.
+    void rasterizerRefusesAForeignSurface()
+    {
+        {
+            Overlay::OverlayManager manager;
+            MockOverlayRenderer renderer;
+            manager.setOverlayRenderer(&renderer);
+            manager.setTextRasterizer(&foreignFormatRasterizer, nullptr);
+            manager.setOverlayState(kType, true);
+
+            manager.updateOverlayText(kType, "Poor connection to PC");
+
+            QVERIFY(manager.getUpdatedOverlaySurface(kType) == nullptr);
+        }
+        {
+            Overlay::OverlayManager manager;
+            MockOverlayRenderer renderer;
+            manager.setOverlayRenderer(&renderer);
+            manager.setTextRasterizer(&fixedArgbRasterizer, nullptr);
+            manager.setOverlayState(kType, true);
+
+            // Disabling calls notifyOverlayUpdated() (state changed) with `enabled == false`; the
+            // rasteriser still returns a valid ARGB8888 surface, and the hook must refuse it.
+            manager.setOverlayState(kType, false);
+
+            QVERIFY(manager.getUpdatedOverlaySurface(kType) == nullptr);
+        }
+    }
+
+    // This test project links no ModeSeven.ttf/SDL_ttf font resource at all (see this file's own
+    // header) - the rasteriser path never touches TTF, so publishing succeeds regardless.
+    void rasterizerRunsWithoutFontData()
+    {
+        OsdCompositor compositor;
+        Overlay::OverlayManager manager;
+        MockOverlayRenderer renderer;
+        manager.setOverlayRenderer(&renderer);
+        manager.setTextRasterizer(&OsdCompositor::rasterize, &compositor);
+        manager.setOverlayState(kType, true);
+
+        manager.updateOverlayText(kType, "Poor connection to PC");
+
+        SDL_Surface* taken = manager.getUpdatedOverlaySurface(kType);
+        QVERIFY(taken != nullptr);
+        SDL_FreeSurface(taken);
+    }
+
+    // The engine clears `text` to empty before calling this class's own text path on disable
+    // (`setOverlayState(false)`); the compositor's own recorded engine text must reflect that, so
+    // a later composition draws Time left alone rather than the stale line.
+    void disablingTheSlotClearsTheRecordedEngineText()
+    {
+        OsdCompositor compositor;
+        Overlay::OverlayManager manager;
+        MockOverlayRenderer renderer;
+        manager.setOverlayRenderer(&renderer);
+        manager.setTextRasterizer(&OsdCompositor::rasterize, &compositor);
+        manager.setOverlayState(kType, true);
+        manager.updateOverlayText(kType, "Poor connection to PC");
+
+        SDL_Surface* withEngineText = manager.getUpdatedOverlaySurface(kType);
+        QVERIFY(withEngineText != nullptr);
+        SDL_FreeSurface(withEngineText);
+
+        manager.setOverlayState(kType, false);
+
+        QVERIFY(compositor.composedBottom().isNull());
+
+        const OsdTimeLeft timeLeft{ true, 4, false };
+        compositor.setTimeLeft(timeLeft);
+        const QImage composed = compositor.composedBottom();
+        const QImage expected = renderOsdBottom(1920, 1080, QString(), 0, timeLeft);
+        QCOMPARE(composed, expected);
+    }
+
+    // Reentrancy (RESEARCH-FORK.md §1.3 "Threads"): the hook runs on the decoder thread, the SDL
+    // main thread and moonlight-common-c's connection-status callback thread. `rasterize()` must
+    // be safe called concurrently from several threads while `setTimeLeft()`/`setWindowSize()`
+    // mutate state on another - every surface returned is well-formed or null, and nothing
+    // crashes.
+    void compositorIsReentrant()
+    {
+        OsdCompositor compositor;
+        std::atomic<bool> sawBadSurface{ false };
+
+        auto rasterizeWorker = [&]() {
+            for (int i = 0; i < 200; ++i) {
+                const SDL_Color colours[] = { { 0xCC, 0x00, 0x00, 0xFF }, { 0xD0, 0xD0, 0x00, 0xFF } };
+                SDL_Surface* s = OsdCompositor::rasterize(kType, "Poor connection to PC", true,
+                                                          colours[i % 2], &compositor);
+                if (s != nullptr) {
+                    if (s->format->format != SDL_PIXELFORMAT_ARGB8888 || SDL_MUSTLOCK(s)) {
+                        sawBadSurface.store(true);
+                    }
+                    SDL_FreeSurface(s);
+                }
+            }
+        };
+
+        auto stateWorker = [&]() {
+            for (int i = 0; i < 200; ++i) {
+                compositor.setTimeLeft(OsdTimeLeft{ (i % 2) == 0, i % 20, (i % 3) == 0 });
+                compositor.setWindowSize(1280 + (i % 4) * 100, 720 + (i % 4) * 100);
+            }
+        };
+
+        std::thread t1(rasterizeWorker);
+        std::thread t2(rasterizeWorker);
+        std::thread t3(rasterizeWorker);
+        std::thread t4(stateWorker);
+
+        t1.join();
+        t2.join();
+        t3.join();
+        t4.join();
+
+        QVERIFY(!sawBadSurface.load());
+    }
 };
 
 QTEST_MAIN(TestOverlayInjection)

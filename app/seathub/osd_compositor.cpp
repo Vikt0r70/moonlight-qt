@@ -71,7 +71,7 @@ SDL_Surface* OsdCompositor::rasterize(Overlay::OverlayType type, const char* tex
 }
 
 SDL_Surface* OsdCompositor::rasterizeInstance(Overlay::OverlayType type, const char* text,
-                                               bool /*enabled*/, SDL_Color color)
+                                               bool enabled, SDL_Color color)
 {
     if (type != Overlay::OverlayStatusUpdate) {
         // Plan 16 adds the stats block for OverlayDebug; nothing to draw here yet.
@@ -81,11 +81,14 @@ SDL_Surface* OsdCompositor::rasterizeInstance(Overlay::OverlayType type, const c
     State current;
     {
         QMutexLocker locker(&m_mutex);
-        // Recorded even while the slot is disabled - the engine already cleared `text` to empty
-        // before this call in that case (`OverlayManager::setOverlayState()`), so this is how
-        // SeatHub learns the engine's own line went away (RESEARCH-FORK.md §1.3).
-        m_state.engineText = QString::fromUtf8(text != nullptr ? text : "");
-        m_state.engineColor = qRgba(color.r, color.g, color.b, color.a);
+        // Task 2 RED (temporary): only recording while enabled is the bug
+        // `disablingTheSlotClearsTheRecordedEngineText` targets - the correct rule (Task 2 GREEN)
+        // records regardless of `enabled`, since the engine already cleared `text` to empty before
+        // this call in the disabled case (`OverlayManager::setOverlayState()`).
+        if (enabled) {
+            m_state.engineText = QString::fromUtf8(text != nullptr ? text : "");
+            m_state.engineColor = qRgba(color.r, color.g, color.b, color.a);
+        }
         current = m_state;
     }
 
