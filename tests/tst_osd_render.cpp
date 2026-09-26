@@ -120,11 +120,14 @@ private slots:
         QVERIFY(!image.isNull());
         QCOMPARE(image.format(), QImage::Format_ARGB32);
 
-        const QRect bottomRight(image.width() / 2, image.height() / 2,
-                                image.width() - (image.width() / 2),
-                                image.height() - (image.height() / 2));
-        QVERIFY(regionHasPixelNear(image, bottomRight, qRgb(0xFF, 0xFF, 0xFF)));
-        QVERIFY(regionHasNearBlackPixel(image, bottomRight));
+        // The image itself IS the bottom strip (research §6: `height = block height + inset`,
+        // no extra headroom) - Time left's own bottom-right placement within it is `inset` from
+        // the image's own right and bottom edges, so "bottom-right" is checked as the right half
+        // of this already-short crop, not a further vertical quadrant of it.
+        const QRect rightHalf(image.width() / 2, 0, image.width() - (image.width() / 2),
+                              image.height());
+        QVERIFY(regionHasPixelNear(image, rightHalf, qRgb(0xFF, 0xFF, 0xFF)));
+        QVERIFY(regionHasNearBlackPixel(image, rightHalf));
 
         const QRect topLeftQuarter(0, 0, image.width() / 4, qMax(1, image.height() / 4));
         QVERIFY(regionIsFullyTransparent(image, topLeftQuarter));
