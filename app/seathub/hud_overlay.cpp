@@ -799,10 +799,7 @@ void HudOverlay::applyTimeLeftReading(qint64 minutes)
     // In `Reminder`/`Critical` the number updates to this read; hidden otherwise (D-16: whole
     // minutes only, so 0 rather than the stale value is the only sane thing to publish while
     // nothing is shown).
-    // RED (06.6-22 task 1): deliberately not wired yet - see the GREEN commit.
-    // m_compositor.setTimeLeft({visible, visible ? minutes : 0, critical});
-    Q_UNUSED(visible);
-    Q_UNUSED(critical);
+    m_compositor.setTimeLeft({visible, visible ? minutes : 0, critical});
 }
 
 void HudOverlay::noteCreditMinutes(qint64 minutes)
