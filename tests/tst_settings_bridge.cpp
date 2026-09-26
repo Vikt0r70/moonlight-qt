@@ -41,6 +41,8 @@ private slots:
     void statsTogglesDefaultOffAndTheDerivedOptionFollowsInBothDirections();
     void enabledStatsLabelsListsOnlyTheOnesTurnedOnInTheEnginesOwnOrder();
     void sessionOverridesAreInMemoryOnly();
+    void settingsShowTheSavedValuesOnly();
+    void theOverrideMechanismIsGone();
     void negotiatedResultsAreExposedOnlyAfterConnectionStarted();
 
 private:
@@ -466,6 +468,37 @@ void TstSettingsBridge::sessionOverridesAreInMemoryOnly()
     m_bridge->clearSessionOverrides();
     QVERIFY(!m_bridge->hasSessionOverrides());
     QCOMPARE(m_bridge->getValue(QStringLiteral("fps")).toInt(), 60);
+}
+
+// A-68 / D-06 reversal (RESEARCH-QUALITY.md § 3 item 2): Settings are the one place the
+// stream's quality comes from now, so `getValue()` always answers the saved value - there is
+// no override mechanism left to shadow it.
+void TstSettingsBridge::settingsShowTheSavedValuesOnly()
+{
+    QVERIFY(m_bridge->setValue(QStringLiteral("width"), 2560));
+    QVERIFY(m_bridge->setValue(QStringLiteral("height"), 1440));
+    QVERIFY(m_bridge->setValue(QStringLiteral("fps"), 30));
+
+    QCOMPARE(m_bridge->getValue(QStringLiteral("width")).toInt(), 2560);
+    QCOMPARE(m_bridge->getValue(QStringLiteral("height")).toInt(), 1440);
+    QCOMPARE(m_bridge->getValue(QStringLiteral("fps")).toInt(), 30);
+
+    // getValue() and getSavedValue() must always agree - there is no second, overriding source.
+    QCOMPARE(m_bridge->getValue(QStringLiteral("fps")), m_bridge->getSavedValue(QStringLiteral("fps")));
+}
+
+// The bridge's own meta-object proves the mechanism is gone, not merely unused: no property, no
+// signal and no invokable method for it remain (checked via QMetaObject, not by calling any of
+// them - they must not exist to be called).
+void TstSettingsBridge::theOverrideMechanismIsGone()
+{
+    const QMetaObject* meta = m_bridge->metaObject();
+    QVERIFY2(meta->indexOfProperty("hasSessionOverrides") < 0,
+             "hasSessionOverrides must not exist");
+    QVERIFY2(meta->indexOfSignal("sessionOverridesChanged()") < 0,
+             "sessionOverridesChanged must not exist");
+    QVERIFY2(meta->indexOfMethod("applySessionOverride(QString)") < 0,
+             "applySessionOverride must not exist");
 }
 
 void TstSettingsBridge::negotiatedResultsAreExposedOnlyAfterConnectionStarted()
