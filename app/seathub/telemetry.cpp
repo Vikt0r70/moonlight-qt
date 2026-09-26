@@ -3,13 +3,23 @@
 #include "log_tee.h"
 #include "path.h"
 #include "seathub_version.h"
+#include "token_store.h"
 
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QJsonParseError>
+#include <QJsonValue>
+#include <QLoggingCategory>
+#include <QSaveFile>
 #include <QStandardPaths>
 #include <QString>
 #include <QStringList>
+#include <QUrl>
+
+#include <atomic>
 
 // `NOMINMAX` before <windows.h>: the Win32 headers define `min`/`max` as macros, which breaks
 // every `std::min`/`std::max` in a translation unit that includes them after Qt (same guard as
@@ -28,11 +38,33 @@
 // This is the ONE translation unit in this fork that includes `sentry.h` (see the header's own
 // comment). Everything below is what `06.3.1-RESEARCH-SPIKE-CRASHPAD.md` proved by running it.
 
+Q_LOGGING_CATEGORY(seathubTelemetry, "seathub.telemetry")
+
 namespace {
 
 bool s_started = false;
 bool s_lastRunCrashed = false;
 QString s_lastCrashEventId;
+
+// --- Plan 15: rotation/re-init bookkeeping and the log-shipper kill switch ---------------------
+
+/// The `Options` the process's very first `startWith()` call used. `applyHandout()`'s one re-init
+/// (`adoptFirstDsn`, below) rebuilds from this rather than from scratch, so the database and
+/// handler paths, release and callbacks never drift between the first init and the re-init
+/// (SEATHUB § C.2's code sketch: "the same options plus the DSN").
+SeatHubTelemetry::Options s_lastOptions;
+/// True when this process's `startWith()` ran with an empty `dsn`. Only such a process ever
+/// re-inits (C.3 rule 2); a process that started with a cached DSN keeps it for the whole run.
+bool s_startedWithNoDsn = false;
+/// True once this process has adopted a first DSN in-process. Guards the one re-init so a second,
+/// later `applyHandout()` in the same run only rewrites the cache (C.3 rule 2).
+bool s_adoptedFirstDsn = false;
+/// Test-only counters, exposed through `initCallCount()`/`closeCallCount()`.
+int s_initCount = 0;
+int s_closeCount = 0;
+/// `false` with no DSN in use, or the last handout's `logs` was `false`. Plan 21's shipper worker
+/// reads this from its own thread while `applyHandout()` may run on the client thread.
+std::atomic<bool> s_logsEnabled{ false };
 
 /// Runs inside crashpad's first-chance filter, in the crashing process, on the crashing thread
 /// (SPIKE Q5, `on_crash` fires before `before_send` for a crash - `sentry_backend_crashpad.cpp`
@@ -92,6 +124,64 @@ QString runningExecutableDir()
     return QFileInfo(exePath).absolutePath();
 }
 
+/// The one place every `sentry_init()` call in this process goes through: `startWith()`'s first
+/// call and the one re-init inside `adoptFirstDsn()`, below. `s_initCount` therefore counts every
+/// call regardless of caller (Task 1's rotation test reads it through `initCallCount()`).
+bool initSentry(const SeatHubTelemetry::Options& options)
+{
+    sentry_options_t* sentryOptions = sentry_options_new();
+
+    // Explicit every time, even when empty: no environment variable (SENTRY_DSN or otherwise) is
+    // ever allowed to inject a DSN behind this call's back (D-01: the DSN comes from the control
+    // plane at run time, never compiled in and never read from the environment).
+    const QByteArray dsnUtf8 = options.dsn.toUtf8();
+    sentry_options_set_dsn(sentryOptions, dsnUtf8.constData());
+
+    sentry_options_set_database_pathw(sentryOptions,
+                                       reinterpret_cast<const wchar_t*>(options.databaseDir.utf16()));
+    sentry_options_set_handler_pathw(sentryOptions,
+                                      reinterpret_cast<const wchar_t*>(options.handlerPath.utf16()));
+
+    const QByteArray releaseUtf8 = options.release.toUtf8();
+    sentry_options_set_release(sentryOptions, releaseUtf8.constData());
+    const QByteArray environmentUtf8 = options.environment.toUtf8();
+    sentry_options_set_environment(sentryOptions, environmentUtf8.constData());
+
+    // No `cache_keep` (Pitfall 4, SPIKE C.1 fact 4: it swaps the prune for `cache_max_*` instead of
+    // the 2-day/8 MB default this design relies on to bound the customer's disk footprint). No
+    // `require_user_consent` (SPIKE C.1 fact 3: consent defaults to "given", so leaving it unset
+    // keeps every report eligible for upload - there is no consent flow to wire it to). No Qt
+    // integration (build-time `SENTRY_INTEGRATION_QT=OFF`). No debug logging (`sentry_options_set_debug`
+    // is never called).
+    sentry_options_set_max_breadcrumbs(sentryOptions, 0);
+    sentry_options_set_http_retry(sentryOptions, 1);
+    sentry_options_set_on_crash(sentryOptions, seatHubOnCrash, nullptr);
+    sentry_options_set_before_send(sentryOptions, seatHubBeforeSend, nullptr);
+    sentry_options_set_on_crashed_last_run(sentryOptions, seatHubOnCrashedLastRun, nullptr);
+
+    const int rv = sentry_init(sentryOptions);
+    ++s_initCount;
+    return rv == 0;
+}
+
+/// Plan 15 (C.2/C.3 rule 2): the ONE re-init this process ever performs, called from
+/// `applyHandout()` only when this process started with no DSN and no handout has been adopted
+/// yet. Reuses every option `start()`/`startWith()` was first called with - only `dsn` and
+/// `environment` change - so the database/handler paths, release and callbacks stay identical
+/// between the first init and this one (SEATHUB § C.2's code sketch: "the same options plus the
+/// DSN"; `environment` also follows the handout here, per RESEARCH.md § C.1: "the environment
+/// ... always from the handout, for every client").
+void adoptFirstDsn(const QString& dsn, const QString& environment)
+{
+    sentry_close();
+    ++s_closeCount;
+    SeatHubTelemetry::Options options = s_lastOptions;
+    options.dsn = dsn;
+    options.environment = environment;
+    s_started = initSentry(options);
+    s_lastOptions = options;
+}
+
 } // namespace
 
 namespace SeatHubTelemetry {
@@ -125,38 +215,10 @@ void removeLegacyDumps(const QString& dir)
 
 bool startWith(const Options& options)
 {
-    sentry_options_t* sentryOptions = sentry_options_new();
-
-    // Explicit every time, even when empty: no environment variable (SENTRY_DSN or otherwise) is
-    // ever allowed to inject a DSN behind this call's back (D-01: the DSN comes from the control
-    // plane at run time, never compiled in and never read from the environment).
-    const QByteArray dsnUtf8 = options.dsn.toUtf8();
-    sentry_options_set_dsn(sentryOptions, dsnUtf8.constData());
-
-    sentry_options_set_database_pathw(sentryOptions,
-                                       reinterpret_cast<const wchar_t*>(options.databaseDir.utf16()));
-    sentry_options_set_handler_pathw(sentryOptions,
-                                      reinterpret_cast<const wchar_t*>(options.handlerPath.utf16()));
-
-    const QByteArray releaseUtf8 = options.release.toUtf8();
-    sentry_options_set_release(sentryOptions, releaseUtf8.constData());
-    const QByteArray environmentUtf8 = options.environment.toUtf8();
-    sentry_options_set_environment(sentryOptions, environmentUtf8.constData());
-
-    // No `cache_keep` (Pitfall 4, SPIKE C.1 fact 4: it swaps the prune for `cache_max_*` instead of
-    // the 2-day/8 MB default this design relies on to bound the customer's disk footprint). No
-    // `require_user_consent` (SPIKE C.1 fact 3: consent defaults to "given", so leaving it unset
-    // keeps every report eligible for upload - there is no consent flow to wire it to). No Qt
-    // integration (build-time `SENTRY_INTEGRATION_QT=OFF`). No debug logging (`sentry_options_set_debug`
-    // is never called).
-    sentry_options_set_max_breadcrumbs(sentryOptions, 0);
-    sentry_options_set_http_retry(sentryOptions, 1);
-    sentry_options_set_on_crash(sentryOptions, seatHubOnCrash, nullptr);
-    sentry_options_set_before_send(sentryOptions, seatHubBeforeSend, nullptr);
-    sentry_options_set_on_crashed_last_run(sentryOptions, seatHubOnCrashedLastRun, nullptr);
-
-    const int rv = sentry_init(sentryOptions);
-    s_started = (rv == 0);
+    s_lastOptions = options;
+    s_startedWithNoDsn = options.dsn.isEmpty();
+    s_adoptedFirstDsn = false;
+    s_started = initSentry(options);
     return s_started;
 }
 
@@ -168,13 +230,113 @@ bool start()
     options.handlerPath = QDir(runningExecutableDir()).filePath(QStringLiteral("crashpad_handler.exe"));
     options.release = QStringLiteral("seathub@" SEATHUB_VERSION);
     options.environment = QStringLiteral("production");
-    options.dsn = QString(); // D-10.1 is empty here; Plan 15 adds the cached-DSN read.
+    options.dsn = QString(); // Plan 15's cached-DSN read, right below, may replace both of these.
+
+    // Plan 15 (C.2/C.3): a cached handout whose DSN still passes `acceptDsn()` (defence in depth -
+    // a tampered or stale cache file is never trusted blind) starts this run with it, so a crash
+    // before this run's own first handout still uploads. `environment` follows the same cache
+    // entry - it never comes from anywhere else (RESEARCH.md § C.1). A cache with no usable DSN
+    // (absent, rejected, or explicitly "off") leaves the defaults above in place.
+    if (const std::optional<Handout> cached = readCache()) {
+        if (!cached->dsn.isEmpty() && acceptDsn(cached->dsn)) {
+            options.dsn = cached->dsn;
+            options.environment = cached->environment;
+            s_logsEnabled = cached->logs;
+        }
+    }
 
     // D-10: nothing here shows the customer anything, on success or failure.
     LogTee::install();
     removeLegacyDumps(Path::getLogDir());
 
     return startWith(options);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Plan 15: the DSN handout, its cache, identity and the test crash switch.
+
+std::optional<Handout> parseHandout(const QJsonObject& body)
+{
+    // RED (Task 1): real parsing lands in the GREEN commit.
+    Q_UNUSED(body);
+    return std::nullopt;
+}
+
+bool acceptDsn(const QString& dsn)
+{
+    // RED (Task 1): real acceptance rule lands in the GREEN commit.
+    Q_UNUSED(dsn);
+    return false;
+}
+
+QString cachePath()
+{
+    // The same directory the token store's DPAPI blobs live in (`token_store.cpp`'s own comment:
+    // the installer's upgrade-preserve step already carries that directory across a version bump).
+    // A plain JSON file, not DPAPI-wrapped - a DSN is not a secret (D-18 F-1) - and
+    // `TokenStore::clearAll()` only ever sweeps its own `*.dpapi` suffix, so it never touches this.
+    return QDir(TokenStore::defaultDirectory()).filePath(QStringLiteral("telemetry.json"));
+}
+
+std::optional<Handout> readCache()
+{
+    QFile file(cachePath());
+    if (!file.open(QIODevice::ReadOnly)) {
+        return std::nullopt;
+    }
+
+    QJsonParseError error;
+    const QJsonDocument document = QJsonDocument::fromJson(file.readAll(), &error);
+    if (error.error != QJsonParseError::NoError || !document.isObject()) {
+        return std::nullopt;
+    }
+
+    return parseHandout(document.object());
+}
+
+void writeCache(const Handout& handout)
+{
+    const QString path = cachePath();
+    QDir().mkpath(QFileInfo(path).absolutePath());
+
+    QJsonObject object;
+    object.insert(QStringLiteral("dsn"), handout.dsn);
+    object.insert(QStringLiteral("environment"), handout.environment);
+    object.insert(QStringLiteral("logs"), handout.logs);
+
+    // QSaveFile: a temp file, committed with a rename - the same primitive `token_store.cpp` uses
+    // for its own blobs, so a crash mid-write never leaves a half-written cache behind.
+    QSaveFile file(path);
+    if (file.open(QIODevice::WriteOnly)) {
+        file.write(QJsonDocument(object).toJson(QJsonDocument::Compact));
+        file.commit();
+    }
+}
+
+void deleteCache()
+{
+    QFile::remove(cachePath());
+}
+
+void applyHandout(const Handout& handout)
+{
+    // RED (Task 1): real cache/re-init logic lands in the GREEN commit.
+    Q_UNUSED(handout);
+}
+
+bool logsEnabled()
+{
+    return s_logsEnabled.load();
+}
+
+int initCallCount()
+{
+    return s_initCount;
+}
+
+int closeCallCount()
+{
+    return s_closeCount;
 }
 
 } // namespace SeatHubTelemetry

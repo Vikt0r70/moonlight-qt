@@ -42,13 +42,26 @@ LIBS += -L$$SEATHUB_SENTRY_DIR/lib -lsentry
 DEFINES += SEATHUB_SENTRY_BIN_DIR=\\\"$$SEATHUB_SENTRY_DIR/bin\\\"
 DEFINES += FORK_ROOT=\\\"$$PWD/..\\\"
 
+# Plan 15: `acceptDsn()`'s real rule is https + `.ingest.de.sentry.io` only - this widens it, in
+# THIS TEST BINARY ONLY, to also accept http to 127.0.0.1, the loopback address every crash child
+# in this suite uses as its fake Sentry endpoint (mirrors the rig agent's own `#[cfg(test)]`
+# widening of `accept_dsn`, 06.3.1-07-PLAN.md). Never defined for app.pro or any other suite, so a
+# release build can never accept an unencrypted loopback DSN (T-06.3.1-41).
+DEFINES += SEATHUB_TEST_ALLOW_LOOPBACK_DSN
+
+win32: LIBS += -lcrypt32
+
 SOURCES += \
     tst_telemetry.cpp \
     ../app/seathub/telemetry.cpp \
     ../app/seathub/log_tee.cpp \
+    ../app/seathub/token_store.cpp \
+    ../app/seathub/error_map.cpp \
     ../app/path.cpp
 
 HEADERS += \
     ../app/seathub/telemetry.h \
     ../app/seathub/log_tee.h \
+    ../app/seathub/token_store.h \
+    ../app/seathub/error_map.h \
     ../app/path.h
