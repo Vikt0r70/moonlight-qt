@@ -552,6 +552,16 @@ private:
     void setAttachedSessionEnded(bool ended);
     /// Recomputes `m_liveSession` from the two and says so when it changed.
     void updateLiveSession();
+    /// D-05/C2: the one pre-stream end path. Marks the attached session ended and, if this
+    /// session's teardown has not already been claimed (the guard is per-session and shared with
+    /// `handleReadyForDeletion()`), runs it with `failed` forwarded to `endSession()`. A no-op
+    /// with no control-plane session attached (`inControlPlaneSession()` false) - there is
+    /// nothing to end. Called by `handlePairingFailed()` and the no-engine branch of
+    /// `handlePairingCompleted()`, both with `failed = true`, after their existing failure report
+    /// and liveness stop and before the trace id is cleared - the failure report and the `/end`
+    /// this queues are both marshalled onto the network thread in that order, so the server
+    /// records the stage before the cancel (RESEARCH-FORK C2).
+    void endAttachedSessionBeforeStream(bool failed);
     /// Applies the answer to the launch-time `GET /api/me` (see `restoreSession()`).
     void applyRestoreResult(const ControlPlaneResult& result);
     /// Applies an answer to `GET /api/wallet`. `epoch` is the credential generation the read was

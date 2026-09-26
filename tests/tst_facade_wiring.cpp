@@ -1673,42 +1673,44 @@ private slots:
         QCOMPARE(client.appState(), QStringLiteral("home"));
     }
 
-    void aSessionTheServerHasNotEndedIsLiveAndPlayResumesItInsteadOfAskingForAnother()
+    // D-05/C2: a failed step before the stream starts ends the session at once rather than leaving
+    // it attached for Play to find later. This test used to be named the other way around
+    // ("...IsLiveAndPlayResumesItInsteadOfAskingForAnother") when the pre-D-05 contract left a
+    // failed session attached and resumable; D-05 replaces that.
+    void aSessionThatFailsBeforeStreamingIsEndedAndPlayStartsAFreshOne()
     {
         SeatHubClient client;
         reachHome(client, 90);
         QVERIFY(!QTest::currentTestFailed());
         QVERIFY(!client.liveSession());
-        QSignalSpy liveChanges(&client, &SeatHubClient::liveSessionChanged);
+        m_fake->answerSession(QStringLiteral("session-live"), QStringLiteral("CANCELLED"));
+        client.teardown()->setVerifyIntervalMs(1);
 
-        // A session is attached (Play's allocation returned it). The rig has no answer in this test,
-        // so pairing fails and connecting stops where it was, with the session still attached.
+        // A session is attached (Play's allocation returned it), but it never streams: the rig has
+        // no answer in this test, so pairing fails - and D-05/C2 ends the session at once.
         client.beginSession(QStringLiteral("session-live"));
-        QVERIFY(client.liveSession());
-        QCOMPARE(liveChanges.count(), 1);
         QTRY_VERIFY_WITH_TIMEOUT(client.connectFailed(), 15000);
         QCOMPARE(client.appState(), QStringLiteral("connecting"));
-        QVERIFY2(client.liveSession(), "a failed step does not end the session on the server");
+        QVERIFY2(!client.liveSession(), "a pre-stream failure ends the session (C2)");
+        QTRY_VERIFY_WITH_TIMEOUT(
+            m_fake->requestPaths().contains(QStringLiteral("/api/sessions/session-live/end")),
+            15000);
 
-        // Back on Home the session is still live: Play reads Resume session (the screen binds to this
-        // flag), and pressing it resumes that session. It does NOT ask for a new one.
+        // Back on Home, Play is a fresh Play: the ended session is never offered for Resume and
+        // is never asked to resume.
         client.dismissError();
         QCOMPARE(client.appState(), QStringLiteral("home"));
-        QVERIFY(client.liveSession());
-        const int pairingBefore =
-            m_fake->requestPaths().count(QStringLiteral("/api/sessions/session-live/pairing"));
-        QVERIFY(pairingBefore >= 1);
+        QVERIFY(!client.liveSession());
 
+        m_fake->answerPlay(201, QByteArrayLiteral("{\"id\":\"session-live-2\"}"));
         client.start();
-        QCOMPARE(client.appState(), QStringLiteral("connecting"));
+        QTRY_COMPARE_WITH_TIMEOUT(client.appState(), QStringLiteral("connecting"), 15000);
+        QCOMPARE(m_fake->requestPaths().count(QStringLiteral("/api/sessions")), 1);
         QTRY_VERIFY_WITH_TIMEOUT(
-            m_fake->requestPaths().count(QStringLiteral("/api/sessions/session-live/pairing"))
-                > pairingBefore,
+            m_fake->requestPaths().contains(QStringLiteral("/api/sessions/session-live-2/pairing")),
             15000);
-        QCOMPARE(m_fake->requestPaths().count(QStringLiteral("/api/sessions")), 0);
 
-        // Sign-out forgets it: the next customer on this PC is never offered this one's session.
-        QTRY_VERIFY_WITH_TIMEOUT(client.connectFailed(), 15000);
+        // Sign-out forgets it either way: the next customer on this PC is never offered a session.
         client.signOut();
         QVERIFY(!client.liveSession());
     }
@@ -2838,8 +2840,11 @@ private slots:
         // The client's own sentence, from the copy it already had; no reference, because none exists.
         QCOMPARE(client.stalledReasonText(), QStringLiteral("The rig didn't finish connecting. Try again."));
         QVERIFY(client.reference().isEmpty());
-        // The session is still the server's to end: Try again picks it up rather than asking for another.
-        QVERIFY(client.liveSession());
+        // D-05/C2: the client's own pairing deadline ends the session at once - it is never left
+        // for Try again to find, and is never offered for Resume.
+        QVERIFY2(!client.liveSession(), "a pre-stream failure ends the session (C2)");
+        QTRY_VERIFY_WITH_TIMEOUT(
+            m_fake->requestPaths().contains(QStringLiteral("/api/sessions/s-stages/end")), 15000);
         verifyNoInternalNameIsShown(client);
     }
 

@@ -613,10 +613,15 @@ QByteArray ControlPlaneClient::buildSessionCreate(const QString& qualityProfile)
 
 QByteArray ControlPlaneClient::buildEndRequest(bool failed)
 {
-    // RED (06.6-17 Task 1): not implemented yet. `endBodyCarriesFailedOnlyWhenAsked` must fail on
-    // this - `{"failed": true}` never reaches the wire yet - not on a compile error.
-    Q_UNUSED(failed);
-    return QByteArray();
+    // Contract 3.3.0 (D-05/D-23): `{"failed": true}` records `CONNECT_FAILED` on a pre-ACTIVE
+    // session; anything else - no body, at all - is the ordinary customer-initiated end
+    // (`CUSTOMER_ENDED`) and is ignored on an ACTIVE one either way.
+    if (!failed) {
+        return QByteArray();
+    }
+    QJsonObject object;
+    object.insert(QStringLiteral("failed"), true);
+    return QJsonDocument(object).toJson(QJsonDocument::Compact);
 }
 
 bool ControlPlaneClient::isValidLivenessState(const QString& state)

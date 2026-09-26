@@ -692,6 +692,21 @@ void SeatHubClient::updateLiveSession()
     emit liveSessionChanged();
 }
 
+void SeatHubClient::endAttachedSessionBeforeStream(bool failed)
+{
+    // A local (no access token) attempt has no control-plane session to end.
+    if (!inControlPlaneSession()) {
+        return;
+    }
+    setAttachedSessionEnded(true);
+    if (m_teardownGuard.markStarted()) {
+        m_teardown->teardown(m_sessionId, m_clientUuid, failed);
+    }
+    // else: this session's teardown was already claimed - by `handleReadyForDeletion()` or by an
+    // earlier call here for the same session - and is already running. A second failure while it
+    // is in flight must not start a second one (T-06.6-50).
+}
+
 void SeatHubClient::setInSettings(bool inSettings)
 {
     if (m_inSettings == inSettings) {
@@ -2190,6 +2205,12 @@ void SeatHubClient::handlePairingCompleted(const QString& clientUuid)
         // or a teardown. Without this it kept reporting `stage: failed` (and reading the wallet)
         // every 10 s until the next `beginSession()` or sign-out.
         m_liveness->stop();
+        // D-05/C2: paired, but nothing could be attached to stream with - end the session now,
+        // with `failed: true`, rather than leaving it for Try again to discover. Queued onto the
+        // network thread right after the report/stop above (both of which self-marshal there too,
+        // being called from this - the facade - thread), so the server records the pairing-stage
+        // report before it sees the cancel.
+        endAttachedSessionBeforeStream(true);
         // WR-01: this Play is over here, at the start refusal - the next one mints its own id.
         // `reportFailure()` above re-invoked itself onto `m_liveness`'s own (network) thread,
         // because this handler runs on the facade thread; a plain, synchronous `clearTraceId()`
@@ -2315,6 +2336,13 @@ void SeatHubClient::handlePairingFailed(const SeatHubFailure& failure)
     // reading the wallet) every 10 s while the customer read the error screen and after returning
     // Home, until the next `beginSession()` or sign-out.
     m_liveness->stop();
+    // D-05/C2: the client's own pairing deadline, or the control plane refusing the pairing read -
+    // either way nothing will ever stream on this session, so end it now with `failed: true`
+    // rather than leaving a dead session for Try again to discover. Queued onto the network
+    // thread right after the report/stop above, so the server records the pairing-stage report
+    // before it sees the cancel; this must run before the trace-id clear below, which is
+    // marshalled onto the same thread and must not overtake it.
+    endAttachedSessionBeforeStream(true);
     // WR-01: this Play is over here, at the pairing failure - the next one mints its own id. See
     // `clearThisPlaysTraceIdAfterAnyQueuedLivenessReport()`'s own comment for why this is not a
     // plain `clearTraceId()` call.
