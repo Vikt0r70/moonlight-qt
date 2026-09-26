@@ -923,10 +923,11 @@ void HudOverlay::tick()
     const qint64 now = nowMs();
     m_elapsedSeconds.store((now - m_sessionStartedMs.load()) / 1000);
 
-    // TEMPORARY RED REGRESSION (Plan 14 Task 2, TDD): disabled for the RED run so
-    // `sizesFollowTheWindow` fails on its own named assertion. Restored for GREEN - see
-    // 06.6-14-SUMMARY.md Deviations.
-    // syncCompositorWindowSize();
+    // D-14 (Plan 14 Task 2): kept current every tick, ahead of the compositor's own read below -
+    // `watchEvents()`'s window-size branch is the preferred, event-driven path and normally keeps
+    // this current already; this call is the fallback for whenever nothing has told the
+    // compositor yet.
+    syncCompositorWindowSize();
 
     const bool wanted = !m_autoHide.load() || (now - m_lastActivityMs.load()) < kAutoHideMs;
     m_visible.store(wanted);
@@ -942,10 +943,7 @@ void HudOverlay::tick()
     // header comment for the one-publish-per-slot rule this implements.
     const bool compositorVisible = !m_compositor.composedBottom().isNull();
 
-    // TEMPORARY RED REGRESSION (Plan 14 Task 2, TDD): `compositorVisible ||` dropped for the RED
-    // run so `hidingTimeLeftKeepsTheEngineLine` fails on its own named assertion. Restored for
-    // GREEN - see 06.6-14-SUMMARY.md Deviations.
-    if (/* compositorVisible || */ wanted || cardShown) {
+    if (compositorVisible || wanted || cardShown) {
         // Re-published every tick while anything is visible, not only when the second changes: the
         // renderer keeps the last texture it was handed, so one publish a second is what keeps the
         // timer on screen current, and re-publishing also repairs a texture lost to a swapchain
@@ -991,13 +989,9 @@ int SDLCALL HudOverlay::watchEvents(void* userdata, SDL_Event* event)
         // The event carries both dimensions already, on the correct thread (the event watch runs
         // synchronously from whichever thread pumps SDL's event queue, never the engine's decoder
         // thread the compositor's own `rasterizeInstance()` must query nothing from).
-        //
-        // TEMPORARY RED REGRESSION (Plan 14 Task 2, TDD): disabled for the RED run so
-        // `sizesFollowTheWindow` fails on its own named assertion. Restored for GREEN - see
-        // 06.6-14-SUMMARY.md Deviations.
-        // if (event->window.data1 > 0 && event->window.data2 > 0) {
-        //     self->m_compositor.setWindowSize(event->window.data1, event->window.data2);
-        // }
+        if (event->window.data1 > 0 && event->window.data2 > 0) {
+            self->m_compositor.setWindowSize(event->window.data1, event->window.data2);
+        }
     }
 
     // The return value of an event watch is ignored; this is an observer, not a filter, and it
