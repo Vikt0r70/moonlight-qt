@@ -727,13 +727,19 @@ QString LogShipper::scrub(const QString& text)
     // request:" << url.toString();`. Each value is hex-encoded (a salt, a certificate, an
     // encrypted challenge or response, or the pairing secret) - never digits-only, so this cannot
     // collide with an IPv4 address (D-09 keeps those).
-    static const QRegularExpression salt(QStringLiteral("&salt=[0-9a-fA-F]+"));
+    // IN-02: all five consistently `&?`-prefixed (matching `clientCert`'s own, already-safer
+    // form) - `nvpairingmanager.cpp`'s request body happens to put every one of these after a
+    // literal `&` today (verified against the real call site), so this was never observable, but
+    // a future reordering of that request construction would otherwise silently defeat scrubbing
+    // for whichever value became first, with no test catching it (a D-09 scrubbing rule whose
+    // whole job is "this secret must never leave the machine").
+    static const QRegularExpression salt(QStringLiteral("&?salt=[0-9a-fA-F]+"));
     static const QRegularExpression clientCert(QStringLiteral("&?clientcert=[0-9a-fA-F]+"));
-    static const QRegularExpression clientChallenge(QStringLiteral("&clientchallenge=[0-9a-fA-F]+"));
+    static const QRegularExpression clientChallenge(QStringLiteral("&?clientchallenge=[0-9a-fA-F]+"));
     static const QRegularExpression serverChallengeResp(
-        QStringLiteral("&serverchallengeresp=[0-9a-fA-F]+"));
+        QStringLiteral("&?serverchallengeresp=[0-9a-fA-F]+"));
     static const QRegularExpression clientPairingSecret(
-        QStringLiteral("&clientpairingsecret=[0-9a-fA-F]+"));
+        QStringLiteral("&?clientpairingsecret=[0-9a-fA-F]+"));
     result.replace(salt, QStringLiteral("&salt=REDACTED"));
     result.replace(clientCert, QStringLiteral("&clientcert=REDACTED"));
     result.replace(clientChallenge, QStringLiteral("&clientchallenge=REDACTED"));
