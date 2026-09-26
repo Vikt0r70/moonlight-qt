@@ -267,7 +267,26 @@ public:
         QString traceId;
     };
 
-    ~Impl() { stop(); }
+    ~Impl()
+    {
+        // WR-03: unregister this Impl's LogTee sink BEFORE the rest of this destructor (and this
+        // object) finishes going away. `LogShipper::instance()`'s function-local static is
+        // constructed at runtime, strictly AFTER `log_tee.cpp`'s own `s_sinks` (a namespace-scope
+        // static that completes its trivial, zero-initialised construction during the program's
+        // static-initialisation phase, before main() runs) - so it is destroyed strictly BEFORE
+        // `s_sinks` is (C++ destroys statics in exact reverse order of construction completion,
+        // across translation units). Without this call, any Qt/SDL log call between this
+        // destructor running and `s_sinks`'s own destruction would dispatch into a dangling
+        // lambda that reads `this->accepting` on freed memory - a genuine use-after-free.
+        // `LogTee::removeSink()` also blocks until any dispatch already calling this sink on
+        // another thread has finished (its own WR-07 guarantee), so this is safe to call
+        // unconditionally, even mid-shutdown, and before `stop()` below.
+        if (sinkHandle != 0) {
+            LogTee::removeSink(sinkHandle);
+            sinkHandle = 0;
+        }
+        stop();
+    }
 
     void start(HandOff handOff)
     {
