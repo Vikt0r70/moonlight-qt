@@ -36,13 +36,12 @@
 #endif
 #include <windows.h>
 
-// CR-02 (and WR-01/WR-02, later fixes in this same file): every qCWarning() call this fix set
-// adds runs on this class's own worker thread only (LogSpool's methods are only ever called from
-// LogShipper's worker - the header's own comment - and pauseHandOff()'s timeout warning runs on
-// whatever thread calls it, same as any other log line this codebase emits from the client
-// thread). The worker thread is guarded against feeding its own qCWarning() calls back into
-// LogShipper's queue by `s_onWorkerThread` (below), so none of these calls can recurse into this
-// sink.
+// WR-01/WR-02/CR-02: every qCWarning() call below runs on this class's own worker thread only
+// (LogSpool's methods are only ever called from LogShipper's worker - the header's own comment -
+// and pauseHandOff()'s timeout warning runs on whatever thread calls it, same as any other log
+// line this codebase emits from the client thread). The worker thread is guarded against feeding
+// its own qCWarning() calls back into LogShipper's queue by `s_onWorkerThread` (below), so none of
+// these calls can recurse into this sink.
 Q_LOGGING_CATEGORY(seathubLogShipper, "seathub.log_shipper")
 
 namespace {
@@ -131,7 +130,15 @@ LogSpool::LogSpool(const QString& directory)
     m_lock = std::make_unique<QLockFile>(m_path + QStringLiteral(".lock"));
     // Our own pid should never collide with a lock another live process holds - this is a very
     // short, effectively non-blocking wait in practice.
-    m_lock->tryLock(1000);
+    if (!m_lock->tryLock(1000)) {
+        // WR-01: SeatHub has no single-instance guard (this class's own header comment) - this
+        // lock is what lets adoptLeftovers() tell a leftover spool file from a live one's apart. A
+        // failure here means this process's own spool file is unprotected for the rest of this
+        // run; log it so a future incident leaves a trail instead of silently reading/writing it
+        // unprotected.
+        qCWarning(seathubLogShipper) << "could not lock" << (m_path + QStringLiteral(".lock"))
+                                      << "- this process's own log spool is now unprotected";
+    }
 }
 
 LogSpool::~LogSpool() = default;
