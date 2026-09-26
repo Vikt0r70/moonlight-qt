@@ -611,6 +611,14 @@ QByteArray ControlPlaneClient::buildSessionCreate(const QString& qualityProfile)
     return QJsonDocument(object).toJson(QJsonDocument::Compact);
 }
 
+QByteArray ControlPlaneClient::buildEndRequest(bool failed)
+{
+    // RED (06.6-17 Task 1): not implemented yet. `endBodyCarriesFailedOnlyWhenAsked` must fail on
+    // this - `{"failed": true}` never reaches the wire yet - not on a compile error.
+    Q_UNUSED(failed);
+    return QByteArray();
+}
+
 bool ControlPlaneClient::isValidLivenessState(const QString& state)
 {
     for (const char* candidate : kLivenessStates) {
@@ -984,11 +992,11 @@ void ControlPlaneClient::postLiveness(const QString& sessionId, const QJsonObjec
          body, true, callback);
 }
 
-void ControlPlaneClient::endSession(const QString& sessionId, Callback callback)
+void ControlPlaneClient::endSession(const QString& sessionId, bool failed, Callback callback)
 {
     send(QStringLiteral("POST"), QStringLiteral("/api/sessions/") + encodedPathSegment(sessionId)
              + QStringLiteral("/end"),
-         QByteArray(), true, callback);
+         buildEndRequest(failed), true, callback);
 }
 
 void ControlPlaneClient::postSessionQuality(const QString& sessionId, const QJsonObject& report,

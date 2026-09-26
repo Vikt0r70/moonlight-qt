@@ -965,9 +965,16 @@ private slots:
         QString tokenPath;
         QVERIFY(storeACredential(client, &tokenPath));
 
-        client.beginSession(QStringLiteral("session-one"));
-        QVERIFY2(client.liveSession(), "a session is live from the moment it is attached");
         armControlPlane(client);
+        // The rig never answers in this test either way; keep the background pairing poll from
+        // resolving on its own - D-05/C2 would otherwise end this session before the test's own
+        // `readyForDeletion` gets a chance to.
+        m_fake->answerPairing(409, playRefusalBody(QStringLiteral("The rig is not ready yet."),
+                                                   QStringLiteral("SH-2K2XQ1")));
+
+        client.beginSession(QStringLiteral("session-one"));
+        emit engine->connectionStarted();
+        QVERIFY2(client.liveSession(), "a session that has streamed is offered for resume (C5)");
 
         QSignalSpy completed(client.teardown(), &TeardownController::teardownCompleted);
         QSignalSpy failed(client.teardown(), &TeardownController::teardownFailed);
@@ -1709,13 +1716,22 @@ private slots:
     void aSessionTheServerReportsOverIsNoLongerOfferedForResume()
     {
         SeatHubClient client;
+        auto* engine = new FakeEngineSession;
+        client.session()->attachSession(engine);
         reachHome(client, 90);
         QVERIFY(!QTest::currentTestFailed());
+        // Keep the background pairing poll from resolving on its own (C2 would otherwise end this
+        // session before it ever streams); the test drives the engine directly instead.
+        m_fake->answerPairing(409, playRefusalBody(QStringLiteral("The rig is not ready yet."),
+                                                   QStringLiteral("SH-2K2XQ1")));
+        client.teardown()->setVerifyIntervalMs(1);
+        m_fake->answerSession(QStringLiteral("session-live"), QStringLiteral("COMPLETED"),
+                             QStringLiteral("BALANCE_EXHAUSTED"));
 
         client.beginSession(QStringLiteral("session-live"));
-        QTRY_VERIFY_WITH_TIMEOUT(client.connectFailed(), 15000);
-        client.dismissError();
-        QVERIFY(client.liveSession());
+        emit engine->connectionStarted();
+        QCOMPARE(client.appState(), QStringLiteral("streaming"));
+        QVERIFY2(client.liveSession(), "a session that streamed is live (C5)");
 
         // The control plane says it is over (the wallet ran out, an operator ended it). It arrives on
         // the session channel, on the network thread, and reaches the facade the way it does in
@@ -1730,12 +1746,21 @@ private slots:
             Qt::BlockingQueuedConnection);
         QTRY_VERIFY_WITH_TIMEOUT(!client.liveSession(), 15000);
 
+        // The engine acknowledges the interrupt the way it does in production: SDL finishes
+        // tearing down and the lifecycle reports `readyForDeletion`, which is what actually
+        // carries the customer back to Home.
+        emit engine->readyForDeletion();
+        QTRY_COMPARE_WITH_TIMEOUT(client.appState(), QStringLiteral("home"), 15000);
+
         // So Play is Play again, and pressing it asks the server for a new session.
         m_fake->answerPlay(402, playRefusalBody(QStringLiteral("Not enough credit."),
                                             QStringLiteral("SH-3K2XQ1")));
         client.start();
         QTRY_COMPARE_WITH_TIMEOUT(client.homeStatus(), QStringLiteral("refused"), 15000);
         QCOMPARE(m_fake->requestPaths().count(QStringLiteral("/api/sessions")), 1);
+
+        client.session()->attachSession(nullptr);
+        delete engine;
     }
 
     void aSessionThatEndsAndTearsDownIsNoLongerLive()
@@ -1749,9 +1774,13 @@ private slots:
         QString tokenPath;
         QVERIFY(storeACredential(client, &tokenPath));
 
-        client.beginSession(QStringLiteral("session-one"));
-        QVERIFY(client.liveSession());
         armControlPlane(client);
+        m_fake->answerPairing(409, playRefusalBody(QStringLiteral("The rig is not ready yet."),
+                                                   QStringLiteral("SH-2K2XQ1")));
+
+        client.beginSession(QStringLiteral("session-one"));
+        emit engine->connectionStarted();
+        QVERIFY(client.liveSession());
 
         QSignalSpy completed(client.teardown(), &TeardownController::teardownCompleted);
         emit engine->readyForDeletion();
@@ -1788,16 +1817,21 @@ private slots:
         // before each Play, not from the start of the whole list, so an earlier request - or a
         // later Play's - is never mistaken for this one's.
         const int beforeFirstPlay = m_fake->requestPaths().size();
+        // Keep the pairing poll from resolving on its own (C2 would otherwise end this session
+        // before it ever streams); the test drives the engine's own `connectionStarted` directly.
+        m_fake->answerPairing(409, playRefusalBody(QStringLiteral("The rig is not ready yet."),
+                                                   QStringLiteral("SH-2K2XQ1")));
         m_fake->answerPlay(201, QByteArrayLiteral("{\"id\":\"s-trace-1\"}"));
         client.start();
-        QTRY_VERIFY_WITH_TIMEOUT(client.liveSession(), 15000);
-        QCOMPARE(m_fake->requestPaths().count(QStringLiteral("/api/sessions")), 1);
 
         // Wait for at least one pairing poll of this session, so there is a second request of
         // this Play to compare the session-create's trace id against.
         QTRY_VERIFY_WITH_TIMEOUT(
             m_fake->requestPaths().count(QStringLiteral("/api/sessions/s-trace-1/pairing")) >= 1,
             15000);
+        QCOMPARE(m_fake->requestPaths().count(QStringLiteral("/api/sessions")), 1);
+        emit engine->connectionStarted();
+        QVERIFY2(client.liveSession(), "a session that streamed is live (C5)");
 
         // Every request of this Play carries the same trace id - the session create itself
         // first of all - and only the span differs (D-27, ADR-0060 item 10).
@@ -1960,8 +1994,11 @@ private slots:
         // pattern), so it mints no trace id of its own - set one directly, standing in for the
         // Play that would have minted it in production.
         client.controlPlane()->setTraceId(QStringLiteral("fedcbafedcbafedcbafedcbafedcbafe"));
+        m_fake->answerPairing(409, playRefusalBody(QStringLiteral("The rig is not ready yet."),
+                                                   QStringLiteral("SH-2K2XQ1")));
         client.beginSession(QStringLiteral("aaaaaaaa-2222-2222-2222-222222222222"));
-        QTRY_VERIFY_WITH_TIMEOUT(client.liveSession(), 15000);
+        emit engine->connectionStarted();
+        QVERIFY2(client.liveSession(), "a session that streamed is live (C5)");
 
         m_fake->answerEnd(500);
         QSignalSpy failed(client.teardown(), &TeardownController::teardownFailed);
@@ -2016,9 +2053,12 @@ private slots:
         auto* engine = new FakeEngineSession;
         client.session()->attachSession(engine);
         client.teardown()->setVerifyIntervalMs(1);
+        m_fake->answerPairing(409, playRefusalBody(QStringLiteral("The rig is not ready yet."),
+                                                   QStringLiteral("SH-2K2XQ1")));
 
         client.beginSession(QStringLiteral("aaaaaaaa-3333-3333-3333-333333333333"));
-        QTRY_VERIFY_WITH_TIMEOUT(client.liveSession(), 15000);
+        emit engine->connectionStarted();
+        QVERIFY2(client.liveSession(), "a session that streamed is live (C5)");
 
         emitStatsBlock(42.0);
 
@@ -2058,9 +2098,12 @@ private slots:
         auto* engine = new FakeEngineSession;
         client.session()->attachSession(engine);
         client.teardown()->setVerifyIntervalMs(1);
+        m_fake->answerPairing(409, playRefusalBody(QStringLiteral("The rig is not ready yet."),
+                                                   QStringLiteral("SH-2K2XQ1")));
 
         client.beginSession(QStringLiteral("aaaaaaaa-4444-4444-4444-444444444444"));
-        QTRY_VERIFY_WITH_TIMEOUT(client.liveSession(), 15000);
+        emit engine->connectionStarted();
+        QVERIFY2(client.liveSession(), "a session that streamed is live (C5)");
 
         emitStatsBlock(55.0);
 
@@ -2199,8 +2242,11 @@ private slots:
         auto* engine = new FakeEngineSession;
         client.session()->attachSession(engine);
         client.teardown()->setVerifyIntervalMs(1);
+        m_fake->answerPairing(409, playRefusalBody(QStringLiteral("The rig is not ready yet."),
+                                                   QStringLiteral("SH-2K2XQ1")));
         client.beginSession(QStringLiteral("aaaaaaaa-5555-5555-5555-555555555555"));
-        QTRY_VERIFY_WITH_TIMEOUT(client.liveSession(), 15000);
+        emit engine->connectionStarted();
+        QVERIFY2(client.liveSession(), "a session that streamed is live (C5)");
 
         emitStatsBlock(48.0);
         m_fake->answerQuality(503); // Retryable - kept, never dropped
@@ -2259,8 +2305,11 @@ private slots:
         auto* engine = new FakeEngineSession;
         client.session()->attachSession(engine);
         client.teardown()->setVerifyIntervalMs(1);
+        m_fake->answerPairing(409, playRefusalBody(QStringLiteral("The rig is not ready yet."),
+                                                   QStringLiteral("SH-2K2XQ1")));
         client.beginSession(sessionA);
-        QTRY_VERIFY_WITH_TIMEOUT(client.liveSession(), 15000);
+        emit engine->connectionStarted();
+        QVERIFY2(client.liveSession(), "a session that streamed is live (C5)");
 
         emitStatsBlock(48.0);
 
@@ -2338,11 +2387,14 @@ private slots:
         auto* engine = new FakeEngineSession;
         client.session()->attachSession(engine);
         client.teardown()->setVerifyIntervalMs(1);
+        m_fake->answerPairing(409, playRefusalBody(QStringLiteral("The rig is not ready yet."),
+                                                   QStringLiteral("SH-2K2XQ1")));
         client.beginSession(QStringLiteral("aaaaaaaa-6666-6666-6666-666666666666"));
-        QTRY_VERIFY_WITH_TIMEOUT(client.liveSession(), 15000);
 
-        // The moment the stream truly begins - starts the aggregator's clock.
+        // The moment the stream truly begins - starts the aggregator's clock, and (C1/C5) is what
+        // makes this session live.
         emit client.session()->connectionStarted();
+        QVERIFY2(client.liveSession(), "a session that streamed is live (C5)");
 
         QThread::msleep(50);
         emitStatsBlock(30.0); // segment 1 (a decoder that ran ~50 ms)
@@ -2852,6 +2904,74 @@ private slots:
         QCOMPARE(m_fake->requestPaths().count(QStringLiteral("/api/sessions")), 1);
         const QByteArray sent = m_fake->bodyFor(QStringLiteral("/api/sessions"));
         QVERIFY2(!sent.contains("host"), "the request names no rig");
+    }
+
+    // --- D-05/D-23: every pre-stream failure ends the session, once (06.6-17) ----------------------
+
+    void pairingFailureEndsTheSession()
+    {
+        SeatHubClient client;
+        beginStagedSession(client);
+        QVERIFY(!QTest::currentTestFailed());
+        client.teardown()->setVerifyIntervalMs(1);
+        m_fake->answerSession(QStringLiteral("s-stages"), QStringLiteral("CANCELLED"));
+
+        emit client.pairing()->pairingFailed(
+            SeatHubFailure::local(QStringLiteral("The rig didn't finish connecting. Try again.")));
+
+        QVERIFY(client.connectFailed());
+        QCOMPARE(client.appState(), QStringLiteral("connecting"));
+
+        QTRY_VERIFY_WITH_TIMEOUT(
+            m_fake->requestPaths().contains(QStringLiteral("/api/sessions/s-stages/end")), 15000);
+        QCOMPARE(m_fake->bodyFor(QStringLiteral("/api/sessions/s-stages/end")),
+                 QByteArrayLiteral("{\"failed\":true}"));
+
+        // The connecting failure view stays on screen: the teardown completing does not carry the
+        // customer away from what they are reading (C2's own contract).
+        QTRY_VERIFY_WITH_TIMEOUT(!client.liveSession(), 15000);
+        QCOMPARE(client.appState(), QStringLiteral("connecting"));
+        QVERIFY(client.connectFailed());
+    }
+
+    void aNoEngineStartEndsTheSession()
+    {
+        SeatHubClient client;
+        beginStagedSession(client);
+        QVERIFY(!QTest::currentTestFailed());
+        client.teardown()->setVerifyIntervalMs(1);
+        m_fake->answerSession(QStringLiteral("s-stages"), QStringLiteral("CANCELLED"));
+
+        // No engine is attached (`beginStagedSession` never attaches one), so pairing completing
+        // finds nothing to start a stream with - the no-engine branch of `handlePairingCompleted`.
+        emit client.pairing()->pairingCompleted(QStringLiteral("aa:bb:cc:dd:ee:ff"));
+
+        QCOMPARE(client.appState(), QStringLiteral("error"));
+        QTRY_VERIFY_WITH_TIMEOUT(
+            m_fake->requestPaths().contains(QStringLiteral("/api/sessions/s-stages/end")), 15000);
+        QCOMPARE(m_fake->bodyFor(QStringLiteral("/api/sessions/s-stages/end")),
+                 QByteArrayLiteral("{\"failed\":true}"));
+        QTRY_VERIFY_WITH_TIMEOUT(!client.liveSession(), 15000);
+    }
+
+    void aSecondFailureDoesNotEndTwice()
+    {
+        SeatHubClient client;
+        beginStagedSession(client);
+        QVERIFY(!QTest::currentTestFailed());
+        // Kept ENDING (never terminal) for the whole test: the guard - not a lucky race against
+        // the verify poll reaching a terminal read - is what keeps the second failure from
+        // starting its own `/end`.
+        m_fake->answerSession(QStringLiteral("s-stages"), QStringLiteral("ENDING"));
+
+        emit client.pairing()->pairingFailed(SeatHubFailure::local(QStringLiteral("first")));
+        QTRY_VERIFY_WITH_TIMEOUT(
+            m_fake->requestPaths().contains(QStringLiteral("/api/sessions/s-stages/end")), 15000);
+        QCOMPARE(m_fake->requestPaths().count(QStringLiteral("/api/sessions/s-stages/end")), 1);
+
+        emit client.pairing()->pairingFailed(SeatHubFailure::local(QStringLiteral("second")));
+        QTest::qWait(200);
+        QCOMPARE(m_fake->requestPaths().count(QStringLiteral("/api/sessions/s-stages/end")), 1);
     }
 
     void backToHomeLeavesTheStalledViewAndForgetsIt()
@@ -4327,7 +4447,9 @@ private slots:
                                                    QStringLiteral("SH-2K2XQ1")));
         m_fake->answerPlay(201, QByteArrayLiteral("{\"id\":\"s-telemetry-play\"}"));
         client.start();
-        QTRY_VERIFY_WITH_TIMEOUT(client.liveSession(), 15000);
+        QTRY_COMPARE_WITH_TIMEOUT(client.appState(), QStringLiteral("connecting"), 15000);
+        emit engine->connectionStarted();
+        QVERIFY2(client.liveSession(), "a session that streamed is live (C5)");
 
         QVERIFY(!SeatHubTelemetry::currentTraceId().isEmpty());
         // The session create is still the first request a Play makes (the existing trace-id tests
@@ -4353,7 +4475,9 @@ private slots:
                                                    QStringLiteral("SH-2K2XQ1")));
         m_fake->answerPlay(201, QByteArrayLiteral("{\"id\":\"s-signout\"}"));
         client.start();
-        QTRY_VERIFY_WITH_TIMEOUT(client.liveSession(), 15000);
+        QTRY_COMPARE_WITH_TIMEOUT(client.appState(), QStringLiteral("connecting"), 15000);
+        emit engine->connectionStarted();
+        QVERIFY2(client.liveSession(), "a session that streamed is live (C5)");
 
         QVERIFY(!SeatHubTelemetry::currentUserId().isEmpty());
         QCOMPARE(SeatHubTelemetry::currentSessionId(), QStringLiteral("s-signout"));

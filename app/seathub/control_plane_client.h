@@ -335,6 +335,9 @@ public:
     /// email or an E.164 phone number); the control plane decides which it is.
     static QByteArray buildLogin(const QString& identifier, const QString& password);
     static QByteArray buildSessionCreate(const QString& qualityProfile);
+    /// `SessionEndRequest` (contract 3.3.0, D-05/D-23): `{"failed": true}` when `failed`, an empty
+    /// body otherwise - the same "assert the shape without a socket" rule as the builders above.
+    static QByteArray buildEndRequest(bool failed);
     /// The liveness body is optional and additive (ADR-0041, D-34). An empty `state` and an
     /// empty `error_code` produce the pre-1.6.0 empty body, which is still a valid report.
     static QByteArray buildLiveness(const QString& state, const QString& errorCode);
@@ -476,7 +479,12 @@ public:
 
     /// `POST /api/sessions/{session_id}/end`. Idempotent server-side: ending an
     /// already-ending or terminal session returns it unchanged.
-    void endSession(const QString& sessionId, Callback callback);
+    ///
+    /// `failed` is D-05/D-23/contract 3.3.0: `true` posts `{"failed": true}`, which the server
+    /// records as `CONNECT_FAILED` on a pre-ACTIVE session (and ignores on an ACTIVE one);
+    /// `false` posts no body, the ordinary customer-initiated end. Every caller must say which -
+    /// there is no default, so a call site can never silently mean "not a failure" by omission.
+    void endSession(const QString& sessionId, bool failed, Callback callback);
 
     /// `POST /api/sessions/{session_id}/quality` (3.1.0, D-17, Plan 15): the parsed end-of-stream
     /// video-stats block (`stream_stats.h`'s `toQualityReport()`), posted once per session. The
