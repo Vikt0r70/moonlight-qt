@@ -225,21 +225,44 @@ jobs:
           $idArgs = @()
           foreach ($id in $debugIds) { $idArgs += '--id'; $idArgs += $id }
 
-          # The three trees sentry-cli scans for matching debug files: SeatHub's own build output,
+          # The two trees that must contain the four ids above: SeatHub's own build output, and
           # sentry-native's installed bin (sentry.dll, crashpad_handler.exe, crashpad_wer.dll and
-          # their PDBs), and the prebuilt libraries submodule, which ships its own PDBs (J.1).
+          # their PDBs). --require-all only fails when one of these four named ids is missing from
+          # what --id searches for here -- it does not, by itself, cause anything else in these
+          # trees or in libs\windows\lib\x64 to upload (MEASURED: sentry-cli's own --id is a
+          # positive filter, not merely a presence check; every debug file whose id is not in the
+          # --id list is dropped from this call's upload set, logged as "Invalid debug ID" even
+          # when the file itself parses fine). That is why the prebuilt libraries' PDBs get their
+          # own unrestricted call below.
           $uploadPaths = @(
             'build\build-x64-release',
-            $sentryInstallBin,
-            'libs\windows\lib\x64'
+            $sentryInstallBin
           )
 
+          $uploadFailed = $false
           & ./sentry-cli.exe debug-files upload --org $env:SENTRY_ORG --project $env:SENTRY_PROJECT --wait --require-all @idArgs @uploadPaths
           if ($LASTEXITCODE -ne 0) {
-            Write-Host "::warning::Sentry symbol upload failed: sentry-cli debug-files upload failed with exit code $LASTEXITCODE; check the project slug and region (06.3.1 owner step). The build still ships -- rigs need the installer more than Sentry needs the symbols."
-            exit 0
+            $uploadFailed = $true
+            Write-Host "::warning::Sentry symbol upload failed: sentry-cli debug-files upload of SeatHub.pdb/sentry.pdb/crashpad_handler.pdb/crashpad_wer.pdb failed with exit code $LASTEXITCODE; check the project slug and region (06.3.1 owner step). The build still ships -- rigs need the installer more than Sentry needs the symbols."
+          } else {
+            Write-Host "uploaded SeatHub's own symbols to Sentry"
           }
-          Write-Host "uploaded SeatHub's symbols to Sentry"
+
+          # J.1: the prebuilt libraries submodule (SDL2, FFmpeg, dav1d, libplacebo, OpenSSL, opus,
+          # discord-rpc) ships its own PDBs, and every one of them carries a debug id no --id list
+          # above ever names -- there is no way to know them ahead of a build, so this call has no
+          # --id and no --require-all: it uploads whatever valid debug files sentry-cli finds under
+          # libs\windows\lib\x64, however many that turns out to be, and only warns if the call
+          # itself fails.
+          & ./sentry-cli.exe debug-files upload --org $env:SENTRY_ORG --project $env:SENTRY_PROJECT --wait 'libs\windows\lib\x64'
+          if ($LASTEXITCODE -ne 0) {
+            $uploadFailed = $true
+            Write-Host "::warning::Sentry symbol upload failed: sentry-cli debug-files upload of the prebuilt libraries' PDBs (libs\windows\lib\x64) failed with exit code $LASTEXITCODE; check the project slug and region (06.3.1 owner step). The build still ships -- rigs need the installer more than Sentry needs the symbols."
+          } else {
+            Write-Host "uploaded the prebuilt libraries' symbols to Sentry"
+          }
+
+          if ($uploadFailed) { exit 0 }
 
       - name: Record the installer hash
         shell: pwsh
