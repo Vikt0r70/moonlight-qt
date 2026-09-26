@@ -257,11 +257,32 @@ jobs:
             $sentryInstallBin
           )
 
+          # WR-06: distinguish the ALREADY-KNOWN, owner-accepted "Project not found" project/region
+          # gap (the exact failure text the real PR run hit - 06.3.1 Plan 23, GitHub Actions run
+          # 36257711287 - and the one this whole warn-and-continue design was built for) from
+          # anything else. A silent regression in the --id/--require-all logic, the debug-id
+          # extraction regex, or the upload call itself would otherwise look IDENTICAL in CI (a
+          # warning, build still green) to today's known, accepted gap - this function makes the
+          # two cases read differently in both the log and the job summary a human actually reads,
+          # without changing the underlying "must not fail the build" behaviour (D-12).
+          $knownGapPattern = 'Project not found'
+          function Report-SentrySymbolUploadFailure($label, $exitCode, $output) {
+            if ($output -match [regex]::Escape($knownGapPattern)) {
+              Write-Host "::warning::Sentry symbol upload failed ($label, exit $exitCode) -- the KNOWN, owner-accepted project/region gap (06.3.1: reissue/reconfigure SENTRY_AUTH_TOKEN for its actual Sentry region). The build still ships -- rigs need the installer more than Sentry needs the symbols."
+              Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "- Sentry symbol upload ($label): known project/region gap -- not a regression, no action needed here."
+            } else {
+              $tail = $output.Substring([Math]::Max(0, $output.Length - 800))
+              Write-Host "::warning::Sentry symbol upload failed ($label, exit $exitCode) with UNEXPECTED output (not the known 'Project not found' project/region gap) -- this may be a real regression in the upload logic, not the pending owner follow-up. The build still ships -- rigs need the installer more than Sentry needs the symbols. Output tail: $tail"
+              Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "- **Sentry symbol upload ($label): UNEXPECTED failure** (not the known project/region gap) -- needs owner/engineer review, may be a real regression."
+            }
+          }
+
           $uploadFailed = $false
-          & ./sentry-cli.exe debug-files upload --org $env:SENTRY_ORG --project $env:SENTRY_PROJECT --wait --require-all @idArgs @uploadPaths
+          $uploadOutputA = (& ./sentry-cli.exe debug-files upload --org $env:SENTRY_ORG --project $env:SENTRY_PROJECT --wait --require-all @idArgs @uploadPaths 2>&1 | Out-String)
+          Write-Host $uploadOutputA
           if ($LASTEXITCODE -ne 0) {
             $uploadFailed = $true
-            Write-Host "::warning::Sentry symbol upload failed: sentry-cli debug-files upload of SeatHub.pdb/sentry.pdb/crashpad_handler.pdb/crashpad_wer.pdb failed with exit code $LASTEXITCODE; check the project slug and region (06.3.1 owner step). The build still ships -- rigs need the installer more than Sentry needs the symbols."
+            Report-SentrySymbolUploadFailure 'SeatHub.pdb/sentry.pdb/crashpad_handler.pdb/crashpad_wer.pdb' $LASTEXITCODE $uploadOutputA
           } else {
             Write-Host "uploaded SeatHub's own symbols to Sentry"
           }
@@ -272,10 +293,11 @@ jobs:
           # --id and no --require-all: it uploads whatever valid debug files sentry-cli finds under
           # libs\windows\lib\x64, however many that turns out to be, and only warns if the call
           # itself fails.
-          & ./sentry-cli.exe debug-files upload --org $env:SENTRY_ORG --project $env:SENTRY_PROJECT --wait 'libs\windows\lib\x64'
+          $uploadOutputB = (& ./sentry-cli.exe debug-files upload --org $env:SENTRY_ORG --project $env:SENTRY_PROJECT --wait 'libs\windows\lib\x64' 2>&1 | Out-String)
+          Write-Host $uploadOutputB
           if ($LASTEXITCODE -ne 0) {
             $uploadFailed = $true
-            Write-Host "::warning::Sentry symbol upload failed: sentry-cli debug-files upload of the prebuilt libraries' PDBs (libs\windows\lib\x64) failed with exit code $LASTEXITCODE; check the project slug and region (06.3.1 owner step). The build still ships -- rigs need the installer more than Sentry needs the symbols."
+            Report-SentrySymbolUploadFailure 'the prebuilt libraries PDBs (libs\windows\lib\x64)' $LASTEXITCODE $uploadOutputB
           } else {
             Write-Host "uploaded the prebuilt libraries' symbols to Sentry"
           }
