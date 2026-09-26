@@ -12,12 +12,16 @@
 
 #include <QtTest>
 
+#include <QDir>
 #include <QFile>
 #include <QFontDatabase>
 #include <QFontInfo>
 #include <QFontMetricsF>
 #include <QImage>
 #include <QList>
+#include <QPainter>
+#include <QPoint>
+#include <QRandomGenerator>
 #include <QRect>
 #include <QRgb>
 #include <QStringList>
@@ -77,6 +81,50 @@ bool regionHasNearBlackPixel(const QImage& image, const QRect& region, int maxCh
         }
     }
     return false;
+}
+
+// D-17's picture sheet: a plain white frame, a plain black frame, and a "busy" mid-grey noise
+// frame from a FIXED seed (so a re-run overwrites the same pixels, not a different-looking one).
+QImage makeBackground(int width, int height, const QString& kind)
+{
+    QImage image(width, height, QImage::Format_ARGB32);
+    if (kind == QLatin1String("white")) {
+        image.fill(Qt::white);
+    }
+    else if (kind == QLatin1String("black")) {
+        image.fill(Qt::black);
+    }
+    else {
+        QRandomGenerator rng(0xD17); // fixed seed - reproducible, not "true" randomness
+        for (int y = 0; y < height; ++y) {
+            for (int x = 0; x < width; ++x) {
+                const int grey = 96 + rng.bounded(64); // mid-grey band, busy enough to be a real test
+                image.setPixel(x, y, qRgb(grey, grey, grey));
+            }
+        }
+    }
+    return image;
+}
+
+// Composites `overlay` onto `background` at `origin`, then saves a 1:1 (never scaled) crop of the
+// overlay's own bounding box plus 64px of background on every side that has room - the picture
+// sheet's whole point is a close-up glance at the overlay, not a full frame nobody can read at
+// thumbnail size.
+void writeCrop(const QString& dir, int height, const QString& background, const QString& kind,
+              const QImage& backgroundImage, const QImage& overlay, const QPoint& origin)
+{
+    QImage composed = backgroundImage.copy();
+    QPainter painter(&composed);
+    painter.drawImage(origin, overlay);
+    painter.end();
+
+    const QRect overlayRect(origin, overlay.size());
+    const QRect cropRect = overlayRect.adjusted(-64, -64, 64, 64)
+        .intersected(QRect(0, 0, composed.width(), composed.height()));
+
+    const QString path = QStringLiteral("%1/%2p-%3-%4.png")
+        .arg(dir, QString::number(height), background, kind);
+    QVERIFY(composed.copy(cropRect).save(path, "PNG"));
 }
 
 } // namespace
@@ -273,6 +321,68 @@ private slots:
         const QString digits = QStringLiteral("123456789");
         for (const QChar digit : digits) {
             QCOMPARE(metrics.horizontalAdvance(QString(digit)), zeroAdvance);
+        }
+    }
+
+    // D-17: a picture sheet of both overlays at four resolutions on three backgrounds, for the
+    // owner to glance at - not a blocking question, so it is produced on request, never on every
+    // run. `SEATHUB_PICTURE_SHEET_DIR` is set by `06.6-06-PLAN.md`'s Task 3 verify command to the
+    // phase's own `06.6-picture-sheet` folder.
+    void pictureSheet()
+    {
+        const QString dir = qEnvironmentVariable("SEATHUB_PICTURE_SHEET_DIR");
+        if (dir.isEmpty()) {
+            QSKIP("SEATHUB_PICTURE_SHEET_DIR not set - the picture sheet is produced on request");
+        }
+
+        QVERIFY(QDir().mkpath(dir));
+        QVERIFY(registerOsdFonts());
+
+        struct Resolution
+        {
+            int width;
+            int height;
+        };
+        const QList<Resolution> resolutions{{1280, 720}, {1920, 1080}, {2560, 1440}, {3840, 2160}};
+        const QStringList backgrounds{QStringLiteral("white"), QStringLiteral("black"),
+                                      QStringLiteral("noise")};
+
+        // The default stats block (`RES`, `FPS`, `LATENCY`) every picture sheet crop shows.
+        const QList<OsdStatsRow> statsRows{
+            OsdStatsRow{QStringLiteral("RES"), true,
+                       {OsdValuePart{QString(), QStringLiteral("1920x1080"), QString()}}},
+            OsdStatsRow{QStringLiteral("FPS"), false,
+                       {OsdValuePart{QString(), QStringLiteral("59.9"), QStringLiteral("fps")}}},
+            OsdStatsRow{QStringLiteral("LATENCY"), false,
+                       {OsdValuePart{QStringLiteral("NET"), QStringLiteral("12"), QStringLiteral("ms")},
+                        OsdValuePart{QStringLiteral("TOTAL"), QStringLiteral("31"), QStringLiteral("ms")}}},
+        };
+
+        for (const Resolution& resolution : resolutions) {
+            const QImage stats = renderOsdStats(statsRows, resolution.height);
+            const QImage bottomWhite = renderOsdBottom(resolution.width, resolution.height,
+                                                       QString(), 0,
+                                                       OsdTimeLeft{true, 9, false});
+            const QImage bottomRed = renderOsdBottom(
+                resolution.width, resolution.height, QStringLiteral("Poor connection to PC"),
+                0xFFCC0000, OsdTimeLeft{true, 4, true});
+            QVERIFY(!stats.isNull());
+            QVERIFY(!bottomWhite.isNull());
+            QVERIFY(!bottomRed.isNull());
+
+            for (const QString& background : backgrounds) {
+                const QImage backgroundImage =
+                    makeBackground(resolution.width, resolution.height, background);
+
+                writeCrop(dir, resolution.height, background, QStringLiteral("stats"),
+                         backgroundImage, stats, QPoint(0, 0));
+                writeCrop(dir, resolution.height, background, QStringLiteral("bottom-white"),
+                         backgroundImage, bottomWhite,
+                         QPoint(0, resolution.height - bottomWhite.height()));
+                writeCrop(dir, resolution.height, background, QStringLiteral("bottom-red"),
+                         backgroundImage, bottomRed,
+                         QPoint(0, resolution.height - bottomRed.height()));
+            }
         }
     }
 };
