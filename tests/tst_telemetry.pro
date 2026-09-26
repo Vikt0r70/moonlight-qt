@@ -64,6 +64,7 @@ SOURCES += \
     tst_telemetry.cpp \
     ../app/seathub/telemetry.cpp \
     ../app/seathub/log_tee.cpp \
+    ../app/seathub/log_shipper.cpp \
     ../app/seathub/token_store.cpp \
     ../app/seathub/error_map.cpp \
     ../app/path.cpp
@@ -71,6 +72,7 @@ SOURCES += \
 HEADERS += \
     ../app/seathub/telemetry.h \
     ../app/seathub/log_tee.h \
+    ../app/seathub/log_shipper.h \
     ../app/seathub/token_store.h \
     ../app/seathub/error_map.h \
     ../app/path.h

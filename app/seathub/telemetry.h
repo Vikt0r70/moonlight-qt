@@ -24,6 +24,17 @@
 // Never call `sentry_close()` here, including at quit (SPIKE T11: a crash after close is captured
 // but without the fatal event, hooks or marker - keep the SDK up for the whole process, per
 // SEATHUB § conclusion 4). Plan 15 is the one place a re-init happens, when the first DSN arrives.
+//
+// Plan 21 (D-14): `start()` registers `logShipperHandOff()` with `LogShipper::instance()` - the
+// only place this fork builds a real `HandOff` (`log_shipper.h`) that calls `sentry_log()`.
+// `logShipperHandOff()` is exposed here, rather than kept file-static in `telemetry.cpp`, so a
+// test that drives `LogShipper` itself against a real (loopback) DSN - `startWith()`, unlike
+// `start()`, never touches `LogShipper` on its own (SPIKE-era tests use `startWith()` so they
+// never hit the real crash-db path) - can wire the exact production hand-off rather than a stub
+// standing in for `sentry_log()` itself. `log_shipper.h` knows nothing about `sentry.h`; including
+// it here does not widen who touches the SDK.
+
+#include "log_shipper.h"
 
 #include <QJsonObject>
 #include <QString>
@@ -96,6 +107,16 @@ void removeLegacyDumps(const QString& dir);
 /// True once a `startWith()` call has returned `sentry_init(...) == 0`. False before any call, and
 /// false if the only call so far failed.
 bool started();
+
+/// The `HandOff` `start()` registers with `LogShipper::instance()`: builds `seathub.logged_at`
+/// (and, when set, `session_id`/`host_id`/`seathub.trace_id`) attributes from `line` and calls
+/// `sentry_log(level, body, attrs)` - never a `sentry_log_*` printf-style variant (Pitfall 6:
+/// user-provided text carrying a literal `%` would otherwise be read as a format string).
+/// Returns `false` (keep the line in the spool) for `SENTRY_LOG_RETURN_FAILED` or
+/// `SENTRY_LOG_RETURN_DISABLED`; `true` otherwise. Safe to call whether or not `sentry_init()` has
+/// ever run in this process (`SENTRY_LOG_RETURN_DISABLED` is exactly what a no-DSN or never-inited
+/// process reports).
+HandOff logShipperHandOff();
 
 /// True when the process that just started crashed on its previous run, per
 /// `sentry_get_crashed_last_run()` read on the first init only. Stays false for a fast-fail crash

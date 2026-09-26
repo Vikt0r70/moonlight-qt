@@ -1,5 +1,6 @@
 #include "telemetry.h"
 
+#include "log_shipper.h"
 #include "log_tee.h"
 #include "path.h"
 #include "seathub_version.h"
@@ -82,6 +83,16 @@ bool s_signedIn = false;
 /// `beginSession()`, is a no-op regardless of what the variable now holds.
 bool s_testCrashChecked = false;
 
+/// Plan 21 (D-14): recomputes `LogShipper::setCanShip()` from the two facts that decide it -
+/// signed in (`s_signedIn`, read from the client thread, same as every other identity read here)
+/// and `s_logsEnabled` (a DSN in use and the handout's `logs` flag - `s_logsEnabled` is already
+/// `false` whenever there is no DSN in use, see its own comment above). Called from `setUser()`,
+/// `clearUser()` and `applyHandout()` - every site that changes either input.
+void updateCanShip()
+{
+    LogShipper::instance().setCanShip(s_signedIn && s_logsEnabled.load());
+}
+
 /// Runs inside crashpad's first-chance filter, in the crashing process, on the crashing thread
 /// (SPIKE Q5, `on_crash` fires before `before_send` for a crash - `sentry_backend_crashpad.cpp`
 /// only calls one or the other, never both). It allocates nothing and takes no lock beyond what
@@ -122,6 +133,53 @@ void seatHubOnCrashedLastRun(const sentry_envelope_t* envelope, void*)
     const char* idStr = sentry_value_as_string(eventId);
     s_lastRunCrashed = true;
     s_lastCrashEventId = idStr ? QString::fromUtf8(idStr) : QString();
+}
+
+/// Plan 21 (D-14): the exact `sentry_level_t` a `LogLevel` maps to. Logs and events use
+/// independent level enums in sentry-native - this mapping has no bearing on `before_send`'s own
+/// fatal-only event filter above, which never sees a log at all (`before_send_log` is separate).
+sentry_level_t seatHubLogLevel(LogLevel level)
+{
+    switch (level) {
+    case LogLevel::Debug:
+        return SENTRY_LEVEL_DEBUG; // never reached in practice - LogShipper filters debug (D-14).
+    case LogLevel::Info:
+        return SENTRY_LEVEL_INFO;
+    case LogLevel::Warning:
+        return SENTRY_LEVEL_WARNING;
+    case LogLevel::Error:
+        return SENTRY_LEVEL_ERROR;
+    case LogLevel::Critical:
+        return SENTRY_LEVEL_FATAL;
+    }
+    return SENTRY_LEVEL_INFO;
+}
+
+/// Plan 21/Pitfall 5: reads the ORIGINAL capture time this line's own attribute carries
+/// (`seathub.logged_at`, set by `logShipperHandOff()` below) and copies it into the log's own
+/// `timestamp` - `apply_attributes()` (sentry_logs.c) has already stamped `timestamp` with NOW by
+/// the time this callback runs, which is the replay time for anything that waited in the spool,
+/// not when it was actually logged. Also re-runs `LogShipper::scrub()` over the body (SEATHUB §
+/// G.3: a defensive second pass, after the worker's own primary scrub) - `LogShipper::scrub()` is
+/// static and pure, so calling it twice costs nothing but a second regex pass.
+sentry_value_t seatHubRestoreTimestampAndScrubLog(sentry_value_t log, void*)
+{
+    const sentry_value_t attributes = sentry_value_get_by_key(log, "attributes");
+    const sentry_value_t loggedAtAttribute
+        = sentry_value_get_by_key(attributes, "seathub.logged_at");
+    const sentry_value_t loggedAtValue = sentry_value_get_by_key(loggedAtAttribute, "value");
+    if (!sentry_value_is_null(loggedAtValue)) {
+        sentry_value_set_by_key(
+            log, "timestamp", sentry_value_new_double(sentry_value_as_double(loggedAtValue)));
+    }
+
+    const char* bodyUtf8 = sentry_value_as_string(sentry_value_get_by_key(log, "body"));
+    const QString scrubbed
+        = LogShipper::scrub(QString::fromUtf8(bodyUtf8 ? bodyUtf8 : ""));
+    const QByteArray scrubbedUtf8 = scrubbed.toUtf8();
+    sentry_value_set_by_key(log, "body", sentry_value_new_string(scrubbedUtf8.constData()));
+
+    return log;
 }
 
 /// `GetModuleFileNameW(nullptr, ...)` resolves the running executable's own path - the interface
@@ -174,6 +232,8 @@ bool initSentry(const SeatHubTelemetry::Options& options)
     sentry_options_set_on_crash(sentryOptions, seatHubOnCrash, nullptr);
     sentry_options_set_before_send(sentryOptions, seatHubBeforeSend, nullptr);
     sentry_options_set_on_crashed_last_run(sentryOptions, seatHubOnCrashedLastRun, nullptr);
+    // Plan 21/D-14: restores the line's own original time and re-scrubs the body.
+    sentry_options_set_before_send_log(sentryOptions, seatHubRestoreTimestampAndScrubLog, nullptr);
 
     const int rv = sentry_init(sentryOptions);
     ++s_initCount;
@@ -215,6 +275,43 @@ bool lastRunCrashed()
 QString lastCrashEventId()
 {
     return s_lastCrashEventId;
+}
+
+HandOff logShipperHandOff()
+{
+    return [](const ShippedLine& line) {
+        sentry_value_t attrs = sentry_value_new_object();
+        sentry_value_set_by_key(attrs, "seathub.logged_at",
+            sentry_value_new_attribute(sentry_value_new_double(line.loggedAt), nullptr));
+        if (!line.sessionId.isEmpty()) {
+            const QByteArray sessionUtf8 = line.sessionId.toUtf8();
+            sentry_value_set_by_key(attrs, "session_id",
+                sentry_value_new_attribute(
+                    sentry_value_new_string(sessionUtf8.constData()), nullptr));
+        }
+        if (!line.hostId.isEmpty()) {
+            const QByteArray hostUtf8 = line.hostId.toUtf8();
+            sentry_value_set_by_key(attrs, "host_id",
+                sentry_value_new_attribute(sentry_value_new_string(hostUtf8.constData()), nullptr));
+        }
+        if (!line.traceId.isEmpty()) {
+            // A `seathub.`-prefixed attribute, never the SDK's own `trace_id` field
+            // (`sentry_set_trace`, G.4's scope-level trace) - `sentry__scope_apply_to_telemetry`
+            // only fills a log's `trace_id` in when it is still null, so this is purely an extra
+            // attribute and never shadows the scope's live trace.
+            const QByteArray traceUtf8 = line.traceId.toUtf8();
+            sentry_value_set_by_key(attrs, "seathub.trace_id",
+                sentry_value_new_attribute(
+                    sentry_value_new_string(traceUtf8.constData()), nullptr));
+        }
+
+        // Never a `sentry_log_*` printf-style variant (Pitfall 6) - `line.body` is
+        // customer/engine-produced text that may contain a literal `%`.
+        const QByteArray bodyUtf8 = line.body.toUtf8();
+        const log_return_value_t rv
+            = sentry_log(seatHubLogLevel(line.level), bodyUtf8.constData(), attrs);
+        return rv != SENTRY_LOG_RETURN_FAILED && rv != SENTRY_LOG_RETURN_DISABLED;
+    };
 }
 
 void removeLegacyDumps(const QString& dir)
@@ -263,6 +360,12 @@ bool start()
 
     // D-10: nothing here shows the customer anything, on success or failure.
     LogTee::install();
+    // Plan 21 (D-14): the one process-lifetime registration - `logShipperHandOff()` is the only
+    // real `HandOff` this fork ever builds. `canShip` starts false regardless of the cached
+    // `s_logsEnabled` value just above - nobody is signed in yet this early (`updateCanShip()`
+    // below folds both facts together once sign-in happens).
+    LogShipper::instance().start(logShipperHandOff());
+    updateCanShip();
     removeLegacyDumps(Path::getLogDir());
 
     return startWith(options);
@@ -381,19 +484,34 @@ void applyHandout(const Handout& handout)
         // crash capture keeps whatever URL this run already has.
         deleteCache();
         s_logsEnabled = false;
+        updateCanShip();
         return;
     }
 
     writeCache(handout);
-    s_logsEnabled = handout.logs;
 
     // C.3 rule 2: only a process that started with no DSN ever re-inits, and only once, on the
     // very first handout it ever applies. A later handout in the same run (a rotation, or this
     // same handout re-delivered) only rewrote the cache above - it takes effect at the next
     // launch, via `start()`'s cache read.
     if (started() && s_startedWithNoDsn && !s_adoptedFirstDsn) {
+        // Plan 21 (SEATHUB § E.3 step 5): the worker must never hand a line to an SDK instance
+        // that is mid-`sentry_close()`/mid-`sentry_init()` - `pauseHandOff()` forces every line
+        // through this window into the spool instead, and is only released once the re-init has
+        // finished AND `s_logsEnabled` (which feeds `canShip`, via `updateCanShip()`) already
+        // reflects this handout. Flipping `s_logsEnabled` before the pause (the previous version
+        // of this function did) left a window where `canShip` could already read `true` while the
+        // OLD, no-DSN SDK instance was still the one `sentry_log()` would reach.
+        LogShipper::instance().pauseHandOff();
+        s_logsEnabled = handout.logs;
         adoptFirstDsn(handout.dsn, handout.environment);
         s_adoptedFirstDsn = true;
+        updateCanShip();
+        LogShipper::instance().resumeHandOff();
+    }
+    else {
+        s_logsEnabled = handout.logs;
+        updateCanShip();
     }
 }
 
@@ -429,6 +547,7 @@ void setUser(const QString& accountId)
     const QByteArray idUtf8 = accountId.toUtf8();
     sentry_set_user(sentry_value_new_user(idUtf8.constData(), nullptr, nullptr, nullptr));
     sentry_set_tag("signed_in", "true");
+    updateCanShip();
 }
 
 void clearUser()
@@ -437,6 +556,7 @@ void clearUser()
     s_signedIn = false;
     sentry_remove_user();
     sentry_set_tag("signed_in", "false");
+    updateCanShip();
 }
 
 void setSession(const QString& sessionId, const QString& hostId)
@@ -461,6 +581,11 @@ void setSession(const QString& sessionId, const QString& hostId)
         sentry_set_attribute("host_id",
                               sentry_value_new_attribute(sentry_value_new_string(hostUtf8.constData()), nullptr));
     }
+
+    // Plan 21: publishes the snapshot every future logged line captures - never read from the
+    // `s_current*` statics above directly (documented client-thread-only; `LogShipper`'s sink
+    // runs on ARBITRARY threads, so that read would be a data race).
+    LogShipper::instance().publishIds(s_currentSessionId, s_currentHostId, s_currentTraceId);
 }
 
 void clearSession()
@@ -471,6 +596,7 @@ void clearSession()
     sentry_remove_attribute("session_id");
     sentry_remove_tag("host_id");
     sentry_remove_attribute("host_id");
+    LogShipper::instance().publishIds(s_currentSessionId, s_currentHostId, s_currentTraceId);
 }
 
 void setTrace(const QString& traceId)
@@ -478,12 +604,14 @@ void setTrace(const QString& traceId)
     s_currentTraceId = traceId;
     const QByteArray traceUtf8 = traceId.toUtf8();
     sentry_set_trace(traceUtf8.constData(), nullptr);
+    LogShipper::instance().publishIds(s_currentSessionId, s_currentHostId, s_currentTraceId);
 }
 
 void clearTrace()
 {
     s_currentTraceId.clear();
     sentry_start_new_trace();
+    LogShipper::instance().publishIds(s_currentSessionId, s_currentHostId, s_currentTraceId);
 }
 
 QString currentUserId()

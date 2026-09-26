@@ -40,6 +40,7 @@
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
+#include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QProcess>
@@ -60,6 +61,13 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+
+// Plan 21: `telemetry.h` now includes `log_shipper.h`, which includes `log_tee.h`, which includes
+// <SDL.h> - and <SDL.h> otherwise `#define`s `main` to `SDL_main` on Windows, which would rename
+// this file's own `main()` (below) out from under the linker (the same fix `tst_log_tee.cpp` and
+// `tst_log_shipper.cpp` use for the same reason - neither of THOSE files pulled SDL in through
+// telemetry.h before this plan, so this file never needed the fix until now).
+#define SDL_MAIN_HANDLED
 
 #include "seathub/telemetry.h"
 
@@ -208,6 +216,54 @@ int runTestCrashChild(int argc, char* argv[])
     return 0; // reached whenever the switch does not crash this process
 }
 
+// --- Plan 21 (D-14): the real LogShipper hand-off, against a loopback DSN -------------------
+
+/// `tst_telemetry --logs-child <dsn> <db> <handler> <spool-dir> <gate>`: wires the REAL
+/// production hand-off (`SeatHubTelemetry::logShipperHandOff()`) onto a `LogShipper` this child
+/// drives itself - `startWith()`, unlike `start()`, never touches `LogShipper`
+/// (`logShipperHandOff()`'s own header comment), so this role does that wiring by hand, against a
+/// temp spool directory the parent's `QTemporaryDir` owns. `gate` is `"signed-in"` (calls
+/// `setUser()` before the handout, so `canShip` - `signedIn() && logsEnabled()` - goes true) or
+/// `"signed-out"` (never signs in, so `canShip` stays false even though the handout's `dsn` and
+/// `logs: true` are otherwise identical) - proving the SAME gating `SeatHubClient` relies on,
+/// through the real `setUser()`/`applyHandout()` calls, not a direct `LogShipper::setCanShip()`
+/// bypass. Stays alive past the logs batcher's own 5000ms flush interval
+/// (`sentry_logs.c`'s `SENTRY_BATCHER_FLUSH_INTERVAL_MS`) only for the signed-in gate - there is
+/// no `sentry_flush()` call available outside `telemetry.cpp`, the one translation unit that
+/// includes `sentry.h`.
+int runLogsChild(int argc, char* argv[])
+{
+    const SeatHubTelemetry::Options options = optionsFromChildArgs(argc, argv);
+    const QString spoolDir = argc > 5 ? QString::fromLocal8Bit(argv[5]) : QString();
+    const QString gate = argc > 6 ? QString::fromLocal8Bit(argv[6]) : QStringLiteral("signed-in");
+
+    LogTee::install();
+    LogShipper::instance().setSpoolDirectoryForTests(spoolDir);
+    LogShipper::instance().start(SeatHubTelemetry::logShipperHandOff());
+    SeatHubTelemetry::startWith(options);
+    SeatHubTelemetry::setSession(QStringLiteral("session-logs-child"), QString());
+
+    if (gate == QStringLiteral("signed-in")) {
+        SeatHubTelemetry::setUser(QStringLiteral("acct-logs-child"));
+    }
+    // Either way: a DSN already in use (via `startWith()` above) and a `logs: true` handout - the
+    // gate's only variable is whether `setUser()` ran.
+    SeatHubTelemetry::Handout handout;
+    handout.dsn = options.dsn;
+    handout.environment = QStringLiteral("test");
+    handout.logs = true;
+    SeatHubTelemetry::applyHandout(handout);
+
+    qInfo() << "logs-child-line-marker";
+
+    LogShipper::instance().drainBeforeSignOut();
+    if (gate == QStringLiteral("signed-in")) {
+        ::Sleep(6000);
+    }
+    LogShipper::instance().stop();
+    return 0;
+}
+
 // --- the fake Sentry endpoint --------------------------------------------------------------
 
 /// Wires `server` to answer every request with `200 {}` and record the request line's path in
@@ -248,6 +304,112 @@ void wireFakeSentryListener(QTcpServer* server, QStringList* receivedPaths)
             QObject::connect(socket, &QTcpSocket::disconnected, socket, &QTcpSocket::deleteLater);
         }
     });
+}
+
+/// Wires `server` to answer every request `200 {}` only once the FULL body (per its own
+/// `Content-Length` header) has arrived, and stores it in `*envelopeBody` -
+/// `wireFakeSentryListener()` above answers as soon as the headers end, which would truncate an
+/// envelope this suite actually needs to parse. Safe to parse directly, never gzipped: this
+/// fork's pinned sentry-native build has `SENTRY_TRANSPORT_COMPRESSION:BOOL=OFF`
+/// (`build/sentry-native-0.17.1/build/CMakeCache.txt`).
+void wireLogEnvelopeListener(QTcpServer* server, QByteArray* envelopeBody)
+{
+    QObject::connect(server, &QTcpServer::newConnection, server, [server, envelopeBody]() {
+        while (QTcpSocket* socket = server->nextPendingConnection()) {
+            auto buffer = std::make_shared<QByteArray>();
+            auto responded = std::make_shared<bool>(false);
+            QObject::connect(socket, &QTcpSocket::readyRead, socket,
+                              [socket, buffer, responded, envelopeBody]() {
+                *buffer += socket->readAll();
+                if (*responded) {
+                    return;
+                }
+                const int headerEnd = buffer->indexOf("\r\n\r\n");
+                if (headerEnd < 0) {
+                    return;
+                }
+                qint64 contentLength = 0;
+                for (const QByteArray& line : buffer->left(headerEnd).split('\n')) {
+                    const QByteArray trimmed = line.trimmed();
+                    if (trimmed.toLower().startsWith("content-length:")) {
+                        contentLength = trimmed.mid(trimmed.indexOf(':') + 1).trimmed().toLongLong();
+                        break;
+                    }
+                }
+                const int bodyStart = headerEnd + 4;
+                if (buffer->size() - bodyStart < contentLength) {
+                    return; // more body still to arrive
+                }
+                *envelopeBody = buffer->mid(bodyStart, static_cast<int>(contentLength));
+                *responded = true;
+                static const QByteArray body = QByteArrayLiteral("{}");
+                QByteArray response = QByteArrayLiteral("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                                                         "Content-Length: ") + QByteArray::number(body.size())
+                    + QByteArrayLiteral("\r\nConnection: close\r\n\r\n") + body;
+                socket->write(response);
+                socket->flush();
+                socket->disconnectFromHost();
+            });
+            QObject::connect(socket, &QTcpSocket::disconnected, socket, &QTcpSocket::deleteLater);
+        }
+    });
+}
+
+/// One "log" envelope item's first entry, per `sentry__envelope_add_logs()`
+/// (`sentry_envelope.c`/`sentry_logs.c`): the envelope is `{envelope headers}\n{item
+/// headers}\n{item payload}` (repeated per item, `SENTRY_TRANSPORT_COMPRESSION` off means never
+/// gzipped in this build), the item header's own `length` field is exactly the payload's byte
+/// count, and the payload itself is `{"items":[{...one log object per sentry_log() call batched
+/// into this envelope...}]}`.
+struct ParsedLogItem
+{
+    bool found = false;
+    QString body;
+    QJsonObject attributes;
+};
+
+ParsedLogItem parseFirstLogItem(const QByteArray& envelopeBody)
+{
+    ParsedLogItem result;
+    int pos = envelopeBody.indexOf('\n');
+    if (pos < 0) {
+        return result;
+    }
+    pos += 1; // past the envelope's own header line
+
+    while (pos < envelopeBody.size()) {
+        const int headerLineEnd = envelopeBody.indexOf('\n', pos);
+        if (headerLineEnd < 0) {
+            break;
+        }
+        QJsonParseError error;
+        const QJsonObject itemHeader =
+            QJsonDocument::fromJson(envelopeBody.mid(pos, headerLineEnd - pos), &error).object();
+        if (error.error != QJsonParseError::NoError) {
+            break;
+        }
+        const qint64 length = itemHeader.value(QStringLiteral("length")).toVariant().toLongLong();
+        const QString type = itemHeader.value(QStringLiteral("type")).toString();
+        pos = headerLineEnd + 1;
+        const QByteArray payload = envelopeBody.mid(pos, static_cast<int>(length));
+        pos += static_cast<int>(length);
+        if (pos < envelopeBody.size() && envelopeBody.at(pos) == '\n') {
+            ++pos; // the next item's own leading newline
+        }
+
+        if (type == QStringLiteral("log")) {
+            const QJsonObject logsObject = QJsonDocument::fromJson(payload).object();
+            const QJsonArray items = logsObject.value(QStringLiteral("items")).toArray();
+            if (!items.isEmpty()) {
+                const QJsonObject firstLog = items.first().toObject();
+                result.found = true;
+                result.body = firstLog.value(QStringLiteral("body")).toString();
+                result.attributes = firstLog.value(QStringLiteral("attributes")).toObject();
+                return result;
+            }
+        }
+    }
+    return result;
 }
 
 bool anyStartsWith(const QStringList& list, const QString& prefix)
@@ -419,6 +581,86 @@ private slots:
         QVERIFY(!QFileInfo(dmp1).exists());
         QVERIFY(!QFileInfo(dmp2).exists());
         QVERIFY(QFileInfo(keptLog).exists());
+    }
+
+    // --- Plan 21 (D-14): the real LogShipper hand-off -----------------------------------------
+
+    void signedInAndLogsTrueSendsAnEnvelopeCarryingTheLineWithSessionAndOriginalTime()
+    {
+        QTemporaryDir dbDir;
+        QVERIFY(dbDir.isValid());
+        QTemporaryDir spoolDir;
+        QVERIFY(spoolDir.isValid());
+
+        QTcpServer server;
+        QByteArray envelopeBody;
+        wireLogEnvelopeListener(&server, &envelopeBody);
+        QVERIFY2(server.listen(QHostAddress::LocalHost, 0),
+                 "the fake Sentry listener must bind 127.0.0.1:0");
+        const QString dsn = QStringLiteral("http://publickey@127.0.0.1:%1/1").arg(server.serverPort());
+
+        const double beforeLog =
+            static_cast<double>(QDateTime::currentMSecsSinceEpoch()) / 1000.0;
+
+        QProcess child;
+        child.setProgram(m_appPath);
+        child.setArguments({ QStringLiteral("--logs-child"), dsn, dbDir.path(), m_handlerPath,
+                             spoolDir.path(), QStringLiteral("signed-in") });
+        child.start();
+        QVERIFY2(child.waitForStarted(5000), "the logs-child process must start");
+
+        QTRY_VERIFY_WITH_TIMEOUT(!envelopeBody.isEmpty(), 15000);
+
+        QVERIFY(child.waitForFinished(10000));
+        QCOMPARE(child.exitCode(), 0);
+
+        const ParsedLogItem item = parseFirstLogItem(envelopeBody);
+        QVERIFY2(item.found, "no log item found in the captured envelope");
+        QVERIFY2(item.body.contains(QStringLiteral("logs-child-line-marker")),
+                 qPrintable(QStringLiteral("unexpected log body: %1").arg(item.body)));
+
+        QVERIFY2(item.attributes.contains(QStringLiteral("session_id")),
+                 "the log's attributes must carry session_id");
+        QCOMPARE(item.attributes.value(QStringLiteral("session_id")).toObject()
+                     .value(QStringLiteral("value")).toString(),
+                 QStringLiteral("session-logs-child"));
+
+        QVERIFY2(item.attributes.contains(QStringLiteral("seathub.logged_at")),
+                 "the log's attributes must carry seathub.logged_at");
+        const double loggedAt = item.attributes.value(QStringLiteral("seathub.logged_at"))
+                                     .toObject().value(QStringLiteral("value")).toDouble();
+        QVERIFY2(loggedAt >= beforeLog - 2.0 && loggedAt <= beforeLog + 10.0,
+                 "seathub.logged_at was not close to when the line was actually logged");
+    }
+
+    void withNoSignInSetCanShipStaysFalseAndNothingReachesTheSdk()
+    {
+        QTemporaryDir dbDir;
+        QVERIFY(dbDir.isValid());
+        QTemporaryDir spoolDir;
+        QVERIFY(spoolDir.isValid());
+
+        QTcpServer server;
+        QByteArray envelopeBody;
+        wireLogEnvelopeListener(&server, &envelopeBody);
+        QVERIFY2(server.listen(QHostAddress::LocalHost, 0),
+                 "the fake Sentry listener must bind 127.0.0.1:0");
+        const QString dsn = QStringLiteral("http://publickey@127.0.0.1:%1/1").arg(server.serverPort());
+
+        QProcess child;
+        child.setProgram(m_appPath);
+        // Same DSN, same `logs: true` handout as the signed-in test above - the only difference
+        // is this role never calls `setUser()` (SeatHubTelemetry::signedIn() stays false), which
+        // must be enough on its own to keep `canShip` - and therefore every hand-off - false.
+        child.setArguments({ QStringLiteral("--logs-child"), dsn, dbDir.path(), m_handlerPath,
+                             spoolDir.path(), QStringLiteral("signed-out") });
+        child.start();
+        QVERIFY2(child.waitForStarted(5000), "the logs-child process must start");
+        QVERIFY(child.waitForFinished(10000));
+        QCOMPARE(child.exitCode(), 0);
+
+        QVERIFY2(envelopeBody.isEmpty(),
+                 "a line reached the SDK despite no sign-in - canShip must have been true");
     }
 
     // --- Task 3: the hook order is guarded by a test, not just by the code review -------------
@@ -808,6 +1050,9 @@ int main(int argc, char* argv[])
     }
     if (argc > 1 && std::strcmp(argv[1], "--test-crash-child") == 0) {
         return runTestCrashChild(argc, argv);
+    }
+    if (argc > 1 && std::strcmp(argv[1], "--logs-child") == 0) {
+        return runLogsChild(argc, argv);
     }
 
     QCoreApplication app(argc, argv);

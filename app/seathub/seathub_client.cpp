@@ -13,6 +13,7 @@
 #include "countries.h"
 #include "duration_text.h"
 #include "engine_termination.h"
+#include "log_shipper.h"
 #include "log_tee.h"
 #include "osd_compositor.h"
 #include "quality_outbox.h"
@@ -457,6 +458,15 @@ SeatHubClient::~SeatHubClient()
     LogTee::removeSink(m_statsSinkHandle);
     m_terminationSinkHandle = 0;
     m_statsSinkHandle = 0;
+
+    // Plan 21 (D-14, SEATHUB § E.3 step 6): "at quit" for this fork is this destructor - one
+    // `SeatHubClient` for the life of the production app. Queues whatever is still in memory
+    // straight to the spool (never attempting a hand-off this late) and joins the worker thread -
+    // required before process exit: a joinable `std::thread` still attached to the `LogShipper`
+    // singleton at its own static destruction would call `std::terminate()`. A no-op, cheaply,
+    // when `LogShipper` was never started (`tst_facade_wiring.cpp` constructs and destroys a
+    // `SeatHubClient` once per test and never calls `SeatHubTelemetry::start()`).
+    LogShipper::instance().stop();
 
     // Order matters. Everything that was moved to the control-plane thread is brought home *from
     // inside that thread* first, the thread is then stopped and joined, and only then is anything
@@ -1403,6 +1413,11 @@ void SeatHubClient::signOut()
     SeatHubTelemetry::clearTrace();
     // D-09, D-18 SV-C4: no session or account survives a sign-out into the next crash's tags.
     SeatHubTelemetry::clearSession();
+    // Plan 21 (D-14, Pitfall 9): every line captured before this point ships - or lands back in
+    // the spool - under THIS account before it is cleared below. Without this, a line from the
+    // last instant of this session could still be sitting in the in-memory queue when
+    // `clearUser()` runs, and ship moments later carrying no account id (or the next one).
+    LogShipper::instance().drainBeforeSignOut();
     SeatHubTelemetry::clearUser();
 
     // Signing out leaves no stored pairing and no usable credential: not on disk, not in memory

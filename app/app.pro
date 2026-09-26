@@ -234,6 +234,7 @@ SOURCES += \
     seathub/moonlight_engine_session.cpp \
     seathub/stub_engine_session.cpp \
     seathub/log_tee.cpp \
+    seathub/log_shipper.cpp \
     seathub/stream_stats.cpp \
     seathub/engine_termination.cpp \
     seathub/quality_outbox.cpp \
@@ -304,6 +305,7 @@ HEADERS += \
     seathub/stream_window_name.h \
     seathub/stub_engine_session.h \
     seathub/log_tee.h \
+    seathub/log_shipper.h \
     seathub/stream_stats.h \
     seathub/engine_termination.h \
     seathub/quality_outbox.h \
