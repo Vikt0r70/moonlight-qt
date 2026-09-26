@@ -164,11 +164,23 @@ jobs:
           $dsnPattern = '@[A-Za-z0-9._-]{1,80}\.ingest\.(de\.)?sentry\.io'
           $shippedBinaries = Get-ChildItem -Path $deployDir -Include '*.exe', '*.dll' -Recurse -ErrorAction SilentlyContinue
           foreach ($bin in $shippedBinaries) {
+            # CR-04: Select-String's default encoding only catches this pattern as narrow (8-bit)
+            # bytes, which is what acceptDsn()'s own QLatin1String validation string happens to
+            # compile to (the false-positive case above). QStringLiteral(...) -- the far more
+            # common Qt idiom for a QString literal, and the natural way a developer would
+            # accidentally hardcode a real DSN -- compiles to UTF-16LE instead, which the default
+            # scan does not see at all. MEASURED: a file holding the UTF-16LE bytes of a synthetic
+            # DSN does not match under the default encoding, but does match with -Encoding Unicode
+            # supplied explicitly. Scan both encodings so a DSN hardcoded either way is caught
+            # (D-01, D-45, SC-10).
             if (Select-String -LiteralPath $bin.FullName -Pattern $dsnPattern -Quiet) {
-              throw "$($bin.FullName) contains what looks like a compiled-in Sentry DSN (matches $dsnPattern) -- no DSN may be compiled in (D-01, SC-10)"
+              throw "$($bin.FullName) contains what looks like a compiled-in Sentry DSN (matches $dsnPattern, narrow/8-bit scan) -- no DSN may be compiled in (D-01, SC-10)"
+            }
+            if (Select-String -LiteralPath $bin.FullName -Pattern $dsnPattern -Encoding Unicode -Quiet) {
+              throw "$($bin.FullName) contains what looks like a compiled-in Sentry DSN (matches $dsnPattern, UTF-16LE/QStringLiteral scan) -- no DSN may be compiled in (D-01, SC-10)"
             }
           }
-          Write-Host "no PDB in $deployDir, and no Sentry DSN is compiled into any shipped exe/dll"
+          Write-Host "no PDB in $deployDir, and no Sentry DSN is compiled into any shipped exe/dll (narrow and UTF-16LE scans)"
 
       # ADR-0063, D-12: every CI build uploads SeatHub's debug symbols to Sentry, so a crash is a
       # readable stack, not an address. A Sentry-side refusal (wrong project slug, wrong region)
