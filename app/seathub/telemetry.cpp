@@ -256,6 +256,27 @@ void adoptFirstDsn(const QString& dsn, const QString& environment)
     options.environment = environment;
     s_started = initSentry(options);
     s_lastOptions = options;
+
+    // CR-01 fix: `sentry_close()`'s own scope cleanup (verified against the vendored
+    // `sentry_scope.c`'s `sentry__scope_cleanup()`) wipes every `sentry_set_user`/
+    // `sentry_set_tag`/`sentry_set_attribute`/`sentry_set_trace` call made before this re-init.
+    // The `s_current*` statics were never touched by that wipe - only the SDK's own copy was - so
+    // replaying them onto the freshly-initialised scope is enough to make a crash or log line
+    // captured after this point still carry the account, session, host and trace id that were set
+    // before the re-init (D-09, D-03). A process with none of these set yet (no identity before
+    // its first Play) replays nothing, matching what a fresh sentry_init() would already look
+    // like.
+    if (s_started) {
+        if (s_signedIn) {
+            SeatHubTelemetry::setUser(s_currentUserId);
+        }
+        if (!s_currentSessionId.isEmpty() || !s_currentHostId.isEmpty()) {
+            SeatHubTelemetry::setSession(s_currentSessionId, s_currentHostId);
+        }
+        if (!s_currentTraceId.isEmpty()) {
+            SeatHubTelemetry::setTrace(s_currentTraceId);
+        }
+    }
 }
 
 } // namespace
@@ -529,6 +550,16 @@ int closeCallCount()
 {
     return s_closeCount;
 }
+
+#ifdef SEATHUB_TEST_ALLOW_LOOPBACK_DSN
+void captureTestMessageForTests(const QString& message)
+{
+    const QByteArray messageUtf8 = message.toUtf8();
+    sentry_value_t event
+        = sentry_value_new_message_event(SENTRY_LEVEL_FATAL, nullptr, messageUtf8.constData());
+    sentry_capture_event(event);
+}
+#endif
 
 // --- identity (D-09, D-13, G.4) ------------------------------------------------------------
 //

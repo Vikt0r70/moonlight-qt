@@ -193,6 +193,44 @@ int runRotationChild(int argc, char* argv[])
     return 0; // unreachable
 }
 
+/// `tst_telemetry --identity-reinit-child <db> <handler> <dsn> <environment>`: starts with no DSN,
+/// sets every identity value (user/session/host/trace) BEFORE applying the handout - CR-01's exact
+/// scenario (a customer's first Play on a fresh install, where setUser()/setSession()/setTrace()
+/// all ran before the first accepted DSN handout triggers `adoptFirstDsn()`'s
+/// `sentry_close()`/`sentry_init()`) - then captures a plain test message event (never a crash: a
+/// crash's own minidump upload is gzipped/msgpack-encoded by crashpad's OUT-OF-PROCESS handler,
+/// which this suite cannot decode; a plain `sentry_capture_event()` goes out through the SDK's own
+/// envelope transport instead, uncompressed in this fork's pinned build, exactly like the log
+/// envelope tests above).
+int runIdentityReinitChild(int argc, char* argv[])
+{
+    SeatHubTelemetry::Options options;
+    options.databaseDir = argc > 2 ? QString::fromLocal8Bit(argv[2]) : QString();
+    options.handlerPath = argc > 3 ? QString::fromLocal8Bit(argv[3]) : QString();
+    options.environment = QStringLiteral("test");
+    options.release = QStringLiteral("tst_telemetry@0.0.0");
+    options.dsn = QString(); // the scenario: this process starts with no DSN at all.
+    SeatHubTelemetry::startWith(options);
+
+    SeatHubTelemetry::setUser(QStringLiteral("acct-reinit-test"));
+    SeatHubTelemetry::setSession(QStringLiteral("session-reinit-test"),
+                                 QStringLiteral("host-reinit-test"));
+    SeatHubTelemetry::setTrace(QStringLiteral("trace-reinit-test"));
+
+    SeatHubTelemetry::Handout handout;
+    handout.dsn = argc > 4 ? QString::fromLocal8Bit(argv[4]) : QString();
+    handout.environment = argc > 5 ? QString::fromLocal8Bit(argv[5]) : QStringLiteral("test");
+    handout.logs = true;
+    SeatHubTelemetry::applyHandout(handout); // triggers the one re-init (adoptFirstDsn()).
+
+    SeatHubTelemetry::captureTestMessageForTests(QStringLiteral("identity-reinit-marker"));
+
+    // There is no sentry_flush() available outside telemetry.cpp (the one TU with sentry.h) - stay
+    // alive long enough for the SDK's own background transport to send the envelope before exit.
+    ::Sleep(3000);
+    return 0;
+}
+
 /// `tst_telemetry --test-crash-child <db> <handler> <dsn>`: starts with `dsn` already in place
 /// (Task 3 is about the switch, not the handout path Task 1 already covers), then calls
 /// `SeatHubTelemetry::maybeTestCrash()` exactly once. `SEATHUB_TEST_CRASH` is read from this
@@ -407,6 +445,67 @@ ParsedLogItem parseFirstLogItem(const QByteArray& envelopeBody)
                 result.attributes = firstLog.value(QStringLiteral("attributes")).toObject();
                 return result;
             }
+        }
+    }
+    return result;
+}
+
+/// One "event" envelope item (CR-01 regression: `captureTestMessageForTests()`'s plain message
+/// event, never a crash). Same envelope shape `parseFirstLogItem()` above already parses - only
+/// the item `type` and the payload's own top-level keys differ: a message event's body lives at
+/// `message.formatted` (`sentry_value_new_message_event_n()`'s own shape, verified against the
+/// vendored `sentry_value.c`), and the scope's live user/tags/trace are merged onto the event's
+/// own `user`/`tags`/`contexts.trace.trace_id` keys (verified against the vendored
+/// `sentry_scope.c`'s `sentry__scope_apply_to_event()`).
+struct ParsedEventItem
+{
+    bool found = false;
+    QString body;
+    QJsonObject tags;
+    QJsonObject user;
+    QString traceId;
+};
+
+ParsedEventItem parseFirstEventItem(const QByteArray& envelopeBody)
+{
+    ParsedEventItem result;
+    int pos = envelopeBody.indexOf('\n');
+    if (pos < 0) {
+        return result;
+    }
+    pos += 1; // past the envelope's own header line
+
+    while (pos < envelopeBody.size()) {
+        const int headerLineEnd = envelopeBody.indexOf('\n', pos);
+        if (headerLineEnd < 0) {
+            break;
+        }
+        QJsonParseError error;
+        const QJsonObject itemHeader =
+            QJsonDocument::fromJson(envelopeBody.mid(pos, headerLineEnd - pos), &error).object();
+        if (error.error != QJsonParseError::NoError) {
+            break;
+        }
+        const qint64 length = itemHeader.value(QStringLiteral("length")).toVariant().toLongLong();
+        const QString type = itemHeader.value(QStringLiteral("type")).toString();
+        pos = headerLineEnd + 1;
+        const QByteArray payload = envelopeBody.mid(pos, static_cast<int>(length));
+        pos += static_cast<int>(length);
+        if (pos < envelopeBody.size() && envelopeBody.at(pos) == '\n') {
+            ++pos; // the next item's own leading newline
+        }
+
+        if (type == QStringLiteral("event")) {
+            const QJsonObject event = QJsonDocument::fromJson(payload).object();
+            result.found = true;
+            result.tags = event.value(QStringLiteral("tags")).toObject();
+            result.user = event.value(QStringLiteral("user")).toObject();
+            result.body = event.value(QStringLiteral("message")).toObject()
+                              .value(QStringLiteral("formatted")).toString();
+            result.traceId = event.value(QStringLiteral("contexts")).toObject()
+                                  .value(QStringLiteral("trace")).toObject()
+                                  .value(QStringLiteral("trace_id")).toString();
+            return result;
         }
     }
     return result;
@@ -925,6 +1024,54 @@ private slots:
         QCOMPARE(cached->dsn, dsnB); // the cache always holds the LATEST handout, adopted or not.
     }
 
+    // --- CR-01 regression: identity survives adoptFirstDsn()'s one re-init ----------------------
+
+    void identitySurvivesTheOneFirstDsnReInit()
+    {
+        QTemporaryDir dbDir;
+        QVERIFY(dbDir.isValid());
+
+        QTcpServer server;
+        QByteArray envelopeBody;
+        wireLogEnvelopeListener(&server, &envelopeBody);
+        QVERIFY2(server.listen(QHostAddress::LocalHost, 0),
+                 "the fake Sentry listener must bind 127.0.0.1:0");
+        const QString dsn = QStringLiteral("http://publickey@127.0.0.1:%1/1").arg(server.serverPort());
+
+        QProcess child;
+        child.setProgram(m_appPath);
+        child.setArguments({ QStringLiteral("--identity-reinit-child"), dbDir.path(), m_handlerPath,
+                             dsn, QStringLiteral("test") });
+        child.start();
+        QVERIFY2(child.waitForStarted(5000), "the identity-reinit-child process must start");
+
+        QTRY_VERIFY_WITH_TIMEOUT(!envelopeBody.isEmpty(), 15000);
+
+        QVERIFY(child.waitForFinished(10000));
+        QCOMPARE(child.exitCode(), 0);
+
+        const ParsedEventItem item = parseFirstEventItem(envelopeBody);
+        QVERIFY2(item.found, "no event item found in the captured envelope");
+        QVERIFY2(item.body.contains(QStringLiteral("identity-reinit-marker")),
+                 qPrintable(QStringLiteral("unexpected event body: %1").arg(item.body)));
+
+        // CR-01: `adoptFirstDsn()`'s `sentry_close()`/`sentry_init()` wipes the whole scope.
+        // Without the fix, NONE of these survive the re-init `applyHandout()` just performed -
+        // even though the C++-side statics (setUser()/setSession()/setTrace() all ran BEFORE the
+        // handout, exactly the "first Play on a fresh install" scenario) still report the right
+        // values (the review's own point: the bug is invisible from the C++ side alone).
+        QVERIFY2(item.user.contains(QStringLiteral("id")), "the event must carry a user id");
+        QCOMPARE(item.user.value(QStringLiteral("id")).toString(), QStringLiteral("acct-reinit-test"));
+
+        QCOMPARE(item.tags.value(QStringLiteral("signed_in")).toString(), QStringLiteral("true"));
+        QCOMPARE(item.tags.value(QStringLiteral("session_id")).toString(),
+                 QStringLiteral("session-reinit-test"));
+        QCOMPARE(item.tags.value(QStringLiteral("host_id")).toString(),
+                 QStringLiteral("host-reinit-test"));
+
+        QCOMPARE(item.traceId, QStringLiteral("trace-reinit-test"));
+    }
+
     // --- Task 3: the test crash switch -----------------------------------------------------------
 
     void testCrashChildCrashesWithSeatHubTestCrash1AndUploadsToTheListener()
@@ -1047,6 +1194,9 @@ int main(int argc, char* argv[])
     }
     if (argc > 1 && std::strcmp(argv[1], "--rotation-child") == 0) {
         return runRotationChild(argc, argv);
+    }
+    if (argc > 1 && std::strcmp(argv[1], "--identity-reinit-child") == 0) {
+        return runIdentityReinitChild(argc, argv);
     }
     if (argc > 1 && std::strcmp(argv[1], "--test-crash-child") == 0) {
         return runTestCrashChild(argc, argv);

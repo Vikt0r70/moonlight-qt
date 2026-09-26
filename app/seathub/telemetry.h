@@ -219,6 +219,17 @@ int initCallCount();
 /// re-init and at quit, and quit never reaches this code).
 int closeCallCount();
 
+#ifdef SEATHUB_TEST_ALLOW_LOOPBACK_DSN
+/// Test-only (CR-01 regression), compile-time gated exactly like `acceptDsn()`'s own
+/// `SEATHUB_TEST_ALLOW_LOOPBACK_DSN` guard above - never declared, let alone defined, in a shipped
+/// build (`app.pro` never sets this macro). Captures a plain message event through the real
+/// `sentry_capture_event()`, at `SENTRY_LEVEL_FATAL` so `seatHubBeforeSend()` does not drop it
+/// (D-11 only lets fatal-level events through). This is the only way a test can observe the
+/// scope's LIVE user/tags/trace after `adoptFirstDsn()`'s re-init - a crash-based test cannot,
+/// short of decoding crashpad's own gzipped, msgpack-encoded minidump upload.
+void captureTestMessageForTests(const QString& message);
+#endif
+
 // --- identity (D-09, D-13, G.4): state SeatHub keeps itself, so a test can assert it without a
 // live SDK, and so the same values are available to `logsEnabled()`'s caller and to a future
 // crash's tags regardless of whether the SDK actually started in this process.
