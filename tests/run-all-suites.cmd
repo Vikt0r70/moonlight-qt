@@ -74,6 +74,7 @@ call :suite tst_engine_seam
 call :suite tst_error_map
 call :suite tst_hud_bitmap
 call :suite tst_liveness
+call :suite tst_log_shipper
 call :suite tst_log_tee
 call :suite tst_overlay_injection
 call :suite tst_pairing
