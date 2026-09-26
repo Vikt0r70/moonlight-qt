@@ -200,6 +200,15 @@ private:
     /// The width the next frame is placed against: the pinned one, else what the window events
     /// have said, else the focused SDL window's, else 0.
     int resolveDisplayWidth();
+    /// D-14 (Plan 14 Task 2): keeps the compositor's own window size current, independent of the
+    /// legacy `displayWidth` pin above (a separate concern - positioning a card, not sizing text).
+    /// The window-size event branch in `watchEvents()` below is the preferred, event-driven path
+    /// (the correct thread, no query needed); this is the fallback for whenever nothing has told
+    /// the compositor yet - a session's first tick, before any resize, or a window that never took
+    /// focus. `SDL_GetWindowSize()` on the SDL thread only (never from the compositor's own
+    /// `rasterizeInstance()`, which runs on the engine's decoder thread and must query nothing -
+    /// `osd_compositor.h`'s own header comment, Pitfall 11).
+    void syncCompositorWindowSize();
     /// Ends the ten-minute card once its lifetime has passed. True when the card list changed.
     bool expireTenMinuteCard(qint64 now);
 

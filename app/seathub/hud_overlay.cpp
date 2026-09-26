@@ -886,6 +886,29 @@ int HudOverlay::resolveDisplayWidth()
     return m_displayWidth.load();
 }
 
+void HudOverlay::syncCompositorWindowSize()
+{
+    // See this method's own header comment: the fallback path, independent of the legacy
+    // `displayWidth` pin (`resolveDisplayWidth()`'s own early return above is that pin, and a
+    // caller who pinned the legacy width for card positioning must not also freeze the
+    // compositor's own D-14 sizing - the two are unrelated concerns). The focused SDL window is
+    // the stream window, the same `SDL_GetWindowSize` the D3D11 renderer sizes its swapchain from.
+    SDL_Window* window = SDL_GetKeyboardFocus();
+    if (window == nullptr) {
+        window = SDL_GetMouseFocus();
+    }
+    if (window == nullptr) {
+        return;
+    }
+
+    int w = 0;
+    int h = 0;
+    SDL_GetWindowSize(window, &w, &h);
+    if (w > 0 && h > 0) {
+        m_compositor.setWindowSize(w, h);
+    }
+}
+
 void HudOverlay::noteActivity()
 {
     m_lastActivityMs.store(nowMs());
@@ -899,6 +922,11 @@ void HudOverlay::tick()
 
     const qint64 now = nowMs();
     m_elapsedSeconds.store((now - m_sessionStartedMs.load()) / 1000);
+
+    // TEMPORARY RED REGRESSION (Plan 14 Task 2, TDD): disabled for the RED run so
+    // `sizesFollowTheWindow` fails on its own named assertion. Restored for GREEN - see
+    // 06.6-14-SUMMARY.md Deviations.
+    // syncCompositorWindowSize();
 
     const bool wanted = !m_autoHide.load() || (now - m_lastActivityMs.load()) < kAutoHideMs;
     m_visible.store(wanted);
@@ -914,7 +942,10 @@ void HudOverlay::tick()
     // header comment for the one-publish-per-slot rule this implements.
     const bool compositorVisible = !m_compositor.composedBottom().isNull();
 
-    if (compositorVisible || wanted || cardShown) {
+    // TEMPORARY RED REGRESSION (Plan 14 Task 2, TDD): `compositorVisible ||` dropped for the RED
+    // run so `hidingTimeLeftKeepsTheEngineLine` fails on its own named assertion. Restored for
+    // GREEN - see 06.6-14-SUMMARY.md Deviations.
+    if (/* compositorVisible || */ wanted || cardShown) {
         // Re-published every tick while anything is visible, not only when the second changes: the
         // renderer keeps the last texture it was handed, so one publish a second is what keeps the
         // timer on screen current, and re-publishing also repairs a texture lost to a swapchain
@@ -948,11 +979,25 @@ int SDLCALL HudOverlay::watchEvents(void* userdata, SDL_Event* event)
     }
     else if (event->type == SDL_WINDOWEVENT
              && (event->window.event == SDL_WINDOWEVENT_SIZE_CHANGED
-                 || event->window.event == SDL_WINDOWEVENT_RESIZED)
-             && event->window.data1 > 0 && !self->m_displayWidthPinned.load()) {
-        // The stream window's width, for the bottom-right card. Only a fallback for when no SDL
-        // window has focus at the moment a frame is placed (`resolveDisplayWidth`).
-        self->m_displayWidth.store(event->window.data1);
+                 || event->window.event == SDL_WINDOWEVENT_RESIZED)) {
+        if (event->window.data1 > 0 && !self->m_displayWidthPinned.load()) {
+            // The stream window's width, for the bottom-right card. Only a fallback for when no
+            // SDL window has focus at the moment a frame is placed (`resolveDisplayWidth`).
+            self->m_displayWidth.store(event->window.data1);
+        }
+        // D-14 (Plan 14 Task 2): the compositor's own window size - unconditional, unlike the
+        // legacy width above, since a caller pinning the legacy `displayWidth` for card
+        // positioning must not also freeze the compositor's own sizing (an unrelated concern).
+        // The event carries both dimensions already, on the correct thread (the event watch runs
+        // synchronously from whichever thread pumps SDL's event queue, never the engine's decoder
+        // thread the compositor's own `rasterizeInstance()` must query nothing from).
+        //
+        // TEMPORARY RED REGRESSION (Plan 14 Task 2, TDD): disabled for the RED run so
+        // `sizesFollowTheWindow` fails on its own named assertion. Restored for GREEN - see
+        // 06.6-14-SUMMARY.md Deviations.
+        // if (event->window.data1 > 0 && event->window.data2 > 0) {
+        //     self->m_compositor.setWindowSize(event->window.data1, event->window.data2);
+        // }
     }
 
     // The return value of an event watch is ignored; this is an observer, not a filter, and it

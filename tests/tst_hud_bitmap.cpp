@@ -1283,6 +1283,160 @@ private slots:
 
         harness.hud().endSession();
     }
+
+    // ---------------------------------------------------------------------------------------
+    // Plan 14 Task 2 (D-14, D-13, ADR-0045 risk 3): sized to the window, republished every
+    // second, and never wiping Moonlight's own message.
+    // ---------------------------------------------------------------------------------------
+
+    // D-14: the compositor learns the stream window's real size from the same SDL window-size
+    // event `resolveDisplayWidth()`'s own fallback learns the legacy width from - never a direct
+    // call into the compositor from anywhere but `HudOverlay` itself.
+    void sizesFollowTheWindow()
+    {
+        if (SDL_InitSubSystem(SDL_INIT_EVENTS) != 0) {
+            QSKIP("SDL's events subsystem is unavailable, so the window-size watch cannot be installed");
+        }
+
+        HudHarness harness;
+        harness.hud().beginSession();
+        harness.hud().noteCreditMinutes(9);
+        harness.hud().tick();
+        const int heightAt1080 = harness.frames().last().height();
+        QVERIFY(heightAt1080 > 0);
+
+        // The real production path is a window-size event, not a direct call into the compositor -
+        // `SeatHubClient` never calls `OsdCompositor::setWindowSize()` itself.
+        SDL_Event resize;
+        SDL_zero(resize);
+        resize.type = SDL_WINDOWEVENT;
+        resize.window.event = SDL_WINDOWEVENT_SIZE_CHANGED;
+        resize.window.data1 = 2560;
+        resize.window.data2 = 1440;
+        QVERIFY(SDL_PushEvent(&resize) >= 0);
+
+        harness.hud().tick();
+        const int heightAt1440 = harness.frames().last().height();
+
+        QVERIFY2(heightAt1440 > heightAt1080,
+                 "Time left's glyphs must be taller at 1440p than at 1080p (D-14's size table)");
+
+        harness.hud().endSession();
+        SDL_QuitSubSystem(SDL_INIT_EVENTS);
+    }
+
+    // Every tick republishes while Time left is shown, not only when a value changes - the
+    // renderer keeps the last texture it was handed, and this is also what repairs a texture lost
+    // to a swapchain recreation (ADR-0045 risk 3).
+    void republishesEveryTickWhileVisible()
+    {
+        HudHarness harness;
+        harness.hud().beginSession();
+        harness.hud().noteCreditMinutes(9);
+        harness.hud().tick();
+        const int countAfterFirstTick = harness.frames().size();
+        QVERIFY(countAfterFirstTick > 0);
+
+        for (int i = 0; i < 3; ++i) {
+            harness.advance(1000);
+            harness.hud().tick();
+        }
+
+        QCOMPARE(harness.frames().size(), countAfterFirstTick + 3);
+
+        harness.hud().endSession();
+    }
+
+    // Moonlight's own `CONN_STATUS_OKAY` disables the whole slot
+    // (`session.cpp`/`overlaymanager.cpp`'s `setOverlayState(type, false)`); `HudOverlay` never
+    // learns this happened, and does not need to - its own next tick republishes unconditionally,
+    // and `publishOverlaySurface()` re-enables the slot before every publish
+    // (`moonlight_engine_session.cpp`'s own `setOverlayState(..., true)` ahead of
+    // `updateOverlaySurface()`), so Time left returns within the second regardless.
+    void timeLeftReturnsAfterTheEngineDisablesTheSlot()
+    {
+        HudHarness harness;
+        harness.hud().beginSession();
+        harness.hud().noteCreditMinutes(9);
+        harness.hud().tick();
+        QVERIFY(harness.frames().size() > 0);
+
+        // Simulate the engine's own disable path reaching the compositor's rasteriser directly -
+        // the same call `OverlayManager::notifyOverlayUpdated()` makes when a rasteriser is
+        // registered (Plan 10's own hook). This does not touch `HudOverlay`'s Time-left state at
+        // all; it only proves the disable cannot reach `HudOverlay`'s own tick.
+        SDL_Color engineColor = {0xCC, 0x00, 0x00, 0xFF};
+        SDL_Surface* disabled = OsdCompositor::rasterize(Overlay::OverlayStatusUpdate, "",
+                                                         /*enabled=*/false, engineColor,
+                                                         &harness.hud().compositor());
+        QVERIFY2(disabled == nullptr, "a disabled rasterise call must return nothing to publish");
+
+        harness.advance(1000);
+        harness.hud().tick();
+
+        const QImage frame = harness.frames().last();
+        QVERIFY2(!frame.isNull(), "Time left must return on the very next tick");
+        const QImage rightHalf = frame.copy(frame.width() / 2, 0, frame.width() / 2, frame.height());
+        QVERIFY2(countColour(rightHalf, qRgb(0xFF, 0xFF, 0xFF), 0) > 0,
+                 "Time left's white value pixels must still be there after the simulated disable");
+
+        harness.hud().endSession();
+    }
+
+    // The `publishOverlaySurface(nullptr)` pitfall (RESEARCH-FORK.md §6): hiding Time left must
+    // not wipe a status line the engine wrote while it was up. With an engine line recorded, the
+    // slot stays enabled and showing that line - never the clear-and-disable path - even after
+    // the strip itself has auto-hidden and no legacy card is up; with none, the existing
+    // clear-and-disable path runs exactly as it always did.
+    void hidingTimeLeftKeepsTheEngineLine()
+    {
+        if (SDL_InitSubSystem(SDL_INIT_EVENTS) != 0) {
+            QSKIP("SDL's events subsystem is unavailable, so auto-hide cannot be exercised");
+        }
+
+        HudHarness harness;
+        harness.hud().beginSession();
+
+        // Auto-hide the strip, with no credit read at all: only the compositor's own recorded
+        // engine line (not Time left, not the legacy card) can keep the slot alive from here.
+        harness.advance(HudOverlay::autoHideMs());
+        harness.hud().tick();
+        QVERIFY2(!harness.hud().isVisible(), "the strip must have auto-hidden first");
+        QVERIFY2(!harness.hud().isCardShown(), "no legacy card must be up");
+        const int hidesBeforeEngineLine = harness.hides();
+
+        // Simulate the engine writing "Poor connection to PC" - the compositor's own recorded
+        // state (Plan 10), reached the same way the real hook reaches it.
+        SDL_Color engineColor = {0xCC, 0x00, 0x00, 0xFF};
+        SDL_Surface* published = OsdCompositor::rasterize(Overlay::OverlayStatusUpdate,
+                                                          "Poor connection to PC", /*enabled=*/true,
+                                                          engineColor, &harness.hud().compositor());
+        QVERIFY2(published != nullptr, "the engine line alone must render something");
+        SDL_FreeSurface(published);
+
+        const int framesBefore = harness.frames().size();
+        harness.hud().tick();
+
+        QVERIFY2(harness.frames().size() > framesBefore,
+                 "the engine line must reach a fresh publish on the very next tick");
+        QVERIFY2(harness.hides() == hidesBeforeEngineLine,
+                 "an engine line must keep the slot enabled, never the clear-and-disable path");
+        QVERIFY2(!harness.frames().last().isNull(), "the engine line must still be published");
+
+        // With no engine line and nothing else to show, the existing clear path runs.
+        SDL_Surface* cleared = OsdCompositor::rasterize(Overlay::OverlayStatusUpdate, "",
+                                                        /*enabled=*/false, engineColor,
+                                                        &harness.hud().compositor());
+        QVERIFY2(cleared == nullptr, "a disabled, textless rasterise call must return nothing");
+        QVERIFY2(harness.hud().compositor().composedBottom().isNull(),
+                 "with no engine line and no Time left, the compositor has nothing to draw");
+        harness.hud().tick();
+        QVERIFY2(harness.hides() > hidesBeforeEngineLine,
+                 "with nothing left to show, the existing clear-and-disable path must run");
+
+        harness.hud().endSession();
+        SDL_QuitSubSystem(SDL_INIT_EVENTS);
+    }
 };
 
 QTEST_MAIN(TestHudBitmap)
