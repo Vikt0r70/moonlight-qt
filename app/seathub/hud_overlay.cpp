@@ -763,12 +763,9 @@ void HudOverlay::noteCreditMinutes(qint64 minutes)
     // shows it (D-16, `screens.md` §25 "at stream start the HUD shows it" is the legacy strip's
     // own separate credit readout, unaffected). This does not clear Time left when the balance
     // rises back above ten - that appear/disappear rule is Plan 22's, not this one's.
-    // TEMPORARY RED REGRESSION (Plan 14 Task 1, TDD): disabled for the RED run so
-    // `nineMinutesReadShowsTimeLeft` fails on its own named assertion rather than passing
-    // vacuously. Restored verbatim for GREEN - see 06.6-14-SUMMARY.md Deviations.
-    // if (minutes <= kTimeLeftThresholdMinutes) {
-    //     m_compositor.setTimeLeft({true, minutes, minutes <= kTimeLeftCriticalMinutes});
-    // }
+    if (minutes <= kTimeLeftThresholdMinutes) {
+        m_compositor.setTimeLeft({true, minutes, minutes <= kTimeLeftCriticalMinutes});
+    }
 
     bool changed = false;
     {

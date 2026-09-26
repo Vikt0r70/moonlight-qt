@@ -25,6 +25,17 @@
 // `app/streaming/` for that one typedef - `osd_compositor.h` (Plan 10) already does the same for
 // the same reason. `moonlight_engine_session.cpp` remains the only translation unit that
 // constructs, attaches to or drives the engine itself; this include is type-only.
+//
+// `overlaymanager.h` pulls in unprotected `<SDL.h>`, which `#define`s `main` to `SDL_main` unless
+// something defines `SDL_MAIN_HANDLED` first (`app/main.cpp`'s own reasoning; `hud_overlay.h`
+// guards itself the same way for the same reason). Since `seathub_client.h` includes this header,
+// and `tst_facade_wiring.cpp` includes `seathub_client.h` without its own SDL guard, an
+// unprotected include here silently renamed `QTEST_MAIN`'s own `main()` to `SDL_main` and broke
+// the link (`LNK2019: unresolved external symbol main`) - fixed by guarding here, exactly as
+// `hud_overlay.h` already does, so every includer is protected transitively.
+#ifndef SDL_MAIN_HANDLED
+#define SDL_MAIN_HANDLED
+#endif
 #include "streaming/video/overlaymanager.h"
 
 class NvApp;

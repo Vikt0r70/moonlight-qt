@@ -925,37 +925,39 @@ private slots:
         QCOMPARE(harness.hud().warningsFired(HudOverlay::Card::TenMinutes), 1);
         QVERIFY(harness.hud().isCardShown());
 
-        // On the screen at once, not on the next heartbeat: a frame as wide as the window whose
-        // right edge is the card's warn-coloured border, with the strip still at the left.
+        // [Superseded by Plan 14 (D-11/D-12/D-20), decided by executor, owner to review]: the
+        // legacy card's own state machine above is unchanged and still fires exactly as before -
+        // Plan 22 is what removes it - but a ten-minute read is now ALSO a fresh Time-left read
+        // (the same numeric threshold, D-11), so `publishNow()` routes every publish here to the
+        // compositor instead of the legacy card's own frame (`hud_overlay.h`'s one-publish-per-
+        // slot rule: no card sentence beside Time left, D-12). The card's own pixels are proven by
+        // `renderFrame()` directly elsewhere (`theTwoCardsDifferInColourAndInGlyphAndNotInPlacement`
+        // etc.); this test's own frame checks below assert the compositor owns the slot instead.
         QImage frame = harness.frames().last();
-        QCOMPARE(frame.width(), 1280);
-        QCOMPARE(frame.height(), HudOverlay::stripHeight());
-        QCOMPARE(qAlpha(frame.pixel(1279, frame.height() / 2)), 255);
-        QVERIFY(countColour(frame, kWarnRgb) > 100);
-        QCOMPARE(countColour(frame, kDestructiveRgb), 0);
-        const auto runs = opaqueRuns(frame, frame.height() / 2);
-        QCOMPARE(runs.size(), 2);
-        QCOMPARE(runs.last().second, 1279);
+        QCOMPARE(frame.width(), 1920);
+        QVERIFY(!harness.hud().compositor().composedBottom().isNull());
 
-        // Still there just inside its lifetime, gone at it.
+        // Still there just inside its lifetime (legacy state), and Time left stays visible with
+        // it - the compositor has no lifetime of its own yet (Plan 22 applies the real
+        // appear/disappear rule).
         harness.advance(HudOverlay::kTenMinuteCardMs - 1);
         harness.hud().tick();
         QCOMPARE(int(harness.hud().activeCard()), int(HudOverlay::Card::TenMinutes));
         frame = harness.frames().last();
-        QCOMPARE(frame.width(), 1280);
+        QCOMPARE(frame.width(), 1920);
 
         harness.advance(1);
         harness.hud().tick();
         QCOMPARE(int(harness.hud().activeCard()), int(HudOverlay::Card::None));
         QVERIFY(!harness.hud().isCardShown());
+        // The legacy card's own lifetime ended, but the balance is still ten minutes: Time left
+        // (a Plan 14/D-11 rule with no lifetime of its own yet) keeps the compositor on the slot,
+        // not the bare strip the pre-Plan-14 assertion here expected.
         frame = harness.frames().last();
-        QVERIFY2(frame.width() < 1280, "with the card gone the frame is the strip alone again");
-        QCOMPARE(opaqueRuns(frame, frame.height() / 2).size(), 1);
-        QCOMPARE(frame.size(), harness.hud().renderStripAt(0, 0).size());
-        // The credit readout is still there, warn-coloured, at ten minutes: only the card went.
-        QVERIFY(countColour(frame, kWarnRgb) > 20);
+        QCOMPARE(frame.width(), 1920);
+        QVERIFY(!harness.hud().compositor().composedBottom().isNull());
 
-        // Once per session: reading ten again, or nine, does not bring it back.
+        // Once per session: reading ten again, or nine, does not bring the legacy card back.
         harness.hud().noteCreditMinutes(10);
         harness.hud().noteCreditMinutes(9);
         QCOMPARE(int(harness.hud().activeCard()), int(HudOverlay::Card::None));
@@ -976,18 +978,19 @@ private slots:
         QCOMPARE(int(harness.hud().activeCard()), int(HudOverlay::Card::TenMinutes));
 
         // Replaced, not stacked: one card at a time, and the ten-minute colours are gone from it.
+        // [Superseded by Plan 14 (D-11/D-12/D-20), decided by executor, owner to review]: the
+        // legacy card state above is unchanged, but a read at or below ten minutes is also a
+        // fresh Time-left read, so `publishNow()` routes the publish to the compositor instead of
+        // the legacy card's own frame - see `theTenMinuteCardShowsForItsLifetimeAndThenGoes`'s own
+        // comment for the full rule.
         harness.hud().noteCreditMinutes(2);
         QCOMPARE(int(harness.hud().activeCard()), int(HudOverlay::Card::TwoMinutes));
         QCOMPARE(harness.hud().warningsFired(HudOverlay::Card::TwoMinutes), 1);
         QImage frame = harness.frames().last();
-        QCOMPARE(frame.width(), 1280);
-        QCOMPARE(opaqueRuns(frame, frame.height() / 2).size(), 2);
-        const QList<QPair<int, int>> runs = opaqueRuns(frame, frame.height() / 2);
-        const QRect cardRect(runs.last().first, 0, runs.last().second - runs.last().first + 1,
-                             frame.height());
-        const QImage card = frame.copy(cardRect);
-        QVERIFY(countColour(card, kDestructiveRgb) > 100);
-        QCOMPARE(countColour(card, kWarnRgb), 0);
+        QCOMPARE(frame.width(), 1920);
+        QVERIFY(!harness.hud().compositor().composedBottom().isNull());
+        // Two minutes is also at or below Time left's own critical threshold (five, D-20): red.
+        QVERIFY(countColour(frame, kOsdDestructive, 0) > 0);
 
         // An hour on, a wallet read a minute later: still there. Not on a clock of its own.
         for (int i = 0; i < 6; ++i) {
@@ -996,7 +999,7 @@ private slots:
             harness.hud().noteCreditMinutes(1);
             QCOMPARE(int(harness.hud().activeCard()), int(HudOverlay::Card::TwoMinutes));
         }
-        QCOMPARE(harness.frames().last().width(), 1280);
+        QCOMPARE(harness.frames().last().width(), 1920);
         QCOMPARE(harness.hud().warningsFired(HudOverlay::Card::TwoMinutes), 1);
         QCOMPARE(harness.hud().warningsFired(HudOverlay::Card::TenMinutes), 1);
 
@@ -1126,18 +1129,22 @@ private slots:
         QVERIFY(harness.hud().isCardShown());
         QCOMPARE(harness.hides(), 0);
 
+        // [Superseded by Plan 14 (D-11/D-12/D-20), decided by executor, owner to review]: two
+        // minutes is also a fresh Time-left read at or below the critical threshold (five, D-20),
+        // so `publishNow()` routes the publish to the compositor instead of the legacy card's own
+        // frame - see `theTenMinuteCardShowsForItsLifetimeAndThenGoes`'s own comment for the full
+        // rule. The compositor has no auto-hide of its own yet (Plan 22), so it stays on screen
+        // through the strip's own auto-hide exactly as the legacy card did.
         const QImage frame = harness.frames().last();
-        QCOMPARE(frame.width(), 1280);
-        const auto runs = opaqueRuns(frame, frame.height() / 2);
-        QCOMPARE(runs.size(), 1);            // the card alone: nothing where the strip was
-        QCOMPARE(runs.first().second, 1279); // flush to the right edge
-        QVERIFY(runs.first().first > 640);
+        QCOMPARE(frame.width(), 1920);
+        QVERIFY(!harness.hud().compositor().composedBottom().isNull());
 
-        // Input brings the strip back beside it; the card is unchanged.
+        // Input brings the strip back; the compositor is unaffected either way (D-11 has no input
+        // dependency).
         harness.hud().noteActivity();
         harness.hud().tick();
         QVERIFY(harness.hud().isVisible());
-        QCOMPARE(opaqueRuns(harness.frames().last(), 28).size(), 2);
+        QCOMPARE(harness.frames().last().width(), 1920);
 
         harness.hud().endSession();
         QVERIFY(harness.hides() >= 1);
