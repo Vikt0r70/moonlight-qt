@@ -3056,6 +3056,33 @@ private slots:
         QCOMPARE(g_engineCreateCalls, before);
     }
 
+    // 06.6-REVIEW CR-01: a late host from a session Cancel already ended, with NO fresh Play in
+    // between, must be dropped too. Unlike `aLateHostFromACancelledSessionIsIgnored()` above -
+    // where a fresh `beginSession("s-fresh")` changes `m_sessionId` and the id check alone catches
+    // the stale host - `interrupt()`'s pre-engine Cancel branch never clears `m_sessionId` at all
+    // (only `setAttachedSessionEnded(true)` runs). A late `hostResolved` for that SAME session id
+    // must still be refused, or a live engine attaches to a session the server has already been
+    // told is over (CR-01).
+    void aLateHostFromTheSameCancelledSessionIsIgnored()
+    {
+        SeatHubClient client;
+        beginStagedSession(client);
+        QVERIFY(!QTest::currentTestFailed());
+
+        client.interrupt();
+        QCOMPARE(client.appState(), QStringLiteral("home"));
+
+        const int before = g_engineCreateCalls;
+        const bool invoked = QMetaObject::invokeMethod(
+            &client, "handleHostResolved", Q_ARG(QString, QStringLiteral("s-stages")),
+            Q_ARG(PairedHostPtr, std::make_shared<PairedHost>()));
+        QVERIFY2(invoked, "handleHostResolved must accept the session id it is resolving for");
+
+        // Still the same session id as before Cancel - the id check alone would let this through.
+        // `m_sessionEnded` is what must drop it: no engine is ever built for it.
+        QCOMPARE(g_engineCreateCalls, before);
+    }
+
     void aHostForTheAttachedSessionIsUsed()
     {
         SeatHubClient client;

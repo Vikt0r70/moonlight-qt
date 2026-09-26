@@ -2335,10 +2335,14 @@ void SeatHubClient::handleHostResolved(const QString& sessionId, const PairedHos
     // superseded by a fresh Play/Try again while this handshake was still running - must never
     // attach an engine (and therefore start a stream) for the wrong session. Checked before
     // anything else here runs, including `releaseEngineSession()`, so a stale result never so much
-    // as touches whatever the actually-attached session has going.
-    if (sessionId != m_sessionId) {
+    // as touches whatever the actually-attached session has going. The id check alone only catches
+    // "superseded by a different session id"; `m_sessionEnded` is what catches "cancelled" - Cancel
+    // (`interrupt()`'s pre-engine branch, via `endAttachedSessionBeforeStream()`) marks the same
+    // session ended without ever clearing `m_sessionId`, so a late handshake for that same id must
+    // still be dropped here.
+    if (sessionId != m_sessionId || m_sessionEnded) {
         qCInfo(seathubClient) << "dropping a paired host resolved for a session that is no longer "
-                                 "attached:" << sessionId;
+                                 "attached or has already ended:" << sessionId;
         return;
     }
 
