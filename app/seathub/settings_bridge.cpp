@@ -1,6 +1,7 @@
 #include "settings_bridge.h"
 
 #include "settings/streamingpreferences.h"
+#include "stats_catalogue.h"
 
 #include <QLoggingCategory>
 #include <QSettings>
@@ -218,44 +219,15 @@ const Setting kSettings[] = {
       "preserves the migration behavior and never presents a version-control setting." },
 };
 
-// The eleven lines Moonlight 6.1.0's own `stringifyVideoStats()` writes (RESEARCH Q3,
-// `ffmpeg.cpp:700-856`), each labelled with that line's own text minus its numbers (OD-03), in
-// its own output order. `copy.md` § Settings carries the same eleven labels verbatim - this is
-// the one place both this bridge and Plan 12's overlay filter read them from (D-26).
-struct StatsToggle {
-    const char* key;
-    const char* label;
-};
-
-const StatsToggle kStatsToggles[] = {
-    { "statsVideoStream", "Video stream" },
-    { "statsIncomingFrameRate", "Incoming frame rate from network" },
-    { "statsDecodingFrameRate", "Decoding frame rate" },
-    { "statsRenderingFrameRate", "Rendering frame rate" },
-    { "statsHostProcessingLatency", "Host processing latency min/max/average" },
-    { "statsNetworkDroppedFrames", "Frames dropped by your network connection" },
-    { "statsJitterDroppedFrames", "Frames dropped due to network jitter" },
-    { "statsNetworkLatency", "Average network latency" },
-    { "statsDecodingTime", "Average decoding time" },
-    { "statsFrameQueueDelay", "Average frame queue delay" },
-    { "statsRenderingTime", "Average rendering time (including monitor V-sync latency)" },
-};
+// D-26/Plan 16: the eleven performance-stats key/label/default rows now live in ONE place,
+// `stats_catalogue.h`'s `kStatsCatalogue[]` - this bridge no longer keeps its own duplicate
+// key/label table. `copy.md` § Settings carries the same eleven long labels verbatim.
 
 const Setting* findSetting(const QString& key)
 {
     for (const Setting& s : kSettings) {
         if (key == QLatin1String(s.key)) {
             return &s;
-        }
-    }
-    return nullptr;
-}
-
-const StatsToggle* findStatsToggle(const QString& key)
-{
-    for (const StatsToggle& t : kStatsToggles) {
-        if (key == QLatin1String(t.key)) {
-            return &t;
         }
     }
     return nullptr;
@@ -975,27 +947,29 @@ int SettingsBridge::bitrateMaximum() const
 QStringList SettingsBridge::statsToggleKeys() const
 {
     QStringList out;
-    for (const StatsToggle& t : kStatsToggles) {
-        out.append(QString::fromLatin1(t.key));
+    for (const StatsCatalogueEntry& entry : kStatsCatalogue) {
+        out.append(QString::fromLatin1(entry.key));
     }
     return out;
 }
 
 QString SettingsBridge::statsToggleLabel(const QString& statsKey) const
 {
-    const StatsToggle* t = findStatsToggle(statsKey);
-    return t ? QString::fromLatin1(t->label) : QString();
+    const StatsCatalogueEntry* entry = findStatsCatalogueEntry(statsKey);
+    return entry ? QString::fromLatin1(entry->longLabel) : QString();
 }
 
 bool SettingsBridge::getStatsToggle(const QString& statsKey) const
 {
-    if (!findStatsToggle(statsKey)) {
+    const StatsCatalogueEntry* entry = findStatsCatalogueEntry(statsKey);
+    if (!entry) {
         return false;
     }
     // Same preference store as everything else (D-12); a SeatHub-only key with no upstream
     // `[streamsettings]` counterpart, so it is read directly rather than through
-    // `StreamingPreferences`, which upstream owns.
-    return QSettings().value(statsKey, false).toBool();
+    // `StreamingPreferences`, which upstream owns. D-10: the default comes from the one catalogue
+    // (`entry->defaultOn`), not a literal `false` - a saved value always wins regardless.
+    return QSettings().value(statsKey, entry->defaultOn).toBool();
 }
 
 bool SettingsBridge::setStatsToggle(const QString& statsKey, bool value)
@@ -1005,7 +979,7 @@ bool SettingsBridge::setStatsToggle(const QString& statsKey, bool value)
                                 << statsKey;
         return false;
     }
-    if (!findStatsToggle(statsKey)) {
+    if (!findStatsCatalogueEntry(statsKey)) {
         qCWarning(seathubSettings) << "unknown stats toggle key:" << statsKey;
         return false;
     }
@@ -1021,13 +995,13 @@ bool SettingsBridge::setStatsToggle(const QString& statsKey, bool value)
 
 QStringList SettingsBridge::enabledStatsLabels() const
 {
-    // D-26: this is the one place both this bridge and Plan 12's overlay filter read the label
-    // catalogue from - `kStatsToggles` above is defined once, here, and the filter itself
-    // (`OverlayManager::setDebugLineFilter()`) carries no copy of it.
+    // D-26: this is the one place both this bridge and the OSD compositor (`osd_compositor.cpp`)
+    // read the label catalogue from - `stats_catalogue.h`'s `kStatsCatalogue` is defined once,
+    // there, and neither this bridge nor the compositor carries its own copy.
     QStringList out;
-    for (const StatsToggle& t : kStatsToggles) {
-        if (getStatsToggle(QString::fromLatin1(t.key))) {
-            out.append(QString::fromLatin1(t.label));
+    for (const StatsCatalogueEntry& entry : kStatsCatalogue) {
+        if (getStatsToggle(QString::fromLatin1(entry.key))) {
+            out.append(QString::fromLatin1(entry.longLabel));
         }
     }
     return out;
@@ -1037,8 +1011,8 @@ void SettingsBridge::recomputeShowPerfOverlay()
 {
     QSettings settings;
     bool anyOn = false;
-    for (const StatsToggle& t : kStatsToggles) {
-        if (settings.value(QString::fromLatin1(t.key), false).toBool()) {
+    for (const StatsCatalogueEntry& entry : kStatsCatalogue) {
+        if (settings.value(QString::fromLatin1(entry.key), entry.defaultOn).toBool()) {
             anyOn = true;
             break;
         }

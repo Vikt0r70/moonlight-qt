@@ -37,8 +37,8 @@ private slots:
     void writesRefusedDuringStream();
     void forcedValuesAreCorrectedOnEveryLoadNotOnlyTheFirst();
     void hostSpeakerRowStaysEditableAtUpstreamsDefault();
-    void statsTogglesDefaultOffAndTheDerivedOptionFollowsInBothDirections();
     void statsDefaultsAreFpsLatencyResolution();
+    void statsTogglesDefaultOffAndTheDerivedOptionFollowsInBothDirections();
     void enabledStatsLabelsListsOnlyTheOnesTurnedOnInTheEnginesOwnOrder();
     void sessionOverridesAreInMemoryOnly();
     void negotiatedResultsAreExposedOnlyAfterConnectionStarted();

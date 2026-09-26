@@ -10,8 +10,11 @@
 //
 // For `OverlayStatusUpdate` it records the engine's own status line and colour, then returns
 // `renderOsdBottom()`'s composition (Moonlight's message plus Time left, D-13) as an owned
-// ARGB8888 surface, or `nullptr` when nothing is drawn. For `OverlayDebug` it returns `nullptr`
-// today - Plan 16 adds the stats block.
+// ARGB8888 surface, or `nullptr` when nothing is drawn. For `OverlayDebug` (Plan 16, D-10) it
+// parses the engine's raw stats text, builds one `OsdStatsRow` per ticked label - in the order
+// RES, FPS, LATENCY, then the rest in `stats_catalogue.h`'s own order - and returns
+// `renderOsdStats()`'s image as an owned surface, or `nullptr` when nothing parsed or every row
+// is off (OD-04, now SeatHub's own rule).
 //
 // Reentrant by design (`06.6-RESEARCH-FORK.md` §1.3 "Threads"): every mutable field lives behind
 // one mutex, a call copies what it needs and renders outside the lock with a fresh `QImage`
@@ -64,6 +67,9 @@ private:
 
     SDL_Surface* rasterizeInstance(Overlay::OverlayType type, const char* text, bool enabled,
                                     SDL_Color color);
+    /// The `OverlayDebug` half of `rasterizeInstance()` (Plan 16, D-10): parses `text` and draws
+    /// the ticked stats rows, or returns `nullptr`.
+    SDL_Surface* rasterizeStats(const char* text, bool enabled) const;
     State snapshot() const;
 
     mutable QMutex m_mutex;
