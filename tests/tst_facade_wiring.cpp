@@ -3375,6 +3375,22 @@ private slots:
         QVERIFY(!client.connectFailed());
     }
 
+    // --- D-23: the CONNECT_FAILED sentence on Home (06.6-18) -----------------------------------------
+
+    void connectFailedSaysTheStreamDidNotStart()
+    {
+        SeatHubClient client;
+        beginStagedSession(client);
+        QVERIFY(!QTest::currentTestFailed());
+
+        SessionInfo over = sessionIn(QStringLiteral("FAILED"));
+        over.endReason = QStringLiteral("CONNECT_FAILED");
+        report(client, over);
+
+        QCOMPARE(client.endReasonText(),
+                 QStringLiteral("The stream didn't start. You were not charged."));
+    }
+
     void theFacadeHandsTheScreenTheBundledCountriesAndARegionThatIsOneOfThem()
     {
         SeatHubClient client;
@@ -4228,6 +4244,7 @@ private slots:
         QTest::addColumn<QString>("text");
 
         QTest::newRow("CUSTOMER_ENDED") << "CUSTOMER_ENDED" << "You ended it";
+        QTest::newRow("CONNECT_FAILED") << "CONNECT_FAILED" << "Didn't start, not charged";
         QTest::newRow("BALANCE_EXHAUSTED") << "BALANCE_EXHAUSTED" << "Balance ran out";
         QTest::newRow("HOST_LOST") << "HOST_LOST" << "Lost contact with the rig";
         QTest::newRow("CLIENT_SILENT") << "CLIENT_SILENT" << "Lost contact with your device";
