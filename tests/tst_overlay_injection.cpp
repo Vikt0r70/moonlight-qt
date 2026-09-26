@@ -787,6 +787,58 @@ private slots:
 
         QVERIFY(!sawBadSurface.load());
     }
+
+    // ------------------------------------------------------------------------------------------
+    // Plan 16 (D-08, D-10, D-26): the compositor's `OverlayDebug` branch - the stats block, drawn
+    // from the raw text of the customer's ticked rows only, in `06.6-DECISION-OSD-LABEL-COLUMN.md`'s
+    // own colours (`#FF9A2E` labels, `#2DD4BF` for the resolution row's label).
+    // ------------------------------------------------------------------------------------------
+
+    // With RES, FPS and LATENCY ticked, the compositor draws all three rows from the raw text -
+    // both label colours are present. With only FPS ticked, the drawn surface is shorter (one row
+    // instead of three), proving the rows drawn really do follow the ticked labels, not every
+    // parsed line.
+    void statsAreDrawnFromTheRawTextOfTickedRows()
+    {
+        OsdCompositor compositor;
+        const SDL_Color yellow{ 0xD0, 0xD0, 0x00, 0xFF };
+
+        compositor.setEnabledStatsLabels({ QStringLiteral("Video stream"),
+                                           QStringLiteral("Rendering frame rate"),
+                                           QStringLiteral("Average network latency") });
+
+        SDL_Surface* threeRows = OsdCompositor::rasterize(Overlay::OverlayDebug, kAllDebugLinesRaw,
+                                                          true, yellow, &compositor);
+        QVERIFY(threeRows != nullptr);
+        QCOMPARE(threeRows->format->format, static_cast<Uint32>(SDL_PIXELFORMAT_ARGB8888));
+        QVERIFY(!SDL_MUSTLOCK(threeRows));
+        QVERIFY(surfaceRegionHasPixelNear(threeRows, 0, 0, threeRows->w, threeRows->h,
+                                          0xFF, 0x9A, 0x2E));
+        QVERIFY(surfaceRegionHasPixelNear(threeRows, 0, 0, threeRows->w, threeRows->h,
+                                          0x2D, 0xD4, 0xBF));
+
+        compositor.setEnabledStatsLabels({ QStringLiteral("Rendering frame rate") });
+        SDL_Surface* oneRow = OsdCompositor::rasterize(Overlay::OverlayDebug, kAllDebugLinesRaw,
+                                                       true, yellow, &compositor);
+        QVERIFY(oneRow != nullptr);
+        QVERIFY(oneRow->h < threeRows->h);
+
+        SDL_FreeSurface(threeRows);
+        SDL_FreeSurface(oneRow);
+    }
+
+    // OD-04, now SeatHub's own rule (RESEARCH-FORK.md §5): with every row unticked, nothing is
+    // drawn, even though the slot itself is enabled and the raw text carries every line.
+    void nothingDrawnWithEveryRowOff()
+    {
+        OsdCompositor compositor;
+        const SDL_Color yellow{ 0xD0, 0xD0, 0x00, 0xFF };
+        compositor.setEnabledStatsLabels({});
+
+        SDL_Surface* surface = OsdCompositor::rasterize(Overlay::OverlayDebug, kAllDebugLinesRaw,
+                                                         true, yellow, &compositor);
+        QVERIFY(surface == nullptr);
+    }
 };
 
 QTEST_MAIN(TestOverlayInjection)
