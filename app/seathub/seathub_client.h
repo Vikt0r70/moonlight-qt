@@ -411,9 +411,10 @@ public:
     Q_INVOKABLE void reloadAccount();
 
     /// Attach a control-plane session to this client: the real path, as opposed to the tracer's
-    /// stubbed stage sequence. Starts the session channel, runs silent pairing, and hands the
-    /// session authorization's `quality_profile` to the settings bridge as an in-memory override
-    /// for this launch only (D-37, WR-05).
+    /// stubbed stage sequence. Attaches the session id, starts liveness (D-11) and runs silent
+    /// pairing; the session's own channel is NOT opened here (the control plane serves no such
+    /// route - ADR-0055). Applies no quality override (A-68/D-06 reversal, 06.6-19) - the
+    /// customer's saved Settings are the only decider of stream quality.
     ///
     /// The access token must already have been set on the control-plane client by a successful
     /// sign-in. Nothing here reads it, returns it, or logs it.
