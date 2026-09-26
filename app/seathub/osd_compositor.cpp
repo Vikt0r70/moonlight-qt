@@ -89,11 +89,10 @@ SDL_Surface* OsdCompositor::rasterizeInstance(Overlay::OverlayType type, const c
         current = m_state;
     }
 
-    // RED (Task 1): the real composition is written in the GREEN commit. Returning nullptr here
-    // unconditionally is the deliberate stub - `compositorDrawsTheEngineLineInItsSlotColour`
-    // fails on this line until it is replaced.
-    (void)current;
-    return nullptr;
+    const QImage image = renderOsdBottom(current.windowWidth, current.windowHeight,
+                                          current.engineText, current.engineColor,
+                                          current.timeLeft);
+    return toOwnedArgbSurface(image);
 }
 
 QImage OsdCompositor::composedBottom() const
