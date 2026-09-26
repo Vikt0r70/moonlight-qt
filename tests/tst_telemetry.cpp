@@ -43,6 +43,7 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QProcess>
+#include <QProcessEnvironment>
 #include <QStandardPaths>
 #include <QStringList>
 #include <QTcpServer>
@@ -182,6 +183,29 @@ int runRotationChild(int argc, char* argv[])
     volatile int* crashPointer = nullptr;
     *crashPointer = 42;
     return 0; // unreachable
+}
+
+/// `tst_telemetry --test-crash-child <db> <handler> <dsn>`: starts with `dsn` already in place
+/// (Task 3 is about the switch, not the handout path Task 1 already covers), then calls
+/// `SeatHubTelemetry::maybeTestCrash()` exactly once. `SEATHUB_TEST_CRASH` is read from this
+/// process's own environment - the parent sets or removes it explicitly before starting this
+/// child (`QProcess::setProcessEnvironment()`), so a developer's own shell can never make this
+/// test flaky. Returns 0 when the switch does not crash this process (unset, empty, or any value
+/// other than `1`/`fastfail`/`qfatal`).
+int runTestCrashChild(int argc, char* argv[])
+{
+    SetErrorMode(SEM_NOGPFAULTERRORBOX | SEM_FAILCRITICALERRORS);
+
+    SeatHubTelemetry::Options options;
+    options.databaseDir = argc > 2 ? QString::fromLocal8Bit(argv[2]) : QString();
+    options.handlerPath = argc > 3 ? QString::fromLocal8Bit(argv[3]) : QString();
+    options.dsn = argc > 4 ? QString::fromLocal8Bit(argv[4]) : QString();
+    options.environment = QStringLiteral("test");
+    options.release = QStringLiteral("tst_telemetry@0.0.0");
+    SeatHubTelemetry::startWith(options);
+
+    SeatHubTelemetry::maybeTestCrash();
+    return 0; // reached whenever the switch does not crash this process
 }
 
 // --- the fake Sentry endpoint --------------------------------------------------------------
@@ -659,6 +683,96 @@ private slots:
         QCOMPARE(cached->dsn, dsnB); // the cache always holds the LATEST handout, adopted or not.
     }
 
+    // --- Task 3: the test crash switch -----------------------------------------------------------
+
+    void testCrashChildCrashesWithSeatHubTestCrash1AndUploadsToTheListener()
+    {
+        QTemporaryDir dbDir;
+        QVERIFY(dbDir.isValid());
+
+        QTcpServer server;
+        QStringList receivedPaths;
+        wireFakeSentryListener(&server, &receivedPaths);
+        QVERIFY2(server.listen(QHostAddress::LocalHost, 0),
+                 "the fake Sentry listener must bind 127.0.0.1:0");
+        const QString dsn = QStringLiteral("http://publickey@127.0.0.1:%1/1").arg(server.serverPort());
+
+        QProcess child;
+        child.setProgram(m_appPath);
+        child.setArguments({ QStringLiteral("--test-crash-child"), dbDir.path(), m_handlerPath, dsn });
+        QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
+        env.insert(QStringLiteral("SEATHUB_TEST_CRASH"), QStringLiteral("1"));
+        child.setProcessEnvironment(env);
+        child.start();
+        QVERIFY2(child.waitForStarted(5000), "the test-crash-child process must start");
+
+        QTRY_VERIFY_WITH_TIMEOUT(anyStartsWith(receivedPaths, QStringLiteral("/api/1/minidump/")), 15000);
+
+        child.waitForFinished(10000);
+        QTRY_COMPARE_WITH_TIMEOUT(child.state(), QProcess::NotRunning, 10000);
+        QCOMPARE(child.exitStatus(), QProcess::CrashExit);
+
+        QTest::qWait(1500);
+    }
+
+    void testCrashChildExitsZeroWhenTheSwitchIsUnsetEmptyOrUnknown()
+    {
+        struct Case
+        {
+            QString label;
+            bool setValue;
+            QString value;
+        };
+        const QList<Case> cases = {
+            { QStringLiteral("unset"), false, QString() },
+            { QStringLiteral("empty"), true, QString() },
+            { QStringLiteral("unknown"), true, QStringLiteral("banana") },
+        };
+
+        for (const Case& testCase : cases) {
+            QTemporaryDir dbDir;
+            QVERIFY(dbDir.isValid());
+
+            QProcess child;
+            child.setProgram(m_appPath);
+            child.setArguments(
+                { QStringLiteral("--test-crash-child"), dbDir.path(), m_handlerPath, QString() });
+            QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
+            if (testCase.setValue) {
+                env.insert(QStringLiteral("SEATHUB_TEST_CRASH"), testCase.value);
+            }
+            else {
+                env.remove(QStringLiteral("SEATHUB_TEST_CRASH"));
+            }
+            child.setProcessEnvironment(env);
+            child.start();
+            QVERIFY2(child.waitForStarted(5000),
+                     qPrintable(QStringLiteral("the %1 case must start").arg(testCase.label)));
+            QVERIFY2(child.waitForFinished(10000),
+                     qPrintable(QStringLiteral("the %1 case must exit on its own").arg(testCase.label)));
+            QCOMPARE(child.exitStatus(), QProcess::NormalExit);
+            QCOMPARE(child.exitCode(), 0);
+        }
+    }
+
+    void maybeTestCrashReadsTheSwitchOnlyOnceInThisProcess()
+    {
+        // Primed with a value that never crashes, so the FIRST call is the one that consumes the
+        // one-shot check - exactly like a real process reading its own real environment once.
+        qputenv("SEATHUB_TEST_CRASH", QByteArrayLiteral("banana"));
+        SeatHubTelemetry::maybeTestCrash();
+
+        // A second call, even with the variable now changed to a value that DOES crash, must be a
+        // no-op: the switch was already read once in this process. Reaching the QVERIFY below at
+        // all is the proof - "1" would otherwise have crashed this very test process.
+        qputenv("SEATHUB_TEST_CRASH", QByteArrayLiteral("1"));
+        SeatHubTelemetry::maybeTestCrash();
+
+        QVERIFY(true);
+
+        qunsetenv("SEATHUB_TEST_CRASH");
+    }
+
 private:
     QTemporaryDir m_handlerDir;
     QString m_handlerPath;
@@ -691,6 +805,9 @@ int main(int argc, char* argv[])
     }
     if (argc > 1 && std::strcmp(argv[1], "--rotation-child") == 0) {
         return runRotationChild(argc, argv);
+    }
+    if (argc > 1 && std::strcmp(argv[1], "--test-crash-child") == 0) {
+        return runTestCrashChild(argc, argv);
     }
 
     QCoreApplication app(argc, argv);

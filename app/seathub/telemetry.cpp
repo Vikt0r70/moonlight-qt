@@ -5,6 +5,8 @@
 #include "seathub_version.h"
 #include "token_store.h"
 
+#include <QByteArray>
+#include <QDebug>
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
@@ -74,6 +76,11 @@ QString s_currentSessionId;
 QString s_currentHostId;
 QString s_currentTraceId;
 bool s_signedIn = false;
+
+/// Task 3 (D-04, D-10): `SEATHUB_TEST_CRASH` is read once per process - the FIRST call to
+/// `maybeTestCrash()` decides everything; every later call, from the same or a later
+/// `beginSession()`, is a no-op regardless of what the variable now holds.
+bool s_testCrashChecked = false;
 
 /// Runs inside crashpad's first-chance filter, in the crashing process, on the crashing thread
 /// (SPIKE Q5, `on_crash` fires before `before_send` for a crash - `sentry_backend_crashpad.cpp`
@@ -502,6 +509,11 @@ QString currentTraceId()
 bool signedIn()
 {
     return s_signedIn;
+}
+
+void maybeTestCrash()
+{
+    // RED (Task 3): real switch lands in the GREEN commit.
 }
 
 } // namespace SeatHubTelemetry

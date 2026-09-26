@@ -582,6 +582,10 @@ void SeatHubClient::beginSession(const QString& sessionId)
     // empty host, which `handleSessionState()` fills in as soon as the session names one.
     SeatHubTelemetry::setSession(sessionId, QString());
 
+    // D-04, D-10: the owner's live test switch. Read once per process (Task 3); every session
+    // this process ever begins after the first checks nothing further.
+    SeatHubTelemetry::maybeTestCrash();
+
     // A new session clears the previous one's end reason: the home screen shows the outcome of
     // the session that just ended, never a stale one (audit E10).
     setEndReasonText(QString());
