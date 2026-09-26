@@ -362,17 +362,16 @@ SeatHubClient::SeatHubClient(QObject* parent)
     connect(m_sessionChannel, &SessionWebSocket::sessionWarningReceived,
             this, &SeatHubClient::handleSessionWarning);
 
-    // Audit F12: the HUD's reconnect line. The control plane's `DISCONNECTED` warning is one
+    // Audit F12: the connection-state stage. The control plane's `DISCONNECTED` warning is one
     // trigger (see `handleSessionWarning`); the channel dropping is the other, and it is the one
-    // that fires when the customer's own connection goes away and no frame can arrive at all.
-    // `setReconnecting` only stores an atomic the HUD's timer thread reads, so the socket's
-    // thread may call it; this connection is queued to the facade's thread anyway.
+    // that fires when the customer's own connection goes away and no frame can arrive at all. The
+    // HUD's own "Connection lost. Reconnecting..." line is dead code Plan 22 removes (D-12; the
+    // reconnect message moves to SeatHub's own window in 06.1, #21) - only the liveness stage
+    // moves here now.
     connect(m_sessionChannel, &SessionWebSocket::opened, this, [this]() {
-        m_hud.setReconnecting(false);
         m_liveness->setStage(QStringLiteral("streaming"));
     });
     connect(m_sessionChannel, &SessionWebSocket::dropped, this, [this](int, int) {
-        m_hud.setReconnecting(true);
         m_liveness->setStage(QStringLiteral("reconnecting"));
     });
 
@@ -1620,12 +1619,10 @@ void SeatHubClient::handleConnectionStarted()
     setAppState(QString::fromLatin1(kStateStreaming));
 
     // The HUD is begun before liveness starts, because the reads liveness makes feed it:
-    // `beginSession()` resets the credit and the once-per-session warning state, so a wallet read
-    // that beat it would be wiped.
-    //
-    // D-56: the duration timer starts here. This fires before the engine creates its SDL window
-    // (D-01), so the first HUD publish may arrive before the renderer has registered; the 1 Hz
-    // heartbeat re-publishes and the stream picks the HUD up on its first frame.
+    // `beginSession()` resets Time left's own state (D-11), so a wallet read that beat it would
+    // be wiped. This fires before the engine creates its SDL window (D-01), so the first publish
+    // may arrive before the renderer has registered; the 1 Hz heartbeat re-publishes and the
+    // stream picks Time left up on its first eligible read.
     m_hud.beginSession();
 
     // WR-04: the moment the stream truly begins is the right anchor for the first decoder
@@ -1633,13 +1630,9 @@ void SeatHubClient::handleConnectionStarted()
     // while pairing and connecting happen and would otherwise overstate it.
     m_statsAggregator.start();
 
-    // A stream that just started is by definition connected (audit F12): whatever the last
-    // session's channel did, this one is live now.
-    m_hud.setReconnecting(false);
-
-    // `Credit left` from the first frame: the last balance read before the stream (`screens.md`
-    // 25). Display only - it can be old, so it fires no warning; the report below reads the wallet
-    // at once and that read is the first thing that can.
+    // The last balance read before the stream (D-16: the seed never shows Time left, however low
+    // it is - it can be old, so it arms no reminder; the report below reads the wallet at once and
+    // that read is the first thing that can).
     if (m_balanceMinutes >= 0) {
         m_hud.seedCreditMinutes(m_balanceMinutes);
     }
@@ -2049,11 +2042,10 @@ void SeatHubClient::handleSessionWarning(const QString& sessionId, const QString
     m_billing.insert(QStringLiteral("warning_deadline_at"), deadlineAt);
     emit sessionWarningChanged();
 
-    // Audit F12: `DISCONNECTED` is the server saying this client stopped reporting, which is
-    // exactly the moment the HUD's strip leaves "Elapsed" and says what is happening. The
-    // strip never shows the "(2 of 5)" attempt counter D-56 defers.
+    // Audit F12: `DISCONNECTED` is the server saying this client stopped reporting. The HUD's own
+    // reconnect line this used to also flip is dead code Plan 22 removes (D-12); only the
+    // liveness stage moves here now.
     const bool reconnecting = warning == QLatin1String("DISCONNECTED");
-    m_hud.setReconnecting(reconnecting);
     m_liveness->setStage(reconnecting ? QStringLiteral("reconnecting") : QStringLiteral("streaming"));
 }
 
