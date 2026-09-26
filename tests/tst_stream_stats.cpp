@@ -269,76 +269,12 @@ private slots:
         QVERIFY(removeReturned);
     }
 
-    // WR-10 (code review 06.3-REVIEW-fork.md, second review pass): a sink that calls
-    // `removeSink()` on itself, from inside its own dispatch, on the SAME thread that is
-    // dispatching it. Before this fix, `removeSink()` unconditionally took the same write lock
-    // `dispatch()` holds for reading across the whole sink-calling loop - `QReadWriteLock` is
-    // non-recursive (Qt's own documentation), so this thread would deadlock against its own read
-    // lock and this test would hang forever rather than fail loudly. The fix defers the removal
-    // instead: this call returns immediately, and the removal takes effect the moment `dispatch()`
-    // (still running, further up this same thread's call stack) returns.
-    void logTee_removeSink_calledFromInsideItsOwnDispatch_deferredNotDeadlocked()
-    {
-        LogTee::clearSinksForTests();
-
-        int callCount = 0;
-        LogTee::SinkHandle handle = 0;
-        handle = LogTee::addSink([&](LogLevel, int, int, const QString& text) {
-            if (!text.contains(QStringLiteral("wr10-self-remove-trigger"))) {
-                return;
-            }
-            ++callCount;
-            // The scenario itself: removing this very sink, on this thread, from inside its own
-            // call. Must return at once (never wait on itself) and must not corrupt the sink list
-            // dispatch() is still iterating over (`dispatch()`'s own copy-then-call ordering
-            // means this is safe either way, but the removal itself must not run here).
-            LogTee::removeSink(handle);
-        });
-
-        qWarning() << "wr10-self-remove-trigger"; // must return promptly, not hang
-
-        QCOMPARE(callCount, 1);
-
-        // The deferred removal must have actually applied once dispatch() returned - not been
-        // silently dropped: a second trigger line must not reach the sink again.
-        qWarning() << "wr10-self-remove-trigger";
-        QCOMPARE(callCount, 1);
-    }
-
-    // WR-10: the same guarantee for `addSink()` - a sink that registers ANOTHER sink from inside
-    // its own dispatch must not deadlock either, and the new sink must actually be registered
-    // once dispatch() returns (not lost, and not called for the very message that triggered its
-    // own registration - it was not on the list yet when this dispatch copied it).
-    void logTee_addSink_calledFromInsideAnotherSinksDispatch_deferredNotDeadlocked()
-    {
-        LogTee::clearSinksForTests();
-
-        int outerCalls = 0;
-        int innerCalls = 0;
-        LogTee::SinkHandle innerHandle = 0;
-        const LogTee::SinkHandle outerHandle = LogTee::addSink(
-            [&](LogLevel, int, int, const QString& text) {
-                if (!text.contains(QStringLiteral("wr10-add-from-dispatch-trigger"))) {
-                    return;
-                }
-                ++outerCalls;
-                if (innerHandle == 0) {
-                    innerHandle = LogTee::addSink(
-                        [&](LogLevel, int, int, const QString&) { ++innerCalls; });
-                }
-            });
-
-        qWarning() << "wr10-add-from-dispatch-trigger"; // registers the inner sink, must not hang
-        QCOMPARE(outerCalls, 1);
-        QCOMPARE(innerCalls, 0); // not registered yet when this dispatch copied the sink list
-
-        qWarning() << "wr10-add-from-dispatch-trigger"; // a later message reaches both sinks
-        QCOMPARE(outerCalls, 2);
-        QCOMPARE(innerCalls, 1);
-
-        LogTee::removeSink(outerHandle);
-        LogTee::removeSink(innerHandle);
-    }
+    // D-16 (06.3.1, area 1 of the design-review trigger): WR-10's two deferral tests used to live
+    // here (a self-removing sink and a sink that adds another sink, both from inside their own
+    // dispatch). The contract they proved is gone - an in-dispatch addSink()/removeSink() is now
+    // refused loudly (Q_ASSERT_X in debug, std::abort() in release) instead of deferred, closing
+    // WR-12 and IN-12 along with it. `tests/tst_log_tee.cpp` proves the new contract, including
+    // the death-test pair for exactly these two scenarios.
 
     // --- parseVideoStatsBlock / toQualityReport --------------------------------------------
 
