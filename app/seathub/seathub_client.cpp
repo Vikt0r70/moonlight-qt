@@ -913,6 +913,16 @@ void SeatHubClient::start()
         return;
     }
 
+    // D-05/C4/C7: a session still attached here, that never streamed, is ended first - whether
+    // this Play is Try again (a session that failed before it streamed) or a fresh Play from
+    // Home itself (C7: the same session's earlier `/end` could not reach the server offline, so
+    // the server still considers it live). Idempotent with C2's own end attempt; the wait this
+    // starts is what keeps the POST below from meeting the "one nonterminal session per
+    // customer" refusal (409 `USER_HAS_NONTERMINAL_SESSION`, `openapi.yaml`).
+    if (endAttachedSessionBeforePlay()) {
+        return;
+    }
+
     // A session this client already has, and the server has not reported over, is Resume session:
     // it is picked up again, not replaced by a request for another one - the control plane would
     // refuse that request anyway (a customer has at most one live session).
@@ -923,6 +933,22 @@ void SeatHubClient::start()
     }
 
     beginPlayRequest();
+}
+
+bool SeatHubClient::endAttachedSessionBeforePlay()
+{
+    if (m_sessionId.isEmpty() || m_streamStarted) {
+        return false;
+    }
+    setRetryBusy(true);
+    if (m_teardownGuard.markStarted()) {
+        m_teardown->teardown(m_sessionId, m_clientUuid, false);
+    }
+    // else: this session's end was already claimed - C2's own pre-stream failure path, or an
+    // earlier call here for the same session - and is already running; just wait for it.
+    // `handleTeardownCompleted()`/`handleTeardownFailed()` notice `m_retryBusy` and continue (or
+    // stop) from there.
+    return true;
 }
 
 void SeatHubClient::beginLocalAttempt()
@@ -1052,22 +1078,10 @@ void SeatHubClient::retry()
 
     setAppState(QString::fromLatin1(kStateHome));
 
-    // D-05/C4: Try again is always a fresh Play, never a Resume of a session that did not stream.
-    // A session still attached here must be ended first - idempotent if a pre-stream failure
-    // already started it (C2) - and its teardown must reach a terminal state before the new Play
-    // goes out, or the POST can race the "one nonterminal session per customer" rule and be
-    // refused 409 (`openapi.yaml` `AllocationRefused`, `USER_HAS_NONTERMINAL_SESSION`).
-    if (!m_sessionId.isEmpty() && !m_streamStarted) {
-        setRetryBusy(true);
-        if (m_teardownGuard.markStarted()) {
-            m_teardown->teardown(m_sessionId, m_clientUuid, false);
-        }
-        // else: a pre-stream failure already claimed this session's teardown (C2) and it is
-        // already running - just wait for it. `handleTeardownCompleted()`/`handleTeardownFailed()`
-        // notice `m_retryBusy` and continue (or stop) from there.
-        return;
-    }
-
+    // D-05/C4/C7: Try again is always a fresh Play, never a Resume of a session that did not
+    // stream - `start()` itself now ends a session left attached here first
+    // (`endAttachedSessionBeforePlay()`), the same one sequence C4's second half asks Play from
+    // Home to run too.
     start();
 }
 

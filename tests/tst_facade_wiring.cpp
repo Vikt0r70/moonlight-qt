@@ -3116,7 +3116,8 @@ private slots:
         m_fake->answerSession(QStringLiteral("s-stages"), QStringLiteral("ENDING"));
         client.start();
         QVERIFY2(client.retryBusy(), "Play ends the never-streamed session first (C4/C7)");
-        QCOMPARE(m_fake->requestPaths().count(QStringLiteral("/api/sessions/s-stages/end")), 2);
+        QTRY_COMPARE_WITH_TIMEOUT(
+            m_fake->requestPaths().count(QStringLiteral("/api/sessions/s-stages/end")), 2, 15000);
 
         // While the old session is still ENDING, no fresh Play has gone out.
         QTest::qWait(100);

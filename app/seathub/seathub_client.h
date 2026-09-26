@@ -573,6 +573,15 @@ private:
     /// this queues are both marshalled onto the network thread in that order, so the server
     /// records the stage before the cancel (RESEARCH-FORK C2).
     void endAttachedSessionBeforeStream(bool failed);
+    /// D-05/C4/C7: shared by `retry()` and `start()` - a session still attached here that never
+    /// streamed is ended first (idempotent if C2 already started it), with `retryBusy` held until
+    /// the wait resolves, before a fresh Play goes out. Returns false (and starts nothing) with no
+    /// session attached, or one that already streamed - the ordinary Resume/Play branches then
+    /// decide. Covers both Try again (a session that failed before streaming) and Play from Home
+    /// (C7: the same session's earlier `/end` that could not reach the server offline) with the
+    /// one sequence, so neither path can race the "one nonterminal session per customer" rule
+    /// (409 `USER_HAS_NONTERMINAL_SESSION`, `openapi.yaml`).
+    bool endAttachedSessionBeforePlay();
     /// Applies the answer to the launch-time `GET /api/me` (see `restoreSession()`).
     void applyRestoreResult(const ControlPlaneResult& result);
     /// Applies an answer to `GET /api/wallet`. `epoch` is the credential generation the read was
