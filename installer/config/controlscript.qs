@@ -37,6 +37,10 @@
 var SEATHUB_TITLE = "SeatHub Setup";                        // config.xml <Title>
 var SEATHUB_MAINTENANCE_TOOL = "SeatHubMaintenanceTool.exe"; // config.xml <MaintenanceToolName> + .exe
 var SEATHUB_CLIENT = "SeatHub.exe";                          // config.xml <RunProgram>
+// 06.3.1 D-02: sentry-native's out-of-process crashpad handler, shipped beside SeatHub.exe. It
+// outlives the client by about 1 s (sends the last pending report, then exits - SPIKE T8a/T8b), so
+// it must be waited for too, or a still-running handler locks its own exe during the purge below.
+var SEATHUB_CRASH_HANDLER = "crashpad_handler.exe";
 var SEATHUB_REMOVED_KEY = "SeatHubPreviousInstallRemoved";
 var SEATHUB_TOOL_WAIT_SECONDS = 30;
 
@@ -95,7 +99,12 @@ function seathubRemovePreviousInstall(targetDir)
 {
     var tool = seathubJoin(targetDir, SEATHUB_MAINTENANCE_TOOL);
 
-    if (!seathubStopClient(seathubJoin(targetDir, SEATHUB_CLIENT)))
+    if (!seathubStopClient(seathubJoin(targetDir, SEATHUB_CLIENT), SEATHUB_CLIENT))
+        return false;
+
+    // The crash handler outlives SeatHub.exe by about 1 s (comment at the constant above), so it
+    // is waited for right after the client, on the same ladder, before the purge below runs.
+    if (!seathubStopClient(seathubJoin(targetDir, SEATHUB_CRASH_HANDLER), SEATHUB_CRASH_HANDLER))
         return false;
 
     // The purge replays installscript.qs's registerPathForUninstallation(tokenDir, wipe=true),
@@ -118,7 +127,11 @@ function seathubRemovePreviousInstall(targetDir)
 
 // The in-app updater quits SeatHub on its own, but a hand-run setup may find it open, and open
 // files make the purge leave the folder behind.
-function seathubStopClient(client)
+// `imageName` is the bare filename taskkill's /IM wants (SEATHUB_CLIENT or SEATHUB_CRASH_HANDLER);
+// `client` is the full path isProcessRunning()/killProcess() key on. They used to be the same
+// hardcoded constant, which meant this function could only ever wait for SeatHub.exe; naming both
+// explicitly is what makes it reusable for the crash handler too (06.3.1 D-02).
+function seathubStopClient(client, imageName)
 {
     // scripting-installer.html: isProcessRunning(name) is case-insensitive on Windows;
     // killProcess(absoluteFilePath) - "true if a process with absoluteFilePath could be killed or
@@ -137,12 +150,13 @@ function seathubStopClient(client)
     if (!installer.isProcessRunning(client))
         return true;
 
-    // Still running: most likely an elevated SeatHub (RunProgram starts it from the elevated
-    // setup) that a non-elevated setup cannot stop. Stop it through the elevated server instead.
+    // Still running: most likely an elevated process (RunProgram starts SeatHub from the elevated
+    // setup, and crashpad_handler.exe is spawned by SeatHub) that a non-elevated setup cannot stop.
+    // Stop it through the elevated server instead.
     seathubLog(client + " is still running; stopping it with elevated rights");
     if (!installer.hasAdminRights() && !seathubGainAdminRights())
         return false;
-    installer.execute(seathubSystemTool("taskkill.exe"), ["/F", "/IM", SEATHUB_CLIENT], "");
+    installer.execute(seathubSystemTool("taskkill.exe"), ["/F", "/IM", imageName], "");
     if (installer.isProcessRunning(client)) {
         seathubLog(client + " could not be stopped");
         return false;
