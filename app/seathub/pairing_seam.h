@@ -111,15 +111,20 @@ public:
                                  const QString& engineError)> done) override;
 
 signals:
-    /// The host the handshake resolved, emitted immediately before `done(true, ...)` on the one
-    /// success path and never on a failure.
+    /// The host the handshake resolved, tagged with the session id of the `pair()` call it answers
+    /// (06.6-18/T-06.6-52), emitted immediately before `done(true, ...)` on the one success path and
+    /// never on a failure.
+    ///
+    /// The tag is what lets a listener refuse a host that resolved for a session that is no longer
+    /// attached - cancelled, or superseded by a fresh Play or Try again - rather than attaching an
+    /// engine (and starting a stream) for the wrong session.
     ///
     /// A signal rather than a getter because the two ends live on different threads: this object is
     /// moved to the network thread (`SeatHubClient::startNetworkThreads()`) while the object that
     /// builds the engine session belongs to the Qt main thread. `PairedHostPtr` is a
     /// `shared_ptr`, so the queued connection that carries it keeps the record alive on both sides
     /// until both are done with it.
-    void hostResolved(const PairedHostPtr& host);
+    void hostResolved(const QString& sessionId, const PairedHostPtr& host);
 
 private slots:
     void handleHandshakeResult(const PairingHandshakeResult& result);
@@ -132,4 +137,7 @@ private:
     QTimer* m_deadline = nullptr;
     int m_deadlineMs = kDeadlineMs;
     bool m_pending = false;
+    /// The session id of the `pair()` call this object is currently running or last ran
+    /// (06.6-18/T-06.6-52). Set at the top of `pair()`, read back in `finish()` to tag `hostResolved`.
+    QString m_sessionId;
 };

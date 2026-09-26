@@ -506,12 +506,16 @@ private slots:
     void handleAuthorizationGranted(const QString& qualityProfile);
 
     /// The host the handshake paired with, emitted by `ProductionPairingSeam` on its success path
-    /// only. Builds the engine session from it and attaches it, so that by the time
-    /// `handlePairingCompleted` runs there is something for `start()` to drive.
+    /// only, tagged with the session id it paired for (06.6-18/T-06.6-52). A `sessionId` that no
+    /// longer matches the attached session - cancelled, or superseded by a fresh Play or Try again
+    /// while this handshake was still in flight - is dropped before anything else runs: no engine is
+    /// built and no stream starts for the wrong session. Otherwise builds the engine session from
+    /// the host and attaches it, so that by the time `handlePairingCompleted` runs there is something
+    /// for `start()` to drive.
     ///
     /// Queued, not direct: the seam lives on the network thread and this slot builds a Qt object
     /// tree that belongs to the facade's thread.
-    void handleHostResolved(const PairedHostPtr& host);
+    void handleHostResolved(const QString& sessionId, const PairedHostPtr& host);
 
     /// One of the profile's reads was answered 401: the credential is no longer valid. Cleared, and
     /// the customer lands on sign-in (`screens.md` §27), exactly as a sign-out that could not reach

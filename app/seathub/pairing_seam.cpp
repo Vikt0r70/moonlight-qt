@@ -126,6 +126,9 @@ void ProductionPairingSeam::pair(const PairingTarget& target,
     }
 
     m_pending = true;
+    // 06.6-18/T-06.6-52: recorded before the handshake starts, so a late `hostResolved` always
+    // carries the session it actually paired for, whatever this object's caller does meanwhile.
+    m_sessionId = target.sessionId;
     m_done = std::move(done);
     m_deadline->start(m_deadlineMs);
 
@@ -175,8 +178,10 @@ void ProductionPairingSeam::finish(const PairingHandshakeResult& result)
     qCInfo(seathubPairingSeam) << "upstream pairing handshake completed";
 
     // The host travels first: the engine session is built from it, and a listener that acted on
-    // `done` before this arrived would be building a session from nothing.
-    emit hostResolved(result.host);
+    // `done` before this arrived would be building a session from nothing. Tagged with the session
+    // this handshake paired for (06.6-18/T-06.6-52), so a listener whose attached session has since
+    // moved on can tell a live result from a stale one.
+    emit hostResolved(m_sessionId, result.host);
 
     done(true, result.clientIdentity, QString());
 }

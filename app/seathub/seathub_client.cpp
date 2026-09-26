@@ -2317,8 +2317,19 @@ void SeatHubClient::handlePairingCompleted(const QString& clientUuid)
     m_liveness->setStage(QStringLiteral("connecting"));
 }
 
-void SeatHubClient::handleHostResolved(const PairedHostPtr& host)
+void SeatHubClient::handleHostResolved(const QString& sessionId, const PairedHostPtr& host)
 {
+    // T-06.6-52: a host that resolved for a session that is no longer attached - cancelled, or
+    // superseded by a fresh Play/Try again while this handshake was still running - must never
+    // attach an engine (and therefore start a stream) for the wrong session. Checked before
+    // anything else here runs, including `releaseEngineSession()`, so a stale result never so much
+    // as touches whatever the actually-attached session has going.
+    if (sessionId != m_sessionId) {
+        qCInfo(seathubClient) << "dropping a paired host resolved for a session that is no longer "
+                                 "attached:" << sessionId;
+        return;
+    }
+
     releaseEngineSession();
     if (m_engineSession != nullptr) {
         // A previous launch is still running. One lifecycle drives one session, so a second engine
