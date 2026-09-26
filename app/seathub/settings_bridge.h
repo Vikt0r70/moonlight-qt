@@ -18,8 +18,8 @@ class StreamingPreferences;
 //     `StreamingPreferences` object; this class caches nothing (D-12, STREAM-02).
 //   * Nothing is written while a stream is running. `setValue()` returns false and the stored
 //     value is untouched (Pitfall 6, T-03-15). Settings changes apply to the NEXT stream (D-13).
-//   * A value the control plane dictates for one launch is an in-memory override. Overrides are
-//     never written to `StreamingPreferences` and never reach disk (D-37, WR-05).
+//   * The control plane never dictates a stream's quality (A-68, D-06 reversal). There is no
+//     session-override mechanism: the customer's saved Settings are the only decider.
 //   * An engine warning about a setting it could not honour never rewrites the preference. It
 //     becomes SeatHub-worded copy the Settings page shows beside the saved value (D-14). The
 //     engine's own sentence is kept for diagnostics only and is never rendered (D-51, T-03-05).
@@ -40,7 +40,6 @@ class SettingsBridge : public QObject
     // False while a stream is active - the Settings page renders read-only (Pitfall 6).
     Q_PROPERTY(bool writable READ writable NOTIFY writableChanged)
     Q_PROPERTY(bool sessionActive READ sessionActive NOTIFY sessionActiveChanged)
-    Q_PROPERTY(bool hasSessionOverrides READ hasSessionOverrides NOTIFY sessionOverridesChanged)
 
     // Setting key -> SeatHub-worded fallback warning. Empty until the engine reports one.
     Q_PROPERTY(QVariantMap negotiationWarnings READ negotiationWarnings NOTIFY negotiationChanged)
@@ -86,9 +85,11 @@ public:
 
     // ------------------------------------------------------------- read and write (STREAM-02)
 
-    /// The value in force right now: the session override if one exists, else the saved value.
+    /// The value in force right now: always the saved value (A-68, D-06 reversal - there is no
+    /// session override mechanism any more).
     Q_INVOKABLE QVariant getValue(const QString& key) const;
-    /// The value persisted in `StreamingPreferences`, ignoring session overrides.
+    /// The value persisted in `StreamingPreferences`. Identical to `getValue()` now that there is
+    /// no override to distinguish it from; kept as its own accessor since callers already name it.
     Q_INVOKABLE QVariant getSavedValue(const QString& key) const;
     /// Write-through. Returns false - and writes nothing - while a stream is active, for an
     /// unknown key, or for a value the setting does not accept.
@@ -161,18 +162,6 @@ public:
     Q_INVOKABLE bool hasNegotiationWarning(const QString& key) const;
     Q_INVOKABLE QString negotiationWarning(const QString& key) const;
 
-    // ------------------------------------------------------ session overrides (D-37 / WR-05)
-
-    /// Apply the session authorization's `quality_profile` for this launch only. The value is
-    /// the OpenAPI `QualityProfile` enum (`1080p60 | 1080p75 | 1080p120`, `openapi.yaml`
-    /// §QualityProfile) - it names a resolution and a frame rate and nothing else, so those are
-    /// the only fields it overrides. The customer's saved bitrate, codec and HDR selections are
-    /// left alone. Nothing is persisted.
-    Q_INVOKABLE void applySessionOverride(const QString& qualityProfile);
-    /// Drop every override. Called when the session finishes; the saved values were never
-    /// touched, so the Settings page simply goes back to showing them.
-    Q_INVOKABLE void clearSessionOverrides();
-
     // ------------------------------------------- lifecycle hooks, called by SeatHubClient
 
     /// Pitfall 6: while this is true every write is refused.
@@ -194,12 +183,10 @@ public:
 
     bool writable() const;
     bool sessionActive() const;
-    bool hasSessionOverrides() const;
 
 signals:
     void writableChanged();
     void sessionActiveChanged();
-    void sessionOverridesChanged();
     void negotiationChanged();
     void valueChanged(const QString& key);
 
@@ -224,7 +211,6 @@ private:
     bool m_streaming = false;
     bool m_connectionStarted = false;
 
-    QHash<QString, QVariant> m_overrides;
     QHash<QString, QString> m_warningSentences;
     QHash<QString, QString> m_warningDiagnostics;
 };

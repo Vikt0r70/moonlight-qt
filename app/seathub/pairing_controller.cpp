@@ -192,7 +192,9 @@ void PairingController::handleAuthorization(const ControlPlaneResult& result)
         return;
     }
 
-    emit authorizationGranted(authorization.qualityProfile);
+    // A-68 / D-06 reversal: `authorization.qualityProfile` is parsed above but never forwarded -
+    // nothing reads it any more.
+    emit authorizationGranted();
 
     if (authorization.pairingPin.isEmpty()) {
         // `pairing_pin` is null until the host is ready to pair. Poll again rather than seating

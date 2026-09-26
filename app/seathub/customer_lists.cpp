@@ -19,6 +19,7 @@ struct EndReasonForm
 
 const EndReasonForm kEndReasonForms[] = {
     { "CUSTOMER_ENDED", "You ended it" },
+    { "CONNECT_FAILED", "Didn't start, not charged" },
     { "BALANCE_EXHAUSTED", "Balance ran out" },
     { "HOST_LOST", "Lost contact with the rig" },
     { "CLIENT_SILENT", "Lost contact with your device" },

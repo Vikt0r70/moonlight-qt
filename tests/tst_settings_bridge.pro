@@ -37,5 +37,6 @@ SOURCES += tst_settings_bridge.cpp \
 # `streamingpreferences.h` is listed so qmake runs moc on it: without its own meta-object the
 # upstream class links as four unresolved externals.
 HEADERS += ../app/seathub/settings_bridge.h \
+    ../app/seathub/stats_catalogue.h \
     ../app/settings/streamingpreferences.h \
     ../app/utils.h

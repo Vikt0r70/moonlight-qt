@@ -114,6 +114,101 @@ if ($versionHeader -notmatch 'SEATHUB_VERSION\s+"([^"]+)"') {
 $Version = $Matches[1]
 Write-Host "SeatHub  : $Version"
 
+# ---------------------------------------------------------------- sentry-native (06.3.1 D-02, D-18)
+# Built here, not only in CI: this script is "the recipe of record" (see the header above), and
+# two build recipes for the same dependency would drift. The pin (version + SHA-256) is mirrored
+# from seathub-ops/pins.yaml `sentry_native` - the build verifies the digest itself rather than
+# trusting that mirror, so a tampered download (T-06.3.1-19) is caught here regardless.
+Step 'sentry-native 0.17.1 (crashpad)'
+$SentryVersion = '0.17.1'
+$SentryZipSha256 = 'e510b714ac0fb5c24b08011e07c5b13fa01c9bd0f40708356e4af022aa20c5a1'
+$SentryRoot = Join-Path $BuildRoot "sentry-native-$SentryVersion"
+$SentryInstallDir = Join-Path $SentryRoot 'install'
+$SentryHeader = Join-Path $SentryInstallDir 'include\sentry.h'
+
+if (Test-Path -LiteralPath $SentryHeader) {
+    Write-Host "sentry-native $SentryVersion already installed at $SentryInstallDir (cache hit)"
+}
+else {
+    New-Item -ItemType Directory -Force -Path $BuildRoot | Out-Null
+    $SentryZipPath = Join-Path $BuildRoot 'sentry-native.zip'
+    $SentryExtractDir = Join-Path $SentryRoot 'src'
+    $SentryBuildDir = Join-Path $SentryRoot 'build'
+
+    if (-not (Test-Path -LiteralPath $SentryZipPath)) {
+        $SentryZipUrl = "https://github.com/getsentry/sentry-native/releases/download/$SentryVersion/sentry-native.zip"
+        Write-Host "Downloading $SentryZipUrl"
+        Invoke-WebRequest -Uri $SentryZipUrl -OutFile $SentryZipPath
+    }
+    $actualHash = (Get-FileHash -LiteralPath $SentryZipPath -Algorithm SHA256).Hash.ToLower()
+    if ($actualHash -ne $SentryZipSha256) {
+        Remove-Item -LiteralPath $SentryZipPath -Force
+        throw "sentry-native.zip SHA-256 mismatch: expected $SentryZipSha256, got $actualHash (T-06.3.1-19: refusing a tampered or corrupted download)"
+    }
+
+    if (Test-Path -LiteralPath $SentryExtractDir) { Remove-Item -LiteralPath $SentryExtractDir -Recurse -Force }
+    New-Item -ItemType Directory -Force -Path $SentryExtractDir | Out-Null
+    Expand-Archive -LiteralPath $SentryZipPath -DestinationPath $SentryExtractDir -Force
+
+    # The zip's top-level folder name is not assumed - find the source root by locating the
+    # CMakeLists.txt that sits beside external\crashpad, the same way the version above is parsed
+    # from seathub_version.h rather than hard-coded.
+    $SentryCmakeLists = Get-ChildItem -Path $SentryExtractDir -Filter 'CMakeLists.txt' -Recurse |
+        Where-Object { Test-Path -LiteralPath (Join-Path $_.Directory.FullName 'external\crashpad') } |
+        Select-Object -First 1
+    if (-not $SentryCmakeLists) { throw "sentry-native source root not found under $SentryExtractDir (no CMakeLists.txt beside external\crashpad)" }
+    $SentrySrcDir = $SentryCmakeLists.Directory.FullName
+
+    # Ninja if Qt's copy is present (the SPIKE's proven recipe: 259 steps, about 1 minute), else
+    # fall back to NMake Makefiles.
+    $ninja = Join-Path (Split-Path -Parent (Split-Path -Parent $QtDir)) 'Tools\Ninja\ninja.exe'
+    $generator = 'NMake Makefiles'
+    if (Test-Path -LiteralPath $ninja) {
+        $env:PATH = "$(Split-Path -Parent $ninja);$env:PATH"
+        $generator = 'Ninja'
+    }
+
+    if (Test-Path -LiteralPath $SentryBuildDir) { Remove-Item -LiteralPath $SentryBuildDir -Recurse -Force }
+    & cmake -S $SentrySrcDir -B $SentryBuildDir -G $generator -DCMAKE_BUILD_TYPE=RelWithDebInfo `
+        -DSENTRY_BACKEND=crashpad -DSENTRY_TRANSPORT=winhttp -DSENTRY_BUILD_SHARED_LIBS=ON `
+        -DSENTRY_BUILD_TESTS=OFF -DSENTRY_BUILD_EXAMPLES=OFF -DSENTRY_INTEGRATION_QT=OFF `
+        -DSENTRY_BUILD_RUNTIMESTATIC=ON
+    if ($LASTEXITCODE -ne 0) { throw "cmake configure (sentry-native) failed with exit code $LASTEXITCODE" }
+
+    # SENTRY_INTEGRATION_QT must stay OFF (D-02): it installs its own qInstallMessageHandler and
+    # would silently detach LogTee's single-installation contract.
+    $cacheText = Get-Content -LiteralPath (Join-Path $SentryBuildDir 'CMakeCache.txt') -Raw
+    if ($cacheText -notmatch 'SENTRY_INTEGRATION_QT:BOOL=OFF') {
+        throw 'sentry-native CMake cache does not have SENTRY_INTEGRATION_QT:BOOL=OFF (D-02 requires the Qt integration stay off)'
+    }
+
+    & cmake --build $SentryBuildDir --config RelWithDebInfo
+    if ($LASTEXITCODE -ne 0) { throw "cmake --build (sentry-native) failed with exit code $LASTEXITCODE" }
+
+    & cmake --install $SentryBuildDir --prefix $SentryInstallDir --config RelWithDebInfo
+    if ($LASTEXITCODE -ne 0) { throw "cmake --install (sentry-native) failed with exit code $LASTEXITCODE" }
+
+    Require $SentryHeader 'sentry-native install (sentry.h)'
+}
+
+# D-04's build assertion (SV-D2, 06.3.1-RESEARCH-SPIKE-CRASHPAD.md § 8): crashpad_wer.dll must not
+# depend on VCRUNTIME140.dll. It is loaded by WerFault from outside SeatHub's own folder, so an
+# app-local CRT deploy does not help it; SENTRY_BUILD_RUNTIMESTATIC=ON is what removes the
+# dependency, and this assertion holds every run, cache hit or not, to catch a future sentry-native
+# upgrade that changes that default back.
+$crashpadWerDll = Join-Path $SentryInstallDir 'bin\crashpad_wer.dll'
+Require $crashpadWerDll 'crashpad_wer.dll (sentry-native install)'
+$dumpbin = Join-Path $env:VCToolsInstallDir 'bin\Hostx64\x64\dumpbin.exe'
+Require $dumpbin 'dumpbin.exe'
+$dependents = & $dumpbin /dependents $crashpadWerDll
+if ($LASTEXITCODE -ne 0) { throw "dumpbin /dependents failed with exit code $LASTEXITCODE" }
+if (($dependents | Out-String) -match 'VCRUNTIME140') {
+    throw "crashpad_wer.dll depends on VCRUNTIME140.dll; SENTRY_BUILD_RUNTIMESTATIC=ON should remove this dependency (D-04, D-18 SV-D2)"
+}
+
+$env:SEATHUB_SENTRY_DIR = $SentryInstallDir
+Write-Host "sentry-native install: $SentryInstallDir"
+
 # ---------------------------------------------------------------- build
 if (-not $SkipBuild) {
     Step "Build (release, all of moonlight-qt.pro: app, AntiHooking, soundio)"
@@ -221,6 +316,13 @@ foreach ($dropped in @(
 # 6. The application itself.
 Copy-Item -LiteralPath $clientExe -Destination $DeployFolder -Force
 
+# 6b. sentry-native with crashpad (06.3.1 D-02, D-18): the DLL, the out-of-process handler and the
+#     WER helper module. Never the .pdb files (D-12-pdb: symbols upload to Sentry's CI step, never
+#     ship to a customer PC).
+foreach ($sentryFile in @('sentry.dll', 'crashpad_handler.exe', 'crashpad_wer.dll')) {
+    Copy-Item -LiteralPath (Join-Path $SentryInstallDir "bin\$sentryFile") -Destination $DeployFolder -Force
+}
+
 # 7. The Microsoft-signed VC++ runtime, copied from the redistributable directory and NOT harvested:
 #    repackaging the unsiged build-tree copies would break their signature.
 #    The redist folder is versioned separately from the toolset (14.44.35112 against a 14.44.35207
@@ -248,17 +350,25 @@ Write-Host "VC++ runtime from: $($crtDir.FullName)"
 #    its settings beside itself; SeatHub must keep them under the customer's profile, because that
 #    is the state D-45 tells the uninstaller to remove.
 
+# 9. Open Sans' own licence (D-15): shipped beside the client, not merged into the GPL/written-offer
+#    licence page below, since the OFL is a separate licence for a separate, unmodified asset.
+$licensesDir = Join-Path $DeployFolder 'licenses'
+New-Item -ItemType Directory -Force -Path $licensesDir | Out-Null
+Copy-Item -LiteralPath (Join-Path $RepoRoot 'app\seathub\fonts\OFL.txt') -Destination (Join-Path $licensesDir 'OpenSans-OFL.txt') -Force
+
 # ---------------------------------------------------------------- verify deploy
 Step 'Verify the deploy folder'
 $missing = @()
 foreach ($required in @('SeatHub.exe', 'AntiHooking.dll', 'gamecontrollerdb.txt', 'Qt6Core.dll',
         'Qt6Quick.dll', 'Qt6WebSockets.dll', 'Qt6Svg.dll', 'SDL2.dll', 'avcodec-61.dll', 'opus.dll',
-        'libssl-3-x64.dll', 'msvcp140.dll', 'vcruntime140.dll')) {
+        'libssl-3-x64.dll', 'msvcp140.dll', 'vcruntime140.dll',
+        'sentry.dll', 'crashpad_handler.exe', 'crashpad_wer.dll')) {
     if (-not (Test-Path -LiteralPath (Join-Path $DeployFolder $required))) { $missing += $required }
 }
 foreach ($requiredDir in @('platforms', 'imageformats', 'tls', 'qml')) {
     if (-not (Test-Path -LiteralPath (Join-Path $DeployFolder $requiredDir))) { $missing += "$requiredDir\" }
 }
+if (-not (Test-Path -LiteralPath (Join-Path $DeployFolder 'licenses\OpenSans-OFL.txt'))) { $missing += 'licenses\OpenSans-OFL.txt' }
 if ($missing.Count -gt 0) { throw "deploy folder is incomplete, missing: $($missing -join ', ')" }
 $deploySize = (Get-ChildItem -LiteralPath $DeployFolder -Recurse -File | Measure-Object -Property Length -Sum).Sum
 Write-Host ('OK - {0:N1} MB' -f ($deploySize / 1MB))

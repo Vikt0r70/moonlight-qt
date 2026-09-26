@@ -113,16 +113,12 @@ public:
 
 signals:
     void stateChanged();
-    /// The control plane granted the session.
-    ///
-    /// `qualityProfile` is the authorization's own `quality_profile` (`ADR-0011`): the value
-    /// `SettingsBridge::applySessionOverride()` turns into this launch's resolution and frame rate,
-    /// in memory, without writing a saved preference (D-37, WR-05). It rides on this signal because
-    /// this controller is the only object in the process that ever sees the authorization, and this
-    /// is the one field of it the facade needs. Nothing else from `SessionAuthorization` leaves this
-    /// class - least of all `pairing_pin`, which is on no signal, in no property and behind no
-    /// accessor (STREAM-03).
-    void authorizationGranted(const QString& qualityProfile);
+    /// The control plane granted the session. Carries no argument: the authorization's own
+    /// `quality_profile` (`ADR-0011`) is parsed but nothing reads it any more (A-68, D-06
+    /// reversal - the customer's saved Settings are the only decider of stream quality). Nothing
+    /// from `SessionAuthorization` leaves this class - least of all `pairing_pin`, which is on no
+    /// signal, in no property and behind no accessor (STREAM-03).
+    void authorizationGranted();
     /// Pairing finished; `clientUuid` is the identity this client reports about itself - the
     /// SHA-256 of its own certificate, the value a host-side reader of Sunshine's client list can
     /// match to this client's pairing record. It is the only thing that ever identifies this

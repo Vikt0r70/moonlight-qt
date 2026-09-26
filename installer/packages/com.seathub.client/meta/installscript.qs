@@ -62,14 +62,25 @@ Component.prototype.createOperations = function()
 
     var paths = [
         // %APPDATA%\Seven Hills\SeatHub - where TokenStore actually puts the encrypted credentials.
-        statePath("APPDATA", "/Seven Hills/SeatHub")
-        // F-6: %LOCALAPPDATA%\SeatHub is deliberately NOT registered. SeatHub never writes there
-        // (`TokenStore::defaultDirectory()` resolves to the Roaming path above), but the retired
-        // Tauri client was installed there: registering it would delete that client's
-        // seathub-client.exe and uninstall.exe without removing any of its state or ours, i.e. it
-        // would break a program this installer was never asked to touch. The directory D-45 names
-        // is therefore recorded as a deliberate non-target here, and the D-30/D-45 path question
-        // belongs in the ADR that reconciles the documents with the resolution (see token_store.h).
+        statePath("APPDATA", "/Seven Hills/SeatHub"),
+        // %LOCALAPPDATA%\Seven Hills\SeatHub\crash-db and \log-spool (06.3.1 D-02, D-14, client.md):
+        // crashpad's per-user crash database and SeatHub's bounded log spool. Removed at uninstall,
+        // like every other piece of customer state (D-45). An upgrade's purge also clears whatever
+        // pending crash reports or spooled lines were sitting there; that is accepted in SEATHUB
+        // D.3 because the launch right before an update already tried to upload/ship them. This is
+        // a different directory from %LOCALAPPDATA%\SeatHub below - it carries the same
+        // "Seven Hills" prefix as the Roaming token path above, so it cannot collide with the
+        // retired Tauri client's install folder.
+        statePath("LOCALAPPDATA", "/Seven Hills/SeatHub/crash-db"),
+        statePath("LOCALAPPDATA", "/Seven Hills/SeatHub/log-spool")
+        // F-6: %LOCALAPPDATA%\SeatHub (no "Seven Hills" prefix) is deliberately NOT registered.
+        // SeatHub never writes there (`TokenStore::defaultDirectory()` resolves to the Roaming path
+        // above), but the retired Tauri client was installed there: registering it would delete
+        // that client's seathub-client.exe and uninstall.exe without removing any of its state or
+        // ours, i.e. it would break a program this installer was never asked to touch. The
+        // directory D-45 names is therefore recorded as a deliberate non-target here, and the
+        // D-30/D-45 path question belongs in the ADR that reconciles the documents with the
+        // resolution (see token_store.h).
     ];
 
     for (var i = 0; i < paths.length; ++i) {

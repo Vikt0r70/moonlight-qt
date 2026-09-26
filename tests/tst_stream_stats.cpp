@@ -269,76 +269,12 @@ private slots:
         QVERIFY(removeReturned);
     }
 
-    // WR-10 (code review 06.3-REVIEW-fork.md, second review pass): a sink that calls
-    // `removeSink()` on itself, from inside its own dispatch, on the SAME thread that is
-    // dispatching it. Before this fix, `removeSink()` unconditionally took the same write lock
-    // `dispatch()` holds for reading across the whole sink-calling loop - `QReadWriteLock` is
-    // non-recursive (Qt's own documentation), so this thread would deadlock against its own read
-    // lock and this test would hang forever rather than fail loudly. The fix defers the removal
-    // instead: this call returns immediately, and the removal takes effect the moment `dispatch()`
-    // (still running, further up this same thread's call stack) returns.
-    void logTee_removeSink_calledFromInsideItsOwnDispatch_deferredNotDeadlocked()
-    {
-        LogTee::clearSinksForTests();
-
-        int callCount = 0;
-        LogTee::SinkHandle handle = 0;
-        handle = LogTee::addSink([&](LogLevel, int, int, const QString& text) {
-            if (!text.contains(QStringLiteral("wr10-self-remove-trigger"))) {
-                return;
-            }
-            ++callCount;
-            // The scenario itself: removing this very sink, on this thread, from inside its own
-            // call. Must return at once (never wait on itself) and must not corrupt the sink list
-            // dispatch() is still iterating over (`dispatch()`'s own copy-then-call ordering
-            // means this is safe either way, but the removal itself must not run here).
-            LogTee::removeSink(handle);
-        });
-
-        qWarning() << "wr10-self-remove-trigger"; // must return promptly, not hang
-
-        QCOMPARE(callCount, 1);
-
-        // The deferred removal must have actually applied once dispatch() returned - not been
-        // silently dropped: a second trigger line must not reach the sink again.
-        qWarning() << "wr10-self-remove-trigger";
-        QCOMPARE(callCount, 1);
-    }
-
-    // WR-10: the same guarantee for `addSink()` - a sink that registers ANOTHER sink from inside
-    // its own dispatch must not deadlock either, and the new sink must actually be registered
-    // once dispatch() returns (not lost, and not called for the very message that triggered its
-    // own registration - it was not on the list yet when this dispatch copied it).
-    void logTee_addSink_calledFromInsideAnotherSinksDispatch_deferredNotDeadlocked()
-    {
-        LogTee::clearSinksForTests();
-
-        int outerCalls = 0;
-        int innerCalls = 0;
-        LogTee::SinkHandle innerHandle = 0;
-        const LogTee::SinkHandle outerHandle = LogTee::addSink(
-            [&](LogLevel, int, int, const QString& text) {
-                if (!text.contains(QStringLiteral("wr10-add-from-dispatch-trigger"))) {
-                    return;
-                }
-                ++outerCalls;
-                if (innerHandle == 0) {
-                    innerHandle = LogTee::addSink(
-                        [&](LogLevel, int, int, const QString&) { ++innerCalls; });
-                }
-            });
-
-        qWarning() << "wr10-add-from-dispatch-trigger"; // registers the inner sink, must not hang
-        QCOMPARE(outerCalls, 1);
-        QCOMPARE(innerCalls, 0); // not registered yet when this dispatch copied the sink list
-
-        qWarning() << "wr10-add-from-dispatch-trigger"; // a later message reaches both sinks
-        QCOMPARE(outerCalls, 2);
-        QCOMPARE(innerCalls, 1);
-
-        LogTee::removeSink(outerHandle);
-        LogTee::removeSink(innerHandle);
-    }
+    // D-16 (06.3.1, area 1 of the design-review trigger): WR-10's two deferral tests used to live
+    // here (a self-removing sink and a sink that adds another sink, both from inside their own
+    // dispatch). The contract they proved is gone - an in-dispatch addSink()/removeSink() is now
+    // refused loudly (Q_ASSERT_X in debug, std::abort() in release) instead of deferred, closing
+    // WR-12 and IN-12 along with it. `tests/tst_log_tee.cpp` proves the new contract, including
+    // the death-test pair for exactly these two scenarios.
 
     // --- parseVideoStatsBlock / toQualityReport --------------------------------------------
 
@@ -414,6 +350,92 @@ private slots:
         QVERIFY(report.value(QStringLiteral("decode_time_ms")).isNull());
         QVERIFY(report.value(QStringLiteral("queue_time_ms")).isNull());
         QVERIFY(report.value(QStringLiteral("render_time_ms")).isNull());
+    }
+
+    // --- Plan 16 Task 2: hostProcessingAvgMs, videoWidth/videoHeight, totalLatencyMs ----------
+    // Pinned against `ffmpeg.cpp`'s exact own formats (RESEARCH-FORK.md §5): "Host processing
+    // latency min/max/average: %.1f/%.1f/%.1f ms" and "Video stream: %dx%d %.2f FPS (Codec: %s)".
+
+    void parsesHostLatencyAndResolution()
+    {
+        VideoStats stats;
+        const bool matched = parseVideoStatsBlock(
+            QStringLiteral("Video stream: 1920x1080 59.94 FPS (Codec: H264)\n"
+                           "Host processing latency min/max/average: 1.0/3.0/2.0 ms\n"),
+            &stats);
+
+        QVERIFY(matched);
+        QVERIFY(stats.hostProcessingAvgMs.present);
+        QCOMPARE(stats.hostProcessingAvgMs.value, 2.0);
+        QVERIFY(stats.videoWidth.present);
+        QCOMPARE(stats.videoWidth.value, 1920.0);
+        QVERIFY(stats.videoHeight.present);
+        QCOMPARE(stats.videoHeight.value, 1080.0);
+    }
+
+    // The owner: "sum it and add it" - the total is the sum of every part Moonlight measures and
+    // prints (`docs/spec/screens.md` §25): the network round trip, the host processing average
+    // (when present), decode, queue and render, rounded to whole ms.
+    void totalLatencyIsTheSumOfMeasuredParts()
+    {
+        VideoStats stats;
+        stats.rttMs = OptionalMetric::of(12.0);
+        stats.hostProcessingAvgMs = OptionalMetric::of(2.0);
+        stats.decodeTimeMs = OptionalMetric::of(1.4);
+        stats.queueTimeMs = OptionalMetric::of(0.6);
+        stats.renderTimeMs = OptionalMetric::of(3.1);
+
+        const OptionalMetric total = totalLatencyMs(stats);
+        QVERIFY(total.present);
+        QCOMPARE(total.value, 19.0);
+    }
+
+    // A Sunshine host that does not report its own processing latency simply has that part
+    // omitted from the sum - never treated as zero, never blocking the other four parts.
+    void totalOmitsHostWhenAbsent()
+    {
+        VideoStats stats;
+        stats.rttMs = OptionalMetric::of(12.0);
+        stats.decodeTimeMs = OptionalMetric::of(1.4);
+        stats.queueTimeMs = OptionalMetric::of(0.6);
+        stats.renderTimeMs = OptionalMetric::of(3.1);
+
+        const OptionalMetric total = totalLatencyMs(stats);
+        QVERIFY(total.present);
+        QCOMPARE(total.value, 17.0);
+    }
+
+    // "Average network latency: N/A": with no round trip there is nothing to add the other parts
+    // to, so there is no total at all (`docs/spec/screens.md` §25: "With no network figure there
+    // is no total").
+    void noTotalWithoutNetwork()
+    {
+        VideoStats stats;
+        stats.hostProcessingAvgMs = OptionalMetric::of(2.0);
+        stats.decodeTimeMs = OptionalMetric::of(1.4);
+        stats.queueTimeMs = OptionalMetric::of(0.6);
+        stats.renderTimeMs = OptionalMetric::of(3.1);
+        // stats.rttMs left absent.
+
+        QVERIFY(!totalLatencyMs(stats).present);
+    }
+
+    // The three new parse-only fields are parse-only in fact, not just in name: the quality
+    // report the client sends to the control plane is byte-for-byte unchanged (contract 3.1.0's
+    // eight fields, nothing more).
+    void toQualityReportSendsNoNewField()
+    {
+        VideoStats stats;
+        stats.hostProcessingAvgMs = OptionalMetric::of(2.0);
+        stats.videoWidth = OptionalMetric::of(1920.0);
+        stats.videoHeight = OptionalMetric::of(1080.0);
+
+        const QJsonObject report = toQualityReport(stats);
+
+        QCOMPARE(report.size(), 8);
+        QVERIFY(!report.contains(QStringLiteral("host_processing_avg_ms")));
+        QVERIFY(!report.contains(QStringLiteral("video_width")));
+        QVERIFY(!report.contains(QStringLiteral("video_height")));
     }
 
     // --- StatsWatcher ------------------------------------------------------------------------

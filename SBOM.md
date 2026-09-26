@@ -113,6 +113,47 @@ client executable, and one data file.
   https://github.com/moonlight-stream/moonlight-qt-prebuilts at `libs` commit `a27d6a7`
 - **Linked:** dynamically (`discord-rpc.dll`).
 
+### sentry-native
+
+- **Version:** 0.17.1 (06.3.1 D-18 pin; `seathub-ops/pins.yaml` `sentry_native`)
+- **License:** MIT
+- **Source:** https://github.com/getsentry/sentry-native, release source zip
+  `https://github.com/getsentry/sentry-native/releases/download/0.17.1/sentry-native.zip`, SHA-256
+  checked against the pin before extraction (`scripts/build-seathub.ps1`).
+- **Linked:** dynamically (`sentry.dll`), built with `SENTRY_BACKEND=crashpad`,
+  `SENTRY_TRANSPORT=winhttp`, `SENTRY_INTEGRATION_QT=OFF`, `SENTRY_BUILD_RUNTIMESTATIC=ON`.
+- **Ships as:** `sentry.dll` beside `SeatHub.exe`. No `.pdb` shipped (D-12-pdb: symbols upload to
+  Sentry's own CI step, never to a customer PC).
+
+### crashpad (getsentry fork, bundled in the sentry-native release zip)
+
+- **Version:** vendored at `external/crashpad` inside the sentry-native 0.17.1 zip; no independent
+  release numbering of its own (a `getsentry/crashpad` fork of Chromium's crashpad, per its own
+  `README.getsentry.md`).
+- **License:** Apache-2.0
+- **Source:** https://github.com/getsentry/crashpad
+- **Linked:** the out-of-process handler and its WER helper module, both built from this source:
+  `crashpad_handler.exe`, `crashpad_wer.dll`.
+- **Ships as:** `crashpad_handler.exe`, `crashpad_wer.dll` beside `SeatHub.exe`. No `.pdb` shipped.
+
+### mini_chromium (crashpad's own third-party dependency)
+
+- **Version:** commit `eef885b0bb80dab8e9d79b9dc0c050a1c8e50c0b` (crashpad's own `DEPS` file,
+  `chromium_git/chromium/mini_chromium`), vendored in the same sentry-native 0.17.1 zip.
+- **License:** BSD-3-Clause
+- **Source:** https://chromium.googlesource.com/chromium/mini_chromium
+- **Linked:** statically, into `crashpad_handler.exe` and `crashpad_wer.dll`. Ships no file of its
+  own.
+
+### zlib (crashpad's own third-party dependency)
+
+- **Version:** 1.2.12 (its own `LICENSE` file's header), commit `fef58692c1d7bec94c4ed3d030a45a1832a9615d`
+  (crashpad's own `DEPS` file, `chromium_git/chromium/src/third_party/zlib`), vendored in the same
+  sentry-native 0.17.1 zip.
+- **License:** Zlib
+- **Source:** https://chromium.googlesource.com/chromium/src/third_party/zlib
+- **Linked:** statically, into `crashpad_handler.exe`. Ships no file of its own.
+
 ### AntiHooking
 
 - **Version:** not versioned; built from source in this fork.
@@ -133,6 +174,25 @@ client executable, and one data file.
 - **Source:** https://learn.microsoft.com/cpp/windows/latest-supported-vc-redist
 - **Taken from:** the MSVC redistributable directory, not from the build tree — the build tree's
   copies are unsigned and repackaging them would break the signature that makes them trustworthy.
+
+### Open Sans
+
+- **Version:** v3.003
+- **License:** SIL Open Font License 1.1 (no Reserved Font Name)
+- **Source:** https://github.com/googlefonts/opensans at commit
+  `bd7e37632246368c60fdcbd374dbf9bad11969b6`
+- **File:** `OpenSans-SemiBold.ttf`, unmodified, compiled into the client as a Qt resource
+  (`app/seathub/fonts/OFL.txt`/`OpenSans-SemiBold.ttf`, registered via `seathub/fonts.qrc`,
+  06.6-06/06.6-14) and read by the pluggable text rasteriser `OsdRenderer` implements (D-15/D-17,
+  the one font for every SeatHub-drawn overlay).
+- **Ships as:** compiled into `SeatHub.exe` (the Qt resource), with its licence text shipped
+  separately at `licenses\OpenSans-OFL.txt` in the deploy folder (D-15; `scripts/build-seathub.ps1`
+  copies it from `app/seathub/fonts/OFL.txt` and the deploy-folder check requires it).
+
+Pre-existing gap, not widened by this entry: upstream's own `ModeSeven.ttf` (the SDL_ttf fallback
+`OverlayManager` still falls back to when no rasteriser is set, `overlaymanager.cpp`'s
+`Path::readDataFile("ModeSeven.ttf")`) has never had its own SBOM row since this file was written
+in 03-06; it is not this plan's asset and this plan does not add, remove or modify it.
 
 ## Statically linked into SeatHub.exe
 

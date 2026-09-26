@@ -43,5 +43,6 @@ SOURCES += tst_ui_screens.cpp \
 
 HEADERS += ../app/seathub/agent_config.h \
     ../app/seathub/settings_bridge.h \
+    ../app/seathub/stats_catalogue.h \
     ../app/settings/streamingpreferences.h \
     ../app/utils.h

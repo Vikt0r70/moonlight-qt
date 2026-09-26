@@ -37,9 +37,11 @@ private slots:
     void writesRefusedDuringStream();
     void forcedValuesAreCorrectedOnEveryLoadNotOnlyTheFirst();
     void hostSpeakerRowStaysEditableAtUpstreamsDefault();
+    void statsDefaultsAreFpsLatencyResolution();
     void statsTogglesDefaultOffAndTheDerivedOptionFollowsInBothDirections();
     void enabledStatsLabelsListsOnlyTheOnesTurnedOnInTheEnginesOwnOrder();
-    void sessionOverridesAreInMemoryOnly();
+    void settingsShowTheSavedValuesOnly();
+    void theOverrideMechanismIsGone();
     void negotiatedResultsAreExposedOnlyAfterConnectionStarted();
 
 private:
@@ -345,7 +347,14 @@ void TstSettingsBridge::statsTogglesDefaultOffAndTheDerivedOptionFollowsInBothDi
     QCOMPARE(m_bridge->statsToggleLabel(QStringLiteral("statsNetworkLatency")),
              QStringLiteral("Average network latency"));
 
-    // OD-03/OD-04: all off by default, and all-off is a valid state - the master option follows.
+    // D-10 (Plan 16): three keys are ticked by default (RES/FPS/LATENCY, covered in full by
+    // `statsDefaultsAreFpsLatencyResolution` below); the derived master follows (on, since
+    // something is ticked). Drive all three off explicitly to reach the "every toggle off" state
+    // OD-04 says is still valid, so the rest of this test (which is about the derived master
+    // following individual toggles, not about D-10's own defaults) starts from a known baseline.
+    QVERIFY(m_bridge->setStatsToggle(QStringLiteral("statsVideoStream"), false));
+    QVERIFY(m_bridge->setStatsToggle(QStringLiteral("statsRenderingFrameRate"), false));
+    QVERIFY(m_bridge->setStatsToggle(QStringLiteral("statsNetworkLatency"), false));
     for (const QString& key : keys) {
         QVERIFY2(!m_bridge->getStatsToggle(key), qPrintable(key));
     }
@@ -377,10 +386,44 @@ void TstSettingsBridge::statsTogglesDefaultOffAndTheDerivedOptionFollowsInBothDi
     m_bridge->setStreamingActive(false);
 }
 
+// D-10 (Plan 16, `06.6-16-PLAN.md`): with no saved keys, the three "essentials any person
+// understands" (the owner's own words, `06.6-CONTEXT.md` D-10) are ticked - `statsVideoStream`
+// (RES), `statsRenderingFrameRate` (FPS) and `statsNetworkLatency` (LATENCY) - and the other
+// eight stay off; the derived master (`showperfoverlay`) follows. A saved choice always wins over
+// the default (OD-03's own "a customer's earlier choice is never overridden" rule), whichever way
+// it was set.
+void TstSettingsBridge::statsDefaultsAreFpsLatencyResolution()
+{
+    QVERIFY(m_bridge->getStatsToggle(QStringLiteral("statsVideoStream")));
+    QVERIFY(m_bridge->getStatsToggle(QStringLiteral("statsRenderingFrameRate")));
+    QVERIFY(m_bridge->getStatsToggle(QStringLiteral("statsNetworkLatency")));
+    QCOMPARE(m_bridge->getValue(QStringLiteral("showperfoverlay")).toBool(), true);
+
+    const QStringList offByDefault = {
+        QStringLiteral("statsIncomingFrameRate"),      QStringLiteral("statsDecodingFrameRate"),
+        QStringLiteral("statsHostProcessingLatency"),  QStringLiteral("statsNetworkDroppedFrames"),
+        QStringLiteral("statsJitterDroppedFrames"),    QStringLiteral("statsDecodingTime"),
+        QStringLiteral("statsFrameQueueDelay"),        QStringLiteral("statsRenderingTime"),
+    };
+    for (const QString& key : offByDefault) {
+        QVERIFY2(!m_bridge->getStatsToggle(key), qPrintable(key));
+    }
+
+    // A saved false stays false even though the key defaults to true (a customer's earlier
+    // choice is never overridden by a later default change).
+    QVERIFY(m_bridge->setStatsToggle(QStringLiteral("statsRenderingFrameRate"), false));
+    QCOMPARE(m_bridge->getStatsToggle(QStringLiteral("statsRenderingFrameRate")), false);
+}
+
 void TstSettingsBridge::enabledStatsLabelsListsOnlyTheOnesTurnedOnInTheEnginesOwnOrder()
 {
     // Phase 5 plan 12 (D-26): the one place `moonlight_engine_session.cpp`'s overlay filter
-    // wiring reads the customer's choice from.
+    // wiring reads the customer's choice from. D-10 (Plan 16) ticks three keys by default, so
+    // this test - about tick ORDER, not about D-10's own defaults (`statsDefaultsAreFpsLatencyResolution`
+    // covers those) - starts by driving all three off to reach a known "nothing enabled" baseline.
+    QVERIFY(m_bridge->setStatsToggle(QStringLiteral("statsVideoStream"), false));
+    QVERIFY(m_bridge->setStatsToggle(QStringLiteral("statsRenderingFrameRate"), false));
+    QVERIFY(m_bridge->setStatsToggle(QStringLiteral("statsNetworkLatency"), false));
     QVERIFY(m_bridge->enabledStatsLabels().isEmpty());
 
     // Turned on out of the engine's own order - "Rendering frame rate" before "Video stream" -
@@ -398,32 +441,35 @@ void TstSettingsBridge::enabledStatsLabelsListsOnlyTheOnesTurnedOnInTheEnginesOw
     QVERIFY(m_bridge->enabledStatsLabels().isEmpty());
 }
 
-void TstSettingsBridge::sessionOverridesAreInMemoryOnly()
+// A-68 / D-06 reversal (RESEARCH-QUALITY.md § 3 item 2): Settings are the one place the
+// stream's quality comes from now, so `getValue()` always answers the saved value - there is
+// no override mechanism left to shadow it.
+void TstSettingsBridge::settingsShowTheSavedValuesOnly()
 {
-    QVERIFY(m_bridge->setValue(QStringLiteral("fps"), 60));
-    QVERIFY(!m_bridge->hasSessionOverrides());
+    QVERIFY(m_bridge->setValue(QStringLiteral("width"), 2560));
+    QVERIFY(m_bridge->setValue(QStringLiteral("height"), 1440));
+    QVERIFY(m_bridge->setValue(QStringLiteral("fps"), 30));
 
-    // D-37 / WR-05: the control plane's per-session profile is applied in memory for that launch.
-    m_bridge->applySessionOverride(QStringLiteral("1080p120"));
-    QVERIFY(m_bridge->hasSessionOverrides());
-    QCOMPARE(m_bridge->getValue(QStringLiteral("width")).toInt(), 1920);
-    QCOMPARE(m_bridge->getValue(QStringLiteral("height")).toInt(), 1080);
-    QCOMPARE(m_bridge->getValue(QStringLiteral("fps")).toInt(), 120);
+    QCOMPARE(m_bridge->getValue(QStringLiteral("width")).toInt(), 2560);
+    QCOMPARE(m_bridge->getValue(QStringLiteral("height")).toInt(), 1440);
+    QCOMPARE(m_bridge->getValue(QStringLiteral("fps")).toInt(), 30);
 
-    // The saved values are untouched, and the settings page can tell the two apart.
-    QCOMPARE(m_bridge->getSavedValue(QStringLiteral("fps")).toInt(), 60);
-    QCOMPARE(StreamingPreferences::get()->fps, 60);
-    QSettings settings;
-    QCOMPARE(settings.value(QStringLiteral("fps")).toInt(), 60);
+    // getValue() and getSavedValue() must always agree - there is no second, overriding source.
+    QCOMPARE(m_bridge->getValue(QStringLiteral("fps")), m_bridge->getSavedValue(QStringLiteral("fps")));
+}
 
-    // Nothing about the override can escape into the preference object, not even a write of the
-    // same value through the ordinary path.
-    QVERIFY(!m_bridge->effectiveValues().isEmpty());
-    QCOMPARE(m_bridge->effectiveValues().value(QStringLiteral("fps")).toInt(), 120);
-
-    m_bridge->clearSessionOverrides();
-    QVERIFY(!m_bridge->hasSessionOverrides());
-    QCOMPARE(m_bridge->getValue(QStringLiteral("fps")).toInt(), 60);
+// The bridge's own meta-object proves the mechanism is gone, not merely unused: no property, no
+// signal and no invokable method for it remain (checked via QMetaObject, not by calling any of
+// them - they must not exist to be called).
+void TstSettingsBridge::theOverrideMechanismIsGone()
+{
+    const QMetaObject* meta = m_bridge->metaObject();
+    QVERIFY2(meta->indexOfProperty("hasSessionOverrides") < 0,
+             "hasSessionOverrides must not exist");
+    QVERIFY2(meta->indexOfSignal("sessionOverridesChanged()") < 0,
+             "sessionOverridesChanged must not exist");
+    QVERIFY2(meta->indexOfMethod("applySessionOverride(QString)") < 0,
+             "applySessionOverride must not exist");
 }
 
 void TstSettingsBridge::negotiatedResultsAreExposedOnlyAfterConnectionStarted()

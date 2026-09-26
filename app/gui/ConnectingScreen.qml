@@ -128,6 +128,10 @@ Item {
             objectName: "tryAgainButton"
             width: parent.width
             visible: root.failed
+            // D-05/C4: Try again always ends the old, never-streamed session first and waits for
+            // it before a fresh Play goes out - the busy state is exactly that wait, not a local
+            // spinner of this screen's own (`retryBusy`, `seathub_client.h`).
+            busy: root.client && root.client.retryBusy === true
             text: qsTr("Try again")
 
             onClicked: root.client.retry()

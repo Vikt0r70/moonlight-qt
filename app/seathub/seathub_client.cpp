@@ -13,12 +13,15 @@
 #include "countries.h"
 #include "duration_text.h"
 #include "engine_termination.h"
+#include "log_shipper.h"
 #include "log_tee.h"
+#include "osd_compositor.h"
 #include "quality_outbox.h"
 #include "region.h"
 #include "session_lifecycle.h"
 #include "settings_bridge.h"
 #include "stream_stats.h"
+#include "telemetry.h"
 #include "update_feed_client.h"
 #include "web_origin.h"
 
@@ -67,10 +70,6 @@ const char* kHomeChecking = "checking";
 const char* kHomeBusy = "busy";
 const char* kHomeOffline = "offline";
 const char* kHomeRefused = "refused";
-
-// The quality profile Play asks for. `ADR-0011` fixes the vocabulary; `1080p60` is its base
-// value and the one the control plane uses in its own examples.
-const char* kDefaultQualityProfile = "1080p60";
 
 // `docs/spec/copy.md` §Play flow: the three customer-visible stage lines (`screens.md` §24). The
 // engine's own stage names (`LiGetStageName()`, e.g. "RTSP handshake") are internal and are never
@@ -123,6 +122,7 @@ int connectStageForState(const QString& state)
 // screen renders after a session ends (audit E10). `%1` is the session's real `minutes_billed` -
 // copy.md: "the client substitutes the session's real `minutes_billed`".
 const char* kEndCustomerEnded = "You ended the session. Unused minutes stay in your account.";
+const char* kEndConnectFailed = "The stream didn't start. You were not charged.";
 const char* kEndHostLost =
     "We lost contact with this rig, so the session ended. You were charged for %1 minutes.";
 const char* kEndClientSilent =
@@ -161,6 +161,7 @@ QString endReasonSentence(const QString& endReason, int minutesBilled, bool styl
     };
     static const ReasonLine kLines[] = {
         { "CUSTOMER_ENDED", kEndCustomerEnded },
+        { "CONNECT_FAILED", kEndConnectFailed },
         { "HOST_LOST", kEndHostLost },
         { "CLIENT_SILENT", kEndClientSilent },
         { "CONNECT_TIMEOUT", kEndConnectTimeout },
@@ -233,6 +234,23 @@ QString randomTraceId()
     return high + low;
 }
 
+/// Applies a `GET /api/me/telemetry` answer (D-01, D-18 SV-C3): a successful body is parsed and
+/// handed to `SeatHubTelemetry::applyHandout()`; a 401, a transport failure, or a malformed body
+/// changes nothing - telemetry is best-effort and never a reason to disrupt anything else. Called
+/// (Plan 15) after the interactive sign-in's `fetchMe`, after restore's `fetchMe`, and at
+/// `beginPlayRequest()`. A free function, not a member: `seathub_client.h` is not one of this
+/// plan's files, and this needs no class state.
+void applyTelemetryResult(const ControlPlaneResult& result)
+{
+    if (!result.ok) {
+        return;
+    }
+    if (const std::optional<SeatHubTelemetry::Handout> handout =
+            SeatHubTelemetry::parseHandout(result.body)) {
+        SeatHubTelemetry::applyHandout(*handout);
+    }
+}
+
 } // namespace
 
 // Control-plane callbacks arrive on the network thread once `startNetworkThreads()` has moved the
@@ -280,6 +298,14 @@ SeatHubClient::SeatHubClient(QObject* parent)
     // same process (as `tst_facade_wiring.cpp` does, once per test) is a no-op
     // (`LogTee::install()`'s own header comment).
     LogTee::install();
+
+    // D-09/D-15 (Plan 14): the bundled Open Sans SemiBold, registered once here - never from
+    // `app/main.cpp`, which 06.3.1 edits (RESEARCH-FORK.md §3, Pitfall 12) - so every path that
+    // constructs a facade (production, and `tst_facade_wiring.cpp`, once per test) has the font
+    // registered before `handleHostResolved()` ever sets the compositor as the engine's
+    // rasteriser. Idempotent (`registerOsdFonts()`'s own header comment); a failure only degrades
+    // to Qt's own fallback face, logged there, not fatal here.
+    registerOsdFonts();
 
     // A-51: the engine's own termination code, read from `Session::clConnectionTerminated`'s log
     // line (`engine_termination.h`'s own header comment says why this is the one route to it)
@@ -353,17 +379,16 @@ SeatHubClient::SeatHubClient(QObject* parent)
     connect(m_sessionChannel, &SessionWebSocket::sessionWarningReceived,
             this, &SeatHubClient::handleSessionWarning);
 
-    // Audit F12: the HUD's reconnect line. The control plane's `DISCONNECTED` warning is one
+    // Audit F12: the connection-state stage. The control plane's `DISCONNECTED` warning is one
     // trigger (see `handleSessionWarning`); the channel dropping is the other, and it is the one
-    // that fires when the customer's own connection goes away and no frame can arrive at all.
-    // `setReconnecting` only stores an atomic the HUD's timer thread reads, so the socket's
-    // thread may call it; this connection is queued to the facade's thread anyway.
+    // that fires when the customer's own connection goes away and no frame can arrive at all. The
+    // HUD's own "Connection lost. Reconnecting..." line is dead code Plan 22 removes (D-12; the
+    // reconnect message moves to SeatHub's own window in 06.1, #21) - only the liveness stage
+    // moves here now.
     connect(m_sessionChannel, &SessionWebSocket::opened, this, [this]() {
-        m_hud.setReconnecting(false);
         m_liveness->setStage(QStringLiteral("streaming"));
     });
     connect(m_sessionChannel, &SessionWebSocket::dropped, this, [this](int, int) {
-        m_hud.setReconnecting(true);
         m_liveness->setStage(QStringLiteral("reconnecting"));
     });
 
@@ -378,8 +403,8 @@ SeatHubClient::SeatHubClient(QObject* parent)
     connect(m_pairing, &PairingController::pairingFailed,
             this, &SeatHubClient::handlePairingFailed);
 
-    // D-37 / WR-05: the authorization's quality profile. Emitted before pairing starts, which is
-    // what puts the override in place before the engine negotiates the stream.
+    // A-68 / D-06 reversal: carries no quality profile any more (nothing applies one). Kept as
+    // the D-11 signal that a real authorization arrived, ahead of pairing.
     connect(m_pairing, &PairingController::authorizationGranted,
             this, &SeatHubClient::handleAuthorizationGranted);
 
@@ -433,6 +458,15 @@ SeatHubClient::~SeatHubClient()
     LogTee::removeSink(m_statsSinkHandle);
     m_terminationSinkHandle = 0;
     m_statsSinkHandle = 0;
+
+    // Plan 21 (D-14, SEATHUB § E.3 step 6): "at quit" for this fork is this destructor - one
+    // `SeatHubClient` for the life of the production app. Queues whatever is still in memory
+    // straight to the spool (never attempting a hand-off this late) and joins the worker thread -
+    // required before process exit: a joinable `std::thread` still attached to the `LogShipper`
+    // singleton at its own static destruction would call `std::terminate()`. A no-op, cheaply,
+    // when `LogShipper` was never started (`tst_facade_wiring.cpp` constructs and destroys a
+    // `SeatHubClient` once per test and never calls `SeatHubTelemetry::start()`).
+    LogShipper::instance().stop();
 
     // Order matters. Everything that was moved to the control-plane thread is brought home *from
     // inside that thread* first, the thread is then stopped and joined, and only then is anything
@@ -551,6 +585,15 @@ void SeatHubClient::beginSession(const QString& sessionId)
     // sessions in one run never tear down (defect F-9; `teardown_guard.h`).
     m_teardownGuard.reset();
 
+    // D-09/D-13: `hostId` is not known yet at this call - only `handleSessionState()`'s own
+    // `SessionInfo` names it, once the server answers - so this starts the tag/attribute with an
+    // empty host, which `handleSessionState()` fills in as soon as the session names one.
+    SeatHubTelemetry::setSession(sessionId, QString());
+
+    // D-04, D-10: the owner's live test switch. Read once per process (Task 3); every session
+    // this process ever begins after the first checks nothing further.
+    SeatHubTelemetry::maybeTestCrash();
+
     // A new session clears the previous one's end reason: the home screen shows the outcome of
     // the session that just ended, never a stale one (audit E10).
     setEndReasonText(QString());
@@ -633,6 +676,12 @@ void SeatHubClient::setSignedIn(bool signedIn)
 
 void SeatHubClient::setAttachedSession(const QString& sessionId)
 {
+    // C1: a genuinely new session id starts with no stream yet. Re-attaching the SAME id - the
+    // Resume branch of `start()` calling `beginSession(m_sessionId)` - is not a change and must
+    // not clear a flag `handleConnectionStarted()` already set for it.
+    if (sessionId != m_sessionId) {
+        m_streamStarted = false;
+    }
     m_sessionId = sessionId;
     if (sessionId.isEmpty()) {
         m_sessionEnded = false;
@@ -648,13 +697,39 @@ void SeatHubClient::setAttachedSessionEnded(bool ended)
 
 void SeatHubClient::updateLiveSession()
 {
-    const bool live = !m_sessionId.isEmpty() && !m_sessionEnded;
+    // C5: Resume is offered only for a session that reached ACTIVE on this client's side - a
+    // pre-stream session is never one Home resumes, even before anything has ended it.
+    const bool live = !m_sessionId.isEmpty() && !m_sessionEnded && m_streamStarted;
     if (m_liveSession == live) {
         return;
     }
     qCInfo(seathubClient) << "live session" << m_liveSession << "->" << live;
     m_liveSession = live;
     emit liveSessionChanged();
+}
+
+void SeatHubClient::setRetryBusy(bool busy)
+{
+    if (m_retryBusy == busy) {
+        return;
+    }
+    m_retryBusy = busy;
+    emit retryBusyChanged();
+}
+
+void SeatHubClient::endAttachedSessionBeforeStream(bool failed)
+{
+    // A local (no access token) attempt has no control-plane session to end.
+    if (!inControlPlaneSession()) {
+        return;
+    }
+    setAttachedSessionEnded(true);
+    if (m_teardownGuard.markStarted()) {
+        m_teardown->teardown(m_sessionId, m_clientUuid, failed);
+    }
+    // else: this session's teardown was already claimed - by `handleReadyForDeletion()` or by an
+    // earlier call here for the same session - and is already running. A second failure while it
+    // is in flight must not start a second one (T-06.6-50).
 }
 
 void SeatHubClient::setInSettings(bool inSettings)
@@ -825,6 +900,17 @@ void SeatHubClient::start()
         return;
     }
 
+    // D-05/C4: `retry()`'s own end-then-fresh-Play sequence is in flight (the old session is still
+    // being torn down). Home's own view stays "ready" for the wait's duration - it is not
+    // "connecting" or "streaming" yet - so without this guard a second Play pressed during the
+    // wait would post its own `POST /api/sessions` and `beginSession()` a second session, which
+    // the old session's own `handleTeardownCompleted()` (arriving after) would then tear back down
+    // as if it were the one that never streamed. `retryBusy` is exactly "a fresh Play is already
+    // promised"; a second one here would only race it.
+    if (m_retryBusy) {
+        return;
+    }
+
     // Play is the control plane's allocation (`POST /api/sessions`, D-35). Without an access
     // token there is nothing to allocate with, so there is nothing to stream: a stream is always
     // the object of an allocated session. This used to run the Plan 03-02 tracer instead, which is
@@ -832,6 +918,16 @@ void SeatHubClient::start()
     // to start with no engine session attached and this reports the failure.
     if (!m_controlPlane->hasAccessToken()) {
         beginLocalAttempt();
+        return;
+    }
+
+    // D-05/C4/C7: a session still attached here, that never streamed, is ended first - whether
+    // this Play is Try again (a session that failed before it streamed) or a fresh Play from
+    // Home itself (C7: the same session's earlier `/end` could not reach the server offline, so
+    // the server still considers it live). Idempotent with C2's own end attempt; the wait this
+    // starts is what keeps the POST below from meeting the "one nonterminal session per
+    // customer" refusal (409 `USER_HAS_NONTERMINAL_SESSION`, `openapi.yaml`).
+    if (endAttachedSessionBeforePlay()) {
         return;
     }
 
@@ -845,6 +941,22 @@ void SeatHubClient::start()
     }
 
     beginPlayRequest();
+}
+
+bool SeatHubClient::endAttachedSessionBeforePlay()
+{
+    if (m_sessionId.isEmpty() || m_streamStarted) {
+        return false;
+    }
+    setRetryBusy(true);
+    if (m_teardownGuard.markStarted()) {
+        m_teardown->teardown(m_sessionId, m_clientUuid, false);
+    }
+    // else: this session's end was already claimed - C2's own pre-stream failure path, or an
+    // earlier call here for the same session - and is already running; just wait for it.
+    // `handleTeardownCompleted()`/`handleTeardownFailed()` notice `m_retryBusy` and continue (or
+    // stop) from there.
+    return true;
 }
 
 void SeatHubClient::beginLocalAttempt()
@@ -876,11 +988,16 @@ void SeatHubClient::beginPlayRequest()
     // D-27: one trace id per Play, minted here so it covers this very request - the session
     // create - and every later request of the same Play, through to teardown
     // (`handleTeardownCompleted` clears it).
-    m_controlPlane->setTraceId(randomTraceId());
+    const QString playTraceId = randomTraceId();
+    m_controlPlane->setTraceId(playTraceId);
+    SeatHubTelemetry::setTrace(playTraceId);
 
-    const QString profile = QString::fromLatin1(kDefaultQualityProfile);
-
-    m_controlPlane->requestSession(profile, [this](const ControlPlaneResult& result) {
+    // The session create goes out first - existing trace-id tests index requests relative to this
+    // being the first one a Play makes - the telemetry refresh right after it (still unguarded by
+    // epoch, like `requestSession()`'s own callback: applying a slightly stale handout after a
+    // sign-out is harmless, D-18 F-1). No quality field is sent (A-68, D-06 reversal): the
+    // customer's saved Settings are the only decider of stream quality.
+    m_controlPlane->requestSession([this](const ControlPlaneResult& result) {
         onClientThread(this, [this, result]() {
             if (!result.ok) {
                 applyPlayFailure(result);
@@ -899,6 +1016,11 @@ void SeatHubClient::beginPlayRequest()
             beginSession(sessionId);
         });
     });
+
+    // Plan 15 (D-01, D-18 SV-C3): one of the three moments SeatHub refreshes its DSN handout.
+    m_controlPlane->fetchTelemetry([this](const ControlPlaneResult& result) {
+        onClientThread(this, [this, result]() { applyTelemetryResult(result); });
+    });
 }
 
 void SeatHubClient::applyPlayFailure(const ControlPlaneResult& result)
@@ -909,6 +1031,7 @@ void SeatHubClient::applyPlayFailure(const ControlPlaneResult& result)
     // shared PC). Before this fix only `handleTeardownCompleted()` ever cleared it, so every
     // refused Play left its id in place.
     m_controlPlane->clearTraceId();
+    SeatHubTelemetry::clearTrace();
 
     // `NO_HOST_AVAILABLE` is the empty state, not an incident (copy.md §Play flow, "No rig"):
     // the right answer is the sentence and the next thing to do, not the error screen.
@@ -961,11 +1084,36 @@ void SeatHubClient::retry()
     }
 
     setAppState(QString::fromLatin1(kStateHome));
+
+    // D-05/C4/C7: Try again is always a fresh Play, never a Resume of a session that did not
+    // stream - `start()` itself now ends a session left attached here first
+    // (`endAttachedSessionBeforePlay()`), the same one sequence C4's second half asks Play from
+    // Home to run too.
     start();
 }
 
 void SeatHubClient::interrupt()
 {
+    // D-05/C3: before the engine runs - the rig being prepared, or pairing -
+    // `SessionLifecycle::interrupt()` is a no-op: there is no active engine to push the quit key
+    // to (`session_lifecycle.cpp:131-140`). Without this branch a Cancel press here did nothing
+    // until an engine eventually attached, which is exactly the "stuck behind a dead session"
+    // shape T-06.6-49 exists to close. Cancel is not a failure, so this never raises one: it
+    // cancels pairing, stops liveness, ends the session through C2's one path with `failed:
+    // false` (C6: no charge either way, the server's call to make), and returns Home at once -
+    // not once the network answers (`screens.md` §24).
+    if (!m_session->active()) {
+        onClientThread(m_pairing, [this]() { m_pairing->cancel(); });
+        m_liveness->stop();
+        endAttachedSessionBeforeStream(false);
+        m_sessionChannel->close();
+        resetConnecting();
+        setHomeStatus(QString::fromLatin1(kHomeReady));
+        setAppState(!m_signedIn ? QString::fromLatin1(kStateSignedOut)
+                                : QString::fromLatin1(kStateHome));
+        return;
+    }
+
     // D-02: the local stop. The engine's own quit keystroke does the stopping; the control-plane
     // teardown runs from `handleReadyForDeletion()`, because the documented order is
     // stop the stream, destroy the SDL window, and only then close the session server-side.
@@ -1121,9 +1269,21 @@ bool SeatHubClient::adoptSignIn(const AuthTokenPair& pair, const QString& identi
             AccountInfo account;
             if (result.ok && AccountInfo::parse(result.body, &account)) {
                 m_accountId = account.id;
+                SeatHubTelemetry::setUser(account.id);
                 flushUntaggedQualityReports();
                 drainQualityOutbox();
             }
+        });
+    });
+
+    // Plan 15 (D-01, D-18 SV-C3): one of the three moments SeatHub refreshes its DSN handout -
+    // right after the interactive sign-in's own `fetchMe`, epoch-guarded the same way.
+    m_controlPlane->fetchTelemetry([this, epoch](const ControlPlaneResult& result) {
+        onClientThread(this, [this, epoch, result]() {
+            if (epoch != m_authEpoch) {
+                return;
+            }
+            applyTelemetryResult(result);
         });
     });
 
@@ -1250,6 +1410,15 @@ void SeatHubClient::signOut()
 
     // WR-01: whatever Play this covered is over.
     m_controlPlane->clearTraceId();
+    SeatHubTelemetry::clearTrace();
+    // D-09, D-18 SV-C4: no session or account survives a sign-out into the next crash's tags.
+    SeatHubTelemetry::clearSession();
+    // Plan 21 (D-14, Pitfall 9): every line captured before this point ships - or lands back in
+    // the spool - under THIS account before it is cleared below. Without this, a line from the
+    // last instant of this session could still be sitting in the in-memory queue when
+    // `clearUser()` runs, and ship moments later carrying no account id (or the next one).
+    LogShipper::instance().drainBeforeSignOut();
+    SeatHubTelemetry::clearUser();
 
     // Signing out leaves no stored pairing and no usable credential: not on disk, not in memory
     // here, and not valid on the server (ADR-0050, D-06). The channel and both timers stop before
@@ -1259,6 +1428,11 @@ void SeatHubClient::signOut()
     m_horizon->disarm();
     onClientThread(m_pairing, [this]() { m_pairing->cancel(); });
     m_teardown->cancel();
+    // D-05/C4: `TeardownController::cancel()` emits neither `teardownCompleted` nor
+    // `teardownFailed`, so a `retry()` wait abandoned by a sign-out would otherwise never clear -
+    // leaving the NEXT, unrelated session's ordinary teardown to find the flag still set and fire
+    // an unrequested `beginPlayRequest()` for a customer who is no longer signed in.
+    setRetryBusy(false);
 
     // The server's revoke goes out first - it is the only thing that makes "signed out" true for
     // anyone who has copied the credential. The request reads the credential when it runs, which
@@ -1358,6 +1532,22 @@ void SeatHubClient::applyRestoreResult(const ControlPlaneResult& result)
             setAccount(account);
             setHomeStatus(QString::fromLatin1(kHomeReady));
             setAppState(QString::fromLatin1(kStateHome));
+
+            // Plan 15 (D-01, D-18 SV-C3): one of the three moments SeatHub refreshes its DSN
+            // handout - right after restore's own `fetchMe` is confirmed. Guarded against the
+            // epoch THIS restore just established above (not the pre-restore value the `fetchMe`
+            // call at `restoreSession()` captured) - `applyRestoreResult()` bumps `m_authEpoch`
+            // itself on every branch, so guarding against the pre-bump value would race that same
+            // bump and drop this read whenever `fetchMe`'s own reply happens to land first.
+            const quint64 telemetryEpoch = m_authEpoch;
+            m_controlPlane->fetchTelemetry([this, telemetryEpoch](const ControlPlaneResult& telemetryResult) {
+                onClientThread(this, [this, telemetryEpoch, telemetryResult]() {
+                    if (telemetryEpoch != m_authEpoch) {
+                        return;
+                    }
+                    applyTelemetryResult(telemetryResult);
+                });
+            });
             return;
         }
         // A 2xx that is not an account is a contract violation, not evidence the credential is
@@ -1374,6 +1564,8 @@ void SeatHubClient::applyRestoreResult(const ControlPlaneResult& result)
         // D-17/Plan 30: no account is signed in past this point; a stale id from a process that
         // never signed out cleanly must not tag a later report.
         m_accountId.clear();
+        // D-18 SV-C4: a crash after this point carries no account id.
+        SeatHubTelemetry::clearUser();
         // WR-06: an untagged report held for this (now-refused) epoch can never be tagged now.
         m_untaggedQualityReports.clear();
         // CR-03: a `drainQualityOutbox()` call this credential started must not still be running
@@ -1419,6 +1611,7 @@ void SeatHubClient::setAccount(const AccountInfo& account)
     // `m_identity` above is the typed phone/email/username and can differ across two sign-ins of
     // the same account, which would tag two reports for one customer as "different accounts".
     m_accountId = account.id;
+    SeatHubTelemetry::setUser(account.id);
     // WR-06: any report parsed before this account id was known (this session's own, or an
     // earlier one this process never got a chance to tag) is tagged and stored now.
     flushUntaggedQualityReports();
@@ -1610,13 +1803,16 @@ void SeatHubClient::handleConnectionStarted()
     advanceConnectStage(kStageStreamingNow);
     setAppState(QString::fromLatin1(kStateStreaming));
 
+    // C1 (D-05): the session reached ACTIVE on this client's side - from here Home may offer
+    // Resume (C5), and Try again must never treat this session as one to end and replace (C4).
+    m_streamStarted = true;
+    updateLiveSession();
+
     // The HUD is begun before liveness starts, because the reads liveness makes feed it:
-    // `beginSession()` resets the credit and the once-per-session warning state, so a wallet read
-    // that beat it would be wiped.
-    //
-    // D-56: the duration timer starts here. This fires before the engine creates its SDL window
-    // (D-01), so the first HUD publish may arrive before the renderer has registered; the 1 Hz
-    // heartbeat re-publishes and the stream picks the HUD up on its first frame.
+    // `beginSession()` resets Time left's own state (D-11), so a wallet read that beat it would
+    // be wiped. This fires before the engine creates its SDL window (D-01), so the first publish
+    // may arrive before the renderer has registered; the 1 Hz heartbeat re-publishes and the
+    // stream picks Time left up on its first eligible read.
     m_hud.beginSession();
 
     // WR-04: the moment the stream truly begins is the right anchor for the first decoder
@@ -1624,13 +1820,9 @@ void SeatHubClient::handleConnectionStarted()
     // while pairing and connecting happen and would otherwise overstate it.
     m_statsAggregator.start();
 
-    // A stream that just started is by definition connected (audit F12): whatever the last
-    // session's channel did, this one is live now.
-    m_hud.setReconnecting(false);
-
-    // `Credit left` from the first frame: the last balance read before the stream (`screens.md`
-    // 25). Display only - it can be old, so it fires no warning; the report below reads the wallet
-    // at once and that read is the first thing that can.
+    // The last balance read before the stream (D-16: the seed never shows Time left, however low
+    // it is - it can be old, so it arms no reminder; the report below reads the wallet at once and
+    // that read is the first thing that can).
     if (m_balanceMinutes >= 0) {
         m_hud.seedCreditMinutes(m_balanceMinutes);
     }
@@ -1979,6 +2171,12 @@ void SeatHubClient::handleSessionState(const SessionInfo& session)
         return;
     }
 
+    // D-09/D-13: `beginSession()` does not know the rig yet - this is the first (and only) place a
+    // `SessionInfo` names one, so this is where the crash tags/attributes actually gain `host_id`.
+    if (!session.hostId.isEmpty()) {
+        SeatHubTelemetry::setSession(m_sessionId, session.hostId);
+    }
+
     // The connecting stages are the session's own state, as the control plane reports it.
     if (m_appState == QLatin1String(kStateConnecting)) {
         advanceConnectStage(connectStageForState(session.state));
@@ -2040,11 +2238,10 @@ void SeatHubClient::handleSessionWarning(const QString& sessionId, const QString
     m_billing.insert(QStringLiteral("warning_deadline_at"), deadlineAt);
     emit sessionWarningChanged();
 
-    // Audit F12: `DISCONNECTED` is the server saying this client stopped reporting, which is
-    // exactly the moment the HUD's strip leaves "Elapsed" and says what is happening. The
-    // strip never shows the "(2 of 5)" attempt counter D-56 defers.
+    // Audit F12: `DISCONNECTED` is the server saying this client stopped reporting. The HUD's own
+    // reconnect line this used to also flip is dead code Plan 22 removes (D-12); only the
+    // liveness stage moves here now.
     const bool reconnecting = warning == QLatin1String("DISCONNECTED");
-    m_hud.setReconnecting(reconnecting);
     m_liveness->setStage(reconnecting ? QStringLiteral("reconnecting") : QStringLiteral("streaming"));
 }
 
@@ -2109,6 +2306,12 @@ void SeatHubClient::handlePairingCompleted(const QString& clientUuid)
         // or a teardown. Without this it kept reporting `stage: failed` (and reading the wallet)
         // every 10 s until the next `beginSession()` or sign-out.
         m_liveness->stop();
+        // D-05/C2: paired, but nothing could be attached to stream with - end the session now,
+        // with `failed: true`, rather than leaving it for Try again to discover. Queued onto the
+        // network thread right after the report/stop above (both of which self-marshal there too,
+        // being called from this - the facade - thread), so the server records the pairing-stage
+        // report before it sees the cancel.
+        endAttachedSessionBeforeStream(true);
         // WR-01: this Play is over here, at the start refusal - the next one mints its own id.
         // `reportFailure()` above re-invoked itself onto `m_liveness`'s own (network) thread,
         // because this handler runs on the facade thread; a plain, synchronous `clearTraceId()`
@@ -2126,8 +2329,23 @@ void SeatHubClient::handlePairingCompleted(const QString& clientUuid)
     m_liveness->setStage(QStringLiteral("connecting"));
 }
 
-void SeatHubClient::handleHostResolved(const PairedHostPtr& host)
+void SeatHubClient::handleHostResolved(const QString& sessionId, const PairedHostPtr& host)
 {
+    // T-06.6-52: a host that resolved for a session that is no longer attached - cancelled, or
+    // superseded by a fresh Play/Try again while this handshake was still running - must never
+    // attach an engine (and therefore start a stream) for the wrong session. Checked before
+    // anything else here runs, including `releaseEngineSession()`, so a stale result never so much
+    // as touches whatever the actually-attached session has going. The id check alone only catches
+    // "superseded by a different session id"; `m_sessionEnded` is what catches "cancelled" - Cancel
+    // (`interrupt()`'s pre-engine branch, via `endAttachedSessionBeforeStream()`) marks the same
+    // session ended without ever clearing `m_sessionId`, so a late handshake for that same id must
+    // still be dropped here.
+    if (sessionId != m_sessionId || m_sessionEnded) {
+        qCInfo(seathubClient) << "dropping a paired host resolved for a session that is no longer "
+                                 "attached or has already ended:" << sessionId;
+        return;
+    }
+
     releaseEngineSession();
     if (m_engineSession != nullptr) {
         // A previous launch is still running. One lifecycle drives one session, so a second engine
@@ -2153,6 +2371,22 @@ void SeatHubClient::handleHostResolved(const PairedHostPtr& host)
     // filtered path - never a second "show everything" one - so with nothing chosen the hotkey
     // draws nothing, which is the owner's OD-04 answer (05-01-SUMMARY) over the alternative.
     engine->setDebugLineFilter(m_settings->enabledStatsLabels());
+
+    // D-09/D-13 (Plan 14): the HUD's own `OsdCompositor` becomes the engine's text rasteriser
+    // here, at the same one construction point `setDebugLineFilter()` above just used - before
+    // `run()` (started from `handlePairingCompleted()`) ever lets the engine write a status line.
+    // `setTextRasterizer()` is a thin forward (`MoonlightEngineSession`'s own header comment); the
+    // instance is the same one `HudOverlay::tick()` publishes `composedBottom()` from
+    // (`m_hud.compositor()`), so both draw from the one recorded state (`osd_compositor.h`'s own
+    // header comment).
+    engine->setTextRasterizer(&OsdCompositor::rasterize, &m_hud.compositor());
+
+    // D-26 (Plan 14): the compositor's own stats-label choice, set alongside the filter above.
+    // Plan 16 is what actually draws the stats block through it. There is only this one call
+    // site today - settings are read-only while a stream is active (T-05-52, same reason
+    // `setDebugLineFilter()`'s own comment above gives), so nothing refreshes this mid-stream; a
+    // future refresh site would set both together, the same as here.
+    m_hud.compositor().setEnabledStatsLabels(m_settings->enabledStatsLabels());
 
     m_engineSession = engine;
     m_session->attachSession(engine);
@@ -2195,6 +2429,13 @@ void SeatHubClient::clearThisPlaysTraceIdAfterAnyQueuedLivenessReport()
     // after this function returns.
     ControlPlaneClient* controlPlane = m_controlPlane;
     const QString thisPlaysTraceId = controlPlane->traceId();
+    // Mirrors clearTraceIdIfEquals()'s own guard, synchronously, on this (client) thread: only
+    // clear SeatHub's own trace identity if this Play's id is still the current one - an older
+    // Play's late clear must never wipe a newer Play's trace (`setTrace()` in `beginPlayRequest()`
+    // already moved on to the newer Play's id by the time this runs, if one has started).
+    if (SeatHubTelemetry::currentTraceId() == thisPlaysTraceId) {
+        SeatHubTelemetry::clearTrace();
+    }
     onClientThread(controlPlane, [controlPlane, thisPlaysTraceId]() {
         controlPlane->clearTraceIdIfEquals(thisPlaysTraceId);
     });
@@ -2211,6 +2452,13 @@ void SeatHubClient::handlePairingFailed(const SeatHubFailure& failure)
     // reading the wallet) every 10 s while the customer read the error screen and after returning
     // Home, until the next `beginSession()` or sign-out.
     m_liveness->stop();
+    // D-05/C2: the client's own pairing deadline, or the control plane refusing the pairing read -
+    // either way nothing will ever stream on this session, so end it now with `failed: true`
+    // rather than leaving a dead session for Try again to discover. Queued onto the network
+    // thread right after the report/stop above, so the server records the pairing-stage report
+    // before it sees the cancel; this must run before the trace-id clear below, which is
+    // marshalled onto the same thread and must not overtake it.
+    endAttachedSessionBeforeStream(true);
     // WR-01: this Play is over here, at the pairing failure - the next one mints its own id. See
     // `clearThisPlaysTraceIdAfterAnyQueuedLivenessReport()`'s own comment for why this is not a
     // plain `clearTraceId()` call.
@@ -2228,18 +2476,12 @@ void SeatHubClient::handlePairingFailed(const SeatHubFailure& failure)
     raiseFailure(failure);
 }
 
-void SeatHubClient::handleAuthorizationGranted(const QString& qualityProfile)
+void SeatHubClient::handleAuthorizationGranted()
 {
-    // D-37 / WR-05: the control plane's `quality_profile` becomes this launch's resolution and
-    // frame rate, in memory, leaving every saved preference untouched (D-12, STREAM-02). It is
-    // applied here - on authorization, ahead of pairing - so the override is in place before
-    // `handleConnectionStarted()` reports what the session actually settled on (D-14), and it is
-    // handed over here rather than in the controller so that the bridge keeps exactly one writer
-    // from the session path.
-    //
-    // The controller is the only object that sees the authorization; it puts this one field on the
-    // signal and keeps the rest, including `pairing_pin` (STREAM-03).
-    m_settings->applySessionOverride(qualityProfile);
+    // A-68 / D-06 reversal: the control plane's `quality_profile` is no longer applied to
+    // anything - the customer's saved Settings are the only decider of stream quality. The
+    // session-override mechanism this slot used to call into (`SettingsBridge`) is removed
+    // entirely (06.6-19 Task 2).
 
     // D-11: a real authorization means the rig has a pairing target - the session has moved past
     // the 409 "not ready yet" polls that are `preparing_rig`, whether or not a PIN has arrived yet.
@@ -2404,6 +2646,10 @@ void SeatHubClient::handleTeardownCompleted(const SessionInfo& finalSession)
     // D-27: the Play this trace id covered is over; the next one (`beginPlayRequest`) mints its
     // own.
     m_controlPlane->clearTraceId();
+    SeatHubTelemetry::clearTrace();
+    // D-09: the session (and whatever rig it named) is over - a crash after this point carries
+    // neither in its tags.
+    SeatHubTelemetry::clearSession();
 
     setAttachedSession(QString());
     m_clientUuid.clear();
@@ -2415,6 +2661,18 @@ void SeatHubClient::handleTeardownCompleted(const SessionInfo& finalSession)
     m_sessionWarning.clear();
     emit billingChanged();
     emit sessionWarningChanged();
+
+    // D-05/C4: `retry()`'s own end-then-fresh-Play sequence was waiting on exactly this teardown -
+    // the old session is gone, so the fresh Play goes out now, instead of the ordinary "land back
+    // on Home" handling below (which would otherwise treat this the way an ordinary finished
+    // session is treated, when the customer never actually watched one happen). This must run
+    // after every clear above (trace id, telemetry session, the attached session itself) so the
+    // fresh Play's own trace id is not the one wiped.
+    if (m_retryBusy) {
+        setRetryBusy(false);
+        beginPlayRequest();
+        return;
+    }
 
     // Only leave the view if the customer is not looking at a failure: a teardown that succeeded says
     // nothing about the failure the error screen - or a stalled connecting view - is already showing.
@@ -2437,6 +2695,18 @@ void SeatHubClient::handleTeardownFailed(const SeatHubFailure& failure)
     // it, so a teardown failure left the id in place for every later request until the next Play,
     // including another customer's sign-in on a shared PC.
     m_controlPlane->clearTraceId();
+    SeatHubTelemetry::clearTrace();
+    // D-09: the session (and whatever rig it named) is over - a crash after this point carries
+    // neither in its tags.
+    SeatHubTelemetry::clearSession();
+
+    // C7: no retry loop is added here, but the NEXT Try again (or Play) must still be able to ask
+    // for a fresh `/end` rather than finding this session's teardown claim already spent - reset
+    // the guard the same way a completed teardown does. `m_sessionId` itself is left attached: the
+    // session is still the server's to end, and a customer who tries again gets exactly the "end
+    // it, then a fresh Play" sequence C4 already describes.
+    m_teardownGuard.reset();
+    setRetryBusy(false);
 
     // STREAM-10: the rig-side disable/remove/verify did not complete, or something was left
     // stored on this PC. Reporting success would tell the customer the opposite of what is true,

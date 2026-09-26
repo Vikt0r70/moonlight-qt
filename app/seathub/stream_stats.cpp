@@ -26,6 +26,18 @@ const char* const kDashesPrefix = "---------------------------------------------
 // terms: `stats.totalFps`, not the rendered rate. `Rendering frame rate: %.2f FPS` (ffmpeg.cpp:
 // 798, 801) is the line that actually carries the rendered rate, and - unlike `Video stream:` -
 // it is printed whenever `stats.receivedFps > 0` (ffmpeg.cpp:777), with no decoder-context gate.
+// D-10 (Plan 16): "Video stream: %dx%d %.2f FPS (Codec: %s)" (`ffmpeg.cpp:778, 792`) - only the
+// resolution is captured; the rendered rate and codec are read from elsewhere (CR-01: this line
+// is gated on `m_VideoDecoderCtx != nullptr` and never printed in the end-of-stream block, but it
+// IS printed in the live `OverlayDebug` text this compositor parses, since the decoder context is
+// still valid there).
+const QRegularExpression& videoStreamPattern()
+{
+    static const QRegularExpression re(
+        QStringLiteral("^Video stream: (\\d+)x(\\d+) .*$"), QRegularExpression::MultilineOption);
+    return re;
+}
+
 const QRegularExpression& renderedFpsPattern()
 {
     static const QRegularExpression re(
@@ -80,6 +92,18 @@ const QRegularExpression& networkLatencyPattern()
     return re;
 }
 
+// D-10 (Plan 16): "Host processing latency min/max/average: %.1f/%.1f/%.1f ms" (`ffmpeg.cpp:811-
+// 819`, gated on `stats.framesWithHostProcessingLatency > 0`) - only the third (average) figure
+// is captured; min/max have no OSD row of their own.
+const QRegularExpression& hostProcessingAvgPattern()
+{
+    static const QRegularExpression re(
+        QStringLiteral("^Host processing latency min/max/average: \\d+(?:\\.\\d+)?/\\d+(?:\\.\\d+)?/"
+                       "(\\d+(?:\\.\\d+)?) ms$"),
+        QRegularExpression::MultilineOption);
+    return re;
+}
+
 const QRegularExpression& decodeTimePattern()
 {
     static const QRegularExpression re(QStringLiteral("^Average decoding time: (\\d+(?:\\.\\d+)?) ms$"),
@@ -120,7 +144,14 @@ bool parseVideoStatsBlock(const QString& block, VideoStats* out)
 
     bool matchedAnyLine = false;
 
-    QRegularExpressionMatch m = renderedFpsPattern().match(block);
+    QRegularExpressionMatch m = videoStreamPattern().match(block);
+    if (m.hasMatch()) {
+        out->videoWidth = OptionalMetric::of(m.captured(1).toDouble());
+        out->videoHeight = OptionalMetric::of(m.captured(2).toDouble());
+        matchedAnyLine = true;
+    }
+
+    m = renderedFpsPattern().match(block);
     if (m.hasMatch()) {
         out->renderedFps = OptionalMetric::of(m.captured(1).toDouble());
         matchedAnyLine = true;
@@ -164,6 +195,12 @@ bool parseVideoStatsBlock(const QString& block, VideoStats* out)
         // stay absent, matched but not filled.
     }
 
+    m = hostProcessingAvgPattern().match(block);
+    if (m.hasMatch()) {
+        out->hostProcessingAvgMs = OptionalMetric::of(m.captured(1).toDouble());
+        matchedAnyLine = true;
+    }
+
     m = decodeTimePattern().match(block);
     if (m.hasMatch()) {
         out->decodeTimeMs = OptionalMetric::of(m.captured(1).toDouble());
@@ -197,6 +234,29 @@ QJsonObject toQualityReport(const VideoStats& stats)
     object.insert(QStringLiteral("queue_time_ms"), metricValue(stats.queueTimeMs));
     object.insert(QStringLiteral("render_time_ms"), metricValue(stats.renderTimeMs));
     return object;
+}
+
+OptionalMetric totalLatencyMs(const VideoStats& stats)
+{
+    if (!stats.rttMs.present) {
+        // `docs/spec/screens.md` §25: "With no network figure there is no total."
+        return OptionalMetric::none();
+    }
+
+    double total = stats.rttMs.value;
+    if (stats.hostProcessingAvgMs.present) {
+        total += stats.hostProcessingAvgMs.value;
+    }
+    if (stats.decodeTimeMs.present) {
+        total += stats.decodeTimeMs.value;
+    }
+    if (stats.queueTimeMs.present) {
+        total += stats.queueTimeMs.value;
+    }
+    if (stats.renderTimeMs.present) {
+        total += stats.renderTimeMs.value;
+    }
+    return OptionalMetric::of(qRound(total));
 }
 
 StatsWatcher::StatsWatcher(QObject* parent) : QObject(parent) {}

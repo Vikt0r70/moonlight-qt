@@ -122,16 +122,19 @@ bool TeardownController::advanceTo(TeardownStage stage)
     return true;
 }
 
-void TeardownController::teardown(const QString& sessionId, const QString& clientUuid)
+void TeardownController::teardown(const QString& sessionId, const QString& clientUuid, bool failed)
 {
     if (!onOwnThread()) {
         // HR-01: `m_verifyTimer` is a child of this object, and this object is moved to the
         // network thread so its work runs while the stream has the main thread suspended. A call
         // from the main thread has to be handed over: `QTimer::start()` from a foreign thread is
         // refused by Qt with a warning, which used to strand teardown before `Clear` - the store
-        // was never cleared and `teardownCompleted()` never fired.
-        QMetaObject::invokeMethod(this, [this, sessionId, clientUuid]() {
-            teardown(sessionId, clientUuid);
+        // was never cleared and `teardownCompleted()` never fired. `failed` is captured and
+        // forwarded here too - a queued call that dropped it would silently re-derive the
+        // parameterless default (`false`) on the owning thread, telling the server "customer
+        // ended" for what was actually a connect failure (D-05/D-23).
+        QMetaObject::invokeMethod(this, [this, sessionId, clientUuid, failed]() {
+            teardown(sessionId, clientUuid, failed);
         }, Qt::QueuedConnection);
         return;
     }
@@ -161,7 +164,7 @@ void TeardownController::teardown(const QString& sessionId, const QString& clien
 
     // Step 1 on the rig, requested through the only route this client has. `POST /end` is
     // idempotent, so pressing End twice is not an error.
-    m_client->endSession(sessionId, [this](const ControlPlaneResult& result) {
+    m_client->endSession(sessionId, failed, [this](const ControlPlaneResult& result) {
         handleEndResult(result);
     });
 }

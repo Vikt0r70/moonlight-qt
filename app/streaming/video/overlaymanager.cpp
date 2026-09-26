@@ -61,7 +61,9 @@ QByteArray filterDebugLines(const char* rawText, const QByteArray& enabledLabels
 OverlayManager::OverlayManager() :
     m_Renderer(nullptr),
     m_FontData(Path::readDataFile("ModeSeven.ttf")),
-    m_DebugLineFilter(nullptr)
+    m_DebugLineFilter(nullptr),
+    m_TextRasterizer(nullptr),
+    m_TextRasterizerContext(nullptr)
 {
     memset(m_Overlays, 0, sizeof(m_Overlays));
 
@@ -236,6 +238,14 @@ QByteArray OverlayManager::filteredDebugText() const
     return filterDebugLines(m_Overlays[OverlayType::OverlayDebug].text, filterCopy);
 }
 
+// SeatHub: D-28 exception (ADR-0045 amendment, 2026-09-26), see FORK-CHANGES.md. See the header's
+// own comment on this method for the full contract.
+void OverlayManager::setTextRasterizer(TextRasterizer rasterizer, void* context)
+{
+    SDL_AtomicSetPtr(&m_TextRasterizerContext, context);
+    SDL_AtomicSetPtr(&m_TextRasterizer, (void*)rasterizer);
+}
+
 void OverlayManager::setOverlayTextUpdated(OverlayType type)
 {
     // Only update the overlay state if it's enabled. If it's not enabled,
@@ -304,6 +314,39 @@ void OverlayManager::reassertPublishedSurface(OverlayType type)
 void OverlayManager::notifyOverlayUpdated(OverlayType type)
 {
     if (m_Renderer == nullptr) {
+        return;
+    }
+
+    // SeatHub: D-28 exception (ADR-0045 amendment, 2026-09-26), see FORK-CHANGES.md.
+    //
+    // Placed before the seatHubSurface re-assert branch below: that branch returns early whenever
+    // a SeatHub bitmap is remembered, and a rasteriser call placed after it would mean the
+    // engine's own status text (the poor-connection warning, the gamepad mouse-mode hint) never
+    // reaches SeatHub while a bitmap (Time left) is remembered - hiding D-13's message for as long
+    // as that bitmap stays published. With the rasteriser first, SeatHub composes both itself.
+    TextRasterizer rasterize = (TextRasterizer)SDL_AtomicGetPtr(&m_TextRasterizer);
+    if (rasterize != nullptr) {
+        SDL_Surface* oldSurface = (SDL_Surface*)SDL_AtomicSetPtr((void**)&m_Overlays[type].surface, nullptr);
+        if (oldSurface != nullptr) {
+            SDL_FreeSurface(oldSurface);
+        }
+
+        // Called even while disabled, so SeatHub learns the engine's text went away
+        // (`setOverlayState(false)` clears `text` to empty just before this runs).
+        SDL_Surface* s = rasterize(type, m_Overlays[type].text, m_Overlays[type].enabled,
+                                   m_Overlays[type].color,
+                                   SDL_AtomicGetPtr(&m_TextRasterizerContext));
+        if (s != nullptr && (!m_Overlays[type].enabled
+                             || s->format->format != SDL_PIXELFORMAT_ARGB8888 || SDL_MUSTLOCK(s))) {
+            // Same refusal rule updateOverlaySurface() applies (:161-177): a foreign format or a
+            // surface that needs locking would trip an assert on a render thread, and a disabled
+            // slot has nothing that would draw it.
+            SDL_FreeSurface(s);
+            s = nullptr;
+        }
+
+        SDL_AtomicSetPtr((void**)&m_Overlays[type].surface, s);
+        m_Renderer->notifyOverlayUpdated(type);
         return;
     }
 

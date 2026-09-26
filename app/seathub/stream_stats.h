@@ -66,6 +66,15 @@ struct VideoStats
     /// all three.
     OptionalMetric receivedFps;
     OptionalMetric decodedFps;
+
+    /// D-10 (Plan 16, `06.6-16-PLAN.md`): parse-only fields for the in-stream stats overlay's
+    /// HOST row and total-latency sum, and the RES row's resolution - like `receivedFps` above,
+    /// never sent on the wire (`toQualityReport()` does not reference any of the three). Parsed
+    /// from the "Host processing latency min/max/average: ... ms" line's own average figure and
+    /// the "Video stream: WxH ..." line's own dimensions (`ffmpeg.cpp:778-848`, read-only).
+    OptionalMetric hostProcessingAvgMs;
+    OptionalMetric videoWidth;
+    OptionalMetric videoHeight;
 };
 
 /// Parses the block that follows the dashes line - `stringifyVideoStats()`'s own output, with
@@ -75,6 +84,14 @@ struct VideoStats
 /// a block with some of the engine's own conditional lines absent still returns `true`, with each
 /// missing metric left absent rather than defaulted to zero.
 bool parseVideoStatsBlock(const QString& block, VideoStats* out);
+
+/// D-10 (Plan 16): the stats overlay's total latency - the sum of every measured part Moonlight
+/// prints (the network round trip, the host processing average when present, decode, queue and
+/// render), rounded to whole ms (`docs/spec/screens.md` §25, the owner: "sum it and add it").
+/// Absent whenever `stats.rttMs` is absent ("With no network figure there is no total") - a
+/// missing host-processing line (a Sunshine host that does not report it) is simply omitted from
+/// the sum, never treated as zero.
+OptionalMetric totalLatencyMs(const VideoStats& stats);
 
 /// `VideoStats` as the `SessionQualityReport` request body (`docs/spec/openapi.yaml`): each
 /// present metric as a JSON number, each absent one as JSON `null` (the schema's own

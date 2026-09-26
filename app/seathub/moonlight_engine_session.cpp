@@ -195,6 +195,14 @@ void MoonlightEngineSession::setDebugLineFilter(const QStringList& enabledLabels
     m_engine->getOverlayManager().setDebugLineFilter(enabledLabels);
 }
 
+void MoonlightEngineSession::setTextRasterizer(Overlay::OverlayManager::TextRasterizer rasterizer,
+                                               void* context)
+{
+    // See this method's own header comment: a thin forward to the engine's own compositor, the
+    // same idiom as `setDebugLineFilter()` above.
+    m_engine->getOverlayManager().setTextRasterizer(rasterizer, context);
+}
+
 bool MoonlightEngineSession::publishOverlaySurface(SDL_Surface* surface)
 {
     // The overlay manager ADR-0045 added a bitmap input to. Reached through this session object

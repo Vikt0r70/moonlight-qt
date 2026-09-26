@@ -1,6 +1,7 @@
 #include "settings_bridge.h"
 
 #include "settings/streamingpreferences.h"
+#include "stats_catalogue.h"
 
 #include <QLoggingCategory>
 #include <QSettings>
@@ -218,44 +219,15 @@ const Setting kSettings[] = {
       "preserves the migration behavior and never presents a version-control setting." },
 };
 
-// The eleven lines Moonlight 6.1.0's own `stringifyVideoStats()` writes (RESEARCH Q3,
-// `ffmpeg.cpp:700-856`), each labelled with that line's own text minus its numbers (OD-03), in
-// its own output order. `copy.md` § Settings carries the same eleven labels verbatim - this is
-// the one place both this bridge and Plan 12's overlay filter read them from (D-26).
-struct StatsToggle {
-    const char* key;
-    const char* label;
-};
-
-const StatsToggle kStatsToggles[] = {
-    { "statsVideoStream", "Video stream" },
-    { "statsIncomingFrameRate", "Incoming frame rate from network" },
-    { "statsDecodingFrameRate", "Decoding frame rate" },
-    { "statsRenderingFrameRate", "Rendering frame rate" },
-    { "statsHostProcessingLatency", "Host processing latency min/max/average" },
-    { "statsNetworkDroppedFrames", "Frames dropped by your network connection" },
-    { "statsJitterDroppedFrames", "Frames dropped due to network jitter" },
-    { "statsNetworkLatency", "Average network latency" },
-    { "statsDecodingTime", "Average decoding time" },
-    { "statsFrameQueueDelay", "Average frame queue delay" },
-    { "statsRenderingTime", "Average rendering time (including monitor V-sync latency)" },
-};
+// D-26/Plan 16: the eleven performance-stats key/label/default rows now live in ONE place,
+// `stats_catalogue.h`'s `kStatsCatalogue[]` - this bridge no longer keeps its own duplicate
+// key/label table. `copy.md` § Settings carries the same eleven long labels verbatim.
 
 const Setting* findSetting(const QString& key)
 {
     for (const Setting& s : kSettings) {
         if (key == QLatin1String(s.key)) {
             return &s;
-        }
-    }
-    return nullptr;
-}
-
-const StatsToggle* findStatsToggle(const QString& key)
-{
-    for (const StatsToggle& t : kStatsToggles) {
-        if (key == QLatin1String(t.key)) {
-            return &t;
         }
     }
     return nullptr;
@@ -635,10 +607,8 @@ QVariant SettingsBridge::getSavedValue(const QString& key) const
 
 QVariant SettingsBridge::getValue(const QString& key) const
 {
-    const auto it = m_overrides.constFind(key);
-    if (it != m_overrides.constEnd()) {
-        return it.value();
-    }
+    // A-68 / D-06 reversal: there is no session-override mechanism any more - the saved value is
+    // always the value in force.
     return getSavedValue(key);
 }
 
@@ -975,27 +945,29 @@ int SettingsBridge::bitrateMaximum() const
 QStringList SettingsBridge::statsToggleKeys() const
 {
     QStringList out;
-    for (const StatsToggle& t : kStatsToggles) {
-        out.append(QString::fromLatin1(t.key));
+    for (const StatsCatalogueEntry& entry : kStatsCatalogue) {
+        out.append(QString::fromLatin1(entry.key));
     }
     return out;
 }
 
 QString SettingsBridge::statsToggleLabel(const QString& statsKey) const
 {
-    const StatsToggle* t = findStatsToggle(statsKey);
-    return t ? QString::fromLatin1(t->label) : QString();
+    const StatsCatalogueEntry* entry = findStatsCatalogueEntry(statsKey);
+    return entry ? QString::fromLatin1(entry->longLabel) : QString();
 }
 
 bool SettingsBridge::getStatsToggle(const QString& statsKey) const
 {
-    if (!findStatsToggle(statsKey)) {
+    const StatsCatalogueEntry* entry = findStatsCatalogueEntry(statsKey);
+    if (!entry) {
         return false;
     }
     // Same preference store as everything else (D-12); a SeatHub-only key with no upstream
     // `[streamsettings]` counterpart, so it is read directly rather than through
-    // `StreamingPreferences`, which upstream owns.
-    return QSettings().value(statsKey, false).toBool();
+    // `StreamingPreferences`, which upstream owns. D-10: the default comes from the one catalogue
+    // (`entry->defaultOn`), not a literal `false` - a saved value always wins regardless.
+    return QSettings().value(statsKey, entry->defaultOn).toBool();
 }
 
 bool SettingsBridge::setStatsToggle(const QString& statsKey, bool value)
@@ -1005,7 +977,7 @@ bool SettingsBridge::setStatsToggle(const QString& statsKey, bool value)
                                 << statsKey;
         return false;
     }
-    if (!findStatsToggle(statsKey)) {
+    if (!findStatsCatalogueEntry(statsKey)) {
         qCWarning(seathubSettings) << "unknown stats toggle key:" << statsKey;
         return false;
     }
@@ -1021,13 +993,13 @@ bool SettingsBridge::setStatsToggle(const QString& statsKey, bool value)
 
 QStringList SettingsBridge::enabledStatsLabels() const
 {
-    // D-26: this is the one place both this bridge and Plan 12's overlay filter read the label
-    // catalogue from - `kStatsToggles` above is defined once, here, and the filter itself
-    // (`OverlayManager::setDebugLineFilter()`) carries no copy of it.
+    // D-26: this is the one place both this bridge and the OSD compositor (`osd_compositor.cpp`)
+    // read the label catalogue from - `stats_catalogue.h`'s `kStatsCatalogue` is defined once,
+    // there, and neither this bridge nor the compositor carries its own copy.
     QStringList out;
-    for (const StatsToggle& t : kStatsToggles) {
-        if (getStatsToggle(QString::fromLatin1(t.key))) {
-            out.append(QString::fromLatin1(t.label));
+    for (const StatsCatalogueEntry& entry : kStatsCatalogue) {
+        if (getStatsToggle(QString::fromLatin1(entry.key))) {
+            out.append(QString::fromLatin1(entry.longLabel));
         }
     }
     return out;
@@ -1037,8 +1009,8 @@ void SettingsBridge::recomputeShowPerfOverlay()
 {
     QSettings settings;
     bool anyOn = false;
-    for (const StatsToggle& t : kStatsToggles) {
-        if (settings.value(QString::fromLatin1(t.key), false).toBool()) {
+    for (const StatsCatalogueEntry& entry : kStatsCatalogue) {
+        if (settings.value(QString::fromLatin1(entry.key), entry.defaultOn).toBool()) {
             anyOn = true;
             break;
         }
@@ -1111,58 +1083,6 @@ QString SettingsBridge::warningKeyFor(const QString& engineText)
     return {};
 }
 
-// ------------------------------------------------------------------ session overrides
-
-void SettingsBridge::applySessionOverride(const QString& qualityProfile)
-{
-    m_overrides.clear();
-
-    // `openapi.yaml` §QualityProfile is a closed enum of three identifiers, matched by equality
-    // (ADR-0011). Each names a resolution and a frame rate; the profile says nothing about
-    // bitrate, codec, HDR or audio, so nothing else is overridden - the customer's saved
-    // choices stand for those.
-    int width = 0;
-    int height = 0;
-    int fps = 0;
-    if (qualityProfile == QLatin1String("1080p60")) {
-        width = 1920;
-        height = 1080;
-        fps = 60;
-    }
-    else if (qualityProfile == QLatin1String("1080p75")) {
-        width = 1920;
-        height = 1080;
-        fps = 75;
-    }
-    else if (qualityProfile == QLatin1String("1080p120")) {
-        width = 1920;
-        height = 1080;
-        fps = 120;
-    }
-    else {
-        qCWarning(seathubSettings) << "unrecognized quality profile, no overrides applied:"
-                                   << qualityProfile;
-        emit sessionOverridesChanged();
-        return;
-    }
-
-    m_overrides.insert(QStringLiteral("width"), width);
-    m_overrides.insert(QStringLiteral("height"), height);
-    m_overrides.insert(QStringLiteral("fps"), fps);
-
-    qCInfo(seathubSettings) << "applied in-memory overrides for" << qualityProfile;
-    emit sessionOverridesChanged();
-}
-
-void SettingsBridge::clearSessionOverrides()
-{
-    if (m_overrides.isEmpty()) {
-        return;
-    }
-    m_overrides.clear();
-    emit sessionOverridesChanged();
-}
-
 // ------------------------------------------------------------------ lifecycle hooks
 
 bool SettingsBridge::writable() const
@@ -1173,11 +1093,6 @@ bool SettingsBridge::writable() const
 bool SettingsBridge::sessionActive() const
 {
     return m_streaming;
-}
-
-bool SettingsBridge::hasSessionOverrides() const
-{
-    return !m_overrides.isEmpty();
 }
 
 void SettingsBridge::setStreamingActive(bool active)
@@ -1211,10 +1126,7 @@ void SettingsBridge::noteConnectionStarted()
 
 void SettingsBridge::noteSessionFinished()
 {
-    // D-37: the overrides belonged to that launch. The saved values were never touched, so
-    // clearing them restores exactly what the customer had.
-    clearSessionOverrides();
-
+    // A-68 / D-06 reversal: there is no session override to clear any more.
     if (m_connectionStarted || !m_warningSentences.isEmpty()) {
         m_connectionStarted = false;
         m_warningSentences.clear();
