@@ -2981,6 +2981,68 @@ private slots:
         QCOMPARE(m_fake->requestPaths().count(QStringLiteral("/api/sessions/s-stages/end")), 1);
     }
 
+    // --- D-05/C3: Cancel before the engine ends the session and goes Home (06.6-23) ----------------
+
+    void cancelBeforeEngineEndsTheSession()
+    {
+        SeatHubClient client;
+        beginStagedSession(client);
+        QVERIFY(!QTest::currentTestFailed());
+        client.teardown()->setVerifyIntervalMs(1);
+        m_fake->answerSession(QStringLiteral("s-stages"), QStringLiteral("CANCELLED"));
+
+        client.interrupt();
+
+        // Cancel is not a failure: it returns Home at once, without waiting on the network - a
+        // customer stuck on this screen while the server answers is exactly what T-06.6-49 exists
+        // to close (`screens.md` §24).
+        QCOMPARE(client.appState(), QStringLiteral("home"));
+        QVERIFY(!client.connectFailed());
+
+        // The pairing poll actually stops - it does not keep failing quietly in the background.
+        QTRY_COMPARE_WITH_TIMEOUT(client.pairing()->state(), QStringLiteral("idle"), 15000);
+
+        QTRY_VERIFY_WITH_TIMEOUT(
+            m_fake->requestPaths().contains(QStringLiteral("/api/sessions/s-stages/end")), 15000);
+        QCOMPARE(m_fake->bodyFor(QStringLiteral("/api/sessions/s-stages/end")),
+                 QByteArrayLiteral("{}"));
+        QCOMPARE(m_fake->requestPaths().count(QStringLiteral("/api/sessions/s-stages/end")), 1);
+    }
+
+    void cancelWhileStreamingIsUnchanged()
+    {
+        auto* engine = new FakeEngineSession;
+        {
+            SeatHubClient client;
+            client.session()->attachSession(engine);
+
+            // The local path (no access token) is the one place this suite can make
+            // `SessionLifecycle::start()` genuinely run the attached engine, so `session()->active()`
+            // is really true here - not the `emit engine->connectionStarted()` shortcut most
+            // streaming-state tests use, which never touches `m_active` at all.
+            client.start();
+            QCOMPARE(client.session()->active(), true);
+            emit engine->connectionStarted();
+            QCOMPARE(client.appState(), QStringLiteral("streaming"));
+
+            client.interrupt();
+
+            // D-05/C3: the engine is active, so Cancel keeps today's quit-key path - it pushes the
+            // interrupt and posts nothing itself; the appState only moves once the engine's own
+            // teardown sequence (`readyForDeletion`) says so, never fast-forwarded to Home the way
+            // the not-yet-active branch above is.
+            QCOMPARE(engine->interrupts, 1);
+            QCOMPARE(client.appState(), QStringLiteral("streaming"));
+
+            emit engine->sessionFinished(0);
+            emit engine->readyForDeletion();
+            QCOMPARE(client.appState(), QStringLiteral("signed_out"));
+
+            client.session()->attachSession(nullptr);
+        }
+        delete engine;
+    }
+
     // --- D-05/C4/C5: Try again is always a fresh Play; Resume only after the stream started --------
 
     void tryAgainIsAFreshPlay()
