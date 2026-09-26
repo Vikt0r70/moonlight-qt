@@ -350,6 +350,12 @@ Write-Host "VC++ runtime from: $($crtDir.FullName)"
 #    its settings beside itself; SeatHub must keep them under the customer's profile, because that
 #    is the state D-45 tells the uninstaller to remove.
 
+# 9. Open Sans' own licence (D-15): shipped beside the client, not merged into the GPL/written-offer
+#    licence page below, since the OFL is a separate licence for a separate, unmodified asset.
+$licensesDir = Join-Path $DeployFolder 'licenses'
+New-Item -ItemType Directory -Force -Path $licensesDir | Out-Null
+Copy-Item -LiteralPath (Join-Path $RepoRoot 'app\seathub\fonts\OFL.txt') -Destination (Join-Path $licensesDir 'OpenSans-OFL.txt') -Force
+
 # ---------------------------------------------------------------- verify deploy
 Step 'Verify the deploy folder'
 $missing = @()
@@ -362,6 +368,7 @@ foreach ($required in @('SeatHub.exe', 'AntiHooking.dll', 'gamecontrollerdb.txt'
 foreach ($requiredDir in @('platforms', 'imageformats', 'tls', 'qml')) {
     if (-not (Test-Path -LiteralPath (Join-Path $DeployFolder $requiredDir))) { $missing += "$requiredDir\" }
 }
+if (-not (Test-Path -LiteralPath (Join-Path $DeployFolder 'licenses\OpenSans-OFL.txt'))) { $missing += 'licenses\OpenSans-OFL.txt' }
 if ($missing.Count -gt 0) { throw "deploy folder is incomplete, missing: $($missing -join ', ')" }
 $deploySize = (Get-ChildItem -LiteralPath $DeployFolder -Recurse -File | Measure-Object -Property Length -Sum).Sum
 Write-Host ('OK - {0:N1} MB' -f ($deploySize / 1MB))

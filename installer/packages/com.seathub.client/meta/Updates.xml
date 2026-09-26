@@ -31,7 +31,7 @@
              directory and records the app_releases row, and the row's url column is what the feed
              answers with. Nothing here may guess that host. -->
         <Url>assigned by the control plane on publish</Url>
-        <Sha256>a3363739dbbb3d27d2a062db65dc9d7328b7f8b727b1506808615fc952185203</Sha256>
+        <Sha256>9cc466a786e058463114fe86eee2a55703be1cb0be52ee57cd648e9506f7c5a8</Sha256>
         <Notes>Phase 3 client: control-plane sessions, silent pairing, in-session HUD.</Notes>
     </ReleaseFeed>
 </Updates>
