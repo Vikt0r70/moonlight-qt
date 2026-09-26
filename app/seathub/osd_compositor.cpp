@@ -81,15 +81,20 @@ SDL_Surface* OsdCompositor::rasterizeInstance(Overlay::OverlayType type, const c
     State current;
     {
         QMutexLocker locker(&m_mutex);
-        // Task 2 RED (temporary): only recording while enabled is the bug
-        // `disablingTheSlotClearsTheRecordedEngineText` targets - the correct rule (Task 2 GREEN)
-        // records regardless of `enabled`, since the engine already cleared `text` to empty before
-        // this call in the disabled case (`OverlayManager::setOverlayState()`).
-        if (enabled) {
-            m_state.engineText = QString::fromUtf8(text != nullptr ? text : "");
-            m_state.engineColor = qRgba(color.r, color.g, color.b, color.a);
-        }
+        // Recorded regardless of `enabled`: the engine already cleared `text` to empty before
+        // this call in the disabled case (`OverlayManager::setOverlayState()`), so this is how
+        // the compositor learns the engine's own line went away (RESEARCH-FORK.md §1.3) - a
+        // stale line from before disabling must not survive into the next composition.
+        m_state.engineText = QString::fromUtf8(text != nullptr ? text : "");
+        m_state.engineColor = qRgba(color.r, color.g, color.b, color.a);
         current = m_state;
+    }
+
+    if (!enabled) {
+        // Nothing would draw it, and `OverlayManager`'s own refusal rule would discard whatever
+        // this returned anyway (the same rule `updateOverlaySurface()` applies) - returning
+        // nullptr here up front avoids the wasted render.
+        return nullptr;
     }
 
     const QImage image = renderOsdBottom(current.windowWidth, current.windowHeight,
