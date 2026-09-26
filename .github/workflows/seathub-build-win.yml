@@ -153,16 +153,22 @@ jobs:
             throw "$deployDir must never hold a .pdb -- no PDBs on customer PCs (D-12)"
           }
 
-          $ingestHosts = 'ingest.de.sentry.io', 'ingest.sentry.io'
+          # MEASURED (a same-fix-set CI run, 2026-09-26): a plain substring match on the bare host
+          # ('ingest.de.sentry.io') is a false positive here. app/seathub/telemetry.cpp's own
+          # acceptDsn() legitimately compiles in that exact string as a Latin1 literal
+          # (url.host().endsWith(".ingest.de.sentry.io")) -- the validation rule that decides
+          # whether a run-time-handed-out DSN is one this build will trust, not an embedded secret.
+          # A real DSN always has the shape scheme://<public_key>@<host>/<project_id> (Sentry's own
+          # DSN format), so the guard requires the '@' that only an actual embedded DSN carries
+          # immediately before the ingest host, which the bare validation-suffix string never has.
+          $dsnPattern = '@[A-Za-z0-9._-]{1,80}\.ingest\.(de\.)?sentry\.io'
           $shippedBinaries = Get-ChildItem -Path $deployDir -Include '*.exe', '*.dll' -Recurse -ErrorAction SilentlyContinue
           foreach ($bin in $shippedBinaries) {
-            foreach ($ingestHost in $ingestHosts) {
-              if (Select-String -LiteralPath $bin.FullName -Pattern $ingestHost -SimpleMatch -Quiet) {
-                throw "$($bin.FullName) contains the Sentry ingest host '$ingestHost' -- no DSN may be compiled in (D-01, SC-10)"
-              }
+            if (Select-String -LiteralPath $bin.FullName -Pattern $dsnPattern -Quiet) {
+              throw "$($bin.FullName) contains what looks like a compiled-in Sentry DSN (matches $dsnPattern) -- no DSN may be compiled in (D-01, SC-10)"
             }
           }
-          Write-Host "no PDB in $deployDir, and no Sentry ingest host is compiled into any shipped exe/dll"
+          Write-Host "no PDB in $deployDir, and no Sentry DSN is compiled into any shipped exe/dll"
 
       # ADR-0063, D-12: every CI build uploads SeatHub's debug symbols to Sentry, so a crash is a
       # readable stack, not an address. A Sentry-side refusal (wrong project slug, wrong region)
