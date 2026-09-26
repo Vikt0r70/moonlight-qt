@@ -14,7 +14,7 @@
 // (D-26's "one catalogue").
 //
 // Header-only, C++11 (`app/app.pro` is `CONFIG += c++11`, unmodified upstream): a `static` array
-// plus `inline` lookup functions give every translation unit its own copy under internal linkage,
+// plus an `inline` lookup function gives every translation unit its own copy under internal linkage,
 // with no ODR risk - the same reasoning `stream_stats.h`'s own header comment gives for avoiding
 // `std::optional`.
 
@@ -58,18 +58,6 @@ inline const StatsCatalogueEntry* findStatsCatalogueEntry(const QString& key)
 {
     for (const StatsCatalogueEntry& entry : kStatsCatalogue) {
         if (key == QLatin1String(entry.key)) {
-            return &entry;
-        }
-    }
-    return nullptr;
-}
-
-/// Looks up a catalogue row by Moonlight's own long label (as `SettingsBridge::enabledStatsLabels()`
-/// returns it). Returns `nullptr` for an unknown label.
-inline const StatsCatalogueEntry* findStatsCatalogueEntryByLongLabel(const QString& longLabel)
-{
-    for (const StatsCatalogueEntry& entry : kStatsCatalogue) {
-        if (longLabel == QLatin1String(entry.longLabel)) {
             return &entry;
         }
     }
