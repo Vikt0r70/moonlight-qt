@@ -20,6 +20,7 @@
 #include "session_lifecycle.h"
 #include "settings_bridge.h"
 #include "stream_stats.h"
+#include "telemetry.h"
 #include "update_feed_client.h"
 #include "web_origin.h"
 
@@ -232,6 +233,23 @@ QString randomTraceId()
     const QString high = QString::number(generator->generate64(), 16).rightJustified(16, QLatin1Char('0'));
     const QString low = QString::number(generator->generate64(), 16).rightJustified(16, QLatin1Char('0'));
     return high + low;
+}
+
+/// Applies a `GET /api/me/telemetry` answer (D-01, D-18 SV-C3): a successful body is parsed and
+/// handed to `SeatHubTelemetry::applyHandout()`; a 401, a transport failure, or a malformed body
+/// changes nothing - telemetry is best-effort and never a reason to disrupt anything else. Called
+/// (Plan 15) after the interactive sign-in's `fetchMe`, after restore's `fetchMe`, and at
+/// `beginPlayRequest()`. A free function, not a member: `seathub_client.h` is not one of this
+/// plan's files, and this needs no class state.
+void applyTelemetryResult(const ControlPlaneResult& result)
+{
+    if (!result.ok) {
+        return;
+    }
+    if (const std::optional<SeatHubTelemetry::Handout> handout =
+            SeatHubTelemetry::parseHandout(result.body)) {
+        SeatHubTelemetry::applyHandout(*handout);
+    }
 }
 
 } // namespace
@@ -559,6 +577,11 @@ void SeatHubClient::beginSession(const QString& sessionId)
     // sessions in one run never tear down (defect F-9; `teardown_guard.h`).
     m_teardownGuard.reset();
 
+    // D-09/D-13: `hostId` is not known yet at this call - only `handleSessionState()`'s own
+    // `SessionInfo` names it, once the server answers - so this starts the tag/attribute with an
+    // empty host, which `handleSessionState()` fills in as soon as the session names one.
+    SeatHubTelemetry::setSession(sessionId, QString());
+
     // A new session clears the previous one's end reason: the home screen shows the outcome of
     // the session that just ended, never a stale one (audit E10).
     setEndReasonText(QString());
@@ -884,10 +907,16 @@ void SeatHubClient::beginPlayRequest()
     // D-27: one trace id per Play, minted here so it covers this very request - the session
     // create - and every later request of the same Play, through to teardown
     // (`handleTeardownCompleted` clears it).
-    m_controlPlane->setTraceId(randomTraceId());
+    const QString playTraceId = randomTraceId();
+    m_controlPlane->setTraceId(playTraceId);
+    SeatHubTelemetry::setTrace(playTraceId);
 
     const QString profile = QString::fromLatin1(kDefaultQualityProfile);
 
+    // The session create goes out first - existing trace-id tests index requests relative to this
+    // being the first one a Play makes - the telemetry refresh right after it (still unguarded by
+    // epoch, like `requestSession()`'s own callback: applying a slightly stale handout after a
+    // sign-out is harmless, D-18 F-1).
     m_controlPlane->requestSession(profile, [this](const ControlPlaneResult& result) {
         onClientThread(this, [this, result]() {
             if (!result.ok) {
@@ -907,6 +936,11 @@ void SeatHubClient::beginPlayRequest()
             beginSession(sessionId);
         });
     });
+
+    // Plan 15 (D-01, D-18 SV-C3): one of the three moments SeatHub refreshes its DSN handout.
+    m_controlPlane->fetchTelemetry([this](const ControlPlaneResult& result) {
+        onClientThread(this, [this, result]() { applyTelemetryResult(result); });
+    });
 }
 
 void SeatHubClient::applyPlayFailure(const ControlPlaneResult& result)
@@ -917,6 +951,7 @@ void SeatHubClient::applyPlayFailure(const ControlPlaneResult& result)
     // shared PC). Before this fix only `handleTeardownCompleted()` ever cleared it, so every
     // refused Play left its id in place.
     m_controlPlane->clearTraceId();
+    SeatHubTelemetry::clearTrace();
 
     // `NO_HOST_AVAILABLE` is the empty state, not an incident (copy.md §Play flow, "No rig"):
     // the right answer is the sentence and the next thing to do, not the error screen.
@@ -1129,9 +1164,21 @@ bool SeatHubClient::adoptSignIn(const AuthTokenPair& pair, const QString& identi
             AccountInfo account;
             if (result.ok && AccountInfo::parse(result.body, &account)) {
                 m_accountId = account.id;
+                SeatHubTelemetry::setUser(account.id);
                 flushUntaggedQualityReports();
                 drainQualityOutbox();
             }
+        });
+    });
+
+    // Plan 15 (D-01, D-18 SV-C3): one of the three moments SeatHub refreshes its DSN handout -
+    // right after the interactive sign-in's own `fetchMe`, epoch-guarded the same way.
+    m_controlPlane->fetchTelemetry([this, epoch](const ControlPlaneResult& result) {
+        onClientThread(this, [this, epoch, result]() {
+            if (epoch != m_authEpoch) {
+                return;
+            }
+            applyTelemetryResult(result);
         });
     });
 
@@ -1258,6 +1305,10 @@ void SeatHubClient::signOut()
 
     // WR-01: whatever Play this covered is over.
     m_controlPlane->clearTraceId();
+    SeatHubTelemetry::clearTrace();
+    // D-09, D-18 SV-C4: no session or account survives a sign-out into the next crash's tags.
+    SeatHubTelemetry::clearSession();
+    SeatHubTelemetry::clearUser();
 
     // Signing out leaves no stored pairing and no usable credential: not on disk, not in memory
     // here, and not valid on the server (ADR-0050, D-06). The channel and both timers stop before
@@ -1366,6 +1417,22 @@ void SeatHubClient::applyRestoreResult(const ControlPlaneResult& result)
             setAccount(account);
             setHomeStatus(QString::fromLatin1(kHomeReady));
             setAppState(QString::fromLatin1(kStateHome));
+
+            // Plan 15 (D-01, D-18 SV-C3): one of the three moments SeatHub refreshes its DSN
+            // handout - right after restore's own `fetchMe` is confirmed. Guarded against the
+            // epoch THIS restore just established above (not the pre-restore value the `fetchMe`
+            // call at `restoreSession()` captured) - `applyRestoreResult()` bumps `m_authEpoch`
+            // itself on every branch, so guarding against the pre-bump value would race that same
+            // bump and drop this read whenever `fetchMe`'s own reply happens to land first.
+            const quint64 telemetryEpoch = m_authEpoch;
+            m_controlPlane->fetchTelemetry([this, telemetryEpoch](const ControlPlaneResult& telemetryResult) {
+                onClientThread(this, [this, telemetryEpoch, telemetryResult]() {
+                    if (telemetryEpoch != m_authEpoch) {
+                        return;
+                    }
+                    applyTelemetryResult(telemetryResult);
+                });
+            });
             return;
         }
         // A 2xx that is not an account is a contract violation, not evidence the credential is
@@ -1382,6 +1449,8 @@ void SeatHubClient::applyRestoreResult(const ControlPlaneResult& result)
         // D-17/Plan 30: no account is signed in past this point; a stale id from a process that
         // never signed out cleanly must not tag a later report.
         m_accountId.clear();
+        // D-18 SV-C4: a crash after this point carries no account id.
+        SeatHubTelemetry::clearUser();
         // WR-06: an untagged report held for this (now-refused) epoch can never be tagged now.
         m_untaggedQualityReports.clear();
         // CR-03: a `drainQualityOutbox()` call this credential started must not still be running
@@ -1427,6 +1496,7 @@ void SeatHubClient::setAccount(const AccountInfo& account)
     // `m_identity` above is the typed phone/email/username and can differ across two sign-ins of
     // the same account, which would tag two reports for one customer as "different accounts".
     m_accountId = account.id;
+    SeatHubTelemetry::setUser(account.id);
     // WR-06: any report parsed before this account id was known (this session's own, or an
     // earlier one this process never got a chance to tag) is tagged and stored now.
     flushUntaggedQualityReports();
@@ -1981,6 +2051,12 @@ void SeatHubClient::handleSessionState(const SessionInfo& session)
         return;
     }
 
+    // D-09/D-13: `beginSession()` does not know the rig yet - this is the first (and only) place a
+    // `SessionInfo` names one, so this is where the crash tags/attributes actually gain `host_id`.
+    if (!session.hostId.isEmpty()) {
+        SeatHubTelemetry::setSession(m_sessionId, session.hostId);
+    }
+
     // The connecting stages are the session's own state, as the control plane reports it.
     if (m_appState == QLatin1String(kStateConnecting)) {
         advanceConnectStage(connectStageForState(session.state));
@@ -2212,6 +2288,13 @@ void SeatHubClient::clearThisPlaysTraceIdAfterAnyQueuedLivenessReport()
     // after this function returns.
     ControlPlaneClient* controlPlane = m_controlPlane;
     const QString thisPlaysTraceId = controlPlane->traceId();
+    // Mirrors clearTraceIdIfEquals()'s own guard, synchronously, on this (client) thread: only
+    // clear SeatHub's own trace identity if this Play's id is still the current one - an older
+    // Play's late clear must never wipe a newer Play's trace (`setTrace()` in `beginPlayRequest()`
+    // already moved on to the newer Play's id by the time this runs, if one has started).
+    if (SeatHubTelemetry::currentTraceId() == thisPlaysTraceId) {
+        SeatHubTelemetry::clearTrace();
+    }
     onClientThread(controlPlane, [controlPlane, thisPlaysTraceId]() {
         controlPlane->clearTraceIdIfEquals(thisPlaysTraceId);
     });
@@ -2421,6 +2504,10 @@ void SeatHubClient::handleTeardownCompleted(const SessionInfo& finalSession)
     // D-27: the Play this trace id covered is over; the next one (`beginPlayRequest`) mints its
     // own.
     m_controlPlane->clearTraceId();
+    SeatHubTelemetry::clearTrace();
+    // D-09: the session (and whatever rig it named) is over - a crash after this point carries
+    // neither in its tags.
+    SeatHubTelemetry::clearSession();
 
     setAttachedSession(QString());
     m_clientUuid.clear();
@@ -2454,6 +2541,10 @@ void SeatHubClient::handleTeardownFailed(const SeatHubFailure& failure)
     // it, so a teardown failure left the id in place for every later request until the next Play,
     // including another customer's sign-in on a shared PC.
     m_controlPlane->clearTraceId();
+    SeatHubTelemetry::clearTrace();
+    // D-09: the session (and whatever rig it named) is over - a crash after this point carries
+    // neither in its tags.
+    SeatHubTelemetry::clearSession();
 
     // STREAM-10: the rig-side disable/remove/verify did not complete, or something was left
     // stored on this PC. Reporting success would tell the customer the opposite of what is true,

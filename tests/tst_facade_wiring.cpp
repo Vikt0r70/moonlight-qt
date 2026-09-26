@@ -71,6 +71,7 @@
 #include "seathub/seathub_client.h"
 #include "seathub/session_lifecycle.h"
 #include "seathub/teardown_controller.h"
+#include "seathub/telemetry.h"
 #include "seathub/token_store.h"
 #include "seathub/web_origin.h"
 
@@ -874,6 +875,13 @@ private slots:
         m_backupRoot.reset(new QTemporaryDir);
         QVERIFY(m_backupRoot->isValid());
         m_fake = nullptr;
+
+        // Plan 15: SeatHubTelemetry's identity is process-global state (this suite never calls
+        // start(), so there is no SDK scope to reset instead) - clear it before every test so an
+        // earlier test's sign-in/session/trace never leaks into this one.
+        SeatHubTelemetry::clearUser();
+        SeatHubTelemetry::clearSession();
+        SeatHubTelemetry::clearTrace();
     }
 
     void cleanup()
@@ -4222,6 +4230,158 @@ private slots:
 
         QCOMPARE(durationText(minutes), plain);
         QCOMPARE(signedDurationText(minutes), signedText);
+    }
+
+    // --- Plan 15 (Task 2): the facade's own telemetry identity wiring --------------------------
+
+    void identityAfterInteractiveSignInSetsUserAndIssuesOneTelemetryRequest()
+    {
+        SeatHubClient client;
+        isolateStore(client);
+        armControlPlane(client);
+        m_fake->answerLogin(200, QByteArrayLiteral("{\"access_token\":\"sb_at_identity\"}"));
+        m_fake->answerMe(200, accountBody());
+        m_fake->answerWallet(200, walletBody(10));
+        const int telemetryBefore = m_fake->countOfPathEndingWith(QStringLiteral("/api/me/telemetry"));
+
+        QSignalSpy accepted(&client, &SeatHubClient::passwordSignInAccepted);
+        client.signInWithPassword(QStringLiteral("lina@example.com"), QStringLiteral("hunter22hunter"));
+        QTRY_COMPARE_WITH_TIMEOUT(accepted.count(), 1, 15000);
+
+        QTRY_COMPARE_WITH_TIMEOUT(SeatHubTelemetry::currentUserId(),
+                                  QStringLiteral("6f1c6f5e-3a1e-4b1e-9f2e-0f1a2b3c4d5e"), 15000);
+        QVERIFY(SeatHubTelemetry::signedIn());
+        QTRY_COMPARE_WITH_TIMEOUT(
+            m_fake->countOfPathEndingWith(QStringLiteral("/api/me/telemetry")),
+            telemetryBefore + 1, 15000);
+    }
+
+    void identityAfterRestoreSetsUserAndIssuesOneTelemetryRequest()
+    {
+        SeatHubClient client;
+        isolateStore(client);
+        const int telemetryBefore = m_fake ? m_fake->countOfPathEndingWith(QStringLiteral("/api/me/telemetry")) : 0;
+
+        reachHome(client, 90);
+        QVERIFY(!QTest::currentTestFailed());
+
+        QCOMPARE(SeatHubTelemetry::currentUserId(),
+                 QStringLiteral("6f1c6f5e-3a1e-4b1e-9f2e-0f1a2b3c4d5e"));
+        QVERIFY(SeatHubTelemetry::signedIn());
+        QTRY_COMPARE_WITH_TIMEOUT(
+            m_fake->countOfPathEndingWith(QStringLiteral("/api/me/telemetry")),
+            telemetryBefore + 1, 15000);
+    }
+
+    void restore401ClearsUser()
+    {
+        SeatHubClient client;
+        QString tokenPath;
+        QVERIFY(storeACredential(client, &tokenPath));
+        armControlPlane(client);
+        m_fake->answerMe(401, refusedBody());
+
+        // A user identity first, the way a previous process's own restore would have left it -
+        // otherwise "cleared" is indistinguishable from "never set".
+        SeatHubTelemetry::setUser(QStringLiteral("stale-account-id"));
+
+        client.restoreSession();
+        QTRY_COMPARE_WITH_TIMEOUT(client.appState(), QStringLiteral("signed_out"), 15000);
+
+        QVERIFY(SeatHubTelemetry::currentUserId().isEmpty());
+        QVERIFY(!SeatHubTelemetry::signedIn());
+    }
+
+    void beginSessionSetsSessionIdAndSessionStateAddsHostId()
+    {
+        SeatHubClient client;
+        beginStagedSession(client);
+        QVERIFY(!QTest::currentTestFailed());
+
+        QCOMPARE(SeatHubTelemetry::currentSessionId(), QStringLiteral("s-stages"));
+        QVERIFY(SeatHubTelemetry::currentHostId().isEmpty());
+
+        SessionInfo info = sessionIn(QStringLiteral("PREPARING"));
+        info.hostId = QStringLiteral("host-42");
+        report(client, info);
+
+        QCOMPARE(SeatHubTelemetry::currentHostId(), QStringLiteral("host-42"));
+        QCOMPARE(SeatHubTelemetry::currentSessionId(), QStringLiteral("s-stages"));
+    }
+
+    void beginPlayRequestSetsTraceIdAndIssuesOneTelemetryRequest()
+    {
+        SeatHubClient client;
+        auto* engine = new FakeEngineSession;
+        client.session()->attachSession(engine);
+        reachHome(client, 90);
+        QVERIFY(!QTest::currentTestFailed());
+
+        const int telemetryBefore = m_fake->countOfPathEndingWith(QStringLiteral("/api/me/telemetry"));
+        const int beforePlay = m_fake->requestPaths().size();
+
+        m_fake->answerPlay(201, QByteArrayLiteral("{\"id\":\"s-telemetry-play\"}"));
+        client.start();
+        QTRY_VERIFY_WITH_TIMEOUT(client.liveSession(), 15000);
+
+        QVERIFY(!SeatHubTelemetry::currentTraceId().isEmpty());
+        // The session create is still the first request a Play makes (the existing trace-id tests
+        // index requests the same way) - the telemetry refresh rides right after it.
+        QVERIFY(m_fake->requestPaths().size() > beforePlay);
+        QCOMPARE(m_fake->requestPaths().at(beforePlay), QStringLiteral("/api/sessions"));
+        QTRY_COMPARE_WITH_TIMEOUT(
+            m_fake->countOfPathEndingWith(QStringLiteral("/api/me/telemetry")),
+            telemetryBefore + 1, 15000);
+    }
+
+    void signOutClearsUserSessionAndTrace()
+    {
+        SeatHubClient client;
+        auto* engine = new FakeEngineSession;
+        client.session()->attachSession(engine);
+        reachHome(client, 90);
+        QVERIFY(!QTest::currentTestFailed());
+
+        m_fake->answerPlay(201, QByteArrayLiteral("{\"id\":\"s-signout\"}"));
+        client.start();
+        QTRY_VERIFY_WITH_TIMEOUT(client.liveSession(), 15000);
+
+        QVERIFY(!SeatHubTelemetry::currentUserId().isEmpty());
+        QCOMPARE(SeatHubTelemetry::currentSessionId(), QStringLiteral("s-signout"));
+        QVERIFY(!SeatHubTelemetry::currentTraceId().isEmpty());
+        QVERIFY(SeatHubTelemetry::signedIn());
+
+        client.signOut();
+
+        QVERIFY(SeatHubTelemetry::currentUserId().isEmpty());
+        QVERIFY(SeatHubTelemetry::currentSessionId().isEmpty());
+        QVERIFY(SeatHubTelemetry::currentTraceId().isEmpty());
+        QVERIFY(!SeatHubTelemetry::signedIn());
+    }
+
+    void teardownClearsSessionAndTrace()
+    {
+        SeatHubClient client;
+        auto* engine = new FakeEngineSession;
+        client.session()->attachSession(engine);
+        client.controlPlane()->setBaseUrl(QStringLiteral("https://control.invalid"));
+        client.controlPlane()->setAccessToken(QString::fromLatin1(kAccessToken));
+        client.teardown()->setVerifyIntervalMs(1);
+
+        QString tokenPath;
+        QVERIFY(storeACredential(client, &tokenPath));
+
+        client.beginSession(QStringLiteral("session-td"));
+        SeatHubTelemetry::setTrace(QStringLiteral("11111111111111111111111111111111"));
+        armControlPlane(client);
+
+        QSignalSpy completed(client.teardown(), &TeardownController::teardownCompleted);
+        emit engine->readyForDeletion();
+        QTRY_COMPARE_WITH_TIMEOUT(completed.count(), 1, 15000);
+
+        QVERIFY(SeatHubTelemetry::currentSessionId().isEmpty());
+        QVERIFY(SeatHubTelemetry::currentHostId().isEmpty());
+        QVERIFY(SeatHubTelemetry::currentTraceId().isEmpty());
     }
 };
 

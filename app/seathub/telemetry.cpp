@@ -66,6 +66,15 @@ int s_closeCount = 0;
 /// reads this from its own thread while `applyHandout()` may run on the client thread.
 std::atomic<bool> s_logsEnabled{ false };
 
+// --- identity (D-09, D-13, G.4): read and written only from `SeatHubClient`'s own (client)
+// thread - see `setUser()`'s own comment - so plain statics need no synchronization here, unlike
+// `s_logsEnabled` above.
+QString s_currentUserId;
+QString s_currentSessionId;
+QString s_currentHostId;
+QString s_currentTraceId;
+bool s_signedIn = false;
+
 /// Runs inside crashpad's first-chance filter, in the crashing process, on the crashing thread
 /// (SPIKE Q5, `on_crash` fires before `before_send` for a crash - `sentry_backend_crashpad.cpp`
 /// only calls one or the other, never both). It allocates nothing and takes no lock beyond what
@@ -394,6 +403,64 @@ int initCallCount()
 int closeCallCount()
 {
     return s_closeCount;
+}
+
+// --- identity (D-09, D-13, G.4) ------------------------------------------------------------
+//
+// Task 2 RED: stubbed (no-ops / defaults) so `tst_facade_wiring`'s new identity tests fail on
+// their own assertions rather than on the compiler - same precedent as Task 1's own RED commit.
+
+void setUser(const QString& accountId)
+{
+    Q_UNUSED(accountId);
+}
+
+void clearUser()
+{
+}
+
+void setSession(const QString& sessionId, const QString& hostId)
+{
+    Q_UNUSED(sessionId);
+    Q_UNUSED(hostId);
+}
+
+void clearSession()
+{
+}
+
+void setTrace(const QString& traceId)
+{
+    Q_UNUSED(traceId);
+}
+
+void clearTrace()
+{
+}
+
+QString currentUserId()
+{
+    return QString();
+}
+
+QString currentSessionId()
+{
+    return QString();
+}
+
+QString currentHostId()
+{
+    return QString();
+}
+
+QString currentTraceId()
+{
+    return QString();
+}
+
+bool signedIn()
+{
+    return false;
 }
 
 } // namespace SeatHubTelemetry
