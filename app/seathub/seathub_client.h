@@ -501,9 +501,11 @@ private slots:
     void handlePairingCompleted(const QString& clientUuid);
     void handlePairingFailed(const SeatHubFailure& failure);
 
-    /// The control plane authorized the session, and with which quality profile. Applies the
-    /// profile to the settings bridge as an in-memory override for this launch only (D-37, WR-05).
-    void handleAuthorizationGranted(const QString& qualityProfile);
+    /// The control plane authorized the session. No quality profile is applied (A-68, D-06
+    /// reversal: the customer's saved Settings are the only decider of stream quality) - this
+    /// slot only advances the liveness stage to "pairing" (D-11). The signal itself carries no
+    /// argument once nothing reads one (`PairingController::authorizationGranted()`).
+    void handleAuthorizationGranted();
 
     /// The host the handshake paired with, emitted by `ProductionPairingSeam` on its success path
     /// only, tagged with the session id it paired for (06.6-18/T-06.6-52). A `sessionId` that no

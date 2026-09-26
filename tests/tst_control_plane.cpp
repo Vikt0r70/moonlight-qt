@@ -966,10 +966,7 @@ private slots:
     // field at all - the customer's saved Settings are the only decider of stream quality.
     void sessionCreateBodyIsEmpty()
     {
-        // RED (06.6-19): called against the pre-change signature (still one QString argument) -
-        // GREEN narrows `buildSessionCreate()` to take no argument at all (mechanical, matching
-        // 06.6-15's precedent for `allocate()`'s own signature narrowing).
-        QCOMPARE(ControlPlaneClient::buildSessionCreate(QString()), QByteArrayLiteral("{}"));
+        QCOMPARE(ControlPlaneClient::buildSessionCreate(), QByteArrayLiteral("{}"));
     }
 
     // --- Phase 5 plan 02: the launch, balance, sign-out and password routes ------------------
@@ -1267,7 +1264,7 @@ private slots:
         client.logout(done);
         client.fetchMe(done);
         client.fetchWallet(done);
-        client.requestSession(QStringLiteral("1080p60"), done); // RED (06.6-19): GREEN narrows this to no argument
+        client.requestSession(done);
         client.fetchSession(QStringLiteral("s"), done);
         client.fetchSessionAuthorization(QStringLiteral("s"), done);
         client.postLiveness(QStringLiteral("s"), QStringLiteral("streaming"), QString(), done);

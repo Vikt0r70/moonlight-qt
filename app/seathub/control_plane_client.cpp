@@ -90,6 +90,9 @@ bool SessionAuthorization::parse(const QJsonObject& body, SessionAuthorization* 
     auth.controlPort = ports.value(QStringLiteral("control")).toInt();
     auth.rtspPort = ports.value(QStringLiteral("rtsp")).toInt();
 
+    // `quality_profile` is `type: [string, "null"]` and optional (contract 3.3.0, ADR-0064).
+    // `toString()` already answers empty for both null and absent - parsed for completeness only,
+    // nothing reads this field (A-68, D-06 reversal).
     auth.qualityProfile = body.value(QStringLiteral("quality_profile")).toString();
 
     const QJsonObject lease = body.value(QStringLiteral("lease")).toObject();
@@ -604,11 +607,11 @@ QByteArray ControlPlaneClient::buildLogin(const QString& identifier, const QStri
     return QJsonDocument(object).toJson(QJsonDocument::Compact);
 }
 
-QByteArray ControlPlaneClient::buildSessionCreate(const QString& qualityProfile)
+QByteArray ControlPlaneClient::buildSessionCreate()
 {
-    QJsonObject object;
-    object.insert(QStringLiteral("quality_profile"), qualityProfile);
-    return QJsonDocument(object).toJson(QJsonDocument::Compact);
+    // Contract 3.3.0 (ADR-0064, A-68/D-06 reversal): the request carries no quality field at
+    // all - the customer's saved Settings are the only decider of stream quality.
+    return QByteArrayLiteral("{}");
 }
 
 QByteArray ControlPlaneClient::buildEndRequest(bool failed)
@@ -957,10 +960,10 @@ void ControlPlaneClient::fetchUsage(Callback callback)
     send(QStringLiteral("GET"), QStringLiteral("/api/usage"), QByteArray(), true, callback);
 }
 
-void ControlPlaneClient::requestSession(const QString& qualityProfile, Callback callback)
+void ControlPlaneClient::requestSession(Callback callback)
 {
     send(QStringLiteral("POST"), QStringLiteral("/api/sessions"),
-         buildSessionCreate(qualityProfile), true, callback);
+         buildSessionCreate(), true, callback);
 }
 
 void ControlPlaneClient::fetchSession(const QString& sessionId, Callback callback)

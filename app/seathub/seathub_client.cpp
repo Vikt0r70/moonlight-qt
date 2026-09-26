@@ -70,10 +70,6 @@ const char* kHomeBusy = "busy";
 const char* kHomeOffline = "offline";
 const char* kHomeRefused = "refused";
 
-// The quality profile Play asks for. `ADR-0011` fixes the vocabulary; `1080p60` is its base
-// value and the one the control plane uses in its own examples.
-const char* kDefaultQualityProfile = "1080p60";
-
 // `docs/spec/copy.md` §Play flow: the three customer-visible stage lines (`screens.md` §24). The
 // engine's own stage names (`LiGetStageName()`, e.g. "RTSP handshake") are internal and are never
 // shown: the engine reaching any of its stages only says that the second stage is under way.
@@ -406,8 +402,8 @@ SeatHubClient::SeatHubClient(QObject* parent)
     connect(m_pairing, &PairingController::pairingFailed,
             this, &SeatHubClient::handlePairingFailed);
 
-    // D-37 / WR-05: the authorization's quality profile. Emitted before pairing starts, which is
-    // what puts the override in place before the engine negotiates the stream.
+    // A-68 / D-06 reversal: carries no quality profile any more (nothing applies one). Kept as
+    // the D-11 signal that a real authorization arrived, ahead of pairing.
     connect(m_pairing, &PairingController::authorizationGranted,
             this, &SeatHubClient::handleAuthorizationGranted);
 
@@ -986,13 +982,12 @@ void SeatHubClient::beginPlayRequest()
     m_controlPlane->setTraceId(playTraceId);
     SeatHubTelemetry::setTrace(playTraceId);
 
-    const QString profile = QString::fromLatin1(kDefaultQualityProfile);
-
     // The session create goes out first - existing trace-id tests index requests relative to this
     // being the first one a Play makes - the telemetry refresh right after it (still unguarded by
     // epoch, like `requestSession()`'s own callback: applying a slightly stale handout after a
-    // sign-out is harmless, D-18 F-1).
-    m_controlPlane->requestSession(profile, [this](const ControlPlaneResult& result) {
+    // sign-out is harmless, D-18 F-1). No quality field is sent (A-68, D-06 reversal): the
+    // customer's saved Settings are the only decider of stream quality.
+    m_controlPlane->requestSession([this](const ControlPlaneResult& result) {
         onClientThread(this, [this, result]() {
             if (!result.ok) {
                 applyPlayFailure(result);
@@ -2462,18 +2457,12 @@ void SeatHubClient::handlePairingFailed(const SeatHubFailure& failure)
     raiseFailure(failure);
 }
 
-void SeatHubClient::handleAuthorizationGranted(const QString& qualityProfile)
+void SeatHubClient::handleAuthorizationGranted()
 {
-    // D-37 / WR-05: the control plane's `quality_profile` becomes this launch's resolution and
-    // frame rate, in memory, leaving every saved preference untouched (D-12, STREAM-02). It is
-    // applied here - on authorization, ahead of pairing - so the override is in place before
-    // `handleConnectionStarted()` reports what the session actually settled on (D-14), and it is
-    // handed over here rather than in the controller so that the bridge keeps exactly one writer
-    // from the session path.
-    //
-    // The controller is the only object that sees the authorization; it puts this one field on the
-    // signal and keeps the rest, including `pairing_pin` (STREAM-03).
-    m_settings->applySessionOverride(qualityProfile);
+    // A-68 / D-06 reversal: the control plane's `quality_profile` is no longer applied to
+    // anything - the customer's saved Settings are the only decider of stream quality. The
+    // override mechanism this slot used to call (`SettingsBridge::applySessionOverride`) is
+    // removed entirely (06.6-19 Task 2).
 
     // D-11: a real authorization means the rig has a pairing target - the session has moved past
     // the 409 "not ready yet" polls that are `preparing_rig`, whether or not a PIN has arrived yet.

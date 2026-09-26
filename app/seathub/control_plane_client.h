@@ -103,7 +103,9 @@ struct SessionAuthorization
     int httpsPort = 0;
     int controlPort = 0;
     int rtspPort = 0;
-    /// `1080p60` | `1080p75` | `1080p120` (ADR-0011, matched by equality).
+    /// `1080p60` | `1080p75` | `1080p120` (ADR-0011, matched by equality), or empty/absent.
+    /// Parsed for completeness only - nothing reads this field (A-68, D-06 reversal: the
+    /// customer's saved Settings are the only decider of stream quality now).
     QString qualityProfile;
     QString leaseId;
     int leaseSeq = 0;
@@ -334,7 +336,10 @@ public:
     /// `LoginRequest`: `{identifier, password}`. The identifier is what the customer typed (an
     /// email or an E.164 phone number); the control plane decides which it is.
     static QByteArray buildLogin(const QString& identifier, const QString& password);
-    static QByteArray buildSessionCreate(const QString& qualityProfile);
+    /// `SessionCreateRequest` (contract 3.3.0, ADR-0064/A-68): always `{}` - the request carries
+    /// no quality field at all, since the customer's saved Settings are the only decider of
+    /// stream quality (D-06 reversal).
+    static QByteArray buildSessionCreate();
     /// `SessionEndRequest` (contract 3.3.0, D-05/D-23): `{"failed": true}` when `failed`, an empty
     /// body otherwise - the same "assert the shape without a socket" rule as the builders above.
     static QByteArray buildEndRequest(bool failed);
@@ -460,7 +465,7 @@ public:
     /// `GET /api/usage` - `Usage`.
     void fetchUsage(Callback callback);
 
-    void requestSession(const QString& qualityProfile, Callback callback);
+    void requestSession(Callback callback);
     void fetchSession(const QString& sessionId, Callback callback);
     void fetchSessionAuthorization(const QString& sessionId, Callback callback);
 

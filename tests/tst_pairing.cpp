@@ -325,17 +325,13 @@ private slots:
         QVERIFY(!controller.sessionId().contains(QLatin1String(kPin)));
     }
 
-    void authorizationGrantedCarriesTheQualityProfile()
+    void authorizationGrantedCarriesNoQualityProfile()
     {
-        // D-37 / WR-05: the session authorization's `quality_profile` is what
-        // `SettingsBridge::applySessionOverride()` turns into this launch's resolution and frame
-        // rate - in memory, without writing a saved preference (D-12, D-37). The controller is the
-        // only object that ever sees the authorization, so the profile has to ride out on this
-        // signal; if it stopped, the override would silently never be applied and the stream would
-        // fall back to the customer's saved resolution with nothing to show for it.
-        //
-        // This is the same signal that used to carry nothing, which is why the override had no
-        // caller at all (`applySessionOverride()` was orphaned - verifier G5).
+        // A-68 / D-06 reversal: the authorization's `quality_profile` is parsed into
+        // `SessionAuthorization` (proven elsewhere - `tst_control_plane.cpp`) but nothing reads
+        // it any more, so this signal - the only thing that could have carried it onward - now
+        // carries nothing at all. This test replaces `authorizationGrantedCarriesTheQualityProfile`
+        // (06.6-19), which asserted the exact D-37/WR-05 override contract this plan removes.
         PairingController controller;
         auto* fake = new FakeNetworkAccessManager;
         auto* seam = new RecordingSeam;
@@ -352,11 +348,9 @@ private slots:
         QTRY_COMPARE(completed.count(), 1);
 
         QCOMPARE(granted.count(), 1);
-        QCOMPARE(granted.at(0).at(0).toString(), QStringLiteral("1080p60"));
-
-        // The profile is the only field on this signal. The lease, the ports and the PIN stay
-        // inside the controller - least of all the PIN, which is on no signal at all.
-        QCOMPARE(granted.at(0).size(), 1);
+        // No field rides this signal any more - the lease, the ports, the (unused) quality
+        // profile and the PIN all stay inside the controller (STREAM-03).
+        QCOMPARE(granted.at(0).size(), 0);
     }
 
     void conflict_isAWaitNotAFailure()
