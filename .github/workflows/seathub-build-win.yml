@@ -123,9 +123,123 @@ jobs:
             throw "Qt reported success but C:\Qt\6.11.2\msvc2022_64 does not exist."
           }
 
+      # Cache the built sentry-native install (06.3.1 D-02, D-18, ADR-0063): build-seathub.ps1
+      # itself skips the build when this directory already has sentry.h (cache hit), so this step
+      # only needs to restore/save the folder. Keyed on the script's own hash so a change to the
+      # cmake configure line (or the pinned sentry-native version living inside it) invalidates the
+      # cache instead of reusing a stale build.
+      - name: Cache sentry-native 0.17.1 (crashpad)
+        uses: actions/cache@v4
+        with:
+          path: build/sentry-native-0.17.1/install
+          key: sentry-native-0.17.1-${{ hashFiles('scripts/build-seathub.ps1') }}-msvc
+
       - name: Build, deploy and package SeatHub
         shell: pwsh
         run: ./scripts/build-seathub.ps1
+
+      # ADR-0063, D-01/SC-10, D-12: runs for every build. No DSN may ever be compiled into what
+      # ships (a DSN can only submit events, but D-45 still forbids shipping one), and no PDB may
+      # ever ship to a customer PC -- symbols reach Sentry through the upload step below instead.
+      - name: No DSN in what ships
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $deployDir = 'build\deploy-x64-release'
+
+          $shippedPdbs = Get-ChildItem -Path $deployDir -Filter '*.pdb' -Recurse -ErrorAction SilentlyContinue
+          if ($shippedPdbs) {
+            $shippedPdbs | ForEach-Object { Write-Host "shipped PDB: $($_.FullName)" }
+            throw "$deployDir must never hold a .pdb -- no PDBs on customer PCs (D-12)"
+          }
+
+          $ingestHosts = 'ingest.de.sentry.io', 'ingest.sentry.io'
+          $shippedBinaries = Get-ChildItem -Path $deployDir -Include '*.exe', '*.dll' -Recurse -ErrorAction SilentlyContinue
+          foreach ($bin in $shippedBinaries) {
+            foreach ($ingestHost in $ingestHosts) {
+              if (Select-String -LiteralPath $bin.FullName -Pattern $ingestHost -SimpleMatch -Quiet) {
+                throw "$($bin.FullName) contains the Sentry ingest host '$ingestHost' -- no DSN may be compiled in (D-01, SC-10)"
+              }
+            }
+          }
+          Write-Host "no PDB in $deployDir, and no Sentry ingest host is compiled into any shipped exe/dll"
+
+      # ADR-0063, D-12: every CI build uploads SeatHub's debug symbols to Sentry, so a crash is a
+      # readable stack, not an address. A Sentry-side refusal (wrong project slug, wrong region)
+      # must not stop the build from shipping -- it warns instead, mirroring hosthub.yml's own fix
+      # (main repo commit de6217c) for the identical "Project not found" failure mode. The token
+      # is read only through env, never placed on a command line or echoed.
+      - name: Upload SeatHub's symbols to Sentry
+        shell: pwsh
+        env:
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+          SENTRY_ORG: space-desk
+          SENTRY_PROJECT: seathub
+          SENTRY_URL: https://de.sentry.io
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          if (-not $env:SENTRY_AUTH_TOKEN) {
+            if ($env:GITHUB_EVENT_NAME -eq 'pull_request') {
+              Write-Host "::warning::Sentry symbol upload skipped: SENTRY_AUTH_TOKEN is not set; skipping the symbol upload on this pull request."
+              exit 0
+            }
+            throw "SENTRY_AUTH_TOKEN is empty on a push to seathub/main -- the owner's secret (A-44) is missing or was revoked (D-12)"
+          }
+
+          $sentryCliSha256 = '2257cf6805a616f5c3ee291a549ebbba021190048b646adc006beb4e8cdef7fd'
+          $sentryCliUrl = 'https://github.com/getsentry/sentry-cli/releases/download/3.8.0/sentry-cli-Windows-x86_64.exe'
+          Write-Host "downloading $sentryCliUrl"
+          Invoke-WebRequest -Uri $sentryCliUrl -OutFile sentry-cli.exe
+
+          $actualHash = (Get-FileHash -LiteralPath sentry-cli.exe -Algorithm SHA256).Hash.ToLower()
+          if ($actualHash -ne $sentryCliSha256) {
+            throw "sentry-cli hash mismatch. expected $sentryCliSha256, got $actualHash"
+          }
+          Write-Host "sentry-cli 3.8.0 SHA-256 matches the pin."
+
+          $sentryInstallBin = 'build\sentry-native-0.17.1\install\bin'
+          $filesToCheck = @(
+            'build\build-x64-release\app\release\SeatHub.pdb',
+            (Join-Path $sentryInstallBin 'sentry.pdb'),
+            (Join-Path $sentryInstallBin 'crashpad_handler.pdb'),
+            (Join-Path $sentryInstallBin 'crashpad_wer.pdb')
+          )
+
+          # Collected, not hardcoded: a rebuild changes every debug id, and --require-all below
+          # must be handed the ids this exact build actually produced.
+          $debugIds = @()
+          foreach ($pdbPath in $filesToCheck) {
+            if (-not (Test-Path -LiteralPath $pdbPath)) { throw "$pdbPath does not exist to check" }
+            $checkText = (& ./sentry-cli.exe debug-files check $pdbPath 2>&1 | Out-String)
+            Write-Host $checkText
+            if ($checkText -notmatch 'Usable: yes') {
+              throw "$pdbPath is not a usable debug file (sentry-cli debug-files check)"
+            }
+            $idMatch = [regex]::Match($checkText, 'Debug ID:\s*([0-9a-fA-F-]+)')
+            if (-not $idMatch.Success) { throw "could not read a debug id for $pdbPath from: $checkText" }
+            $debugIds += $idMatch.Groups[1].Value
+          }
+          Write-Host "debug ids: $($debugIds -join ', ')"
+
+          $idArgs = @()
+          foreach ($id in $debugIds) { $idArgs += '--id'; $idArgs += $id }
+
+          # The three trees sentry-cli scans for matching debug files: SeatHub's own build output,
+          # sentry-native's installed bin (sentry.dll, crashpad_handler.exe, crashpad_wer.dll and
+          # their PDBs), and the prebuilt libraries submodule, which ships its own PDBs (J.1).
+          $uploadPaths = @(
+            'build\build-x64-release',
+            $sentryInstallBin,
+            'libs\windows\lib\x64'
+          )
+
+          & ./sentry-cli.exe debug-files upload --org $env:SENTRY_ORG --project $env:SENTRY_PROJECT --wait --require-all @idArgs @uploadPaths
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::warning::Sentry symbol upload failed: sentry-cli debug-files upload failed with exit code $LASTEXITCODE; check the project slug and region (06.3.1 owner step). The build still ships -- rigs need the installer more than Sentry needs the symbols."
+            exit 0
+          }
+          Write-Host "uploaded SeatHub's symbols to Sentry"
 
       - name: Record the installer hash
         shell: pwsh
