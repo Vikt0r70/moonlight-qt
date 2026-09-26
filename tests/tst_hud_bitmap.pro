@@ -42,13 +42,20 @@ RESOURCES += ../app/seathub/fonts.qrc
 
 # `duration_text.cpp` is the one formatter every client surface uses (FLOW-09); the HUD's `Credit
 # left` calls it rather than making a second one, so this project has to link it.
+#
+# Plan 16 (D-10, Rule 3 - out of this plan's own files_modified, same precedent as 06.6-14's own
+# tst_facade_wiring.cpp conversion): `osd_compositor.cpp`'s new `OverlayDebug` branch calls
+# `parseVideoStatsBlock()`/`totalLatencyMs()`, so this project - which links `osd_compositor.cpp`
+# directly - now needs `stream_stats.cpp` too, or the link fails with two unresolved externals.
 SOURCES += tst_hud_bitmap.cpp \
     ../app/seathub/hud_overlay.cpp \
     ../app/seathub/duration_text.cpp \
     ../app/seathub/osd_compositor.cpp \
-    ../app/seathub/osd_renderer.cpp
+    ../app/seathub/osd_renderer.cpp \
+    ../app/seathub/stream_stats.cpp
 
 HEADERS += ../app/seathub/hud_overlay.h \
     ../app/seathub/duration_text.h \
     ../app/seathub/osd_compositor.h \
-    ../app/seathub/osd_renderer.h
+    ../app/seathub/osd_renderer.h \
+    ../app/seathub/stream_stats.h

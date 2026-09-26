@@ -3135,16 +3135,22 @@ void TstUiScreens::theStatsGroupRendersOneToggleAndTheyDefaultOff()
     }
     QVERIFY2(sawGroupTitle, "the stats group title must be upstream's own label");
 
-    // D-23/OD-03: one toggle per line, eleven of them, each off by default. Found through the
-    // real (visual) item tree, not `QObject::findChildren` - see `statsCheckBoxFor`'s comment
-    // for why a Repeater's own delegates are invisible to that walk.
+    // D-23/OD-03: one toggle per line, eleven of them. D-10 (Plan 16, `06.6-16-PLAN.md`) ticks
+    // three of them by default (RES/FPS/LATENCY, "the essentials any person understands"); the
+    // other eight are off. Found through the real (visual) item tree, not
+    // `QObject::findChildren` - see `statsCheckBoxFor`'s comment for why a Repeater's own
+    // delegates are invisible to that walk.
     const QStringList keys = fixture.bridge->statsToggleKeys();
     QCOMPARE(keys.size(), 11);
     const QHash<QString, QObject*> boxes = statsCheckBoxesByKey(root.data(), fixture.bridge);
     QCOMPARE(boxes.size(), 11);
+    const QStringList onByDefault = { QStringLiteral("statsVideoStream"),
+                                      QStringLiteral("statsRenderingFrameRate"),
+                                      QStringLiteral("statsNetworkLatency") };
     for (auto it = boxes.constBegin(); it != boxes.constEnd(); ++it) {
-        QVERIFY2(!it.value()->property("checked").toBool(),
-                 qPrintable(QStringLiteral("stats toggle must default off: ") + it.key()));
+        const bool expectedChecked = onByDefault.contains(it.key());
+        QVERIFY2(it.value()->property("checked").toBool() == expectedChecked,
+                 qPrintable(QStringLiteral("stats toggle default mismatch: ") + it.key()));
     }
 
     // Each toggle's own label is Moonlight's own line text (`copy.md` § Settings), with no
