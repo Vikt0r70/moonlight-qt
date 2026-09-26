@@ -3951,30 +3951,30 @@ private slots:
 
     void theWalletIsReadOnTheLivenessTickAndReachesTheHudWhileTheFacadesThreadIsSuspended()
     {
-        // The whole of CUST-15 rests on this: nothing in the client knew the balance during a stream,
+        // The whole of this rests on this: nothing in the client knew the balance during a stream,
         // and the one thread that is stopped for the stream is the facade's. The reads are made and
-        // the HUD is fed on the network thread; this test never runs its own event loop, so a design
-        // that hopped to the facade's thread to update the HUD would leave the value at the seed.
+        // Time left is fed on the network thread; this test never runs its own event loop, so a
+        // design that hopped to the facade's thread to update it would leave the value at the seed.
         SeatHubClient client;
         auto* engine = new FakeEngineSession;
         WalletTicks ticks;
         beginStreaming(client, engine, &ticks, /*home*/ 40, /*wallet*/ 7);
         QVERIFY(!QTest::currentTestFailed());
 
-        // At the first frame: a balance is shown (the seed Home read, or already the server's).
-        QVERIFY(client.hud()->isVisible());
+        // At the first frame: the seed Home read is on the HUD (D-16: never shown, but recorded).
         QVERIFY(client.hud()->creditMinutes() >= 0);
 
         // A liveness tick inside the stream reads the wallet; the server's answer replaces the seed
-        // and, at seven minutes, brings the ten-minute card up. The session's opening read (made at
+        // and, at seven minutes, arms the D-11 reminder. The session's opening read (made at
         // `beginSession()`, before the HUD's session began) may or may not have reached the HUD, so
         // one tick is driven and waited for (`settleIntoTheStream`). The HUD's own direct connection
         // was made in the facade's constructor, ahead of the counter this waits on, so the value is
         // on the HUD by the time the wait returns - read here with no event loop having run.
         QVERIFY2(settleIntoTheStream(client, &ticks), "no wallet answer came back on the tick");
         QCOMPARE(client.hud()->creditMinutes(), qint64(7));
-        QCOMPARE(int(client.hud()->activeCard()), int(HudOverlay::Card::TenMinutes));
-        QCOMPARE(client.hud()->warningsFired(HudOverlay::Card::TenMinutes), 1);
+        client.hud()->tick();
+        QVERIFY2(!client.hud()->compositor().composedBottom().isNull(),
+                 "seven minutes must show Time left (D-11)");
 
         // The facade's own properties have not moved: they are marshalled to its thread, which has
         // not run. They catch up when it does - and the value they end on is the server's.
@@ -4063,11 +4063,11 @@ private slots:
             QVERIFY2(tickAndWait(client, &ticks), failure.what);
             QCOMPARE(ticks.failed.load(), failedBefore + 1);
 
-            // Nothing changed: the last value stays, no card fired, and it is not zero.
+            // Nothing changed: the last value stays, and Time left shows nothing (thirty is above
+            // the reminder).
             QCOMPARE(client.hud()->creditMinutes(), qint64(30));
-            QCOMPARE(int(client.hud()->activeCard()), int(HudOverlay::Card::None));
-            QCOMPARE(client.hud()->warningsFired(HudOverlay::Card::TenMinutes), 0);
-            QCOMPARE(client.hud()->warningsFired(HudOverlay::Card::TwoMinutes), 0);
+            client.hud()->tick();
+            QVERIFY(client.hud()->compositor().composedBottom().isNull());
         }
 
         // Not even a rejected credential ends the stream or signs anybody out from a wallet read.
@@ -4078,12 +4078,18 @@ private slots:
         m_fake->answerWallet(200, walletBody(9));
         QVERIFY(tickAndWait(client, &ticks));
         QCOMPARE(client.hud()->creditMinutes(), qint64(9));
-        QCOMPARE(int(client.hud()->activeCard()), int(HudOverlay::Card::TenMinutes));
+        client.hud()->tick();
+        QVERIFY2(!client.hud()->compositor().composedBottom().isNull(),
+                 "nine minutes must show Time left (D-11)");
 
         endStreaming(client, engine);
     }
 
-    void eachThresholdFiresExactlyOnceAcrossASession()
+    // [Renamed from `eachThresholdFiresExactlyOnceAcrossASession` (D-12/D-21): the CUST-15 once-
+    // per-session cards this test used to pin are retired by Plan 22's D-11 rule, whose reminder
+    // is armed once per top-up-or-session, not once per session outright - the top-up assertion at
+    // the end is the rule change, not a bent test.]
+    void theReminderArmsAtTenCriticalHoldsFromFiveAndATopUpReArms()
     {
         SeatHubClient client;
         auto* engine = new FakeEngineSession;
@@ -4094,39 +4100,52 @@ private slots:
         // tick can, and it leaves no earlier answer in flight to arrive one step late in the loop.
         QVERIFY(settleIntoTheStream(client, &ticks));
         QCOMPARE(client.hud()->creditMinutes(), qint64(90));
+        client.hud()->tick();
+        QVERIFY2(client.hud()->compositor().composedBottom().isNull(), "ninety minutes shows nothing");
 
-        // One minute at a time, past both thresholds and to zero, and a read repeated at each.
+        // One minute at a time, past both D-11 thresholds and to zero, and a read repeated at each.
         for (int minutes = 15; minutes >= 0; --minutes) {
             m_fake->answerWallet(200, walletBody(minutes));
             QVERIFY(tickAndWait(client, &ticks));
             QVERIFY(tickAndWait(client, &ticks));   // the same balance again changes nothing
             QCOMPARE(client.hud()->creditMinutes(), qint64(minutes));
+            client.hud()->tick();
 
-            const bool tenFired = minutes <= 10;
-            const bool twoFired = minutes <= 2;
-            QCOMPARE(client.hud()->warningsFired(HudOverlay::Card::TenMinutes), tenFired ? 1 : 0);
-            QCOMPARE(client.hud()->warningsFired(HudOverlay::Card::TwoMinutes), twoFired ? 1 : 0);
-            // Ten minutes: the ten-minute card, until its lifetime; two minutes: the two-minute
-            // one, which replaced it and is still there at zero.
-            if (minutes <= 2) {
-                QCOMPARE(int(client.hud()->activeCard()), int(HudOverlay::Card::TwoMinutes));
+            // Robust assertion points only: the reminder's own one-minute window runs on the real
+            // monotonic clock here (the facade injects none), so only the boundary readings - the
+            // reminder's own arming point, and everything at or below the final threshold - are
+            // guaranteed regardless of how much real time this loop takes.
+            if (minutes == 10) {
+                QVERIFY2(!client.hud()->compositor().composedBottom().isNull(),
+                         "ten minutes arms the reminder");
+            }
+            if (minutes <= 5) {
+                QVERIFY2(!client.hud()->compositor().composedBottom().isNull(),
+                         qPrintable(QStringLiteral("%1 min must show Time left (D-11 final)")
+                                        .arg(minutes)));
             }
         }
-        QCOMPARE(client.hud()->warningsFired(HudOverlay::Card::TenMinutes), 1);
-        QCOMPARE(client.hud()->warningsFired(HudOverlay::Card::TwoMinutes), 1);
 
-        // A top-up mid-stream and back down: the thresholds are spent for this session.
+        // A top-up mid-stream re-arms the rule (D-21): still above ten (sixty) hides it, and the
+        // descent to eight - inside the 6-10 band - shows the reminder again, unlike the retired
+        // once-per-session cards this test used to assert.
         m_fake->answerWallet(200, walletBody(60));
         QVERIFY(tickAndWait(client, &ticks));
+        client.hud()->tick();
+        QVERIFY2(client.hud()->compositor().composedBottom().isNull(), "a top-up above ten hides it");
         m_fake->answerWallet(200, walletBody(8));
         QVERIFY(tickAndWait(client, &ticks));
-        QCOMPARE(client.hud()->warningsFired(HudOverlay::Card::TenMinutes), 1);
-        QCOMPARE(client.hud()->warningsFired(HudOverlay::Card::TwoMinutes), 1);
+        client.hud()->tick();
+        QVERIFY2(!client.hud()->compositor().composedBottom().isNull(),
+                 "D-21: a top-up into 6-10 re-arms the reminder");
 
         endStreaming(client, engine);
     }
 
-    void aSessionThatBeginsUnderTwoMinutesFiresOnlyTheLowerWarning()
+    // [Renamed from `aSessionThatBeginsUnderTwoMinutesFiresOnlyTheLowerWarning` (D-11): the
+    // once-per-session "lower warning" this test used to pin is retired - the state machine has no
+    // "warnings" to fire independently any more, only Critical from any state.]
+    void aSessionThatBeginsAtOrBelowFiveShowsCriticalAtOnce()
     {
         SeatHubClient client;
         auto* engine = new FakeEngineSession;
@@ -4134,13 +4153,13 @@ private slots:
         beginStreaming(client, engine, &ticks, 90, 1);
         QVERIFY(!QTest::currentTestFailed());
         // The opening read may have landed before the HUD's session began (and been dropped); the
-        // settle's tick is a read inside it. Whichever read fired the card, it fired once.
+        // settle's tick is a read inside it.
         QVERIFY(settleIntoTheStream(client, &ticks));
         QCOMPARE(client.hud()->creditMinutes(), qint64(1));
 
-        QCOMPARE(client.hud()->warningsFired(HudOverlay::Card::TwoMinutes), 1);
-        QCOMPARE(client.hud()->warningsFired(HudOverlay::Card::TenMinutes), 0);
-        QCOMPARE(int(client.hud()->activeCard()), int(HudOverlay::Card::TwoMinutes));
+        client.hud()->tick();
+        QVERIFY2(!client.hud()->compositor().composedBottom().isNull(),
+                 "one minute shows Time left at once (D-11 Critical)");
 
         endStreaming(client, engine);
     }
@@ -4170,8 +4189,9 @@ private slots:
         QCOMPARE(ticks.failed.load(), 2);
 
         QCOMPARE(client.hud()->creditMinutes(), qint64(1));
-        QCOMPARE(int(client.hud()->activeCard()), int(HudOverlay::Card::None));
-        QCOMPARE(client.hud()->warningsFired(HudOverlay::Card::TwoMinutes), 0);
+        client.hud()->tick();
+        QVERIFY2(client.hud()->compositor().composedBottom().isNull(),
+                 "the seed alone must not show Time left (D-16) - a failed read fires nothing");
 
         endStreaming(client, engine);
     }
