@@ -5221,7 +5221,23 @@ private slots:
         emit engine->displayLaunchError(QStringLiteral("Connection terminated"));
         emit engine->readyForDeletion();
 
-        QTRY_VERIFY_WITH_TIMEOUT(m_fake->bodiesFor(livenessPath).size() > callsBeforeDrop, 15000);
+        // 06.1-19 fix (found post-wave, reproduced 2/10 without extra load): `noteTermination()`
+        // (the sink, `ending`) and `enterReconnect()`'s `setStage("reconnecting")` are two
+        // SEPARATE cross-thread calls, each independently marshalled onto the network thread and
+        // each completing its own POST through the fake's own `QTimer::singleShot(0, ...)` reply.
+        // Waiting for "at least one new body" stops polling the instant the first of the two
+        // lands - `ending` alone, on an unlucky poll - so the snapshot below could be taken before
+        // `reconnecting`'s own round trip has completed, reading `sawReconnecting` as false with
+        // no bug in the production code at all. Waiting for the LAST body to actually BE
+        // `reconnecting` (the real invariant every assertion below needs) waits out both: the two
+        // calls are issued in that order from `handleDisplayLaunchError()` and each posts through
+        // the same synchronous-per-call path, so the second can never overtake the first.
+        QTRY_VERIFY_WITH_TIMEOUT(
+            m_fake->bodiesFor(livenessPath).size() > callsBeforeDrop
+                && QJsonDocument::fromJson(m_fake->bodiesFor(livenessPath).last()).object()
+                           .value(QStringLiteral("stage")).toString()
+                       == QStringLiteral("reconnecting"),
+            15000);
         const QList<QByteArray> afterDrop = m_fake->bodiesFor(livenessPath).mid(callsBeforeDrop);
         bool sawEnding = false;
         bool sawReconnecting = false;
