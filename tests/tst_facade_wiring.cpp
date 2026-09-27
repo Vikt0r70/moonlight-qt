@@ -5278,6 +5278,78 @@ private slots:
         // real ending every other in-stream test in this file uses to dispose of its own engine.
         emit secondEngine->readyForDeletion();
     }
+
+    // --- 06.1-19/J-07 Task 3: the Reconnecting screen's ghost End session and the two endings ----
+
+    void endSessionEndsTheHeldSession()
+    {
+        auto* engine = new FakeEngineSession;
+        SeatHubClient client;
+        WalletTicks ticks;
+        beginStreaming(client, engine, &ticks, 90, 80);
+        QVERIFY(!QTest::currentTestFailed());
+        client.teardown()->setVerifyIntervalMs(1);
+        m_fake->answerSession(QStringLiteral("s-live"), QStringLiteral("CANCELLED"),
+                              QStringLiteral("CUSTOMER_ENDED"));
+
+        emitConnectionTerminated(-1);
+        emit engine->displayLaunchError(QStringLiteral("Connection terminated"));
+        emit engine->readyForDeletion();
+        QTRY_VERIFY_WITH_TIMEOUT(client.reconnectTimer()->isActive(), 15000);
+
+        client.endHeldSession();
+
+        QVERIFY(!client.reconnecting());
+        QVERIFY(!client.reconnectTimer()->isActive());
+        QTRY_VERIFY_WITH_TIMEOUT(
+            m_fake->requestPaths().contains(QStringLiteral("/api/sessions/s-live/end")), 15000);
+        const QJsonObject sent = QJsonDocument::fromJson(
+            m_fake->bodyFor(QStringLiteral("/api/sessions/s-live/end"))).object();
+        // `buildEndRequest(false, ...)` posts no body at all - only a failed end has anything to
+        // say about why.
+        QVERIFY2(!sent.contains(QStringLiteral("failed")), "no failed flag for an ordinary end");
+        QTRY_COMPARE_WITH_TIMEOUT(client.appState(), QStringLiteral("home"), 15000);
+    }
+
+    void theEndingsShowTheirSentences()
+    {
+        struct Case
+        {
+            QString endReason;
+            int minutesBilled;
+            QString sentence;
+        };
+        const QList<Case> cases = {
+            { QStringLiteral("GRACE_EXPIRED"), 23,
+              QStringLiteral("We couldn't reconnect, so the session ended. You were charged for "
+                             "<font face=\"Geist Mono\">23</font> minutes.") },
+            { QStringLiteral("RECONNECT_LIMIT"), 41,
+              QStringLiteral("Your connection dropped too many times, so the session ended. You "
+                             "were charged for <font face=\"Geist Mono\">41</font> minutes.") },
+        };
+
+        for (const Case& testCase : cases) {
+            auto* engine = new FakeEngineSession;
+            SeatHubClient client;
+            WalletTicks ticks;
+            beginStreaming(client, engine, &ticks, 90, 80);
+            QVERIFY(!QTest::currentTestFailed());
+
+            emitConnectionTerminated(-1);
+            emit engine->displayLaunchError(QStringLiteral("Connection terminated"));
+            emit engine->readyForDeletion();
+            QTRY_VERIFY_WITH_TIMEOUT(client.reconnectTimer()->isActive(), 15000);
+
+            SessionInfo over = sessionIn(QStringLiteral("COMPLETED"), QStringLiteral("s-live"));
+            over.endReason = testCase.endReason;
+            over.minutesBilled = testCase.minutesBilled;
+            report(client, over);
+
+            QTRY_VERIFY_WITH_TIMEOUT(client.reconnectEnded(), 15000);
+            QVERIFY(client.connectFailed());
+            QCOMPARE(client.stalledReasonText(), testCase.sentence);
+        }
+    }
 };
 
 QTEST_MAIN(TstFacadeWiring)
