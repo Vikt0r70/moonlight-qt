@@ -87,9 +87,11 @@ public:
     void setErrorCode(const QString& reference);
     /// D-11/3.1.0: SeatHub's own stage - `preparing_rig`, `pairing`, `connecting`,
     /// `first_frame`, `streaming`, `reconnecting`, `ending` or `failed`. A value outside that
-    /// list is ignored (never sent). A genuine change reports at once, ahead of the next tick,
-    /// so the server sees a stage transition the moment it happens rather than up to
-    /// `kIntervalMs` later.
+    /// list is ignored (never sent). 06.1-19/J-07 (Task 2): a change to `reconnecting`, or to
+    /// `streaming` from `reconnecting`, reports at once, ahead of the next tick, and restarts the
+    /// interval from that report - the two transitions the server's own state machine acts on
+    /// immediately (opening the disconnect grace, committing the reconnect). Every other genuine
+    /// change keeps the ordinary `kIntervalMs` cadence.
     void setStage(const QString& stage);
     /// D-11: the engine's own stage name (`Limelight.h`'s `LiGetStageName()` family, e.g. "RTSP
     /// handshake"), diagnostic only and never shown (D-51). A free string, no enum: upstream's
