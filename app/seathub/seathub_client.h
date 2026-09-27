@@ -936,7 +936,10 @@ private:
     /// A sentinel outside the engine's own range (`Limelight.h`'s `ML_ERROR_*` are `0` or negative,
     /// per `engine_termination.h`'s own parser comment) - "no termination code has been seen yet
     /// for the currently attached session", never mistaken for a real one.
-    static constexpr int kNoTerminationCode = std::numeric_limits<int>::min();
+    // Parenthesised to defeat the <windows.h> `min` macro some Qt/SDL header pulls in transitively
+    // on this build (MSVC error C2589 without it): `(...)` around the member access stops the
+    // preprocessor from matching `min` as a call-like macro invocation.
+    static constexpr int kNoTerminationCode = (std::numeric_limits<int>::min)();
     /// A-51/FORK 1.2: the engine's own termination code, written from the log-tee sink lambda that
     /// already calls `noteTermination()` (relaxed store, no new thread crossing) and read (relaxed
     /// load) from `handleDisplayLaunchError()` on the facade thread - the exact cross-thread read
