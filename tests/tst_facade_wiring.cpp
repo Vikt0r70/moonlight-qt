@@ -339,6 +339,15 @@ public:
         return m_bodies.value(path);
     }
 
+    /// Every body a request for `path` has carried, in order. `bodyFor()` keeps only the last one
+    /// - 06.1-19/J-07's own reconnect tests need the whole sequence of liveness reports a drop and
+    /// a return post, not just the most recent.
+    QList<QByteArray> bodiesFor(const QString& path) const
+    {
+        QMutexLocker lock(&m_mutex);
+        return m_bodyHistory.value(path);
+    }
+
     /// The `Authorization` header the last request for `path` carried.
     QByteArray authorizationFor(const QString& path) const
     {
@@ -378,7 +387,9 @@ protected:
             m_auth.insert(path, request.rawHeader("Authorization"));
             m_traceparents.append(request.rawHeader("traceparent"));
             if (outgoing) {
-                m_bodies.insert(path, outgoing->peek(outgoing->size()));
+                const QByteArray body = outgoing->peek(outgoing->size());
+                m_bodies.insert(path, body);
+                m_bodyHistory[path].append(body);
             }
             loginStatus = m_loginStatus;
             loginBody = m_loginBody;
@@ -497,6 +508,7 @@ private:
     QHash<QString, QByteArray> m_auth;
     QList<QByteArray> m_traceparents;
     QHash<QString, QByteArray> m_bodies;
+    QHash<QString, QList<QByteArray>> m_bodyHistory;
     int m_loginStatus = 200;
     QByteArray m_loginBody;
     int m_playStatus = 201;
@@ -586,6 +598,17 @@ void emitStatsBlock(double renderedFps)
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Global video stats");
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                 "----------------------------------------------------------\n%s", body.constData());
+}
+
+/// Fires upstream's own termination log line through the real `LogTee` singleton (06.1-19/J-07,
+/// `engine_termination.h`), exactly the one `SDL_LogError()` call `Session::clConnectionTerminated`
+/// makes - the one route to the engine's own code, unconditionally, on every ending including `0`
+/// (`ML_ERROR_GRACEFUL_TERMINATION`). Reaches every attached facade's own termination sink
+/// synchronously, on this (the test) thread, the same way `emitStatsBlock()` above does for the
+/// stats sink.
+void emitConnectionTerminated(int code)
+{
+    SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "Connection terminated: %d", code);
 }
 
 } // namespace
@@ -4998,6 +5021,262 @@ private slots:
         QVERIFY(SeatHubTelemetry::currentSessionId().isEmpty());
         QVERIFY(SeatHubTelemetry::currentHostId().isEmpty());
         QVERIFY(SeatHubTelemetry::currentTraceId().isEmpty());
+    }
+
+    // --- 06.1-19/J-07: a dropped stream comes back on the same session ---------------------------
+
+    void aConnectionDropReconnectsTheSameSession()
+    {
+        auto* engine = new FakeEngineSession;
+        SeatHubClient client;
+        WalletTicks ticks;
+        beginStreaming(client, engine, &ticks, 90, 80);
+        QVERIFY(!QTest::currentTestFailed());
+
+        emitConnectionTerminated(-1); // ENet's own "unexpected disconnect" - a network blip
+        emit engine->displayLaunchError(QStringLiteral("Connection terminated"));
+        QCOMPARE(client.appState(), QStringLiteral("connecting"));
+        QVERIFY(client.reconnecting());
+
+        emit engine->readyForDeletion();
+        QTRY_COMPARE_WITH_TIMEOUT(client.reconnectTimer()->interval(), 2000, 15000);
+        QVERIFY(client.reconnectTimer()->isActive());
+
+        // The session stays held: no `/end` for this drop.
+        QVERIFY(!m_fake->requestPaths().contains(QStringLiteral("/api/sessions/s-live/end")));
+
+        // Fire the backoff at once rather than waiting the real 2 s.
+        client.reconnectTimer()->start(0);
+        QTRY_VERIFY_WITH_TIMEOUT(
+            m_fake->requestPaths().contains(QStringLiteral("/api/sessions/s-live/pairing")), 15000);
+
+        auto* secondEngine = new FakeEngineSession;
+        client.session()->attachSession(secondEngine);
+        emit secondEngine->connectionStarted();
+        QCOMPARE(client.appState(), QStringLiteral("streaming"));
+        QVERIFY(!client.reconnecting());
+        QVERIFY2(client.liveSession(), "the same session, resumed");
+
+        // `SessionLifecycle` refuses to detach an engine it still considers active
+        // (`start()`/`readyForDeletion()` are the only two things that change that) - the same
+        // real ending every other in-stream test in this file uses to dispose of its own engine.
+        emit secondEngine->readyForDeletion();
+    }
+
+    void aGracefulQuitStillEnds()
+    {
+        auto* engine = new FakeEngineSession;
+        SeatHubClient client;
+        WalletTicks ticks;
+        beginStreaming(client, engine, &ticks, 90, 80);
+        QVERIFY(!QTest::currentTestFailed());
+        client.teardown()->setVerifyIntervalMs(1);
+        m_fake->answerSession(QStringLiteral("s-live"), QStringLiteral("COMPLETED"),
+                              QStringLiteral("CUSTOMER_ENDED"));
+
+        emitConnectionTerminated(0); // ML_ERROR_GRACEFUL_TERMINATION - a real code, not "no error"
+        emit engine->displayLaunchError(QStringLiteral("Connection terminated"));
+        QVERIFY(!client.reconnecting());
+        QCOMPARE(client.appState(), QStringLiteral("error"));
+
+        emit engine->readyForDeletion();
+        QTRY_VERIFY_WITH_TIMEOUT(
+            m_fake->requestPaths().contains(QStringLiteral("/api/sessions/s-live/end")), 15000);
+        QCOMPARE(m_fake->requestPaths().count(QStringLiteral("/api/sessions/s-live/end")), 1);
+    }
+
+    void aHostSideCodeStillEnds()
+    {
+        auto* engine = new FakeEngineSession;
+        SeatHubClient client;
+        WalletTicks ticks;
+        beginStreaming(client, engine, &ticks, 90, 80);
+        QVERIFY(!QTest::currentTestFailed());
+        client.teardown()->setVerifyIntervalMs(1);
+        m_fake->answerSession(QStringLiteral("s-live"), QStringLiteral("COMPLETED"),
+                              QStringLiteral("HOST_LOST"));
+
+        emitConnectionTerminated(-102); // ML_ERROR_UNEXPECTED_EARLY_TERMINATION - host-side
+        emit engine->displayLaunchError(QStringLiteral("Connection terminated"));
+        QVERIFY(!client.reconnecting());
+        QCOMPARE(client.appState(), QStringLiteral("error"));
+
+        emit engine->readyForDeletion();
+        QTRY_VERIFY_WITH_TIMEOUT(
+            m_fake->requestPaths().contains(QStringLiteral("/api/sessions/s-live/end")), 15000);
+        QCOMPARE(m_fake->requestPaths().count(QStringLiteral("/api/sessions/s-live/end")), 1);
+    }
+
+    void aFailedAttemptTriesAgainWithBackoff()
+    {
+        auto* engine = new FakeEngineSession;
+        SeatHubClient client;
+        WalletTicks ticks;
+        beginStreaming(client, engine, &ticks, 90, 80);
+        QVERIFY(!QTest::currentTestFailed());
+        m_fake->answerSession(QStringLiteral("s-live"), QStringLiteral("ACTIVE"));
+
+        emitConnectionTerminated(-1);
+        emit engine->displayLaunchError(QStringLiteral("Connection terminated"));
+        emit engine->readyForDeletion();
+        QTRY_COMPARE_WITH_TIMEOUT(client.reconnectTimer()->interval(), 2000, 15000);
+
+        const SeatHubFailure pairingFailure =
+            SeatHubFailure::local(QStringLiteral("The rig didn't finish connecting. Try again."));
+
+        emit client.pairing()->pairingFailed(pairingFailure);
+        QTRY_COMPARE_WITH_TIMEOUT(client.reconnectTimer()->interval(), 4000, 15000);
+        QVERIFY(client.reconnecting());
+
+        emit client.pairing()->pairingFailed(pairingFailure);
+        QTRY_COMPARE_WITH_TIMEOUT(client.reconnectTimer()->interval(), 8000, 15000);
+
+        emit client.pairing()->pairingFailed(pairingFailure);
+        QTRY_COMPARE_WITH_TIMEOUT(client.reconnectTimer()->interval(), 15000, 15000);
+
+        emit client.pairing()->pairingFailed(pairingFailure);
+        QTRY_COMPARE_WITH_TIMEOUT(client.reconnectTimer()->interval(), 15000, 15000);
+
+        QVERIFY(!m_fake->requestPaths().contains(QStringLiteral("/api/sessions/s-live/end")));
+    }
+
+    void theServerEndingTheHeldSessionStopsTheAttempts()
+    {
+        auto* engine = new FakeEngineSession;
+        SeatHubClient client;
+        WalletTicks ticks;
+        beginStreaming(client, engine, &ticks, 90, 80);
+        QVERIFY(!QTest::currentTestFailed());
+
+        emitConnectionTerminated(-1);
+        emit engine->displayLaunchError(QStringLiteral("Connection terminated"));
+        emit engine->readyForDeletion();
+        QTRY_VERIFY_WITH_TIMEOUT(client.reconnectTimer()->isActive(), 15000);
+
+        SessionInfo over = sessionIn(QStringLiteral("COMPLETED"), QStringLiteral("s-live"));
+        over.endReason = QStringLiteral("GRACE_EXPIRED");
+        over.minutesBilled = 23;
+        report(client, over);
+
+        QTRY_VERIFY_WITH_TIMEOUT(client.reconnectEnded(), 15000);
+        QVERIFY(!client.reconnecting());
+        QVERIFY(!client.reconnectTimer()->isActive());
+        QVERIFY(client.connectFailed());
+        QCOMPARE(client.stalledReasonText(),
+                 QStringLiteral("We couldn't reconnect, so the session ended. You were charged "
+                                "for <font face=\"Geist Mono\">23</font> minutes."));
+    }
+
+    void aDropBeforeTheStreamStartedIsNotAReconnect()
+    {
+        auto* engine = new FakeEngineSession;
+        {
+            SeatHubClient client;
+            client.session()->attachSession(engine);
+            beginStagedSession(client);
+            QVERIFY(!QTest::currentTestFailed());
+            client.teardown()->setVerifyIntervalMs(1);
+            m_fake->answerSession(QStringLiteral("s-stages"), QStringLiteral("CANCELLED"));
+
+            emitConnectionTerminated(-1);
+            emit engine->displayLaunchError(QStringLiteral("Connection terminated"));
+
+            QVERIFY2(!client.reconnecting(), "the stream never started - not a reconnect (D-05)");
+            QVERIFY(client.connectFailed());
+            QCOMPARE(client.appState(), QStringLiteral("connecting"));
+
+            emit engine->readyForDeletion();
+            QTRY_VERIFY_WITH_TIMEOUT(
+                m_fake->requestPaths().contains(QStringLiteral("/api/sessions/s-stages/end")),
+                15000);
+            // `handleReadyForDeletion()`'s ordinary (non-reconnect) path already released and
+            // `deleteLater()`d `engine` above - it is not this test's to delete a second time.
+        }
+    }
+
+    void aReconnectKeepsTheReconnectingStageUntilTheStreamIsBack()
+    {
+        auto* engine = new FakeEngineSession;
+        SeatHubClient client;
+        WalletTicks ticks;
+        beginStreaming(client, engine, &ticks, 90, 80);
+        QVERIFY(!QTest::currentTestFailed());
+
+        const QString livenessPath = QStringLiteral("/api/sessions/s-live/liveness");
+        // `beginSession()`'s own `preparing_rig` tick and `handleConnectionStarted()`'s own
+        // `streaming` report are both posted through queued calls onto the network thread
+        // (`LivenessTimer::start()`/`setStage()` self-marshal), so `beginStreaming()` returning
+        // on this (test) thread does not mean either has landed in the fake's body history yet.
+        // Settling here first means the baseline below is never contaminated by a setup-phase
+        // post arriving late and being mistaken for a second `start()`.
+        QTRY_VERIFY_WITH_TIMEOUT(
+            !m_fake->bodiesFor(livenessPath).isEmpty()
+                && QJsonDocument::fromJson(m_fake->bodiesFor(livenessPath).last()).object()
+                           .value(QStringLiteral("stage")).toString()
+                       == QStringLiteral("streaming"),
+            15000);
+        const int callsBeforeDrop = m_fake->bodiesFor(livenessPath).size();
+
+        emitConnectionTerminated(-1);
+        emit engine->displayLaunchError(QStringLiteral("Connection terminated"));
+        emit engine->readyForDeletion();
+
+        QTRY_VERIFY_WITH_TIMEOUT(m_fake->bodiesFor(livenessPath).size() > callsBeforeDrop, 15000);
+        const QList<QByteArray> afterDrop = m_fake->bodiesFor(livenessPath).mid(callsBeforeDrop);
+        bool sawEnding = false;
+        bool sawReconnecting = false;
+        bool sawPreparingRigAgain = false;
+        for (const QByteArray& body : afterDrop) {
+            const QString stage =
+                QJsonDocument::fromJson(body).object().value(QStringLiteral("stage")).toString();
+            if (stage == QStringLiteral("ending")) {
+                sawEnding = true;
+            }
+            if (stage == QStringLiteral("reconnecting")) {
+                sawReconnecting = true;
+            }
+            if (stage == QStringLiteral("preparing_rig")) {
+                sawPreparingRigAgain = true;
+            }
+        }
+        // `noteTermination()` (the engine's own code) is reported before the reconnect's own
+        // `reconnecting` stage - the two are separate calls, in that order, inside
+        // `handleDisplayLaunchError()`'s sink and branch.
+        QVERIFY2(sawEnding, "the termination code itself is still reported");
+        QVERIFY2(sawReconnecting, "the reconnect's own stage is reported");
+        QVERIFY2(!sawPreparingRigAgain, "LivenessTimer::start() must not run again across a reconnect");
+        QCOMPARE(QJsonDocument::fromJson(afterDrop.last()).object()
+                     .value(QStringLiteral("stage")).toString(),
+                 QStringLiteral("reconnecting"));
+
+        client.reconnectTimer()->start(0);
+        QTRY_VERIFY_WITH_TIMEOUT(
+            m_fake->requestPaths().contains(QStringLiteral("/api/sessions/s-live/pairing")), 15000);
+
+        emit client.pairing()->authorizationGranted();
+        QTest::qWait(20);
+        QCOMPARE(QJsonDocument::fromJson(m_fake->bodiesFor(livenessPath).last()).object()
+                     .value(QStringLiteral("stage")).toString(),
+                 QStringLiteral("reconnecting"));
+
+        auto* secondEngine = new FakeEngineSession;
+        client.session()->attachSession(secondEngine);
+        emit client.pairing()->pairingCompleted(QStringLiteral("aa:bb:cc:dd:ee:11"));
+        QTest::qWait(20);
+        QCOMPARE(QJsonDocument::fromJson(m_fake->bodiesFor(livenessPath).last()).object()
+                     .value(QStringLiteral("stage")).toString(),
+                 QStringLiteral("reconnecting"));
+
+        emit secondEngine->connectionStarted();
+        QCOMPARE(client.appState(), QStringLiteral("streaming"));
+        QTRY_COMPARE_WITH_TIMEOUT(
+            QJsonDocument::fromJson(m_fake->bodiesFor(livenessPath).last()).object()
+                .value(QStringLiteral("stage")).toString(),
+            QStringLiteral("streaming"), 15000);
+
+        // `SessionLifecycle` refuses to detach an engine it still considers active - the same
+        // real ending every other in-stream test in this file uses to dispose of its own engine.
+        emit secondEngine->readyForDeletion();
     }
 };
 
