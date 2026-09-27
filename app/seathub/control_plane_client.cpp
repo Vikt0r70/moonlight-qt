@@ -137,6 +137,11 @@ bool SessionInfo::parse(const QJsonObject& body, SessionInfo* out)
     info.saveDeadlineAt = body.value(QStringLiteral("save_deadline_at")).toString();
     info.billingStartedAt = body.value(QStringLiteral("billing_started_at")).toString();
     info.endReason = body.value(QStringLiteral("end_reason")).toString();
+    // 06.1's ADR item 9/4: absent, present-and-null and present-and-empty all read the same
+    // "not set" way `toString()` already gives every optional field on this struct.
+    info.graceDeadlineAt = body.value(QStringLiteral("grace_deadline_at")).toString();
+    info.endBlame = body.value(QStringLiteral("end_blame")).toString();
+    info.endReference = body.value(QStringLiteral("end_reference")).toString();
 
     *out = info;
     return true;
@@ -621,14 +626,38 @@ QByteArray ControlPlaneClient::buildSessionCreate()
 
 QByteArray ControlPlaneClient::buildEndRequest(bool failed)
 {
+    return buildEndRequest(failed, EndReport());
+}
+
+QByteArray ControlPlaneClient::buildEndRequest(bool failed, const EndReport& report)
+{
     // Contract 3.3.0 (D-05/D-23): `{"failed": true}` records `CONNECT_FAILED` on a pre-ACTIVE
     // session; anything else - no body, at all - is the ordinary customer-initiated end
-    // (`CUSTOMER_ENDED`) and is ignored on an ACTIVE one either way.
+    // (`CUSTOMER_ENDED`) and is ignored on an ACTIVE one either way. A report has nothing to add
+    // to an end that is not itself a failure, so `failed == false` still posts no body at all.
     if (!failed) {
         return QByteArray();
     }
     QJsonObject object;
     object.insert(QStringLiteral("failed"), true);
+    // Contract 3.5.0 (06.1's ADR, J-22): each of the report's fields rides beside `failed` only
+    // when it is known - an absent field is not the same as an empty or zero one on this leniently
+    // -parsed body (`docs/spec/openapi.yaml` `SessionEndRequest`).
+    if (!report.stage.isEmpty()) {
+        object.insert(QStringLiteral("stage"), report.stage);
+    }
+    if (!report.engineStage.isEmpty()) {
+        object.insert(QStringLiteral("engine_stage"), report.engineStage);
+    }
+    if (report.hasEngineError) {
+        object.insert(QStringLiteral("engine_error"), report.engineError);
+    }
+    if (!report.failingPorts.isEmpty()) {
+        object.insert(QStringLiteral("failing_ports"), report.failingPorts);
+    }
+    if (!report.errorCode.isEmpty()) {
+        object.insert(QStringLiteral("error_code"), report.errorCode);
+    }
     return QJsonDocument(object).toJson(QJsonDocument::Compact);
 }
 
@@ -1020,9 +1049,15 @@ void ControlPlaneClient::postLiveness(const QString& sessionId, const QJsonObjec
 
 void ControlPlaneClient::endSession(const QString& sessionId, bool failed, Callback callback)
 {
+    endSession(sessionId, failed, EndReport(), callback);
+}
+
+void ControlPlaneClient::endSession(const QString& sessionId, bool failed, const EndReport& report,
+                                    Callback callback)
+{
     send(QStringLiteral("POST"), QStringLiteral("/api/sessions/") + encodedPathSegment(sessionId)
              + QStringLiteral("/end"),
-         buildEndRequest(failed), true, callback);
+         buildEndRequest(failed, report), true, callback);
 }
 
 void ControlPlaneClient::postSessionQuality(const QString& sessionId, const QJsonObject& report,

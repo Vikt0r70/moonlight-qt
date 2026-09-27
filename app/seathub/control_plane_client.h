@@ -90,6 +90,26 @@ struct ControlPlaneResult
     SeatHubFailure toFailure() const;
 };
 
+/// `SessionEndRequest` (contract 3.5.0, 06.1's ADR, J-22): what a pre-stream failure tells the
+/// server about itself, carried on `endSession(sessionId, true, report, callback)`. Every field
+/// is optional and independently omitted from the wire body when it is not known - the server
+/// parses this leniently and never answers 422 for it (`docs/spec/openapi.yaml`
+/// `SessionEndRequest`). `engineError` needs `hasEngineError` because `0` is a real Moonlight
+/// code, not "absent" (the same reason `LivenessReport` never used a bare `int`).
+struct EndReport
+{
+    /// `LivenessStage` (e.g. `pairing`, `connecting`). Empty when not known.
+    QString stage;
+    /// moonlight-common-c's own stage name, free text, no enum (06.1's ADR).
+    QString engineStage;
+    bool hasEngineError = false;
+    int engineError = 0;
+    QString failingPorts;
+    /// A reference an earlier error surface already gave the client (06.1's ADR, J-22). The
+    /// client never mints one; this only carries one it was already given.
+    QString errorCode;
+};
+
 /// `GET /api/sessions/{session_id}/pairing` (`SessionAuthorization`). Short-lived and scoped
 /// to one session; never contains Sunshine admin credentials.
 struct SessionAuthorization
@@ -140,6 +160,15 @@ struct SessionInfo
     QString saveDeadlineAt;
     QString billingStartedAt;
     QString endReason;
+    /// The reconnect grace's end while the session is held after a disconnect (06.1's ADR item
+    /// 9). Empty when the session is not in its grace.
+    QString graceDeadlineAt;
+    /// Who a failing ending is attributed to - `rig` | `connection` | `us` (`FailureBlame`,
+    /// 06.1's ADR item 4). Empty on a non-failing end, or on an older server that named none.
+    QString endBlame;
+    /// The SH- reference minted for a blame-carrying ending (ADR-0008). Empty when there is no
+    /// blame. The client never generates one of these - it only ever carries what the server sent.
+    QString endReference;
 
     /// True for COMPLETED, FAILED, EXPIRED, CANCELLED - the four terminal SessionStates
     /// (`docs/spec/state-machines.md`). Teardown waits for one of these (STREAM-10: the
@@ -348,7 +377,14 @@ public:
     static QByteArray buildSessionCreate();
     /// `SessionEndRequest` (contract 3.3.0, D-05/D-23): `{"failed": true}` when `failed`, an empty
     /// body otherwise - the same "assert the shape without a socket" rule as the builders above.
+    /// Kept for the callers this exact shape still has (tests exercising the builder directly);
+    /// forwards an empty `EndReport` to the overload below.
     static QByteArray buildEndRequest(bool failed);
+    /// Contract 3.5.0 (06.1's ADR, J-22): the full end body - `failed` plus whichever of
+    /// `report`'s fields are set, under the contract's snake_case keys. `false` still posts no
+    /// body at all, regardless of what `report` carries: only a failed end has anything to say
+    /// about why.
+    static QByteArray buildEndRequest(bool failed, const EndReport& report);
     /// The liveness body is optional and additive (ADR-0041, D-34). An empty `state` and an
     /// empty `error_code` produce the pre-1.6.0 empty body, which is still a valid report.
     static QByteArray buildLiveness(const QString& state, const QString& errorCode);
@@ -495,7 +531,12 @@ public:
     /// records as `CONNECT_FAILED` on a pre-ACTIVE session (and ignores on an ACTIVE one);
     /// `false` posts no body, the ordinary customer-initiated end. Every caller must say which -
     /// there is no default, so a call site can never silently mean "not a failure" by omission.
+    /// Forwards an empty `EndReport` to the overload below.
     void endSession(const QString& sessionId, bool failed, Callback callback);
+    /// Contract 3.5.0 (06.1's ADR, J-22): `endSession` with a report of what a pre-stream failure
+    /// knows about itself (`report`, ignored when `failed` is `false`). One report per `/end`.
+    void endSession(const QString& sessionId, bool failed, const EndReport& report,
+                    Callback callback);
 
     /// `POST /api/sessions/{session_id}/quality` (3.1.0, D-17, Plan 15): the parsed end-of-stream
     /// video-stats block (`stream_stats.h`'s `toQualityReport()`), posted once per session. The

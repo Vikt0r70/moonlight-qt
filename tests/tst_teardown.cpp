@@ -78,15 +78,20 @@ public:
     QList<int> statuses;
     QList<QByteArray> bodies;
     QStringList paths;
+    /// The outgoing body of every request, in order - what `theEndBodyCarriesTheReport()` reads to
+    /// prove the exact wire shape `ControlPlaneClient::sendOnOwningThread()` posted.
+    QList<QByteArray> requestBodies;
     int calls = 0;
 
 protected:
-    QNetworkReply* createRequest(Operation, const QNetworkRequest& request, QIODevice*) override
+    QNetworkReply* createRequest(Operation, const QNetworkRequest& request,
+                                 QIODevice* outgoing) override
     {
         const int index = qMax(0, qMin(calls, statuses.size() - 1));
         const int status = statuses.isEmpty() ? 200 : statuses.at(index);
         const QByteArray body = bodies.isEmpty() ? QByteArray() : bodies.at(index);
         paths.append(request.url().path());
+        requestBodies.append(outgoing ? outgoing->peek(outgoing->size()) : QByteArray());
         ++calls;
         return new FakeReply(status, body, this);
     }
@@ -286,6 +291,101 @@ private slots:
         QSignalSpy completed(&controller, &TeardownController::teardownCompleted);
         controller.teardown(QString::fromLatin1(kSessionId), QString::fromLatin1(kClientUuid));
         QTRY_COMPARE(completed.count(), 1);
+    }
+
+    // --- 06.1's ADR (J-22): the failure goes up on /end, the blame and reference come back ------
+
+    void theEndBodyCarriesTheReport()
+    {
+        // Straight through `ControlPlaneClient::endSession()`, not `buildEndRequest()` directly -
+        // this proves the exact body a real end request posts.
+        ControlPlaneClient client;
+        auto* fake = new FakeNetworkAccessManager;
+        client.setNetworkAccessManager(fake);
+        fake->statuses = { 200 };
+        fake->bodies = { sessionBody(QStringLiteral("CANCELLED")) };
+
+        EndReport report;
+        report.stage = QStringLiteral("pairing");
+        report.hasEngineError = true;
+        report.engineError = -102;
+        report.failingPorts = QStringLiteral("UDP 47998");
+
+        bool done = false;
+        client.endSession(QString::fromLatin1(kSessionId), true, report,
+                          [&done](const ControlPlaneResult&) { done = true; });
+        QTRY_VERIFY(done);
+
+        QCOMPARE(fake->calls, 1);
+        const QJsonObject sent = QJsonDocument::fromJson(fake->requestBodies.first()).object();
+        QCOMPARE(sent.value(QStringLiteral("failed")).toBool(), true);
+        QCOMPARE(sent.value(QStringLiteral("stage")).toString(), QStringLiteral("pairing"));
+        QCOMPARE(sent.value(QStringLiteral("engine_error")).toInt(), -102);
+        QCOMPARE(sent.value(QStringLiteral("failing_ports")).toString(), QStringLiteral("UDP 47998"));
+        // Unknown fields (`engineStage`, `errorCode`) are left out of the body entirely, not sent
+        // as null or empty - the same "absence, not a placeholder" rule `SessionInfo::parse` reads.
+        QVERIFY2(!sent.contains(QStringLiteral("engine_stage")), "unset engineStage must not be sent");
+        QVERIFY2(!sent.contains(QStringLiteral("error_code")), "unset errorCode must not be sent");
+
+        // `failed: false` still posts no body at all, whatever the report carries.
+        const QJsonObject notFailed =
+            QJsonDocument::fromJson(ControlPlaneClient::buildEndRequest(false, report)).object();
+        QVERIFY2(notFailed.isEmpty(), "endSession(..., false, ...) must build no body at all");
+    }
+
+    void theTerminalReadCarriesBlameAndReference()
+    {
+        TeardownController controller;
+        auto* client = new ControlPlaneClient(&controller);
+        auto* fake = new FakeNetworkAccessManager;
+        client->setNetworkAccessManager(fake);
+        controller.setControlPlane(client);
+        controller.setVerifyIntervalMs(1);
+
+        QJsonObject terminal =
+            QJsonDocument::fromJson(sessionBody(QStringLiteral("CANCELLED"))).object();
+        terminal.insert(QStringLiteral("end_reason"), QStringLiteral("CONNECT_FAILED"));
+        terminal.insert(QStringLiteral("end_blame"), QStringLiteral("rig"));
+        terminal.insert(QStringLiteral("end_reference"), QStringLiteral("SH-4F7KQ2"));
+
+        fake->statuses = { 202, 200 };
+        fake->bodies = { sessionBody(QStringLiteral("ENDING")),
+                         QJsonDocument(terminal).toJson(QJsonDocument::Compact) };
+
+        QSignalSpy completed(&controller, &TeardownController::teardownCompleted);
+        controller.teardown(QString::fromLatin1(kSessionId), QString::fromLatin1(kClientUuid), true);
+        QTRY_COMPARE(completed.count(), 1);
+
+        const SessionInfo finalSession = completed.at(0).at(0).value<SessionInfo>();
+        QCOMPARE(finalSession.endBlame, QStringLiteral("rig"));
+        QCOMPARE(finalSession.endReference, QStringLiteral("SH-4F7KQ2"));
+    }
+
+    void anOlderServersReadHasNeither()
+    {
+        // An older server's terminal read has neither field at all - absence, not an empty string
+        // the client could mistake for a blame.
+        TeardownController controller;
+        auto* client = new ControlPlaneClient(&controller);
+        auto* fake = new FakeNetworkAccessManager;
+        client->setNetworkAccessManager(fake);
+        controller.setControlPlane(client);
+        controller.setVerifyIntervalMs(1);
+
+        fake->statuses = { 202, 200 };
+        fake->bodies = { sessionBody(QStringLiteral("ENDING")),
+                         sessionBody(QStringLiteral("CANCELLED")) };
+
+        QSignalSpy completed(&controller, &TeardownController::teardownCompleted);
+        QSignalSpy failed(&controller, &TeardownController::teardownFailed);
+        controller.teardown(QString::fromLatin1(kSessionId), QString::fromLatin1(kClientUuid));
+        QTRY_COMPARE(completed.count(), 1);
+        QCOMPARE(failed.count(), 0);
+
+        const SessionInfo finalSession = completed.at(0).at(0).value<SessionInfo>();
+        QVERIFY(finalSession.endBlame.isEmpty());
+        QVERIFY(finalSession.endReference.isEmpty());
+        QVERIFY(finalSession.graceDeadlineAt.isEmpty());
     }
 
     // --- failure modes ---------------------------------------------------------------------

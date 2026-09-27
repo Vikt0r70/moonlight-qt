@@ -96,9 +96,11 @@ public:
     /// `failed` (D-05/D-23) is forwarded verbatim to `ControlPlaneClient::endSession()`: `true`
     /// records `CONNECT_FAILED` on a pre-ACTIVE session (a pairing failure, or a paired session
     /// with no engine attached); the default `false` is every other end, including the ordinary
-    /// end of a session that streamed.
+    /// end of a session that streamed. `report` (contract 3.5.0, 06.1's ADR, J-22) is forwarded
+    /// alongside it and is meaningless when `failed` is `false` - `ControlPlaneClient` already
+    /// drops it there.
     Q_INVOKABLE void teardown(const QString& sessionId, const QString& clientUuid,
-                              bool failed = false);
+                              bool failed = false, const EndReport& report = EndReport());
     /// Abandon a teardown in flight (a second End press, or sign-out).
     Q_INVOKABLE void cancel();
 
