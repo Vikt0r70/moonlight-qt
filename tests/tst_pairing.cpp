@@ -135,7 +135,9 @@ QByteArray conflictBody()
     return QJsonDocument(object).toJson(QJsonDocument::Compact);
 }
 
-QByteArray authorizationBody(const QString& pin)
+// `state` defaults to empty, meaning "absent" - the shape an older server still sends, with no
+// `state` field on the wire at all. A non-empty value adds it, per contract 3.5.0.
+QByteArray authorizationBody(const QString& pin, const QString& state = QString())
 {
     QJsonObject ports;
     ports.insert(QStringLiteral("https"), 47984);
@@ -156,6 +158,9 @@ QByteArray authorizationBody(const QString& pin)
     body.insert(QStringLiteral("ports"), ports);
     body.insert(QStringLiteral("quality_profile"), QStringLiteral("1080p60"));
     body.insert(QStringLiteral("lease"), lease);
+    if (!state.isEmpty()) {
+        body.insert(QStringLiteral("state"), state);
+    }
     return QJsonDocument(body).toJson(QJsonDocument::Compact);
 }
 
@@ -374,6 +379,108 @@ private slots:
         controller.start(QString::fromLatin1(kSessionId));
         QTRY_COMPARE(completed.count(), 1);
         QCOMPARE(failed.count(), 0);
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // J-16 / 06.1's ADR item 3: the tracer for the waiting branch (Plan 09, Task 1).
+    // -----------------------------------------------------------------------------------------
+
+    void aWaitingAnswerIsNotAFailure()
+    {
+        // A 200 answer whose state is REQUESTED, ALLOCATED or PREPARING fails nothing, does not
+        // emit `authorizationGranted`, restarts the clock and schedules the next poll - exactly
+        // like the 409 branch it replaces on a modern server.
+        PairingController controller;
+        auto* fake = new FakeNetworkAccessManager;
+        auto* seam = new RecordingSeam;
+        wire(controller, fake);
+        controller.setSeam(seam);
+        controller.setPollIntervalMs(1);
+
+        fake->statuses = { 200, 200 };
+        fake->bodies = { authorizationBody(QString(), QStringLiteral("PREPARING")),
+                         authorizationBody(QString::fromLatin1(kPin), QStringLiteral("READY")) };
+
+        QSignalSpy granted(&controller, &PairingController::authorizationGranted);
+        QSignalSpy failed(&controller, &PairingController::pairingFailed);
+        QSignalSpy completed(&controller, &PairingController::pairingCompleted);
+
+        controller.start(QString::fromLatin1(kSessionId));
+
+        QTRY_COMPARE(completed.count(), 1);
+        QCOMPARE(failed.count(), 0);
+        // Granted exactly once - for the READY answer, never for the waiting one.
+        QCOMPARE(granted.count(), 1);
+        QCOMPARE(seam->calls, 1);
+    }
+
+    void aReadyAnswerWithAPinPairs()
+    {
+        // A 200 answer with `state: "READY"` and a PIN starts pairing as today.
+        PairingController controller;
+        auto* fake = new FakeNetworkAccessManager;
+        auto* seam = new RecordingSeam;
+        wire(controller, fake);
+        controller.setSeam(seam);
+
+        fake->statuses = { 200 };
+        fake->bodies = { authorizationBody(QString::fromLatin1(kPin), QStringLiteral("READY")) };
+
+        QSignalSpy completed(&controller, &PairingController::pairingCompleted);
+        QSignalSpy failed(&controller, &PairingController::pairingFailed);
+
+        controller.start(QString::fromLatin1(kSessionId));
+
+        QTRY_COMPARE(completed.count(), 1);
+        QCOMPARE(failed.count(), 0);
+        QCOMPARE(seam->calls, 1);
+        QCOMPARE(seam->lastTarget.pairingPin, QString::fromLatin1(kPin));
+    }
+
+    void anOlderServers409IsStillAWait()
+    {
+        // The existing 409 behaviour, for an older server that has not moved to the 200-with-
+        // state shape, is unchanged.
+        PairingController controller;
+        auto* fake = new FakeNetworkAccessManager;
+        auto* seam = new RecordingSeam;
+        wire(controller, fake);
+        controller.setSeam(seam);
+        controller.setPollIntervalMs(1);
+
+        fake->statuses = { 409, 200 };
+        fake->bodies = { conflictBody(), authorizationBody(QString::fromLatin1(kPin),
+                                                            QStringLiteral("READY")) };
+
+        QSignalSpy failed(&controller, &PairingController::pairingFailed);
+        QSignalSpy completed(&controller, &PairingController::pairingCompleted);
+
+        controller.start(QString::fromLatin1(kSessionId));
+        QTRY_COMPARE(completed.count(), 1);
+        QCOMPARE(failed.count(), 0);
+    }
+
+    void anOlderServers200WithoutStateAndNoPinPollsAgain()
+    {
+        // An answer with no `state` field at all (an older server) and a null PIN keeps today's
+        // behaviour: granted, then poll again rather than seating an empty PIN into the engine.
+        PairingController controller;
+        auto* fake = new FakeNetworkAccessManager;
+        auto* seam = new RecordingSeam;
+        wire(controller, fake);
+        controller.setSeam(seam);
+        controller.setPollIntervalMs(1);
+
+        fake->statuses = { 200, 200 };
+        fake->bodies = { authorizationBody(QString()), authorizationBody(QString::fromLatin1(kPin)) };
+
+        QSignalSpy completed(&controller, &PairingController::pairingCompleted);
+        QSignalSpy failed(&controller, &PairingController::pairingFailed);
+        controller.start(QString::fromLatin1(kSessionId));
+
+        QTRY_COMPARE(completed.count(), 1);
+        QCOMPARE(failed.count(), 0);
+        QCOMPARE(seam->calls, 1);
     }
 
     void nullPin_pollsAgainRatherThanPairingWithNothing()

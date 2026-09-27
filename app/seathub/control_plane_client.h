@@ -94,6 +94,11 @@ struct ControlPlaneResult
 struct SessionAuthorization
 {
     QString sessionId;
+    /// `SessionState` (J-16 / 06.1's ADR item 3): REQUESTED ALLOCATED PREPARING READY when the
+    /// server has one to report, empty when absent (an older server, or a schema this field has
+    /// not reached). A state in `kWaitingStates` (`pairing_controller.cpp`) means the rig is
+    /// still getting ready - a wait, not a failure - even though the HTTP status is 200.
+    QString state;
     /// The control-plane-issued pairing PIN (ADR-0034), or empty when the session has not
     /// asked to pair yet. It is handed to the engine's own pairing flow and is never shown
     /// to the customer and never written to disk (STREAM-03, D-30).

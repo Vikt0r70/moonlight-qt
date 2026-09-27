@@ -80,6 +80,10 @@ bool SessionAuthorization::parse(const QJsonObject& body, SessionAuthorization* 
 
     SessionAuthorization auth;
     auth.sessionId = body.value(QStringLiteral("session_id")).toString();
+    // J-16 / 06.1's ADR item 3: optional, absent on an older server. `toString()` already
+    // answers empty for both absent and any non-string value, which is exactly "not a waiting
+    // state" - the same reading `qualityProfile` below already relies on.
+    auth.state = body.value(QStringLiteral("state")).toString();
     // `pairing_pin` is `type: [string, "null"]` - explicitly nullable, and null means this
     // session has not asked to pair yet. Absent and null are the same thing here.
     auth.pairingPin = body.value(QStringLiteral("pairing_pin")).toString();
