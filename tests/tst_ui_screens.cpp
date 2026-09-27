@@ -3759,7 +3759,7 @@ void TstUiScreens::theStepperDrawsThreeStagesFromTheFacadesStageAndNothingElse()
     QVERIFY(sentenceOfSecond);
     QVERIFY(effectivelyVisible(sentenceOfSecond));
     QCOMPARE(sentenceOfSecond->property("text").toString(),
-             QStringLiteral("Starting Sunshine and pairing your client. Usually under a minute."));
+             QStringLiteral("Pairing your client with the rig. Usually a few seconds."));
     QObject* sentenceOfFirst = itemNamed(itemNamed(stepper.data(), QStringLiteral("stage0")),
                                          QStringLiteral("stageSentence"));
     QVERIFY(sentenceOfFirst);

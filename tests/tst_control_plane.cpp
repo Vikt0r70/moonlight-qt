@@ -24,7 +24,9 @@
 #include <QNetworkAccessManager>
 #include <QNetworkReply>
 #include <QNetworkRequest>
+#include <QRegularExpression>
 #include <QTimer>
+#include <QUuid>
 
 #include "seathub/control_plane_client.h"
 #include "seathub/countries.h"
@@ -805,6 +807,37 @@ private slots:
         QVERIFY2(second.startsWith(QByteArray("00-" + traceId.toUtf8() + "-")),
                  "the trace id is the same on every request of this Play");
         QVERIFY2(second != first, "the span differs between two requests");
+    }
+
+    void everyPlayCarriesAFreshRetryKey()
+    {
+        // ADR-0062 decision 11: every Play posts a fresh Idempotency-Key - a new uuid per press.
+        // This client makes no retry of its own; a caller that presses Play twice sends two keys.
+        ControlPlaneClient client;
+        auto* fake = new FakeNetworkAccessManager;
+        client.setNetworkAccessManager(fake);
+        fake->status = 200;
+        fake->body = okBody();
+
+        bool called = false;
+        client.requestSession([&](const ControlPlaneResult&) { called = true; });
+        QTRY_VERIFY(called);
+        const QByteArray first = fake->lastRequest.rawHeader("Idempotency-Key");
+
+        called = false;
+        client.requestSession([&](const ControlPlaneResult&) { called = true; });
+        QTRY_VERIFY(called);
+        const QByteArray second = fake->lastRequest.rawHeader("Idempotency-Key");
+
+        const QRegularExpression uuidShape(
+            QStringLiteral("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"));
+        QVERIFY2(uuidShape.match(QString::fromUtf8(first)).hasMatch(),
+                 qPrintable(QStringLiteral("not a bare uuid: %1").arg(QString::fromUtf8(first))));
+        QVERIFY2(uuidShape.match(QString::fromUtf8(second)).hasMatch(),
+                 qPrintable(QStringLiteral("not a bare uuid: %1").arg(QString::fromUtf8(second))));
+        QVERIFY(!QUuid::fromString(QString::fromUtf8(first)).isNull());
+        QVERIFY(!QUuid::fromString(QString::fromUtf8(second)).isNull());
+        QVERIFY2(first != second, "the second Play must not reuse the first Play's key");
     }
 
     void setTraceId_withAMalformedValue_isIgnored()

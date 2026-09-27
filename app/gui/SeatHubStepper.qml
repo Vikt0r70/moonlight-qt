@@ -10,7 +10,7 @@ import SeatHub.Tokens 1.0
 // third is the stream actually starting. This file only draws that number, so the stepper cannot
 // invent a stage the facade did not reach, and it never moves back because the facade never does.
 //
-//   1  Preparing the rig      waking the PC and switching it into rental mode
+//   1  Preparing the rig      getting the rig ready
 //   2  Preparing the stream   starting the streaming service and pairing this client
 //   3  Streaming              live; the window then hides
 //
@@ -42,8 +42,8 @@ Item {
     ]
 
     readonly property var stageSentences: [
-        qsTr("Waking the PC and switching it into rental mode. About 90 seconds."),
-        qsTr("Starting Sunshine and pairing your client. Usually under a minute."),
+        qsTr("Getting the rig ready. Usually a few seconds."),
+        qsTr("Pairing your client with the rig. Usually a few seconds."),
         ""
     ]
 

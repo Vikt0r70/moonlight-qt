@@ -253,11 +253,75 @@ private slots:
         qRegisterMetaType<SeatHubFailure>("SeatHubFailure");
     }
 
-    void constants_areTheLockedValues()
+    void theDefaultsAre30sAnd1s()
     {
-        // D-08: 250 ms poll, 90 s deadline. Neither is the client's to choose.
-        QCOMPARE(PairingController::kPollIntervalMs, 250);
-        QCOMPARE(PairingController::kDeadlineMs, 90000);
+        // 06.1's ADR item R1: 30 s from READY. J-16: 1 s. Neither is the client's to choose.
+        QCOMPARE(PairingController::kPollIntervalMs, 1000);
+        QCOMPARE(PairingController::kDeadlineMs, 30000);
+
+        // And a fresh controller actually holds them, before `setDeadlineMs`/`setPollIntervalMs`
+        // (the test-only overrides used everywhere else in this file) ever run.
+        PairingController controller;
+        QCOMPARE(controller.pollIntervalMs(), 1000);
+        QCOMPARE(controller.deadlineMs(), 30000);
+    }
+
+    void theClockCountsFromReady()
+    {
+        // R1: the clock is scoped to a pairing resolving once the rig is READY, not to the rig
+        // getting ready. A run of waiting answers restarts it on every "not yet" - the same rule
+        // `conflict_doesNotSpendThePairingDeadline` already holds for the 409 shape - and it
+        // must still pair once READY with a PIN finally arrives, however long the wait ran.
+        {
+            PairingController controller;
+            auto* fake = new FakeNetworkAccessManager;
+            auto* seam = new RecordingSeam;
+            wire(controller, fake);
+            controller.setSeam(seam);
+            controller.setPollIntervalMs(20);
+            controller.setDeadlineMs(100);
+
+            // Each poll spends two replies; forty waiting answers is about 400 ms of "not ready",
+            // several times the 100 ms deadline under test - and it must still pair.
+            for (int i = 0; i < 40; ++i) {
+                fake->statuses.append(200);
+                fake->bodies.append(authorizationBody(QString(), QStringLiteral("PREPARING")));
+            }
+            fake->statuses.append(200);
+            fake->bodies.append(authorizationBody(QString::fromLatin1(kPin), QStringLiteral("READY")));
+
+            QSignalSpy failed(&controller, &PairingController::pairingFailed);
+            QSignalSpy completed(&controller, &PairingController::pairingCompleted);
+
+            controller.start(QString::fromLatin1(kSessionId));
+            QTRY_COMPARE_WITH_TIMEOUT(completed.count(), 1, 5000);
+            QCOMPARE(failed.count(), 0);
+            QCOMPARE(seam->calls, 1);
+        }
+
+        // A READY answer with no PIN pending is not the rig getting ready - it is a pairing that
+        // has not resolved - so it does spend this clock, and fails closed with the timed-out
+        // sentence once the deadline passes.
+        {
+            PairingController controller;
+            auto* fake = new FakeNetworkAccessManager;
+            auto* seam = new RecordingSeam;
+            wire(controller, fake);
+            controller.setSeam(seam);
+            controller.setPollIntervalMs(1);
+            controller.setDeadlineMs(1);
+
+            fake->statuses = { 200 };
+            fake->bodies = { authorizationBody(QString(), QStringLiteral("READY")) };
+
+            QSignalSpy failed(&controller, &PairingController::pairingFailed);
+            controller.start(QString::fromLatin1(kSessionId));
+
+            QTRY_COMPARE(failed.count(), 1);
+            const SeatHubFailure failure = failed.at(0).at(0).value<SeatHubFailure>();
+            QCOMPARE(failure.error, QStringLiteral("The rig didn't finish connecting. Try again."));
+            QCOMPARE(seam->calls, 0);
+        }
     }
 
     void happyPath_authorizesThenPairsAndNeverInvolvesTheCustomer()

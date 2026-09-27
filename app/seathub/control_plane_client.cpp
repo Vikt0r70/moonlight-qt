@@ -11,6 +11,7 @@
 #include <QRegularExpression>
 #include <QThread>
 #include <QUrl>
+#include <QUuid>
 
 namespace {
 
@@ -787,7 +788,8 @@ void ControlPlaneClient::stopOwnedThread()
 // ---------------------------------------------------------------- transport
 
 void ControlPlaneClient::send(const QString& method, const QString& path, const QByteArray& body,
-                             bool authenticated, Callback callback)
+                             bool authenticated, Callback callback,
+                             const QHash<QByteArray, QByteArray>& extraHeaders)
 {
     // WR-01: the access token and the trace id are captured here, at call time, under the same
     // lock `setAccessToken`/`setTraceId`/`clearTraceId` take - not read from the member again once
@@ -818,20 +820,24 @@ void ControlPlaneClient::send(const QString& method, const QString& path, const 
     if (QThread::currentThread() != thread()) {
         QMetaObject::invokeMethod(
             this,
-            [this, method, path, body, authenticated, accessToken, traceId, callback]() {
-                sendOnOwningThread(method, path, body, authenticated, accessToken, traceId, callback);
+            [this, method, path, body, authenticated, accessToken, traceId, callback,
+             extraHeaders]() {
+                sendOnOwningThread(method, path, body, authenticated, accessToken, traceId,
+                                   callback, extraHeaders);
             },
             Qt::QueuedConnection);
         return;
     }
 
-    sendOnOwningThread(method, path, body, authenticated, accessToken, traceId, callback);
+    sendOnOwningThread(method, path, body, authenticated, accessToken, traceId, callback,
+                       extraHeaders);
 }
 
 void ControlPlaneClient::sendOnOwningThread(const QString& method, const QString& path,
                                             const QByteArray& body, bool authenticated,
                                             const QString& accessToken, const QString& traceId,
-                                            Callback callback)
+                                            Callback callback,
+                                            const QHash<QByteArray, QByteArray>& extraHeaders)
 {
     QUrl url(m_baseUrl + path);
     QNetworkRequest request(url);
@@ -849,6 +855,10 @@ void ControlPlaneClient::sendOnOwningThread(const QString& method, const QString
                              QByteArrayLiteral("00-") + traceId.toUtf8()
                                  + QByteArrayLiteral("-") + randomHex16().toUtf8()
                                  + QByteArrayLiteral("-01"));
+    }
+
+    for (auto it = extraHeaders.constBegin(); it != extraHeaders.constEnd(); ++it) {
+        request.setRawHeader(it.key(), it.value());
     }
 
     QNetworkReply* reply = nullptr;
@@ -966,8 +976,12 @@ void ControlPlaneClient::fetchUsage(Callback callback)
 
 void ControlPlaneClient::requestSession(Callback callback)
 {
+    // ADR-0062 decision 11: every Play posts a fresh Idempotency-Key - a new uuid per press,
+    // never reused. A retry of the same press is the caller's to make with the same key; this
+    // client makes none of its own.
     send(QStringLiteral("POST"), QStringLiteral("/api/sessions"),
-         buildSessionCreate(), true, callback);
+         buildSessionCreate(), true, callback,
+         { { "Idempotency-Key", QUuid::createUuid().toString(QUuid::WithoutBraces).toUtf8() } });
 }
 
 void ControlPlaneClient::fetchSession(const QString& sessionId, Callback callback)

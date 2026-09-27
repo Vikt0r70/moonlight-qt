@@ -45,6 +45,7 @@
 // is moved onto a thread with its own running event loop for the duration of a stream; the
 // accessors below are safe to call from any thread.
 
+#include <QHash>
 #include <QJsonObject>
 #include <QList>
 #include <QMutex>
@@ -510,14 +511,19 @@ signals:
     void transportFailed(const QString& message);
 
 private:
+    /// `extraHeaders` rides alongside the standard `Authorization`/`traceparent` headers - today
+    /// only `requestSession()`'s `Idempotency-Key` (ADR-0062 decision 11) uses it. Defaulted so
+    /// every other call site is unaffected.
     void send(const QString& method, const QString& path, const QByteArray& body,
-              bool authenticated, Callback callback);
+              bool authenticated, Callback callback,
+              const QHash<QByteArray, QByteArray>& extraHeaders = {});
     /// The rest of what `send()` used to do after its thread marshal, now taking the access token
     /// and trace id as parameters captured at `send()`'s own call time (WR-01) instead of reading
     /// `m_accessToken`/`m_traceId` again here, on whichever thread this runs on.
     void sendOnOwningThread(const QString& method, const QString& path, const QByteArray& body,
                             bool authenticated, const QString& accessToken, const QString& traceId,
-                            Callback callback);
+                            Callback callback,
+                            const QHash<QByteArray, QByteArray>& extraHeaders = {});
     void finishReply(QNetworkReply* reply, Callback callback);
 
     QNetworkAccessManager* m_network = nullptr;

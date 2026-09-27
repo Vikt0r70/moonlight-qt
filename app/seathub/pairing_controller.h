@@ -72,11 +72,14 @@ public:
 //   * This client hands the same PIN to upstream's pairing flow and waits for the handshake.
 //     The two halves meet at the PIN.
 //
-// The deadline is 90 s (D-08), counted from `start()` or from the last 409 "not pairable yet",
+// The deadline is 30 s (06.1's ADR item R1), counted from `start()` or from the last waiting
+// answer - a 409, or a 200 whose `state` is REQUESTED, ALLOCATED or PREPARING (J-16) -
 // whichever is later: the rig's preparation is bounded by the server's own readiness deadline,
-// not by this one (2026-09-23). At expiry the controller fails closed with a
-// SeatHub error, which the error screen renders with a reason, a retry and an `SH-` reference
-// - never a Moonlight dialog (ADR-0008, D-51).
+// not by this one (2026-09-23). This clock now bounds only a pairing resolving once the rig is
+// READY; the server's own CONNECT lease deadline (60 s from READY) is sized around it, giving a
+// pairing that starts the moment READY arrives room to finish well inside the lease. At expiry
+// the controller fails closed with a SeatHub error, which the error screen renders with a
+// reason, a retry and an `SH-` reference - never a Moonlight dialog (ADR-0008, D-51).
 class PairingController : public QObject
 {
     Q_OBJECT
@@ -85,17 +88,23 @@ class PairingController : public QObject
     Q_PROPERTY(QString state READ state NOTIFY stateChanged)
 
 public:
-    /// D-08's locked poll interval, which the Node Agent uses against Sunshine. The client's
-    /// authorization poll matches it: the whole window has to fit inside the 90 s deadline, and
-    /// a slower client poll would spend the deadline before asking.
-    static const int kPollIntervalMs = 250;
-    /// D-08's locked deadline for a pairing to resolve.
-    static const int kDeadlineMs = 90000;
+    /// J-16: the client's authorization poll backs off from D-08's original 250 ms to 1 s -
+    /// waiting is no longer urgent now that the rig-preparing wait arrives as its own 200
+    /// answer (`kWaitingStates`, `pairing_controller.cpp`) rather than sharing this clock.
+    static const int kPollIntervalMs = 1000;
+    /// 06.1's ADR item R1: 30 s, counted from READY, for a pairing to resolve - replacing D-08's
+    /// 90 s now that the rig getting ready no longer spends this clock at all (see the class
+    /// comment above).
+    static const int kDeadlineMs = 30000;
 
     explicit PairingController(QObject* parent = nullptr);
 
     QString state() const { return m_state; }
     QString sessionId() const { return m_sessionId; }
+    /// Test accessor: what a fresh controller actually holds, before any override below runs.
+    int pollIntervalMs() const { return m_pollIntervalMs; }
+    /// Test accessor: see `pollIntervalMs()`.
+    int deadlineMs() const { return m_deadlineMs; }
 
     void setControlPlane(ControlPlaneClient* client);
     void setSeam(PairingSeam* seam);
