@@ -251,6 +251,25 @@ void applyTelemetryResult(const ControlPlaneResult& result)
     }
 }
 
+// 06.1's ADR item 4 / J-22: the guard-claim-and-teardown sequence
+// `SeatHubClient::endAttachedSessionBeforeStream()` already runs for a pre-stream failure with no
+// report to add, now carrying one - shared by `handlePairingFailed()`, the no-engine branch of
+// `handlePairingCompleted()`, and `handleStageFailed()`'s pre-stream branch. A free function taking
+// the exact pieces `endAttachedSessionBeforeStream()` itself reads (`seathub_client.h` is not part
+// of this plan's touched files, so this is not a new declared member): `TeardownController` and
+// `SessionTeardownGuard` already expose the public API this needs.
+void endPreStreamSessionWithReport(SessionTeardownGuard& guard, TeardownController* teardown,
+                                   const QString& sessionId, const QString& clientUuid,
+                                   const EndReport& report)
+{
+    if (guard.markStarted()) {
+        teardown->teardown(sessionId, clientUuid, true, report);
+    }
+    // else: this session's teardown was already claimed - by `handleReadyForDeletion()` or by an
+    // earlier call here for the same session - and is already running (T-06.6-50); see
+    // `endAttachedSessionBeforeStream()`'s own comment.
+}
+
 } // namespace
 
 // Control-plane callbacks arrive on the network thread once `startNetworkThreads()` has moved the
@@ -1790,6 +1809,24 @@ void SeatHubClient::handleStageFailed(const QString& stage, int errorCode, const
     // the engine was in, and says so in the deck's words rather than sending them to the error view.
     if (connectingSession()) {
         raiseConnectFailure(mapStageFailure(stage, errorCode, failingPorts));
+        // 06.1's ADR item 4 / J-22: the server needs what the engine just told us, now - not only
+        // at `handleReadyForDeletion()`'s later, report-less teardown - so it can attribute blame.
+        // `report.stage` is `connecting` (D-11: this is a stage failure inside stage 2, never
+        // `pairing`, which already succeeded for the engine to have started at all); `engineStage`
+        // is moonlight-common-c's own stage name, exactly as `m_liveness->reportFailure()` above
+        // just reported it - `hasEngineError` is set unconditionally the same way, because this
+        // 3-argument overload is only ever called with a real platform code.
+        if (inControlPlaneSession()) {
+            setAttachedSessionEnded(true);
+            EndReport report;
+            report.stage = QStringLiteral("connecting");
+            report.engineStage = stage;
+            report.hasEngineError = true;
+            report.engineError = errorCode;
+            report.failingPorts = failingPorts;
+            endPreStreamSessionWithReport(m_teardownGuard, m_teardown, m_sessionId, m_clientUuid,
+                                          report);
+        }
         return;
     }
     raiseFailure(mapStageFailure(stage, errorCode, failingPorts));
@@ -2310,8 +2347,16 @@ void SeatHubClient::handlePairingCompleted(const QString& clientUuid)
         // with `failed: true`, rather than leaving it for Try again to discover. Queued onto the
         // network thread right after the report/stop above (both of which self-marshal there too,
         // being called from this - the facade - thread), so the server records the pairing-stage
-        // report before it sees the cancel.
-        endAttachedSessionBeforeStream(true);
+        // report before it sees the cancel. 06.1's ADR item 4 / J-22: connecting is what actually
+        // failed here (pairing itself succeeded), so the report tells the server that, the same
+        // stage `m_liveness->setStage()` would have moved to next.
+        if (inControlPlaneSession()) {
+            setAttachedSessionEnded(true);
+            EndReport report;
+            report.stage = QStringLiteral("connecting");
+            endPreStreamSessionWithReport(m_teardownGuard, m_teardown, m_sessionId, m_clientUuid,
+                                          report);
+        }
         // WR-01: this Play is over here, at the start refusal - the next one mints its own id.
         // `reportFailure()` above re-invoked itself onto `m_liveness`'s own (network) thread,
         // because this handler runs on the facade thread; a plain, synchronous `clearTraceId()`
@@ -2457,8 +2502,16 @@ void SeatHubClient::handlePairingFailed(const SeatHubFailure& failure)
     // rather than leaving a dead session for Try again to discover. Queued onto the network
     // thread right after the report/stop above, so the server records the pairing-stage report
     // before it sees the cancel; this must run before the trace-id clear below, which is
-    // marshalled onto the same thread and must not overtake it.
-    endAttachedSessionBeforeStream(true);
+    // marshalled onto the same thread and must not overtake it. 06.1's ADR item 4 / J-22: this is
+    // exactly the stage `m_liveness->reportFailure()` above just reported, so the same stage name
+    // rides the end body too.
+    if (inControlPlaneSession()) {
+        setAttachedSessionEnded(true);
+        EndReport report;
+        report.stage = QStringLiteral("pairing");
+        endPreStreamSessionWithReport(m_teardownGuard, m_teardown, m_sessionId, m_clientUuid,
+                                      report);
+    }
     // WR-01: this Play is over here, at the pairing failure - the next one mints its own id. See
     // `clearThisPlaysTraceIdAfterAnyQueuedLivenessReport()`'s own comment for why this is not a
     // plain `clearTraceId()` call.
@@ -2638,6 +2691,23 @@ void SeatHubClient::handleTeardownCompleted(const SessionInfo& finalSession)
     // is not.
     if (!finalSession.endReason.isEmpty()) {
         setEndReasonText(endReasonSentence(finalSession.endReason, finalSession.minutesBilled));
+    }
+
+    // 06.1's ADR item 4 / J-22: the connecting view already showed the client's own best guess the
+    // moment connecting stopped (`raiseConnectFailure()`, at the stage or pairing failure itself) -
+    // this terminal read is the server's verdict, arriving after. When it names a blame for this
+    // exact CONNECT_FAILED ending, it replaces what the customer reads with copy.md's blame
+    // sentence and the server's own SH- reference. `raiseConnectFailure()` itself would no-op here
+    // (`m_connectFailed` is already true, and rightly so elsewhere - it is what stops a LATER
+    // failure from overwriting the FIRST one the customer read), so this writes `m_failure` and
+    // `m_stalledReasonText` directly instead. Any other end reason keeps whatever
+    // `raiseConnectFailure()` already showed.
+    if (m_connectFailed && finalSession.endReason == QLatin1String("CONNECT_FAILED")) {
+        const SeatHubFailure blamed = mapEndBlame(finalSession.endBlame, finalSession.endReference);
+        m_failure = blamed.toVariantMap();
+        m_stalledReasonText = blamed.error.toHtmlEscaped();
+        emit failureChanged();
+        emit connectFailedChanged();
     }
 
     m_liveness->stop();

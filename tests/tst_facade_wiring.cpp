@@ -276,9 +276,12 @@ public:
 
     /// What `GET /api/sessions/{id}` answers: the session in `state`, under `id`, with an end reason
     /// and a billed-minutes count when given. The default is a terminal session under another id,
-    /// which teardown's verification wants and the connecting stages ignore.
+    /// which teardown's verification wants and the connecting stages ignore. `endBlame` and
+    /// `endReference` (06.1's ADR item 4, J-22) ride the same optional-when-empty rule as
+    /// `endReason` - a session with no blame at all sends neither.
     void answerSession(const QString& id, const QString& state, const QString& endReason = QString(),
-                       int minutesBilled = 0)
+                       int minutesBilled = 0, const QString& endBlame = QString(),
+                       const QString& endReference = QString())
     {
         QMutexLocker lock(&m_mutex);
         QJsonObject object;
@@ -290,6 +293,12 @@ public:
         object.insert(QStringLiteral("requested_at"), QStringLiteral("2026-09-19T00:00:00Z"));
         if (!endReason.isEmpty()) {
             object.insert(QStringLiteral("end_reason"), endReason);
+        }
+        if (!endBlame.isEmpty()) {
+            object.insert(QStringLiteral("end_blame"), endBlame);
+        }
+        if (!endReference.isEmpty()) {
+            object.insert(QStringLiteral("end_reference"), endReference);
         }
         m_sessionBody = QJsonDocument(object).toJson(QJsonDocument::Compact);
     }
@@ -2979,8 +2988,12 @@ private slots:
 
         QTRY_VERIFY_WITH_TIMEOUT(
             m_fake->requestPaths().contains(QStringLiteral("/api/sessions/s-stages/end")), 15000);
-        QCOMPARE(m_fake->bodyFor(QStringLiteral("/api/sessions/s-stages/end")),
-                 QByteArrayLiteral("{\"failed\":true}"));
+        // 06.1's ADR item 4 / J-22: the end body now also carries the stage this failed at -
+        // `aPairingFailureReportsItsStage()` is the dedicated test for that; this only needs
+        // `failed` still there, unaffected by the addition.
+        const QJsonObject endBody = QJsonDocument::fromJson(
+            m_fake->bodyFor(QStringLiteral("/api/sessions/s-stages/end"))).object();
+        QCOMPARE(endBody.value(QStringLiteral("failed")).toBool(), true);
 
         // The connecting failure view stays on screen: the teardown completing does not carry the
         // customer away from what they are reading (C2's own contract).
@@ -3004,9 +3017,101 @@ private slots:
         QCOMPARE(client.appState(), QStringLiteral("error"));
         QTRY_VERIFY_WITH_TIMEOUT(
             m_fake->requestPaths().contains(QStringLiteral("/api/sessions/s-stages/end")), 15000);
-        QCOMPARE(m_fake->bodyFor(QStringLiteral("/api/sessions/s-stages/end")),
-                 QByteArrayLiteral("{\"failed\":true}"));
+        // 06.1's ADR item 4 / J-22: the end body now also carries the stage this failed at
+        // ("connecting" - pairing itself succeeded); `failed` is unaffected by the addition.
+        const QJsonObject endBody = QJsonDocument::fromJson(
+            m_fake->bodyFor(QStringLiteral("/api/sessions/s-stages/end"))).object();
+        QCOMPARE(endBody.value(QStringLiteral("failed")).toBool(), true);
         QTRY_VERIFY_WITH_TIMEOUT(!client.liveSession(), 15000);
+    }
+
+    // --- 06.1's ADR item 4 / J-22: the report goes up, the blame comes back ---------------------
+
+    void aPairingFailureReportsItsStage()
+    {
+        SeatHubClient client;
+        beginStagedSession(client);
+        QVERIFY(!QTest::currentTestFailed());
+        client.teardown()->setVerifyIntervalMs(1);
+        m_fake->answerSession(QStringLiteral("s-stages"), QStringLiteral("CANCELLED"));
+
+        emit client.pairing()->pairingFailed(
+            SeatHubFailure::local(QStringLiteral("The rig didn't finish connecting. Try again.")));
+
+        QTRY_VERIFY_WITH_TIMEOUT(
+            m_fake->requestPaths().contains(QStringLiteral("/api/sessions/s-stages/end")), 15000);
+        const QJsonObject sent = QJsonDocument::fromJson(
+            m_fake->bodyFor(QStringLiteral("/api/sessions/s-stages/end"))).object();
+        QCOMPARE(sent.value(QStringLiteral("failed")).toBool(), true);
+        QCOMPARE(sent.value(QStringLiteral("stage")).toString(), QStringLiteral("pairing"));
+    }
+
+    void aStageFailureReportsItsEngineCodeAndPorts()
+    {
+        auto* engine = new FakeEngineSession;
+        {
+            SeatHubClient client;
+            client.session()->attachSession(engine);
+            beginStagedSession(client);
+            QVERIFY(!QTest::currentTestFailed());
+            client.teardown()->setVerifyIntervalMs(1);
+            m_fake->answerSession(QStringLiteral("s-stages"), QStringLiteral("CANCELLED"));
+
+            emit engine->stageStarting(QStringLiteral("RTSP handshake"));
+            emit engine->stageFailed(QStringLiteral("RTSP handshake"), -102,
+                                     QStringLiteral("UDP 47998"));
+
+            QVERIFY(client.connectFailed());
+            QTRY_VERIFY_WITH_TIMEOUT(
+                m_fake->requestPaths().contains(QStringLiteral("/api/sessions/s-stages/end")), 15000);
+            const QJsonObject sent = QJsonDocument::fromJson(
+                m_fake->bodyFor(QStringLiteral("/api/sessions/s-stages/end"))).object();
+            QCOMPARE(sent.value(QStringLiteral("failed")).toBool(), true);
+            // D-11: the stage is `connecting` here, not the engine's own stage name - pairing
+            // already succeeded for the engine to have started at all.
+            QCOMPARE(sent.value(QStringLiteral("stage")).toString(), QStringLiteral("connecting"));
+            QCOMPARE(sent.value(QStringLiteral("engine_stage")).toString(),
+                     QStringLiteral("RTSP handshake"));
+            QCOMPARE(sent.value(QStringLiteral("engine_error")).toInt(), -102);
+            QCOMPARE(sent.value(QStringLiteral("failing_ports")).toString(),
+                     QStringLiteral("UDP 47998"));
+            // The engine's own stage name never becomes customer-facing copy (D-51) - it only
+            // rides the diagnostic end body the server sees.
+            verifyNoInternalNameIsShown(client);
+
+            client.session()->attachSession(nullptr);
+        }
+        delete engine;
+    }
+
+    void theFailureScreenShowsTheServersBlameAndReference()
+    {
+        SeatHubClient client;
+        beginStagedSession(client);
+        QVERIFY(!QTest::currentTestFailed());
+        client.teardown()->setVerifyIntervalMs(1);
+
+        // The client's own best guess, shown at once when connecting stopped.
+        emit client.pairing()->pairingFailed(
+            SeatHubFailure::local(QStringLiteral("The rig didn't finish connecting. Try again.")));
+        QVERIFY(client.connectFailed());
+
+        // The server's verdict, arriving on the terminal read teardown ends on: this exact
+        // CONNECT_FAILED ending, blamed on the connection, with the server's own reference.
+        m_fake->answerSession(QStringLiteral("s-stages"), QStringLiteral("CANCELLED"),
+                             QStringLiteral("CONNECT_FAILED"), 0, QStringLiteral("connection"),
+                             QStringLiteral("SH-4F7KQ2"));
+
+        QTRY_COMPARE_WITH_TIMEOUT(
+            client.failure().value(QStringLiteral("error")).toString(),
+            QStringLiteral("Your connection couldn't reach the rig, so the stream didn't start. "
+                           "You were not charged."),
+            15000);
+        QCOMPARE(client.reference(), QStringLiteral("SH-4F7KQ2"));
+        // The view still reads the same two properties `ConnectingScreen.qml` renders.
+        QCOMPARE(client.stalledReasonText(),
+                 QStringLiteral("Your connection couldn't reach the rig, so the stream didn't start. "
+                                "You were not charged."));
     }
 
     void aSecondFailureDoesNotEndTwice()
