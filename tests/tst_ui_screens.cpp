@@ -304,7 +304,14 @@ class FakeShellClient : public QObject
     Q_PROPERTY(bool balanceStale READ balanceStale NOTIFY balanceChanged)
     Q_PROPERTY(QVariantList countries READ countries CONSTANT)
     Q_PROPERTY(QString defaultCountryCode READ defaultCountryCode CONSTANT)
-    Q_PROPERTY(bool animationEffects READ animationEffects CONSTANT)
+    // 06.4-15 Task 3: settable now (was CONSTANT-false), so `theBalancePillPulsesOnALiveChange`'s
+    // positive case can switch it on; every existing slot's default (false) is unchanged, so their
+    // instant reveals keep working exactly as before.
+    Q_PROPERTY(bool animationEffects READ animationEffects NOTIFY animationEffectsChanged)
+    // D-04, ADR-0067.
+    Q_PROPERTY(bool liveUpdatesPaused READ liveUpdatesPaused NOTIFY liveUpdatesPausedChanged)
+    // D-07, ADR-0067.
+    Q_PROPERTY(bool signedOutNotice READ signedOutNotice NOTIFY signedOutNoticeChanged)
     Q_PROPERTY(bool liveSession READ liveSession NOTIFY liveSessionChanged)
     Q_PROPERTY(int connectStage READ connectStage NOTIFY connectStageChanged)
     Q_PROPERTY(bool connectFailed READ connectFailed NOTIFY connectFailedChanged)
@@ -458,8 +465,31 @@ public:
 
     QVariantList countries() const { return bundledCountries(); }
     QString defaultCountryCode() const { return QStringLiteral("JO"); }
-    // Off: the field's reveal is instant, so a test reads the end state without waiting on a timer.
-    bool animationEffects() const { return false; }
+    // Off by default: every existing slot's reveal is instant, so a test reads the end state
+    // without waiting on a timer. Settable (06.4-15 Task 3) so `theBalancePillPulsesOnALiveChange`
+    // can switch it on for its one positive case.
+    bool animationEffects() const { return m_animationEffects; }
+    void setAnimationEffects(bool enabled)
+    {
+        m_animationEffects = enabled;
+        emit animationEffectsChanged();
+    }
+
+    // D-04, ADR-0067.
+    bool liveUpdatesPaused() const { return m_liveUpdatesPaused; }
+    void setLiveUpdatesPaused(bool paused)
+    {
+        m_liveUpdatesPaused = paused;
+        emit liveUpdatesPausedChanged();
+    }
+
+    // D-07, ADR-0067.
+    bool signedOutNotice() const { return m_signedOutNotice; }
+    void setSignedOutNotice(bool showing)
+    {
+        m_signedOutNotice = showing;
+        emit signedOutNoticeChanged();
+    }
 
     qint64 balanceMinutes() const { return m_balanceMinutes; }
     QString balanceText() const { return m_balanceText; }
@@ -575,6 +605,9 @@ signals:
     void accountChanged();
     void totalsChanged();
     void balanceChanged();
+    void animationEffectsChanged();
+    void liveUpdatesPausedChanged();
+    void signedOutNoticeChanged();
     void connectStageChanged();
     void connectFailedChanged();
     void reconnectingChanged();
@@ -596,6 +629,9 @@ private:
     qint64 m_balanceMinutes = -1;
     QString m_balanceText;
     bool m_balanceStale = false;
+    bool m_animationEffects = false;
+    bool m_liveUpdatesPaused = false;
+    bool m_signedOutNotice = false;
     QString m_homeStatus = QStringLiteral("ready");
     QString m_endReasonText;
     QString m_identity = QStringLiteral("+962 7 0001 0002");
@@ -756,6 +792,10 @@ private slots:
     void theShellGivesEverySignedInViewTheHeaderAndNeitherSignInNorTheSplash();
     void balancePillDrawsEachOfItsStates();
     void balancePillChangesColourExactlyAtTheSpecsThresholds();
+    void theBalancePillShowsTheLiveUpdatesIndicatorWhilePaused();
+    void theBalancePillPulsesOnALiveChange();
+    void theSignedOutNoticeShowsOverWhicheverScreenIsCurrent();
+    void theMainWindowHostsTheSignedOutNotice();
     void menuHasItsThreeItemsAndTopUpAsksTheFacadeForTheWebsite();
     void menuPopupIsWideEnoughToShowItsThreeItems();
     void theProfileIsRoutedAsAViewInsideHomeAndHomeNoLongerSignsOut();
@@ -884,6 +924,7 @@ void TstUiScreens::everyShellScreenLoads()
                               QStringLiteral("SeatHubReadOnlyRow.qml"),
                               QStringLiteral("AgentConfigPanel.qml"),
                               QStringLiteral("BalancePill.qml"),
+                              QStringLiteral("SignedOutNotice.qml"),
                               QStringLiteral("AppHeader.qml"),
                               QStringLiteral("SeatHubMenu.qml"),
                               QStringLiteral("RestoreSplash.qml"),
@@ -1548,6 +1589,146 @@ void TstUiScreens::balancePillChangesColourExactlyAtTheSpecsThresholds()
     client.setBalance(-1, QString(), false);
     QVERIFY(pill->property("loading").toBool());
     QVERIFY(!findVisibleTextItem(pill.data(), QStringLiteral("Unavailable")));
+}
+
+void TstUiScreens::theBalancePillShowsTheLiveUpdatesIndicatorWhilePaused()
+{
+    // D-04, ADR-0067, ui.md §7 "Live-updates indicator".
+    QQuickStyle::setStyle(QStringLiteral("Basic"));
+    QQmlEngine engine;
+    registerTokenSingletons(&engine);
+
+    FakeShellClient client;
+    QString error;
+    QScopedPointer<QObject> pill(instantiate(&engine, QStringLiteral("BalancePill.qml"), &error));
+    QVERIFY2(pill, qPrintable(error));
+    QVERIFY(pill->setProperty("client", QVariant::fromValue(static_cast<QObject*>(&client))));
+    client.setBalance(135, QStringLiteral("2 h 15 min"), false);
+
+    QVERIFY2(!pill->property("paused").toBool(), "hidden by default");
+    QVERIFY(!findVisibleTextItem(pill.data(), QStringLiteral("Reconnecting to live updates…")));
+    QObject* dot = pill->findChild<QObject*>(QStringLiteral("liveUpdatesDot"));
+    QVERIFY(dot);
+    QVERIFY2(!effectivelyVisible(dot), "the warn dot must be hidden by default too");
+
+    client.setLiveUpdatesPaused(true);
+    QVERIFY(pill->property("paused").toBool());
+    QVERIFY2(findVisibleTextItem(pill.data(), QStringLiteral("Reconnecting to live updates…")),
+             "the indicator's own sentence must show while paused");
+    QVERIFY2(effectivelyVisible(dot), "a warn dot must show beside it - colour is never alone (§9)");
+    QCOMPARE(dot->property("color").value<QColor>(), QColor(QStringLiteral("#f59e0b")));
+
+    client.setLiveUpdatesPaused(false);
+    QVERIFY2(!pill->property("paused").toBool(), "gone the moment it is live again");
+    QVERIFY(!findVisibleTextItem(pill.data(), QStringLiteral("Reconnecting to live updates…")));
+    QVERIFY(!effectivelyVisible(dot));
+}
+
+void TstUiScreens::theBalancePillPulsesOnALiveChange()
+{
+    // D-05, ADR-0067: one opacity pulse, never on the first known value, never for an unchanged
+    // value, never with animation effects off.
+    QQuickStyle::setStyle(QStringLiteral("Basic"));
+    QQmlEngine engine;
+    registerTokenSingletons(&engine);
+
+    FakeShellClient client;
+    client.setAnimationEffects(true);
+    QString error;
+    QScopedPointer<QObject> pill(instantiate(&engine, QStringLiteral("BalancePill.qml"), &error));
+    QVERIFY2(pill, qPrintable(error));
+    QVERIFY(pill->setProperty("client", QVariant::fromValue(static_cast<QObject*>(&client))));
+
+    QObject* pulse = pill->findChild<QObject*>(QStringLiteral("balancePulse"));
+    QVERIFY(pulse);
+
+    // The first known value: nothing to compare it against yet.
+    client.setBalance(90, QStringLiteral("1 h 30 min"), false);
+    QVERIFY2(!pulse->property("running").toBool(), "the first value must never pulse");
+
+    // The same value again, from a second read that answered no differently.
+    client.setBalance(90, QStringLiteral("1 h 30 min"), false);
+    QVERIFY2(!pulse->property("running").toBool(), "an unchanged value must never pulse");
+
+    // A genuine change: one pulse.
+    client.setBalance(75, QStringLiteral("1 h 15 min"), false);
+    QVERIFY2(pulse->property("running").toBool(), "a live change must pulse");
+
+    // With animation effects off, a genuine change never pulses.
+    pulse->setProperty("running", false);
+    client.setAnimationEffects(false);
+    client.setBalance(60, QStringLiteral("1 h"), false);
+    QVERIFY2(!pulse->property("running").toBool(),
+             "animation effects off must suppress the pulse the same way it suppresses every "
+             "other reveal in this client");
+}
+
+void TstUiScreens::theSignedOutNoticeShowsOverWhicheverScreenIsCurrent()
+{
+    // D-07, ADR-0067, the owner's design A-87; ui.md §7 "Signed-out notice".
+    QQuickStyle::setStyle(QStringLiteral("Basic"));
+    QQmlEngine engine;
+    registerTokenSingletons(&engine);
+
+    FakeShellClient client;
+    QString error;
+    QScopedPointer<QObject> notice(
+        instantiate(&engine, QStringLiteral("SignedOutNotice.qml"), &error));
+    QVERIFY2(notice, qPrintable(error));
+    QVERIFY(notice->setProperty("client", QVariant::fromValue(static_cast<QObject*>(&client))));
+
+    QObject* panel = notice->findChild<QObject*>(QStringLiteral("signedOutPanel"));
+    QVERIFY(panel);
+
+    QVERIFY2(!effectivelyVisible(panel), "hidden by default");
+    QVERIFY(!findVisibleTextItem(notice.data(), QStringLiteral("You were signed out.")));
+
+    client.setSignedOutNotice(true);
+    QVERIFY(effectivelyVisible(panel));
+    QVERIFY2(findVisibleTextItem(notice.data(), QStringLiteral("You were signed out.")),
+             "copy.md's own sentence, verbatim");
+
+    // Never dismissible, never blocking: no button, no MouseArea anywhere in the tree.
+    for (QObject* item : notice->findChildren<QObject*>()) {
+        QVERIFY2(!item->inherits("QQuickButton"), "the notice has no dismiss control");
+        QVERIFY2(!item->inherits("QQuickMouseArea"),
+                 "the notice must never take input from the screen under it");
+    }
+
+    client.setSignedOutNotice(false);
+    QVERIFY(!effectivelyVisible(panel));
+}
+
+void TstUiScreens::theMainWindowHostsTheSignedOutNotice()
+{
+    // `main.qml` instantiates the real SeatHubClient, which only the application registers, so it
+    // is read as source - the same technique `theShellRoutesTheRestoreStateToTheSplashNotToSignIn`
+    // already uses.
+    const QString source = readSource(guiDir() + QStringLiteral("/main.qml"));
+    QVERIFY2(!source.isEmpty(), "main.qml must be readable");
+
+    const int noticeStart = source.indexOf(QStringLiteral("\n    SignedOutNotice {"));
+    QVERIFY2(noticeStart >= 0,
+             "SignedOutNotice must be a direct child of the ApplicationWindow, at "
+             "ForcedUpdateModal's own four-space indentation");
+
+    const int blockClose = source.indexOf(QStringLiteral("\n    }"), noticeStart);
+    QVERIFY2(blockClose > noticeStart, "the SignedOutNotice block must have its own closing brace");
+    const QString block = source.mid(noticeStart, blockClose - noticeStart);
+    QVERIFY2(block.contains(QStringLiteral("client: seatHub")),
+             "the notice must read the same facade every other view does");
+
+    // Outside the Loader, and before the forced-update modal (which must still cover everything).
+    const int loaderIndex = source.indexOf(QStringLiteral("id: viewLoader"));
+    const int modalIndex = source.indexOf(QStringLiteral("ForcedUpdateModal {"));
+    QVERIFY(loaderIndex >= 0);
+    QVERIFY(modalIndex >= 0);
+    QVERIFY2(noticeStart > loaderIndex && noticeStart < modalIndex,
+             "the notice must sit after the view Loader and before ForcedUpdateModal");
+
+    // Compiled in.
+    const QString qrcText = readSource(guiDir() + QStringLiteral("/../qml.qrc"));
+    QVERIFY(qrcText.contains(QStringLiteral("gui/SignedOutNotice.qml")));
 }
 
 void TstUiScreens::menuHasItsThreeItemsAndTopUpAsksTheFacadeForTheWebsite()
