@@ -42,6 +42,7 @@
 #include "quality_outbox.h"
 #include "session_lifecycle.h"
 #include "session_websocket.h"
+#include "sse_client.h"
 #include "stream_stats.h"
 // Included rather than forward-declared: moc needs complete types for the `SettingsBridge*` and
 // `UpdateFeedClient*` properties below (a bare forward declaration fails the pointer-metatype
@@ -238,6 +239,18 @@ class SeatHubClient : public QObject
     /// while this holds: there is no balance before sign-in (CUST-06, `screens.md` Common shell).
     Q_PROPERTY(bool signedIn READ signedIn NOTIFY signedInChanged)
 
+    /// True while the account push channel has not been live for L5 (10 s, `timing.md`): SeatHub
+    /// reads `GET /api/account-state` every `kAccountFallbackMs` with `X-Stream-Fallback: seathub`
+    /// until it is live again (D-04, D-06, ADR-0067). The indicator (`ui.md` §7) shows while this
+    /// holds.
+    Q_PROPERTY(bool liveUpdatesPaused READ liveUpdatesPaused NOTIFY liveUpdatesPausedChanged)
+
+    /// True for `kSignedOutNoticeMs` (3 s, L9) on the screen already open after a revoked stream
+    /// or the fallback read's own 401 (D-07, the owner's design A-87), before this client signs
+    /// out through `handleCredentialRefused()`. Deferred, notice included, until a running stream
+    /// ends (Phase 3 D-33): a control-plane channel never ends a paid stream.
+    Q_PROPERTY(bool signedOutNotice READ signedOutNotice NOTIFY signedOutNoticeChanged)
+
     /// True while the profile is showing. Like Settings it is a view inside the home state, not an
     /// appState of its own, so it keeps the signed-in header and a session that ends while it is open
     /// still lands on the right view (`screens.md` §27).
@@ -282,6 +295,9 @@ public:
     UpdateFeedClient* updates() const { return m_updates; }
     ControlPlaneClient* controlPlane() const { return m_controlPlane; }
     SessionWebSocket* sessionChannel() const { return m_sessionChannel; }
+    /// The account push channel (06.4, ADR-0067). Exposed the way `pairing()`/`teardown()`/
+    /// `liveness()` already are: so a test can drive the real object through the real facade.
+    SseClient* sse() const { return m_sse; }
     PairingController* pairing() const { return m_pairing; }
     TeardownController* teardown() const { return m_teardown; }
     /// The in-stream HUD and the liveness reporter that feeds it a balance. Exposed the way
@@ -314,6 +330,8 @@ public:
     QString defaultCountryCode() const { return m_defaultCountryCode; }
     bool animationEffects() const { return m_animationEffects; }
     bool signedIn() const { return m_signedIn; }
+    bool liveUpdatesPaused() const { return m_liveUpdatesPaused; }
+    bool signedOutNotice() const { return m_signedOutNotice; }
     bool liveSession() const { return m_liveSession; }
     bool retryBusy() const { return m_retryBusy; }
     bool reconnecting() const { return m_reconnecting; }
@@ -389,6 +407,13 @@ public:
     /// Replaces what opens an address (the default is the desktop's browser). A test uses this so
     /// it can see what would have been opened without launching one.
     void setUrlOpener(std::function<bool(const QUrl&)> opener) { m_urlOpener = std::move(opener); }
+
+    /// Test seam: overrides `kAccountFallbackMs` (10 s, L5, `timing.md`) for the paused-fallback
+    /// read's own repeating interval.
+    void setAccountFallbackMs(int milliseconds);
+    /// Test seam: overrides `kSignedOutNoticeMs` (3 s, L9, `timing.md`, D-07) the notice shows for
+    /// before this client signs out.
+    void setSignedOutNoticeMs(int milliseconds);
 
     /// Launch (CUST-08, D-06): reads the stored credential, confirms it with `GET /api/me`, and
     /// opens on Home. Called once by main.qml; further calls are ignored.
@@ -494,6 +519,8 @@ signals:
     void endReasonTextChanged();
     void balanceChanged();
     void signedInChanged();
+    void liveUpdatesPausedChanged();
+    void signedOutNoticeChanged();
     void liveSessionChanged();
     void retryBusyChanged();
     void reconnectingChanged();
@@ -533,6 +560,23 @@ private slots:
 
     // The control plane's session channel (`/ws/session/{session_id}`).
     void handleSessionState(const SessionInfo& session);
+
+    /// The account push channel's own `account.state` frame (06.4, ADR-0067, D-01): sets the
+    /// balance exactly as a successful `refreshBalance()` answer does, and - when the profile is
+    /// open and the open top-up notice changed - reloads the Top-ups list and the totals.
+    void handleAccountState(const AccountStateInfo& account);
+
+    /// The account push channel's own `session.state` frame (06.4, ADR-0067): wakes the pairing
+    /// poll for the session currently being connected (`PairingController::pollNow`), so it does
+    /// not wait out its own interval. The poll stays running as the fallback and the source of
+    /// truth; this frame is never applied to any other state - `handleSessionState()` is.
+    void handleSseSessionState(const SessionInfo& session);
+    /// `SseClient::pausedChanged` (D-04, D-06, L5): starts or stops the 10 s fallback read.
+    void handleSsePaused(bool paused);
+    /// `SseClient::revoked` (`stream.closing {reason: "revoked"}`, or a 401/403 on the stream
+    /// request itself): the D-07 signed-out sequence, deferred while the stream is running.
+    void handleSseRevoked();
+
     void handleSessionBilling(const QString& sessionId, int minutesBilled, int balanceMinutes,
                               int minuteIndex);
     void handleSessionWarning(const QString& sessionId, const QString& warning,
@@ -611,6 +655,21 @@ private:
     void resetProfileData();
     void readTotals();
     void readAccount();
+    /// L5, D-06: the 10 s fallback `GET /api/account-state` read while the account push channel
+    /// is paused. Its own 401 starts the D-07 signed-out sequence (`timing.md` L9), never an
+    /// immediate sign-out.
+    void fetchAccountStateFallback();
+    /// The D-07 signed-out sequence itself (the owner's design A-87), started by
+    /// `handleSseRevoked()`, the fallback read's own 401, or a running stream's own end applying
+    /// a deferred one (`m_pendingSignedOutNotice`, Phase 3 D-33). While the engine's stream is
+    /// running, only remembers it; otherwise shows the notice (unless one is already showing) and
+    /// starts `m_signedOutNoticeTimer`, whose timeout clears it and signs out through the one
+    /// path (`handleCredentialRefused()`).
+    void startSignedOutSequence();
+    /// `signOut()` and a successful sign-in (`adoptSignIn()`): stops the notice timer and clears
+    /// `signedOutNotice`/`m_pendingSignedOutNotice`, so a manual sign-out or a fresh sign-in during
+    /// the wait never lets a second sign-out follow.
+    void clearSignedOutNotice();
     /// The one writer of `m_signedIn`, so `signedInChanged()` can never be missed.
     void setSignedIn(bool signedIn);
     /// The one writer of `m_sessionId`, and of whether that session has ended, so `liveSession` can
@@ -816,6 +875,10 @@ private:
     QString m_creditLeftText;
     QString m_totalsError;
     QString m_totalsErrorReference;
+    /// 06.4/ADR-0067, D-01: the last `open_topup_notice` id an `account.state` push named (empty
+    /// when none is open), so `handleAccountState()` reloads the Top-ups list and the totals only
+    /// on a genuine change - not on every push that leaves it the same.
+    QString m_lastOpenTopupNoticeId;
     bool m_accountFailed = false;
     QString m_accountError;
     QString m_accountErrorReference;
@@ -843,6 +906,29 @@ private:
     QString m_balanceText;
     bool m_balanceStale = false;
 
+    // --- 06.4/ADR-0067: the D-04/D-06 fallback read and the D-07 signed-out notice ---------------
+
+    /// L5, `timing.md`: 10 s. The paused-fallback read's own repeating interval, overridable for a
+    /// test (`setAccountFallbackMs()`).
+    static const int kAccountFallbackMs = 10000;
+    /// L9, `timing.md`, D-07 (the owner's design A-87): 3 s. Overridable for a test
+    /// (`setSignedOutNoticeMs()`).
+    static const int kSignedOutNoticeMs = 3000;
+    bool m_liveUpdatesPaused = false;
+    bool m_signedOutNotice = false;
+    /// D-07/D-33: a revoked stream (or the fallback read's own 401) that arrived while the
+    /// engine's stream was running - the notice and the sign-out both wait for the stream's end
+    /// (`handleReadyForDeletion()`), which starts the same sequence once, wherever it lands.
+    bool m_pendingSignedOutNotice = false;
+    int m_accountFallbackMs = kAccountFallbackMs;
+    int m_signedOutNoticeMs = kSignedOutNoticeMs;
+    /// Facade-thread timers, like `m_reconnectTimer`: neither needs to run while an engine stream
+    /// suspends this thread's event loop (D-33 - the balance element is not even shown then), and
+    /// keeping them here means starting/stopping them needs no `onClientThread()` marshal.
+    QTimer* m_accountFallbackTimer = nullptr;
+    /// Single-shot; its timeout clears `signedOutNotice` and calls `handleCredentialRefused()`.
+    QTimer* m_signedOutNoticeTimer = nullptr;
+
     QWindow* m_hostWindow = nullptr;
     SessionLifecycle* m_session = nullptr;
     SettingsBridge* m_settings = nullptr;
@@ -854,6 +940,10 @@ private:
     ControlPlaneClient* m_controlPlane = nullptr;
     TokenStore* m_tokenStore = nullptr;
     SessionWebSocket* m_sessionChannel = nullptr;
+    /// The account push channel (06.4, ADR-0067): opened after a confirmed sign-in or restore,
+    /// stopped in `signOut()`. Lives on the control-plane's network thread, like `m_liveness`/
+    /// `m_pairing` - never parented, for the same `moveToThread()` reason as those two.
+    SseClient* m_sse = nullptr;
     PairingController* m_pairing = nullptr;
     /// The production pairing seam (the gap 03-03 left open). Owned here, moved to the network
     /// thread with the controller it serves, and never exposed: it is the only object in the

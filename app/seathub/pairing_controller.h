@@ -116,6 +116,13 @@ public:
     Q_INVOKABLE void start(const QString& sessionId);
     /// Stop polling and forget the session. Called from teardown and from `signOut()`.
     Q_INVOKABLE void cancel();
+    /// 06.4/ADR-0067: runs the next authorization read at once rather than waiting out
+    /// `pollIntervalMs()` - the account push channel's own `session.state` frame wakes this so
+    /// connecting speeds up on push. A no-op while idle (no session) or once pairing has already
+    /// resolved (`pollAuthorization()`'s own guard). Restarts the interval timer: the answer's own
+    /// `handleAuthorization()` reschedules the next poll from here, exactly as an ordinary tick
+    /// would, so this cannot make the poll fire twice in quick succession.
+    Q_INVOKABLE void pollNow();
 
     /// True once the deadline has passed without a result.
     bool deadlineExceeded() const;

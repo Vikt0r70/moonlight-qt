@@ -318,6 +318,20 @@ public:
         m_usageStatus = status;
         m_usageBody = body;
     }
+    /// What `GET /api/account-state` answers (06.4/ADR-0067, the D-06 fallback read).
+    void answerAccountState(int status, const QByteArray& body)
+    {
+        QMutexLocker lock(&m_mutex);
+        m_accountStateStatus = status;
+        m_accountStateBody = body;
+    }
+    /// The last `X-Stream-Fallback` header a request for `path` carried, or empty for a request
+    /// that carried none (an ordinary, non-fallback read).
+    QByteArray streamFallbackHeaderFor(const QString& path) const
+    {
+        QMutexLocker lock(&m_mutex);
+        return m_streamFallbackHeaders.value(path);
+    }
     /// Every list reply arrives this many milliseconds after it was asked for, so a test can ask a
     /// second time while the first is still in flight.
     void delayLists(int milliseconds)
@@ -386,6 +400,7 @@ protected:
             m_queries[path].append(request.url().query(QUrl::FullyEncoded));
             m_auth.insert(path, request.rawHeader("Authorization"));
             m_traceparents.append(request.rawHeader("traceparent"));
+            m_streamFallbackHeaders.insert(path, request.rawHeader("X-Stream-Fallback"));
             if (outgoing) {
                 const QByteArray body = outgoing->peek(outgoing->size());
                 m_bodies.insert(path, body);
@@ -438,6 +453,16 @@ protected:
                 usageBody = m_usageBody;
             }
             return new FakeReply(usageStatus, usageBody, this);
+        }
+        if (isGet && path == QLatin1String("/api/account-state")) {
+            int accountStateStatus;
+            QByteArray accountStateBody;
+            {
+                QMutexLocker lock(&m_mutex);
+                accountStateStatus = m_accountStateStatus;
+                accountStateBody = m_accountStateBody;
+            }
+            return new FakeReply(accountStateStatus, accountStateBody, this);
         }
         if (path == QLatin1String("/api/me")) {
             return new FakeReply(meStatus, meBody, this);
@@ -505,6 +530,12 @@ private:
     int m_listDelay = 0;
     int m_usageStatus = 200;
     QByteArray m_usageBody = QByteArrayLiteral("{\"minutes_played\":0,\"balance_minutes\":0}");
+    int m_accountStateStatus = 200;
+    QByteArray m_accountStateBody = QByteArrayLiteral(
+        "{\"topic\":\"account:acc-1\",\"at\":\"2026-09-27T00:00:00Z\","
+        "\"account\":{\"wallet\":{\"balance_minutes\":0},\"live_session_id\":\"\","
+        "\"open_topup_notice\":null,\"signup_stage\":\"complete\"}}");
+    QHash<QString, QByteArray> m_streamFallbackHeaders;
     QHash<QString, QByteArray> m_auth;
     QList<QByteArray> m_traceparents;
     QHash<QString, QByteArray> m_bodies;
@@ -5533,6 +5564,218 @@ private slots:
         QTRY_VERIFY_WITH_TIMEOUT(client.reconnectTimer()->isActive(), 15000);
         QVERIFY2(!client.reconnectStillTrying(),
                  "WR-15: enterReconnect() must reset m_reconnectStillTrying for the new episode");
+    }
+
+    // --- 06.4-15 Task 1: the SseClient's lifecycle and account.state wiring ------------------------
+
+    void theStreamStartsAfterSignInAndStopsAtSignOut()
+    {
+        SeatHubClient client;
+        reachHome(client, 90);
+
+        // 06.4/ADR-0067, D-01: opened the moment sign-in (here, a confirmed restore) is confirmed.
+        QTRY_VERIFY_WITH_TIMEOUT(client.sse()->state() != QStringLiteral("idle"), 15000);
+
+        client.signOut();
+
+        // `stop()` sets the state to "idle" and aborts any open reply - no stream request survives
+        // a sign-out.
+        QTRY_COMPARE_WITH_TIMEOUT(client.sse()->state(), QStringLiteral("idle"), 15000);
+    }
+
+    void aPushedAccountStateUpdatesTheBalance()
+    {
+        SeatHubClient client;
+        reachHome(client, 90);
+
+        QSignalSpy balanceSpy(&client, &SeatHubClient::balanceChanged);
+
+        // `feed()` is the test seam and the production entry point alike (sse_client.h's own
+        // header comment): a whole `account.state` frame, fed directly.
+        client.sse()->feed(QByteArrayLiteral(
+            "event: account.state\n"
+            "data: {\"topic\":\"account:acc-1\",\"at\":\"2026-09-27T00:00:00Z\","
+            "\"account\":{\"wallet\":{\"balance_minutes\":125},\"live_session_id\":\"\","
+            "\"open_topup_notice\":null,\"signup_stage\":\"complete\"}}\n"
+            "\n"));
+
+        QTRY_COMPARE_WITH_TIMEOUT(client.balanceMinutes(), qint64(125), 15000);
+        QCOMPARE(client.balanceText(), QStringLiteral("2 h 05 min"));
+        QVERIFY(!client.balanceStale());
+        QCOMPARE(balanceSpy.count(), 1);
+    }
+
+    void aChangedTopupNoticeReloadsTheProfileLists()
+    {
+        SeatHubClient client;
+        reachProfile(client, 90);
+
+        const int topupsBefore =
+            m_fake->countOfPathEndingWith(QStringLiteral("/api/topup-notices"));
+        const int usageBefore = m_fake->countOfPathEndingWith(QStringLiteral("/api/usage"));
+
+        const QByteArray noticeOpen = QByteArrayLiteral(
+            "event: account.state\n"
+            "data: {\"topic\":\"account:acc-1\",\"at\":\"2026-09-27T00:00:00Z\","
+            "\"account\":{\"wallet\":{\"balance_minutes\":90},\"live_session_id\":\"\","
+            "\"open_topup_notice\":{\"id\":\"notice-1\"},\"signup_stage\":\"complete\"}}\n"
+            "\n");
+        client.sse()->feed(noticeOpen);
+
+        QTRY_COMPARE_WITH_TIMEOUT(
+            m_fake->countOfPathEndingWith(QStringLiteral("/api/topup-notices")),
+            topupsBefore + 1, 15000);
+        QTRY_COMPARE_WITH_TIMEOUT(
+            m_fake->countOfPathEndingWith(QStringLiteral("/api/usage")), usageBefore + 1, 15000);
+
+        // The identical notice again reloads nothing a second time.
+        client.sse()->feed(noticeOpen);
+        QTest::qWait(50);
+        QCOMPARE(m_fake->countOfPathEndingWith(QStringLiteral("/api/topup-notices")),
+                 topupsBefore + 1);
+        QCOMPARE(m_fake->countOfPathEndingWith(QStringLiteral("/api/usage")), usageBefore + 1);
+    }
+
+    // --- 06.4-15 Task 2: the connecting wake-up, the paused fallback read, and the revoked -------
+    // --- notice-then-sign-out (deferred during a stream) -------------------------------------------
+
+    void aSessionStateWakesThePairingPollAtOnce()
+    {
+        SeatHubClient client;
+        beginStagedSession(client);
+        QVERIFY(!QTest::currentTestFailed());
+
+        // The first poll (from `start()`) has already landed; a very long interval means only
+        // `pollNow()` could produce another one inside this test's own window.
+        QTRY_VERIFY_WITH_TIMEOUT(
+            m_fake->requestPaths().contains(QStringLiteral("/api/sessions/s-stages/pairing")),
+            15000);
+        client.pairing()->setPollIntervalMs(60000);
+        const int pairingBefore = m_fake->countOfPathEndingWith(QStringLiteral("/pairing"));
+
+        // A session.state for a different session does not wake it.
+        emit client.sse()->sessionState(
+            sessionIn(QStringLiteral("PREPARING"), QStringLiteral("not-s-stages")));
+        QTest::qWait(100);
+        QCOMPARE(m_fake->countOfPathEndingWith(QStringLiteral("/pairing")), pairingBefore);
+
+        // A session.state for the session being connected wakes it at once.
+        emit client.sse()->sessionState(
+            sessionIn(QStringLiteral("PREPARING"), QStringLiteral("s-stages")));
+        QTRY_COMPARE_WITH_TIMEOUT(m_fake->countOfPathEndingWith(QStringLiteral("/pairing")),
+                                  pairingBefore + 1, 15000);
+    }
+
+    void aPausedStreamReadsTheAccountEveryTenSecondsWithTheMarker()
+    {
+        SeatHubClient client;
+        reachHome(client, 90);
+        client.setAccountFallbackMs(50);
+
+        QSignalSpy pausedSpy(&client, &SeatHubClient::liveUpdatesPausedChanged);
+
+        m_fake->answerAccountState(200, QByteArrayLiteral(
+            "{\"topic\":\"account:acc-1\",\"at\":\"2026-09-27T00:00:00Z\","
+            "\"account\":{\"wallet\":{\"balance_minutes\":77},\"live_session_id\":\"\","
+            "\"open_topup_notice\":null,\"signup_stage\":\"complete\"}}"));
+
+        emit client.sse()->pausedChanged(true);
+        QCOMPARE(pausedSpy.count(), 1);
+        QVERIFY(client.liveUpdatesPaused());
+
+        QTRY_COMPARE_WITH_TIMEOUT(client.balanceMinutes(), qint64(77), 15000);
+        QCOMPARE(m_fake->streamFallbackHeaderFor(QStringLiteral("/api/account-state")),
+                 QByteArrayLiteral("seathub"));
+
+        // Live again: the property clears and the reads stop.
+        const int readsBeforeLive =
+            m_fake->countOfPathEndingWith(QStringLiteral("/api/account-state"));
+        emit client.sse()->pausedChanged(false);
+        QCOMPARE(pausedSpy.count(), 2);
+        QVERIFY(!client.liveUpdatesPaused());
+        QTest::qWait(150);
+        QCOMPARE(m_fake->countOfPathEndingWith(QStringLiteral("/api/account-state")),
+                 readsBeforeLive);
+
+        // A 401 on the fallback read starts the signed-out sequence, not an immediate sign-out.
+        client.setSignedOutNoticeMs(60000);
+        m_fake->answerAccountState(401, refusedBody());
+        emit client.sse()->pausedChanged(true);
+        QTRY_VERIFY_WITH_TIMEOUT(client.signedOutNotice(), 15000);
+        QVERIFY2(client.signedIn(), "the 401 must start the notice, not sign out at once");
+    }
+
+    void aRevokedStreamShowsTheNoticeThenSignsOut()
+    {
+        SeatHubClient client;
+        reachHome(client, 90);
+        client.setSignedOutNoticeMs(200);
+
+        QSignalSpy noticeSpy(&client, &SeatHubClient::signedOutNoticeChanged);
+        emit client.sse()->revoked();
+
+        QVERIFY2(client.signedOutNotice(), "the notice must show right after revoked()");
+        QVERIFY2(client.signedIn(), "the client must still be signed in during the notice");
+
+        // A second revoked() during the wait starts no second sign-out.
+        emit client.sse()->revoked();
+        QVERIFY(client.signedIn());
+
+        QTRY_VERIFY_WITH_TIMEOUT(!client.signedIn(), 15000);
+        QVERIFY(!client.signedOutNotice());
+        QCOMPARE(client.appState(), QStringLiteral("signed_out"));
+        // The notice's own property goes true once, then false once - never a second true.
+        QCOMPARE(noticeSpy.count(), 2);
+        QCOMPARE(m_fake->requestPaths().count(QStringLiteral("/api/auth/logout")), 1);
+    }
+
+    void aRevokedStreamDuringAStreamWaitsForItsEnd()
+    {
+        auto* engine = new FakeEngineSession;
+        SeatHubClient client;
+        WalletTicks ticks;
+        beginStreaming(client, engine, &ticks, 90, 80);
+        QVERIFY(!QTest::currentTestFailed());
+        client.setSignedOutNoticeMs(200);
+        m_fake->answerSession(QStringLiteral("s-live"), QStringLiteral("CANCELLED"),
+                              QStringLiteral("CUSTOMER_ENDED"));
+
+        emit client.sse()->revoked();
+        QTest::qWait(100);
+        QVERIFY2(!client.signedOutNotice(), "the notice must wait for the stream to end");
+        QVERIFY2(client.signedIn(), "revoked() must not sign out mid-stream");
+
+        client.interrupt();
+        emit engine->sessionFinished(0);
+        emit engine->readyForDeletion();
+
+        // The same delayed sequence now runs once: the notice, then - after L9 - the sign-out.
+        // Never immediately, even once the stream has ended.
+        QVERIFY2(client.signedIn(), "must not sign out the instant the stream ends either");
+        QTRY_VERIFY_WITH_TIMEOUT(!client.signedIn(), 15000);
+        QCOMPARE(client.appState(), QStringLiteral("signed_out"));
+    }
+
+    void aSignOutDuringTheNoticeCancelsIt()
+    {
+        SeatHubClient client;
+        reachHome(client, 90);
+        client.setSignedOutNoticeMs(200);
+
+        emit client.sse()->revoked();
+        QVERIFY(client.signedOutNotice());
+
+        const int logoutsBefore =
+            m_fake->requestPaths().count(QStringLiteral("/api/auth/logout"));
+        client.signOut();
+
+        QVERIFY(!client.signedOutNotice());
+        QCOMPARE(client.appState(), QStringLiteral("signed_out"));
+
+        // Past where the notice would have elapsed on its own: no second sign-out follows.
+        QTest::qWait(400);
+        QCOMPARE(m_fake->requestPaths().count(QStringLiteral("/api/auth/logout")),
+                 logoutsBefore + 1);
     }
 };
 

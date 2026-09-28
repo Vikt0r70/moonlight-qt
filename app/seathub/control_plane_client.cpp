@@ -415,6 +415,10 @@ ControlPlaneClient::ControlPlaneClient(QObject* parent)
 {
     m_network = new QNetworkAccessManager(this);
     m_ownsNetwork = true;
+    // Parented the same way as `m_network`, so `moveToOwnThread()` moves both together (Qt moves
+    // a QObject's children with it) and there is exactly one place either is constructed.
+    m_streamNetwork = new QNetworkAccessManager(this);
+    m_ownsStreamNetwork = true;
 }
 
 ControlPlaneClient::~ControlPlaneClient()
@@ -765,6 +769,15 @@ void ControlPlaneClient::setNetworkAccessManager(QNetworkAccessManager* manager)
     m_ownsNetwork = false;
 }
 
+void ControlPlaneClient::setStreamNetworkAccessManager(QNetworkAccessManager* manager)
+{
+    if (!manager || manager == m_streamNetwork) {
+        return;
+    }
+    m_streamNetwork = manager;
+    m_ownsStreamNetwork = false;
+}
+
 void ControlPlaneClient::moveToOwnThread()
 {
     if (m_thread) {
@@ -1027,6 +1040,41 @@ void ControlPlaneClient::fetchSessionAuthorization(const QString& sessionId, Cal
     send(QStringLiteral("GET"), QStringLiteral("/api/sessions/") + encodedPathSegment(sessionId)
              + QStringLiteral("/pairing"),
          QByteArray(), true, callback);
+}
+
+QNetworkReply* ControlPlaneClient::openAccountStream()
+{
+    // D-35/T-06.4-45: captured under the same lock every other call reads the bearer under, and
+    // handed to the caller only inside the request header - never as a value this method returns
+    // or that crosses into `SseClient` any other way.
+    QString accessToken;
+    {
+        QMutexLocker locker(&m_credentialMutex);
+        accessToken = m_accessToken;
+    }
+
+    QUrl url(m_baseUrl + QStringLiteral("/api/stream"));
+    QNetworkRequest request(url);
+    request.setHeader(QNetworkRequest::UserAgentHeader, QStringLiteral("SeatHub"));
+    request.setRawHeader("Accept", "text/event-stream");
+    if (!accessToken.isEmpty()) {
+        request.setRawHeader("Authorization", QByteArrayLiteral("Bearer ") + accessToken.toUtf8());
+    }
+    // Deliberately no `setTransferTimeout()` - see this method's header comment: it would reset
+    // on the server's own `: ping` keep-alive exactly like a genuinely live connection does, so
+    // it detects only a dead TCP connection, never a hub whose dispatcher died. `SseClient` owns
+    // the application-level L3 timer that actually covers that gap.
+    return m_streamNetwork->get(request);
+}
+
+void ControlPlaneClient::fetchAccountState(bool fallback, Callback callback)
+{
+    QHash<QByteArray, QByteArray> extraHeaders;
+    if (fallback) {
+        extraHeaders.insert("X-Stream-Fallback", "seathub");
+    }
+    send(QStringLiteral("GET"), QStringLiteral("/api/account-state"), QByteArray(), true, callback,
+         extraHeaders);
 }
 
 void ControlPlaneClient::postLiveness(const QString& sessionId, const QString& state,

@@ -111,6 +111,16 @@ void PairingController::cancel()
     setState(QString::fromLatin1(kStateIdle));
 }
 
+void PairingController::pollNow()
+{
+    // `pollAuthorization()` itself is a no-op while idle (`m_sessionId` empty) or once pairing has
+    // finished (`m_finished`) - both its own top-of-function guard, so nothing further is needed
+    // here for either case. Stopping any pending tick first means an interval timer that was about
+    // to fire moments from now cannot also run a second, redundant poll right behind this one.
+    m_pollTimer->stop();
+    pollAuthorization();
+}
+
 void PairingController::scheduleNextPoll()
 {
     m_pollTimer->start(m_pollIntervalMs);
