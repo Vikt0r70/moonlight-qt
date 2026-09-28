@@ -372,6 +372,21 @@ SeatHubClient::SeatHubClient(QObject* parent)
     m_reconnectTimer->setSingleShot(true);
     connect(m_reconnectTimer, &QTimer::timeout, this, &SeatHubClient::resumeAfterReconnect);
 
+    // 06.4/ADR-0067, D-04/D-06: the paused-fallback read (L5). Repeating, parented to `this` for
+    // the same reason `m_reconnectTimer` is (its class comment above).
+    m_accountFallbackTimer = new QTimer(this);
+    connect(m_accountFallbackTimer, &QTimer::timeout, this,
+            &SeatHubClient::fetchAccountStateFallback);
+
+    // 06.4/ADR-0067, D-07: the notice shows for L9 before this client signs out.
+    m_signedOutNoticeTimer = new QTimer(this);
+    m_signedOutNoticeTimer->setSingleShot(true);
+    connect(m_signedOutNoticeTimer, &QTimer::timeout, this, [this]() {
+        m_signedOutNotice = false;
+        emit signedOutNoticeChanged();
+        handleCredentialRefused();
+    });
+
     // D-17: the end-of-stream video-stats block, read the same way and held until
     // `handleTeardownCompleted()` posts it (`handleVideoStatsParsed()`).
     m_statsWatcher = new StatsWatcher(this);
@@ -454,6 +469,19 @@ SeatHubClient::SeatHubClient(QObject* parent)
     // successful `refreshBalance()` answer does, and reloads the Top-ups list and the totals when
     // the open top-up notice changed while the profile is open.
     connect(m_sse, &SseClient::accountState, this, &SeatHubClient::handleAccountState);
+
+    // 06.4/ADR-0067: a `session.state` for the session being connected wakes the pairing poll at
+    // once, so connecting speeds up on push; the poll keeps running as the fallback and the
+    // source of truth (Task 2).
+    connect(m_sse, &SseClient::sessionState, this, &SeatHubClient::handleSseSessionState);
+
+    // 06.4/ADR-0067, D-04/D-06 (L5): the fallback read starts and stops with the channel's own
+    // paused state.
+    connect(m_sse, &SseClient::pausedChanged, this, &SeatHubClient::handleSsePaused);
+
+    // 06.4/ADR-0067, D-07 (the owner's design A-87): a revoked stream starts the signed-out
+    // sequence, deferred while the engine's stream is running (Phase 3 D-33).
+    connect(m_sse, &SseClient::revoked, this, &SeatHubClient::handleSseRevoked);
 
     connect(m_pairing, &PairingController::pairingCompleted,
             this, &SeatHubClient::handlePairingCompleted);
@@ -1535,6 +1563,10 @@ bool SeatHubClient::adoptSignIn(const AuthTokenPair& pair, const QString& identi
     // runs on the facade thread, `m_sse` lives on the network thread.
     onClientThread(m_sse, [this]() { m_sse->start(); });
 
+    // 06.4/ADR-0067, D-07: a successful sign-in stops the notice timer and clears any signed-out
+    // notice left over from the credential this one replaces.
+    clearSignedOutNotice();
+
     // WR-06 (code review 06.3-REVIEW-fork.md): a fresh sign-in used to read the account's real id
     // only when the outbox already held a file (`hasQueuedReports()`), so a customer who signed in
     // for the first time and played straight away had `m_accountId` still empty at their own
@@ -1717,6 +1749,9 @@ void SeatHubClient::signOut()
     // 06.4/ADR-0067: the account push channel closes with everything else, before the credential
     // it was opened with is cleared below.
     onClientThread(m_sse, [this]() { m_sse->stop(); });
+    // 06.4/ADR-0067, D-07: a manual sign-out inside the notice's own wait stops the timer and
+    // clears it, so no second sign-out follows once it would otherwise have elapsed.
+    clearSignedOutNotice();
     onClientThread(m_pairing, [this]() { m_pairing->cancel(); });
     m_teardown->cancel();
     // D-05/C4: `TeardownController::cancel()` emits neither `teardownCompleted` nor
@@ -2263,6 +2298,15 @@ void SeatHubClient::handleReadyForDeletion()
                                 : QString::fromLatin1(kStateHome));
     }
 
+    // 06.4/ADR-0067, D-07/D-33: a signed-out notice deferred while this stream was running (a
+    // revoked stream, or the fallback read's own 401) now shows on whatever screen the stream's
+    // end just landed on. `startSignedOutSequence()`'s own running-stream check is false here -
+    // the engine has already finished - so this runs the ordinary notice-then-sign-out sequence.
+    if (m_pendingSignedOutNotice) {
+        m_pendingSignedOutNotice = false;
+        startSignedOutSequence();
+    }
+
     // The stream is over, so nothing more is reported to the control plane about it (D-31).
     m_liveness->stop();
     m_horizon->disarm();
@@ -2643,6 +2687,116 @@ void SeatHubClient::handleAccountState(const AccountStateInfo& account)
         }
         m_lastOpenTopupNoticeId = account.openTopupNoticeId;
     }
+}
+
+void SeatHubClient::handleSseSessionState(const SessionInfo& session)
+{
+    // Only the session currently being connected: a state for a different (stale, or already
+    // superseded by a fresh Play) session must not wake a poll that no longer concerns it. Mirrors
+    // `handleSessionState()`'s own guard.
+    if (m_sessionId.isEmpty() || (!session.id.isEmpty() && session.id != m_sessionId)) {
+        return;
+    }
+    onClientThread(m_pairing, [this]() { m_pairing->pollNow(); });
+}
+
+void SeatHubClient::handleSsePaused(bool paused)
+{
+    if (m_liveUpdatesPaused == paused) {
+        return;
+    }
+    m_liveUpdatesPaused = paused;
+    emit liveUpdatesPausedChanged();
+
+    if (paused) {
+        m_accountFallbackTimer->start(m_accountFallbackMs);
+    }
+    else {
+        m_accountFallbackTimer->stop();
+    }
+}
+
+void SeatHubClient::fetchAccountStateFallback()
+{
+    if (!m_signedIn || !m_controlPlane->hasAccessToken()) {
+        return;
+    }
+
+    const quint64 epoch = m_authEpoch;
+    m_controlPlane->fetchAccountState(true, [this, epoch](const ControlPlaneResult& result) {
+        onClientThread(this, [this, epoch, result]() {
+            // Signed out, or signed in as someone else, since this read was issued: not this
+            // read's to show.
+            if (epoch != m_authEpoch || !m_signedIn) {
+                return;
+            }
+
+            if (!result.ok && result.statusCode == 401) {
+                // L9 (`timing.md`): SeatHub's fallback-read 401 starts the same signed-out
+                // sequence a revoked stream does - never an immediate sign-out.
+                startSignedOutSequence();
+                return;
+            }
+
+            // `GET /api/account-state` answers the same `AccountStateEvent` shape the pushed
+            // frame's `data` carries (`topic`/`at`/`account`) - the account object itself is
+            // nested exactly like `SseClient::dispatchFrame()` reads it, never the response body
+            // directly.
+            AccountStateInfo account;
+            if (result.ok
+                && AccountStateInfo::parse(result.body.value(QStringLiteral("account")).toObject(),
+                                           &account)) {
+                setBalance(account.balanceMinutes);
+            }
+        });
+    });
+}
+
+void SeatHubClient::startSignedOutSequence()
+{
+    // Phase 3 D-33: a control-plane channel never ends a paid, running stream - the server ends it
+    // through the liveness grace. While the engine's stream is running, only remember it; the same
+    // sequence runs once where the stream's end is handled (`handleReadyForDeletion()`), so the
+    // notice shows on whatever screen the stream's end lands on.
+    if (m_session->active() || m_appState == QLatin1String(kStateStreaming)) {
+        m_pendingSignedOutNotice = true;
+        return;
+    }
+
+    if (m_signedOutNoticeTimer->isActive()) {
+        // Already showing the notice and waiting it out: a second `revoked()` (or fallback-read
+        // 401) during the wait starts no second sign-out.
+        return;
+    }
+
+    m_signedOutNotice = true;
+    emit signedOutNoticeChanged();
+    m_signedOutNoticeTimer->start(m_signedOutNoticeMs);
+}
+
+void SeatHubClient::clearSignedOutNotice()
+{
+    m_signedOutNoticeTimer->stop();
+    m_pendingSignedOutNotice = false;
+    if (m_signedOutNotice) {
+        m_signedOutNotice = false;
+        emit signedOutNoticeChanged();
+    }
+}
+
+void SeatHubClient::setAccountFallbackMs(int milliseconds)
+{
+    m_accountFallbackMs = qMax(1, milliseconds);
+}
+
+void SeatHubClient::setSignedOutNoticeMs(int milliseconds)
+{
+    m_signedOutNoticeMs = qMax(1, milliseconds);
+}
+
+void SeatHubClient::handleSseRevoked()
+{
+    startSignedOutSequence();
 }
 
 void SeatHubClient::handleSessionBilling(const QString& sessionId, int minutesBilled,
