@@ -46,7 +46,7 @@ client executable, and one data file.
   `--enable-gpl` would be GPL-2.0-or-later instead, and the two are not interchangeable here.
 - **Source (project):** https://ffmpeg.org/
 - **Source (this build):** the prebuilt binaries come from moonlight-qt's `libs` prebuilts
-  repository, https://github.com/moonlight-stream/moonlight-qt-prebuilts, pinned in this fork at
+  repository, https://github.com/cgutman/moonlight-qt-prebuilts, pinned in this fork at
   commit `a27d6a7`.
 - **Linked:** dynamically.
 
@@ -110,7 +110,7 @@ client executable, and one data file.
   `not recorded; prebuilts libs@a27d6a7` rather than guessed.
 - **License:** MIT
 - **Source:** https://github.com/discord/discord-rpc, shipped as a prebuilt from
-  https://github.com/moonlight-stream/moonlight-qt-prebuilts at `libs` commit `a27d6a7`
+  https://github.com/cgutman/moonlight-qt-prebuilts at `libs` commit `a27d6a7`
 - **Linked:** dynamically (`discord-rpc.dll`).
 
 ### sentry-native
@@ -230,8 +230,9 @@ commits above.
   by `scripts/build-seathub.ps1` from `GPL-3.0.txt` and `installer/WRITTEN-OFFER.txt`. The license
   file alone is **not** compliance: the offer is what makes the source reachable (Pitfall 9).
 - **The written offer points at the fork repository**, which is why making
-  `Vikt0r70/moonlight-qt` public is a release-prep blocker: an offer that resolves for nobody
-  satisfies no one. Recorded in `docs/runbooks/client-release.md`.
+  `Vikt0r70/moonlight-qt` public was a release-prep blocker until it was done on 2026-09-20
+  (OWNER-ACTIONS A-4): an offer that resolves for nobody satisfies no one. The repository is
+  public now, as `docs/runbooks/client-release.md` in the SevenHills monorepo records.
 - **LGPL-3.0 / LGPL-2.1-or-later / MIT / BSD / Apache-2.0 / Zlib components** are all dynamically
   linked as DLLs (or, for MIT/BSD-2 statically linked code with permissive terms), so the
   relinking and notice conditions are met by shipping the unmodified DLLs beside the client and this
