@@ -319,6 +319,8 @@ SeatHubClient::SeatHubClient(QObject* parent)
       m_controlPlane(new ControlPlaneClient(nullptr)),
       m_tokenStore(new TokenStore(this)),
       m_sessionChannel(new SessionWebSocket(nullptr)),
+      // 06.4/ADR-0067: the account push channel, moved with the others in `startNetworkThreads()`.
+      m_sse(new SseClient(nullptr)),
       // `m_pairing` has to travel with the seam and its poll timer: a `QTimer` fires only on the
       // thread its object lives on, and the main thread is suspended for the whole stream.
       m_pairing(new PairingController(nullptr)),
@@ -379,6 +381,7 @@ SeatHubClient::SeatHubClient(QObject* parent)
 
     // The sign-in field's data: read from the binary, never fetched (Phase 5 D-02).
     qRegisterMetaType<SessionInfo>("SessionInfo");
+    qRegisterMetaType<AccountStateInfo>("AccountStateInfo");
     m_countries = SeatHubCountries::all();
     m_defaultCountryCode = SeatHubRegion::initialCountryCode();
     m_animationEffects = SeatHubSystem::animationEffectsEnabled();
@@ -418,6 +421,7 @@ SeatHubClient::SeatHubClient(QObject* parent)
     m_pairing->setControlPlane(m_controlPlane);
     m_teardown->setControlPlane(m_controlPlane);
     m_liveness->setControlPlane(m_controlPlane);
+    m_sse->setControlPlane(m_controlPlane);
 
     connect(m_sessionChannel, &SessionWebSocket::sessionStateReceived,
             this, &SeatHubClient::handleSessionState);
@@ -444,6 +448,12 @@ SeatHubClient::SeatHubClient(QObject* parent)
     // only thing that feeds `handleSessionState` while a session is connecting.
     connect(m_pairing, &PairingController::sessionRead,
             this, &SeatHubClient::handleSessionState);
+
+    // 06.4/ADR-0067, D-01: Home and Profile had no live update of their own before this
+    // (RESEARCH-FORK.md) - a pushed `account.state` now updates the balance the same way a
+    // successful `refreshBalance()` answer does, and reloads the Top-ups list and the totals when
+    // the open top-up notice changed while the profile is open.
+    connect(m_sse, &SseClient::accountState, this, &SeatHubClient::handleAccountState);
 
     connect(m_pairing, &PairingController::pairingCompleted,
             this, &SeatHubClient::handlePairingCompleted);
@@ -536,7 +546,7 @@ SeatHubClient::~SeatHubClient()
         }
         else {
             const QList<QObject*> workers = { m_pairingSeam, m_pairing, m_liveness, m_horizon,
-                                              m_sessionChannel, m_teardown };
+                                              m_sessionChannel, m_teardown, m_sse };
             const QThread* home = QThread::currentThread();
             // Blocking, and issued through an object that lives on the worker thread: a move is
             // only accepted when it comes from the object's own thread, and this is the last point
@@ -564,6 +574,7 @@ SeatHubClient::~SeatHubClient()
     delete m_horizon;
     delete m_sessionChannel;
     delete m_teardown;
+    delete m_sse;
 
     // Last, and only when no stream is running. `run()` blocks inside this thread's event loop, so
     // a live session means this destructor is running *underneath* the engine's own frames - the
@@ -599,6 +610,9 @@ void SeatHubClient::startNetworkThreads()
     m_liveness->moveToThread(networkThread);
     m_horizon->moveToThread(networkThread);
     m_sessionChannel->moveToThread(networkThread);
+    // 06.4/ADR-0067: `SseClient::start()`'s own `openAccountStream()` call requires being on this
+    // thread (its header comment).
+    m_sse->moveToThread(networkThread);
 
     // The seam's handshake blocks - upstream's first pairing request is issued with no client-side
     // timeout at all - so it runs on a pool thread and only its deadline timer lives here.
@@ -1516,6 +1530,11 @@ bool SeatHubClient::adoptSignIn(const AuthTokenPair& pair, const QString& identi
     m_identity = identity;
     emit identityChanged();
 
+    // 06.4/ADR-0067, D-01: the account push channel opens the moment there is a token to open it
+    // with - the same one `applyRestoreResult()` opens for a confirmed restore. Marshalled: this
+    // runs on the facade thread, `m_sse` lives on the network thread.
+    onClientThread(m_sse, [this]() { m_sse->start(); });
+
     // WR-06 (code review 06.3-REVIEW-fork.md): a fresh sign-in used to read the account's real id
     // only when the outbox already held a file (`hasQueuedReports()`), so a customer who signed in
     // for the first time and played straight away had `m_accountId` still empty at their own
@@ -1695,6 +1714,9 @@ void SeatHubClient::signOut()
     m_sessionChannel->close();
     m_liveness->stop();
     m_horizon->disarm();
+    // 06.4/ADR-0067: the account push channel closes with everything else, before the credential
+    // it was opened with is cleared below.
+    onClientThread(m_sse, [this]() { m_sse->stop(); });
     onClientThread(m_pairing, [this]() { m_pairing->cancel(); });
     m_teardown->cancel();
     // D-05/C4: `TeardownController::cancel()` emits neither `teardownCompleted` nor
@@ -1752,6 +1774,9 @@ void SeatHubClient::signOut()
     m_accountId.clear();
     emit identityChanged();
     resetBalance();
+    // 06.4/ADR-0067: the next customer's first account.state push must be compared against
+    // nothing, never against a previous sign-in's notice.
+    m_lastOpenTopupNoticeId.clear();
     clearFailure();
     resetConnecting();
     setInSettings(false);
@@ -1811,6 +1836,10 @@ void SeatHubClient::applyRestoreResult(const ControlPlaneResult& result)
             setAccount(account);
             setHomeStatus(QString::fromLatin1(kHomeReady));
             setAppState(QString::fromLatin1(kStateHome));
+
+            // 06.4/ADR-0067, D-01: opened the moment a restore is confirmed - the same channel
+            // `adoptSignIn()` opens for an interactive sign-in.
+            onClientThread(m_sse, [this]() { m_sse->start(); });
 
             // Plan 15 (D-01, D-18 SV-C3): one of the three moments SeatHub refreshes its DSN
             // handout - right after restore's own `fetchMe` is confirmed. Guarded against the
@@ -2591,6 +2620,28 @@ void SeatHubClient::handleSessionState(const SessionInfo& session)
         // lands on once teardown finishes (audit E10). The minute count is the server's own
         // `minutes_billed`, never arithmetic done here.
         setEndReasonText(endReasonSentence(session.endReason, session.minutesBilled));
+    }
+}
+
+void SeatHubClient::handleAccountState(const AccountStateInfo& account)
+{
+    // 06.4/ADR-0067, D-01: the same properties, the same signal, a successful refreshBalance()
+    // answer sets - Home and Profile, which had no refresh of their own (RESEARCH-FORK.md), go
+    // live the moment a push frame carries a new figure. Not this account's push (signed out, or
+    // signed in as someone else, since the channel this frame arrived on was opened) is not shown.
+    if (m_signedIn) {
+        setBalance(account.balanceMinutes);
+    }
+
+    // The profile's Top-ups tab and its two totals only reload when the open notice actually
+    // changed and the profile is the view showing it - an unrelated account.state push (a balance
+    // change with no notice) must not thrash a list nobody asked to reload.
+    if (account.openTopupNoticeId != m_lastOpenTopupNoticeId) {
+        if (m_inProfile) {
+            reloadList(QStringLiteral("topups"));
+            reloadTotals();
+        }
+        m_lastOpenTopupNoticeId = account.openTopupNoticeId;
     }
 }
 

@@ -5534,6 +5534,76 @@ private slots:
         QVERIFY2(!client.reconnectStillTrying(),
                  "WR-15: enterReconnect() must reset m_reconnectStillTrying for the new episode");
     }
+
+    // --- 06.4-15 Task 1: the SseClient's lifecycle and account.state wiring ------------------------
+
+    void theStreamStartsAfterSignInAndStopsAtSignOut()
+    {
+        SeatHubClient client;
+        reachHome(client, 90);
+
+        // 06.4/ADR-0067, D-01: opened the moment sign-in (here, a confirmed restore) is confirmed.
+        QTRY_VERIFY_WITH_TIMEOUT(client.sse()->state() != QStringLiteral("idle"), 15000);
+
+        client.signOut();
+
+        // `stop()` sets the state to "idle" and aborts any open reply - no stream request survives
+        // a sign-out.
+        QTRY_COMPARE_WITH_TIMEOUT(client.sse()->state(), QStringLiteral("idle"), 15000);
+    }
+
+    void aPushedAccountStateUpdatesTheBalance()
+    {
+        SeatHubClient client;
+        reachHome(client, 90);
+
+        QSignalSpy balanceSpy(&client, &SeatHubClient::balanceChanged);
+
+        // `feed()` is the test seam and the production entry point alike (sse_client.h's own
+        // header comment): a whole `account.state` frame, fed directly.
+        client.sse()->feed(QByteArrayLiteral(
+            "event: account.state\n"
+            "data: {\"topic\":\"account:acc-1\",\"at\":\"2026-09-27T00:00:00Z\","
+            "\"account\":{\"wallet\":{\"balance_minutes\":125},\"live_session_id\":\"\","
+            "\"open_topup_notice\":null,\"signup_stage\":\"complete\"}}\n"
+            "\n"));
+
+        QTRY_COMPARE_WITH_TIMEOUT(client.balanceMinutes(), qint64(125), 15000);
+        QCOMPARE(client.balanceText(), QStringLiteral("2 h 05 min"));
+        QVERIFY(!client.balanceStale());
+        QCOMPARE(balanceSpy.count(), 1);
+    }
+
+    void aChangedTopupNoticeReloadsTheProfileLists()
+    {
+        SeatHubClient client;
+        reachProfile(client, 90);
+
+        const int topupsBefore =
+            m_fake->countOfPathEndingWith(QStringLiteral("/api/topup-notices"));
+        const int usageBefore = m_fake->countOfPathEndingWith(QStringLiteral("/api/usage"));
+
+        const QByteArray noticeOpen = QByteArrayLiteral(
+            "event: account.state\n"
+            "data: {\"topic\":\"account:acc-1\",\"at\":\"2026-09-27T00:00:00Z\","
+            "\"account\":{\"wallet\":{\"balance_minutes\":90},\"live_session_id\":\"\","
+            "\"open_topup_notice\":{\"id\":\"notice-1\"},\"signup_stage\":\"complete\"}}\n"
+            "\n");
+        client.sse()->feed(noticeOpen);
+
+        QTRY_COMPARE_WITH_TIMEOUT(
+            m_fake->countOfPathEndingWith(QStringLiteral("/api/topup-notices")),
+            topupsBefore + 1, 15000);
+        QTRY_COMPARE_WITH_TIMEOUT(
+            m_fake->countOfPathEndingWith(QStringLiteral("/api/usage")), usageBefore + 1, 15000);
+
+        // The identical notice again reloads nothing a second time.
+        client.sse()->feed(noticeOpen);
+        QTest::qWait(50);
+        QCOMPARE(m_fake->countOfPathEndingWith(QStringLiteral("/api/topup-notices")),
+                 topupsBefore + 1);
+        QCOMPARE(m_fake->countOfPathEndingWith(QStringLiteral("/api/usage")), usageBefore + 1);
+    }
 };
 
 QTEST_MAIN(TstFacadeWiring)

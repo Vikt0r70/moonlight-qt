@@ -42,6 +42,7 @@
 #include "quality_outbox.h"
 #include "session_lifecycle.h"
 #include "session_websocket.h"
+#include "sse_client.h"
 #include "stream_stats.h"
 // Included rather than forward-declared: moc needs complete types for the `SettingsBridge*` and
 // `UpdateFeedClient*` properties below (a bare forward declaration fails the pointer-metatype
@@ -282,6 +283,9 @@ public:
     UpdateFeedClient* updates() const { return m_updates; }
     ControlPlaneClient* controlPlane() const { return m_controlPlane; }
     SessionWebSocket* sessionChannel() const { return m_sessionChannel; }
+    /// The account push channel (06.4, ADR-0067). Exposed the way `pairing()`/`teardown()`/
+    /// `liveness()` already are: so a test can drive the real object through the real facade.
+    SseClient* sse() const { return m_sse; }
     PairingController* pairing() const { return m_pairing; }
     TeardownController* teardown() const { return m_teardown; }
     /// The in-stream HUD and the liveness reporter that feeds it a balance. Exposed the way
@@ -533,6 +537,11 @@ private slots:
 
     // The control plane's session channel (`/ws/session/{session_id}`).
     void handleSessionState(const SessionInfo& session);
+
+    /// The account push channel's own `account.state` frame (06.4, ADR-0067, D-01): sets the
+    /// balance exactly as a successful `refreshBalance()` answer does, and - when the profile is
+    /// open and the open top-up notice changed - reloads the Top-ups list and the totals.
+    void handleAccountState(const AccountStateInfo& account);
     void handleSessionBilling(const QString& sessionId, int minutesBilled, int balanceMinutes,
                               int minuteIndex);
     void handleSessionWarning(const QString& sessionId, const QString& warning,
@@ -816,6 +825,10 @@ private:
     QString m_creditLeftText;
     QString m_totalsError;
     QString m_totalsErrorReference;
+    /// 06.4/ADR-0067, D-01: the last `open_topup_notice` id an `account.state` push named (empty
+    /// when none is open), so `handleAccountState()` reloads the Top-ups list and the totals only
+    /// on a genuine change - not on every push that leaves it the same.
+    QString m_lastOpenTopupNoticeId;
     bool m_accountFailed = false;
     QString m_accountError;
     QString m_accountErrorReference;
@@ -854,6 +867,10 @@ private:
     ControlPlaneClient* m_controlPlane = nullptr;
     TokenStore* m_tokenStore = nullptr;
     SessionWebSocket* m_sessionChannel = nullptr;
+    /// The account push channel (06.4, ADR-0067): opened after a confirmed sign-in or restore,
+    /// stopped in `signOut()`. Lives on the control-plane's network thread, like `m_liveness`/
+    /// `m_pairing` - never parented, for the same `moveToThread()` reason as those two.
+    SseClient* m_sse = nullptr;
     PairingController* m_pairing = nullptr;
     /// The production pairing seam (the gap 03-03 left open). Owned here, moved to the network
     /// thread with the controller it serves, and never exposed: it is the only object in the
