@@ -5476,6 +5476,64 @@ private slots:
         QVERIFY2(!reconnectingSpy.isEmpty(), "WR-14(c): reconnectingChanged must fire on sign-out too");
         QCOMPARE(client.appState(), QStringLiteral("signed_out"));
     }
+
+    void aSecondReconnectEpisodeStartsAsConnectingLostNotStillTrying()
+    {
+        // WR-15: `m_reconnectStillTrying` is documented as "Reset in `enterReconnect()`" but was
+        // never actually reset there - so once ANY attempt in this session's life ever reached
+        // `retryReconnectOrGiveUp()` once, a second (or later) reconnect episode's own first
+        // attempt would immediately show "Still trying" instead of "Connection lost. Reconnecting…"
+        auto* engine = new FakeEngineSession;
+        SeatHubClient client;
+        WalletTicks ticks;
+        beginStreaming(client, engine, &ticks, 90, 80);
+        QVERIFY(!QTest::currentTestFailed());
+
+        // Episode 1: drop, then let the first attempt itself fail/time out, which is exactly what
+        // sets `m_reconnectStillTrying` true (`retryReconnectOrGiveUp()`).
+        emitConnectionTerminated(-1);
+        emit engine->displayLaunchError(QStringLiteral("Connection terminated"));
+        emit engine->readyForDeletion();
+        QTRY_VERIFY_WITH_TIMEOUT(client.reconnectTimer()->isActive(), 15000);
+        QVERIFY2(!client.reconnectStillTrying(),
+                 "precondition: the very first attempt of episode 1 must not already say "
+                 "'Still trying'");
+
+        client.reconnectTimer()->start(0);
+        QTRY_VERIFY_WITH_TIMEOUT(
+            m_fake->requestPaths().contains(QStringLiteral("/api/sessions/s-live/pairing")), 15000);
+
+        const SeatHubFailure pairingFailure =
+            SeatHubFailure::local(QStringLiteral("The rig didn't finish connecting. Try again."));
+        emit client.pairing()->pairingFailed(pairingFailure);
+        QTRY_VERIFY_WITH_TIMEOUT(client.reconnectStillTrying(), 15000);
+
+        // Recover episode 1 back to streaming: a fresh retry, pairing, and a fresh engine reaching
+        // `connectionStarted()`.
+        client.reconnectTimer()->start(0);
+        QTRY_VERIFY_WITH_TIMEOUT(
+            m_fake->requestPaths().count(QStringLiteral("/api/sessions/s-live/pairing")) >= 2,
+            15000);
+        emit client.pairing()->authorizationGranted();
+        QTest::qWait(20);
+        auto* secondEngine = new FakeEngineSession;
+        client.session()->attachSession(secondEngine);
+        emit client.pairing()->pairingCompleted(QStringLiteral("aa:bb:cc:dd:ee:11"));
+        emit secondEngine->connectionStarted();
+        QTRY_COMPARE_WITH_TIMEOUT(client.appState(), QStringLiteral("streaming"), 15000);
+        // `m_reconnectStillTrying` survives the recovery back to streaming (only `enterReconnect()`
+        // resets it) - the bug this test exists to catch.
+        QVERIFY(client.reconnectStillTrying());
+
+        // Episode 2: drop again. The very first attempt of THIS episode must read "Connection lost.
+        // Reconnecting…", not "Still trying" left over from episode 1.
+        emitConnectionTerminated(-1);
+        emit secondEngine->displayLaunchError(QStringLiteral("Connection terminated"));
+        emit secondEngine->readyForDeletion();
+        QTRY_VERIFY_WITH_TIMEOUT(client.reconnectTimer()->isActive(), 15000);
+        QVERIFY2(!client.reconnectStillTrying(),
+                 "WR-15: enterReconnect() must reset m_reconnectStillTrying for the new episode");
+    }
 };
 
 QTEST_MAIN(TstFacadeWiring)

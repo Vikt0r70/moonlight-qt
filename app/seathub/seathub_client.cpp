@@ -834,6 +834,14 @@ void SeatHubClient::enterReconnect()
 {
     m_reconnecting = true;
     m_reconnectBackoffMs = kReconnectInitialBackoffMs;
+    // WR-15: this is the header's own documented reset point ("Reset in `enterReconnect()`") -
+    // without it, once any attempt in an earlier episode of this same session ever reached
+    // `retryReconnectOrGiveUp()` once, every later episode's own first attempt would show "Still
+    // trying" instead of "Connection lost. Reconnecting... (n of 5)".
+    if (m_reconnectStillTrying) {
+        m_reconnectStillTrying = false;
+        emit reconnectStillTryingChanged();
+    }
     // `setAppState()` itself would unlock Settings/the updater here (leaving "streaming"); this
     // relocks them at once, for the whole episode (T-06.1-57).
     setAppState(QString::fromLatin1(kStateConnecting));
