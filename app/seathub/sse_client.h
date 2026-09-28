@@ -21,9 +21,14 @@
 #include <QObject>
 #include <QString>
 
+#include <functional>
+
 #include "control_plane_client.h"
 
 class QJsonObject;
+class QNetworkReply;
+class QTimer;
+class ControlPlaneClient;
 
 /// `AccountStateEvent.account` (`docs/spec/openapi.yaml`): the `account:{user_id}` topic's
 /// snapshot and `GET /api/account-state`'s body. Defensive like `SessionInfo::parse` - a
@@ -45,12 +50,20 @@ struct AccountStateInfo
 // Crosses a QSignalSpy/queued-connection boundary the same way `SessionInfo` already does.
 Q_DECLARE_METATYPE(AccountStateInfo)
 
-/// One connection's frame reader. Owns no socket and no `QNetworkAccessManager` of its own;
-/// `feed()` is handed raw bytes by whatever opened the stream
-/// (`ControlPlaneClient::openAccountStream`, Task 2).
+/// One connection's frame reader and the connection's own state machine (Task 2: L3-L5,
+/// ADR-0067). Owns no `QNetworkAccessManager` of its own - `openAccountStream()` on the
+/// `ControlPlaneClient` given to `setControlPlane()` opens each attempt, on its own manager, so
+/// the bearer never crosses into this object (D-35, T-06.4-45). `feed()` stays the test seam
+/// (Task 1); `start()`/`stop()` are the production entry points that wire a real `QNetworkReply`
+/// to it.
 class SseClient : public QObject
 {
     Q_OBJECT
+
+    /// `idle` (never started, or `stop()` called) | `connecting` (a reply is open, not live yet)
+    /// | `live` | `paused` (L5: not live for `pausedDelayMs`, shows the fallback indicator) |
+    /// `stopped` (revoked, or a 401/403 - requests no further stream).
+    Q_PROPERTY(QString state READ state NOTIFY stateChanged)
 
 public:
     explicit SseClient(QObject* parent = nullptr);
@@ -62,7 +75,51 @@ public:
     /// build has no case for is a silent no-op, never an error.
     void feed(const QByteArray& chunk);
 
+    /// The `ControlPlaneClient` whose `openAccountStream()`/`m_streamNetwork` opens every attempt
+    /// this object makes. Must be set before `start()`.
+    void setControlPlane(ControlPlaneClient* controlPlane);
+
+    /// Opens the first attempt and arms the paused-fallback timer. A second call while already
+    /// running is a no-op (mirrors `SessionWebSocket::open`'s own idempotence).
+    void start();
+    /// Closes deliberately: aborts any open reply, stops every timer, and - unlike a `revoked`
+    /// closing - never reconnects and never emits `revoked()`. `idle`, not `stopped`: this is not
+    /// the server saying no, it is the caller saying stop.
+    void stop();
+
+    QString state() const { return m_state; }
+
+    /// L3: 45 000 ms by default (`docs/spec/timing.md` L3). Only enforced once a hello has named
+    /// `alive_ms` - see `feed()`'s `hello` handling.
+    void setDeadStreamTimeoutMs(int ms);
+    /// L5: 10 000 ms by default (`docs/spec/timing.md` L5) - not live this long shows the
+    /// fallback indicator.
+    void setPausedDelayMs(int ms);
+    /// L4's `replaced` case: 30 000 ms by default (`docs/spec/timing.md` L4) - waits the cap
+    /// rather than the ordinary schedule, so as not to fight the connection that just replaced
+    /// this one.
+    void setReconnectCapMs(int ms);
+    /// Overrides the jitter term `reconnectDelayMs` reads by default (`QRandomGenerator`, `[0,
+    /// 0.2]`) - the test seam for `reconnectDelayUsesTheScheduleWithJitter` and the paced-backoff
+    /// tests above it.
+    void setJitterProvider(std::function<double()> provider);
+
+    /// `SessionWebSocket::reconnectDelayMs(attempt)` scaled by `1 + min(jitter, 0.2)` (L4/V15:
+    /// "1 s doubling to a 30 s cap plus up to 20% jitter"). Pure, so the schedule is asserted
+    /// without a socket - the reused schedule itself is `SessionWebSocket`'s (§1.2); this only
+    /// adds the jitter term that schedule does not have.
+    static int reconnectDelayMs(int attempt, double jitter);
+
 signals:
+    void stateChanged();
+    /// L5's fallback indicator (D-04): `true` on the paused-delay's expiry while not live,
+    /// `false` the moment the connection goes live again. Fires at most once per transition -
+    /// `pausedAfterTheFallbackDelay` checks this, not just `state()`.
+    void pausedChanged(bool paused);
+    /// `stream.closing {reason: "revoked"}`, or a 401/403 answer to the stream request itself
+    /// (§2.3: the same `handleCredentialRefused()` path a REST 401 already takes). Requests no
+    /// further stream.
+    void revoked();
     /// `stream.hello`. `aliveMs` is `alive_ms` when the hello named it, 0 when it did not (L3:
     /// the dead-stream timeout is enforced only when this is present).
     void hello(int aliveMs);
@@ -83,6 +140,58 @@ signals:
 private:
     void processLine(const QByteArray& line);
     void dispatchFrame();
+
+    /// Starts (or restarts, on reconnect) one connection attempt: resets the per-attempt hello
+    /// state, moves to `connecting`, opens the reply and arms the paused timer.
+    void beginConnection();
+    void openStream();
+    void scheduleReconnect(int delayMs);
+    void setState(const QString& state);
+    void markLive();
+    double jitterValue() const;
+
+    void handleReadyRead();
+    void handleFinished();
+    void onHello(int aliveMs);
+    void onAlive();
+    void onClosing(const QString& reason);
+    /// `resync`/`account.state`/`session.state` all do the same one thing here: restart the
+    /// dead-stream timer when L3 enforces it. Connected to all three signals.
+    void onNamedEvent();
+
+    ControlPlaneClient* m_controlPlane = nullptr;
+    QNetworkReply* m_reply = nullptr;
+
+    QString m_state = QStringLiteral("idle");
+    bool m_running = false;
+    /// Set by `stop()` only - distinguishes a deliberate close (never reconnects, never emits
+    /// `revoked()`) from every other way a connection ends.
+    bool m_stopping = false;
+    bool m_live = false;
+    bool m_paused = false;
+    /// True once the current attempt's `stream.hello` has named `alive_ms` - L3's dead-stream
+    /// timeout is enforced only then, and clears at the start of every new attempt.
+    bool m_helloNamedAliveMs = false;
+    /// The `reason` from the most recent `stream.closing` frame on the current attempt, consumed
+    /// (and cleared) by `handleFinished()` once the reply the server closed actually completes.
+    QString m_lastCloseReason;
+    /// Consecutive failed-to-stay-live attempts; feeds `reconnectDelayMs`'s exponential term and
+    /// resets to 0 once a connection has stayed live 60 s (L4).
+    int m_attempt = 0;
+
+    QTimer* m_deadStreamTimer = nullptr;
+    QTimer* m_pausedTimer = nullptr;
+    QTimer* m_reconnectTimer = nullptr;
+    /// Single-shot, armed on every `markLive()`: 60 s of continuous liveness resets `m_attempt`
+    /// (L4: "back to 1 s after a connection that stayed live 60 s").
+    QTimer* m_liveResetTimer = nullptr;
+
+    int m_deadStreamTimeoutMs = 45000;
+    int m_pausedDelayMs = 10000;
+    int m_reconnectCapMs = 30000;
+    std::function<double()> m_jitterProvider;
+
+    static const int kLiveResetMs = 60000;
 
     /// Bytes of the line currently being assembled, across however many `feed()` calls it takes.
     QByteArray m_lineBuffer;

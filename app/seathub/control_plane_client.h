@@ -431,6 +431,10 @@ public:
 
     QNetworkAccessManager* networkAccessManager() const { return m_network; }
 
+    /// Replaces the stream's own access manager (see `m_streamNetwork`'s comment). The same test
+    /// seam `setNetworkAccessManager` is for the REST manager; production never calls it.
+    void setStreamNetworkAccessManager(QNetworkAccessManager* manager);
+
     // --- threading (see the header comment)
 
     /// Moves this object - and therefore its QNetworkAccessManager - onto a thread with its
@@ -511,6 +515,26 @@ public:
     void fetchSession(const QString& sessionId, Callback callback);
     void fetchSessionAuthorization(const QString& sessionId, Callback callback);
 
+    /// `GET /api/stream` (3.5.0, ADR-0062/ADR-0067): opens the account's push channel on
+    /// `m_streamNetwork`, its own manager (never `m_network`, D-35/T-06.4-45 - a long-lived
+    /// stream sharing a connection with ordinary short REST calls would entangle their scheduling
+    /// and timeout behaviour, `06.4-RESEARCH-FORK.md` "Alternatives Considered"). The bearer is
+    /// attached here, under the same lock every other call reads it under, and never crosses into
+    /// the returned reply's caller (`SseClient`) as anything but a `QNetworkReply*`. No
+    /// `QNetworkRequest::setTransferTimeout` - that only detects a dead TCP connection (Mode A)
+    /// and resets on the server's own `: ping` keep-alive exactly like a live one does; the
+    /// dead-stream bound is `SseClient`'s own application-level L3 timer instead. Callers must be
+    /// on this object's owning thread - unlike `send()`, this is not marshalled, since
+    /// `SseClient` already lives on the same network thread this class does.
+    QNetworkReply* openAccountStream();
+
+    /// `GET /api/account-state` (3.6.0, ADR-0067): the same `AccountStateEvent` body
+    /// `GET /api/stream`'s `account.state` frame carries, for the fallback read while the live
+    /// stream is not live (D-06, `docs/spec/timing.md` L5). `fallback` true sends
+    /// `X-Stream-Fallback: seathub`; false sends no marker (an ordinary one-shot read, e.g. at
+    /// launch).
+    void fetchAccountState(bool fallback, Callback callback);
+
     /// The 10-second liveness report (D-31) carrying `state` and/or `error_code` (D-34,
     /// ADR-0041). Both are optional; both empty is the pre-1.6.0 deadline extension. Kept for the
     /// callers this exact shape still has (tests exercising the class directly); production
@@ -569,6 +593,11 @@ private:
 
     QNetworkAccessManager* m_network = nullptr;
     bool m_ownsNetwork = false;
+    /// `openAccountStream()`'s own manager, separate from `m_network` (see that method's own
+    /// comment). Parented to `this` like `m_network`, so `moveToOwnThread()` carries both to the
+    /// network thread together and `stopOwnedThread()`'s join destroys both.
+    QNetworkAccessManager* m_streamNetwork = nullptr;
+    bool m_ownsStreamNetwork = false;
     QThread* m_thread = nullptr;
     QString m_baseUrl;
 
