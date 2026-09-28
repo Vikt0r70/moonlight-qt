@@ -1,0 +1,9 @@
+{
+  "event": "stream.hello",
+  "data": {
+    "connection_id": "c-9a1c2e3f4b5d",
+    "server_time": "2026-09-27T10:00:01.123Z",
+    "topics": ["account:22222222-2222-4222-8222-222222222222"],
+    "retry_ms": 3000
+  }
+}

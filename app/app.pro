@@ -217,6 +217,7 @@ SOURCES += \
     seathub/agent_config.cpp \
     seathub/hud_overlay.cpp \
     seathub/control_plane_client.cpp \
+    seathub/sse_client.cpp \
     seathub/duration_text.cpp \
     seathub/jordan_time.cpp \
     seathub/customer_lists.cpp \
@@ -285,6 +286,7 @@ HEADERS += \
     seathub/agent_config.h \
     seathub/hud_overlay.h \
     seathub/control_plane_client.h \
+    seathub/sse_client.h \
     seathub/duration_text.h \
     seathub/jordan_time.h \
     seathub/customer_lists.h \
