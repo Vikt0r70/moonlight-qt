@@ -1694,6 +1694,16 @@ void SeatHubClient::signOut()
     // leaving the NEXT, unrelated session's ordinary teardown to find the flag still set and fire
     // an unrequested `beginPlayRequest()` for a customer who is no longer signed in.
     setRetryBusy(false);
+    // WR-14: signing out mid-episode (e.g. during the backoff gap) stops and clears every other
+    // piece of reconnect state above, but left `m_reconnectTimer`, `m_reconnecting` and the
+    // Settings/updater lock stuck exactly as `enterReconnect()` set them - nobody signed in to
+    // notice, until the next `beginSession()`'s own lock cycle happened to touch it.
+    if (m_reconnecting) {
+        m_reconnectTimer->stop();
+        m_reconnecting = false;
+        setReconnectLock(false);
+        emit reconnectingChanged();
+    }
 
     // The server's revoke goes out first - it is the only thing that makes "signed out" true for
     // anyone who has copied the credential. The request reads the credential when it runs, which
@@ -2544,7 +2554,15 @@ void SeatHubClient::handleSessionState(const SessionInfo& session)
             // streaming, this same terminal read still wins - clear `m_reconnecting` first, so
             // `handleReadyForDeletion()`, once this interrupt reaches it, takes the ordinary end
             // path instead of scheduling another attempt for a session that is already over.
-            m_reconnecting = false;
+            // WR-14: only when a retry's engine is still genuinely `m_reconnecting` - the ordinary
+            // already-`"streaming"` sub-case (`m_reconnecting` already false here) is unlocked by
+            // `setAppState()`'s own toggle once `handleReadyForDeletion()` leaves "streaming", and
+            // releasing the Settings/updater lock again here would double-unlock it.
+            if (m_reconnecting) {
+                m_reconnecting = false;
+                setReconnectLock(false);
+                emit reconnectingChanged();
+            }
             // The engine is running: it stops it, and its own end path carries the customer home.
             m_session->interrupt();
         }

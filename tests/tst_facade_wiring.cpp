@@ -5386,6 +5386,96 @@ private slots:
         }
     }
 
+    void aTerminalReadDuringARetrysMidLaunchReleasesTheLock()
+    {
+        // WR-14(a): a terminal session read that arrives while a retry's own engine is mid-launch
+        // - `m_session->active()` true, but `m_appState` still "connecting" (the retry has not yet
+        // reached `handleConnectionStarted()`) - must still release the Settings/updater lock
+        // `enterReconnect()` engaged, and must still notify `reconnecting` (WR-14c).
+        auto* engine = new FakeEngineSession;
+        SeatHubClient client;
+        WalletTicks ticks;
+        beginStreaming(client, engine, &ticks, 90, 80);
+        QVERIFY(!QTest::currentTestFailed());
+
+        emitConnectionTerminated(-1);
+        emit engine->displayLaunchError(QStringLiteral("Connection terminated"));
+        emit engine->readyForDeletion();
+        QTRY_VERIFY_WITH_TIMEOUT(client.reconnectTimer()->isActive(), 15000);
+        QVERIFY2(client.settings()->sessionActive(),
+                 "precondition: enterReconnect() must have engaged the Settings/updater lock");
+
+        client.reconnectTimer()->start(0);
+        QTRY_VERIFY_WITH_TIMEOUT(
+            m_fake->requestPaths().contains(QStringLiteral("/api/sessions/s-live/pairing")), 15000);
+
+        emit client.pairing()->authorizationGranted();
+        QTest::qWait(20);
+
+        auto* secondEngine = new FakeEngineSession;
+        client.session()->attachSession(secondEngine);
+        emit client.pairing()->pairingCompleted(QStringLiteral("aa:bb:cc:dd:ee:11"));
+        QTest::qWait(20);
+
+        // Precondition: the retry's own engine is mid-launch (active), but has not yet reached
+        // `handleConnectionStarted()` - `appState` is still "connecting", not "streaming". This is
+        // the specific sub-case WR-14(a) describes; the ordinary already-`"streaming"` sub-case is
+        // already correctly unlocked elsewhere and is not what this test is proving.
+        QVERIFY2(client.session()->active(), "the retry's own engine must be active for this case");
+        QCOMPARE(client.appState(), QStringLiteral("connecting"));
+        QVERIFY2(client.reconnecting(), "precondition: still reconnecting going into the terminal read");
+
+        QSignalSpy reconnectingSpy(&client, &SeatHubClient::reconnectingChanged);
+
+        SessionInfo over = sessionIn(QStringLiteral("COMPLETED"), QStringLiteral("s-live"));
+        over.endReason = QStringLiteral("HOST_LOST");
+        report(client, over);
+
+        QTRY_VERIFY_WITH_TIMEOUT(!client.reconnecting(), 15000);
+        QVERIFY2(!reconnectingSpy.isEmpty(),
+                 "WR-14(c): reconnectingChanged must fire for this branch too");
+        QVERIFY2(!client.settings()->sessionActive(),
+                 "WR-14(a): the Settings/updater lock must release once this branch clears "
+                 "m_reconnecting");
+        QCOMPARE(secondEngine->interrupts, 1);
+
+        emit secondEngine->readyForDeletion();
+    }
+
+    void signOutMidReconnectReleasesTheLockAndStopsTheTimer()
+    {
+        // WR-14(b): signing out during the backoff gap (mid-episode) stops and clears every other
+        // piece of reconnect state - but before this fix, never touched `m_reconnectTimer`, never
+        // cleared `m_reconnecting`, and never released the Settings/updater lock.
+        auto* engine = new FakeEngineSession;
+        SeatHubClient client;
+        WalletTicks ticks;
+        beginStreaming(client, engine, &ticks, 90, 80);
+        QVERIFY(!QTest::currentTestFailed());
+
+        emitConnectionTerminated(-1);
+        emit engine->displayLaunchError(QStringLiteral("Connection terminated"));
+        emit engine->readyForDeletion();
+        QTRY_VERIFY_WITH_TIMEOUT(client.reconnectTimer()->isActive(), 15000);
+
+        // Preconditions: reconnecting, the timer armed, and the lock engaged - all three of which
+        // this fix must clear/release/stop on sign-out.
+        QVERIFY2(client.reconnecting(), "precondition: still reconnecting at the moment of sign-out");
+        QVERIFY2(client.reconnectTimer()->isActive(), "precondition: the backoff timer is armed");
+        QVERIFY2(client.settings()->sessionActive(),
+                 "precondition: enterReconnect() must have engaged the Settings/updater lock");
+
+        QSignalSpy reconnectingSpy(&client, &SeatHubClient::reconnectingChanged);
+
+        client.signOut();
+
+        QVERIFY2(!client.reconnecting(), "WR-14(b): signOut() must clear m_reconnecting");
+        QVERIFY2(!client.reconnectTimer()->isActive(), "WR-14(b): signOut() must stop the timer");
+        QVERIFY2(!client.settings()->sessionActive(),
+                 "WR-14(b): signOut() must release the Settings/updater lock");
+        QVERIFY2(!reconnectingSpy.isEmpty(), "WR-14(c): reconnectingChanged must fire on sign-out too");
+        QCOMPARE(client.appState(), QStringLiteral("signed_out"));
+    }
 };
 
 QTEST_MAIN(TstFacadeWiring)
