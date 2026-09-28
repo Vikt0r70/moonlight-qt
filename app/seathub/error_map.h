@@ -89,6 +89,14 @@ Q_DECLARE_METATYPE(SeatHubFailure)
 /// Maps `Session::stageFailed(stage, errorCode, failingPorts)` to a SeatHub failure.
 SeatHubFailure mapStageFailure(const QString& stage, int errorCode, const QString& failingPorts);
 
+/// Maps a session's terminal `end_blame`/`end_reference` (06.1's ADR item 4, J-22,
+/// `docs/spec/copy.md` §Session end reasons' `CONNECT_FAILED` row) to the sentence and reference
+/// the customer reads. `blame` is `rig` | `connection` | `us` | empty (`FailureBlame`, or absent
+/// on an older server / a non-failing end). `reference` - the server's own `end_reference` - is
+/// carried through verbatim and only when `blame` names one; this function never invents a code
+/// (ADR-0008). An empty `blame` returns today's plain `CONNECT_FAILED` sentence with no reference.
+SeatHubFailure mapEndBlame(const QString& blame, const QString& reference);
+
 /// Maps `Session::displayLaunchError(text)` to a SeatHub failure. The raw `text` is
 /// retained in `diagnostic` only - it must never reach the customer (T-03-05).
 SeatHubFailure mapLaunchError(const QString& text);

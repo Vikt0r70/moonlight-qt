@@ -233,11 +233,29 @@ void LivenessTimer::setStage(const QString& stage)
     if (m_stage == stage) {
         return;
     }
+    const QString previousStage = m_stage;
     m_stage = stage;
     emit payloadChanged();
-    // A stage change is reported immediately, ahead of the next scheduled tick, so the server
-    // sees the transition the moment it happens.
-    reportNow();
+
+    // 06.1-19/J-07 (Task 2): only these two transitions are load-bearing on the server's own
+    // state machine (`state-machines.md`: a liveness report with stage `reconnecting` is what
+    // opens the 5-minute grace on a disconnect, and one with stage `streaming` is what commits
+    // the reconnect and increments `reconnect_count` within it) - narrowed from every genuine
+    // stage change reporting at once, which no row of that table depends on for `preparing_rig`,
+    // `pairing` or `connecting` (confirmed against `06.1-RESEARCH.md`'s own Time Budget: those
+    // stage reports are diagnostic only and are not what the `timeline_events` rows the live
+    // timing proof reads are derived from). The interval restarts from this report too, so the
+    // ordinary cadence resumes counting from the moment the server actually heard this, not from
+    // whenever it last happened to fire.
+    const bool enteringReconnect = stage == QLatin1String("reconnecting");
+    const bool returningToStreaming = stage == QLatin1String("streaming")
+            && previousStage == QLatin1String("reconnecting");
+    if (enteringReconnect || returningToStreaming) {
+        reportNow();
+        if (m_timer->isActive()) {
+            m_timer->start();
+        }
+    }
 }
 
 void LivenessTimer::setEngineStage(const QString& engineStage)

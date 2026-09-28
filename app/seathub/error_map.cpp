@@ -14,6 +14,21 @@ const char* kGenericSentence = "Something went wrong on our side.";
 // copy.md §Support & errors, "Offline", in full. Home shows the same sentence; the two must not drift.
 const char* kOfflineSentence = "Can't reach SevenHills right now. Showing the last known balance.";
 
+// copy.md §Session end reasons, the `CONNECT_FAILED` row (06.1's ADR item 4, J-22) - the three
+// blame-carrying sentences, and the row's own "no blame (an older server)" fallback. None of the
+// three carries a minute count, so unlike `kEndConnectFailed`'s sibling sentences in
+// `seathub_client.cpp` these are never run through the mono-minutes formatter.
+const char* kBlameRig =
+    "The rig had a problem, so the stream didn't start. You were not charged.";
+const char* kBlameConnection =
+    "Your connection couldn't reach the rig, so the stream didn't start. You were not charged.";
+const char* kBlameUs =
+    "Something went wrong on our side, so the stream didn't start. You were not charged.";
+// The row's "no blame" fallback - identical wording to `seathub_client.cpp`'s own
+// `kEndConnectFailed`, kept as a second literal here rather than a cross-file reference because
+// this file has no dependency on that one.
+const char* kBlameNone = "The stream didn't start. You were not charged.";
+
 } // namespace
 
 SeatHubFailure SeatHubFailure::network(const QString& message)
@@ -143,4 +158,38 @@ SeatHubFailure mapPortTestFailure(int portTestResult)
 {
     Q_UNUSED(portTestResult);
     return SeatHubFailure::generic();
+}
+
+// ---------------------------------------------------------------------------
+// 06.1's ADR item 4 / J-22: the blame the server attributed to a failed start, and the reference
+// that proves it. `kind` is `Api` - the sentence and the reference both come from the control
+// plane's own terminal session read, the same source `SeatHubFailure::api()` reads from for every
+// other server-attributed failure.
+// ---------------------------------------------------------------------------
+
+SeatHubFailure mapEndBlame(const QString& blame, const QString& reference)
+{
+    SeatHubFailure f;
+    f.kind = FailureKind::Api;
+
+    if (blame == QLatin1String("rig")) {
+        f.error = QString::fromLatin1(kBlameRig);
+        f.reference = reference;
+    }
+    else if (blame == QLatin1String("connection")) {
+        f.error = QString::fromLatin1(kBlameConnection);
+        f.reference = reference;
+    }
+    else if (blame == QLatin1String("us")) {
+        f.error = QString::fromLatin1(kBlameUs);
+        f.reference = reference;
+    }
+    else {
+        // No blame: an older server that never named one, or a non-failing end. copy.md's plain
+        // CONNECT_FAILED sentence, and no reference - there is nothing here for one to have named,
+        // and ADR-0008 forbids inventing one.
+        f.error = QString::fromLatin1(kBlameNone);
+    }
+
+    return f;
 }
