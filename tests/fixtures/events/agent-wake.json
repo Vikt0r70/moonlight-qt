@@ -1,0 +1,6 @@
+{
+  "event": "agent.wake",
+  "data": {
+    "reason": "session"
+  }
+}

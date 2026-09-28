@@ -63,6 +63,7 @@ SOURCES += \
     ../app/seathub/customer_lists.cpp \
     ../app/seathub/token_store.cpp \
     ../app/seathub/session_websocket.cpp \
+    ../app/seathub/sse_client.cpp \
     ../app/seathub/pairing_controller.cpp \
     ../app/seathub/pairing_seam.cpp \
     ../app/seathub/teardown_controller.cpp \
@@ -100,6 +101,7 @@ HEADERS += \
     ../app/seathub/customer_lists.h \
     ../app/seathub/token_store.h \
     ../app/seathub/session_websocket.h \
+    ../app/seathub/sse_client.h \
     ../app/seathub/pairing_controller.h \
     ../app/seathub/pairing_seam.h \
     ../app/seathub/teardown_controller.h \

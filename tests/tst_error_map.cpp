@@ -91,6 +91,7 @@ private slots:
     void diagnostic_neverReachesTheViewModel();
     void apiFailure_passesTheServerReferenceThrough();
     void errorScreen_rendersReasonAndMonoReference();
+    void mapEndBlame();
 };
 
 void TstErrorMap::initTestCase()
@@ -272,6 +273,42 @@ void TstErrorMap::errorScreen_rendersReasonAndMonoReference()
         }
     }
     QVERIFY2(sawRetryAction, "the error screen must offer a retry action");
+}
+
+void TstErrorMap::mapEndBlame()
+{
+    // 06.1's ADR item 4 / J-22, copy.md §Session end reasons' CONNECT_FAILED row: each of the
+    // three blames gives its own sentence, with the server's reference set; an empty blame keeps
+    // today's plain sentence and shows no reference; a reference never appears without a server
+    // value to have carried it.
+    const SeatHubFailure rig = ::mapEndBlame(QStringLiteral("rig"), QStringLiteral("SH-4F7KQ2"));
+    QCOMPARE(rig.error,
+             QStringLiteral("The rig had a problem, so the stream didn't start. You were not charged."));
+    QCOMPARE(rig.reference, QStringLiteral("SH-4F7KQ2"));
+
+    const SeatHubFailure connection =
+        ::mapEndBlame(QStringLiteral("connection"), QStringLiteral("SH-4F7KQ2"));
+    QCOMPARE(connection.error,
+             QStringLiteral("Your connection couldn't reach the rig, so the stream didn't start. "
+                            "You were not charged."));
+    QCOMPARE(connection.reference, QStringLiteral("SH-4F7KQ2"));
+
+    const SeatHubFailure us = ::mapEndBlame(QStringLiteral("us"), QStringLiteral("SH-4F7KQ2"));
+    QCOMPARE(us.error,
+             QStringLiteral("Something went wrong on our side, so the stream didn't start. You "
+                            "were not charged."));
+    QCOMPARE(us.reference, QStringLiteral("SH-4F7KQ2"));
+
+    // An empty blame (an older server, or a non-failing end): the plain sentence, no reference -
+    // even when a reference somehow arrived alongside it, ADR-0008 leaves nothing for it to name.
+    const SeatHubFailure noBlame = ::mapEndBlame(QString(), QStringLiteral("SH-4F7KQ2"));
+    QCOMPARE(noBlame.error, QStringLiteral("The stream didn't start. You were not charged."));
+    QVERIFY2(noBlame.reference.isEmpty(),
+             "an empty blame must show no reference, whatever the argument carried");
+
+    const SeatHubFailure neither = ::mapEndBlame(QString(), QString());
+    QCOMPARE(neither.error, QStringLiteral("The stream didn't start. You were not charged."));
+    QVERIFY(neither.reference.isEmpty());
 }
 
 QTEST_MAIN(TstErrorMap)

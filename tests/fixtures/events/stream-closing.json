@@ -1,0 +1,6 @@
+{
+  "event": "stream.closing",
+  "data": {
+    "reason": "replaced"
+  }
+}

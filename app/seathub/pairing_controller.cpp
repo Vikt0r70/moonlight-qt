@@ -1,6 +1,7 @@
 #include "pairing_controller.h"
 
 #include <QLoggingCategory>
+#include <QSet>
 
 Q_LOGGING_CATEGORY(seathubPairing, "seathub.pairing")
 
@@ -11,6 +12,18 @@ const char* kStateAuthorizing = "authorizing";
 const char* kStatePairing = "pairing";
 const char* kStateReady = "ready";
 const char* kStateFailed = "failed";
+
+// J-16 / 06.1's ADR item 3: the server answers 200 now, with one of these `SessionState` values,
+// while the rig is still getting ready - replacing the 409 an older server still sends for the
+// same thing. Either shape is a wait, not a failure: this set is checked in `handleAuthorization`
+// right where the 409 branch already is, and handled exactly the same way (it costs nothing
+// against the pairing deadline below, because that clock bounds a pairing resolving, not the rig
+// getting ready).
+const QSet<QString> kWaitingStates = {
+    QStringLiteral("REQUESTED"),
+    QStringLiteral("ALLOCATED"),
+    QStringLiteral("PREPARING"),
+};
 
 // `docs/spec/copy.md` §Play flow. A pairing that does not resolve is a SeatHub failure with a
 // reason and a retry, never a Moonlight error surface (ADR-0008, D-51). These are the local sentences;
@@ -96,6 +109,16 @@ void PairingController::cancel()
     m_clock.invalidate();
     m_sessionId.clear();
     setState(QString::fromLatin1(kStateIdle));
+}
+
+void PairingController::pollNow()
+{
+    // `pollAuthorization()` itself is a no-op while idle (`m_sessionId` empty) or once pairing has
+    // finished (`m_finished`) - both its own top-of-function guard, so nothing further is needed
+    // here for either case. Stopping any pending tick first means an interval timer that was about
+    // to fire moments from now cannot also run a second, redundant poll right behind this one.
+    m_pollTimer->stop();
+    pollAuthorization();
 }
 
 void PairingController::scheduleNextPoll()
@@ -189,6 +212,19 @@ void PairingController::handleAuthorization(const ControlPlaneResult& result)
     SessionAuthorization authorization;
     if (!SessionAuthorization::parse(result.body, &authorization)) {
         fail(SeatHubFailure::local(QString::fromLatin1(kNoAuthorization)));
+        return;
+    }
+
+    if (kWaitingStates.contains(authorization.state)) {
+        // J-16 / 06.1's ADR item 3: a 200 answer whose state is REQUESTED, ALLOCATED or
+        // PREPARING is the rig still getting ready, told the modern way. Handled exactly like
+        // the 409 branch above - it is not logged as a problem, it does not grant, and it does
+        // not spend the pairing deadline: that clock restarts on every "not yet" the same way it
+        // does for a 409, because preparation has its own server deadline and a session that
+        // deadline fails arrives here as a terminal session read, not as this poll's answer.
+        ++m_conflictPolls;
+        m_clock.restart();
+        scheduleNextPoll();
         return;
     }
 

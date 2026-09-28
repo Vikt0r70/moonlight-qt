@@ -11,6 +11,7 @@
 #include <QRegularExpression>
 #include <QThread>
 #include <QUrl>
+#include <QUuid>
 
 namespace {
 
@@ -80,6 +81,10 @@ bool SessionAuthorization::parse(const QJsonObject& body, SessionAuthorization* 
 
     SessionAuthorization auth;
     auth.sessionId = body.value(QStringLiteral("session_id")).toString();
+    // J-16 / 06.1's ADR item 3: optional, absent on an older server. `toString()` already
+    // answers empty for both absent and any non-string value, which is exactly "not a waiting
+    // state" - the same reading `qualityProfile` below already relies on.
+    auth.state = body.value(QStringLiteral("state")).toString();
     // `pairing_pin` is `type: [string, "null"]` - explicitly nullable, and null means this
     // session has not asked to pair yet. Absent and null are the same thing here.
     auth.pairingPin = body.value(QStringLiteral("pairing_pin")).toString();
@@ -132,6 +137,11 @@ bool SessionInfo::parse(const QJsonObject& body, SessionInfo* out)
     info.saveDeadlineAt = body.value(QStringLiteral("save_deadline_at")).toString();
     info.billingStartedAt = body.value(QStringLiteral("billing_started_at")).toString();
     info.endReason = body.value(QStringLiteral("end_reason")).toString();
+    // 06.1's ADR item 9/4: absent, present-and-null and present-and-empty all read the same
+    // "not set" way `toString()` already gives every optional field on this struct.
+    info.graceDeadlineAt = body.value(QStringLiteral("grace_deadline_at")).toString();
+    info.endBlame = body.value(QStringLiteral("end_blame")).toString();
+    info.endReference = body.value(QStringLiteral("end_reference")).toString();
 
     *out = info;
     return true;
@@ -405,6 +415,10 @@ ControlPlaneClient::ControlPlaneClient(QObject* parent)
 {
     m_network = new QNetworkAccessManager(this);
     m_ownsNetwork = true;
+    // Parented the same way as `m_network`, so `moveToOwnThread()` moves both together (Qt moves
+    // a QObject's children with it) and there is exactly one place either is constructed.
+    m_streamNetwork = new QNetworkAccessManager(this);
+    m_ownsStreamNetwork = true;
 }
 
 ControlPlaneClient::~ControlPlaneClient()
@@ -616,14 +630,38 @@ QByteArray ControlPlaneClient::buildSessionCreate()
 
 QByteArray ControlPlaneClient::buildEndRequest(bool failed)
 {
+    return buildEndRequest(failed, EndReport());
+}
+
+QByteArray ControlPlaneClient::buildEndRequest(bool failed, const EndReport& report)
+{
     // Contract 3.3.0 (D-05/D-23): `{"failed": true}` records `CONNECT_FAILED` on a pre-ACTIVE
     // session; anything else - no body, at all - is the ordinary customer-initiated end
-    // (`CUSTOMER_ENDED`) and is ignored on an ACTIVE one either way.
+    // (`CUSTOMER_ENDED`) and is ignored on an ACTIVE one either way. A report has nothing to add
+    // to an end that is not itself a failure, so `failed == false` still posts no body at all.
     if (!failed) {
         return QByteArray();
     }
     QJsonObject object;
     object.insert(QStringLiteral("failed"), true);
+    // Contract 3.5.0 (06.1's ADR, J-22): each of the report's fields rides beside `failed` only
+    // when it is known - an absent field is not the same as an empty or zero one on this leniently
+    // -parsed body (`docs/spec/openapi.yaml` `SessionEndRequest`).
+    if (!report.stage.isEmpty()) {
+        object.insert(QStringLiteral("stage"), report.stage);
+    }
+    if (!report.engineStage.isEmpty()) {
+        object.insert(QStringLiteral("engine_stage"), report.engineStage);
+    }
+    if (report.hasEngineError) {
+        object.insert(QStringLiteral("engine_error"), report.engineError);
+    }
+    if (!report.failingPorts.isEmpty()) {
+        object.insert(QStringLiteral("failing_ports"), report.failingPorts);
+    }
+    if (!report.errorCode.isEmpty()) {
+        object.insert(QStringLiteral("error_code"), report.errorCode);
+    }
     return QJsonDocument(object).toJson(QJsonDocument::Compact);
 }
 
@@ -731,6 +769,15 @@ void ControlPlaneClient::setNetworkAccessManager(QNetworkAccessManager* manager)
     m_ownsNetwork = false;
 }
 
+void ControlPlaneClient::setStreamNetworkAccessManager(QNetworkAccessManager* manager)
+{
+    if (!manager || manager == m_streamNetwork) {
+        return;
+    }
+    m_streamNetwork = manager;
+    m_ownsStreamNetwork = false;
+}
+
 void ControlPlaneClient::moveToOwnThread()
 {
     if (m_thread) {
@@ -783,7 +830,8 @@ void ControlPlaneClient::stopOwnedThread()
 // ---------------------------------------------------------------- transport
 
 void ControlPlaneClient::send(const QString& method, const QString& path, const QByteArray& body,
-                             bool authenticated, Callback callback)
+                             bool authenticated, Callback callback,
+                             const QHash<QByteArray, QByteArray>& extraHeaders)
 {
     // WR-01: the access token and the trace id are captured here, at call time, under the same
     // lock `setAccessToken`/`setTraceId`/`clearTraceId` take - not read from the member again once
@@ -814,20 +862,24 @@ void ControlPlaneClient::send(const QString& method, const QString& path, const 
     if (QThread::currentThread() != thread()) {
         QMetaObject::invokeMethod(
             this,
-            [this, method, path, body, authenticated, accessToken, traceId, callback]() {
-                sendOnOwningThread(method, path, body, authenticated, accessToken, traceId, callback);
+            [this, method, path, body, authenticated, accessToken, traceId, callback,
+             extraHeaders]() {
+                sendOnOwningThread(method, path, body, authenticated, accessToken, traceId,
+                                   callback, extraHeaders);
             },
             Qt::QueuedConnection);
         return;
     }
 
-    sendOnOwningThread(method, path, body, authenticated, accessToken, traceId, callback);
+    sendOnOwningThread(method, path, body, authenticated, accessToken, traceId, callback,
+                       extraHeaders);
 }
 
 void ControlPlaneClient::sendOnOwningThread(const QString& method, const QString& path,
                                             const QByteArray& body, bool authenticated,
                                             const QString& accessToken, const QString& traceId,
-                                            Callback callback)
+                                            Callback callback,
+                                            const QHash<QByteArray, QByteArray>& extraHeaders)
 {
     QUrl url(m_baseUrl + path);
     QNetworkRequest request(url);
@@ -845,6 +897,10 @@ void ControlPlaneClient::sendOnOwningThread(const QString& method, const QString
                              QByteArrayLiteral("00-") + traceId.toUtf8()
                                  + QByteArrayLiteral("-") + randomHex16().toUtf8()
                                  + QByteArrayLiteral("-01"));
+    }
+
+    for (auto it = extraHeaders.constBegin(); it != extraHeaders.constEnd(); ++it) {
+        request.setRawHeader(it.key(), it.value());
     }
 
     QNetworkReply* reply = nullptr;
@@ -962,8 +1018,12 @@ void ControlPlaneClient::fetchUsage(Callback callback)
 
 void ControlPlaneClient::requestSession(Callback callback)
 {
+    // ADR-0062 decision 11: every Play posts a fresh Idempotency-Key - a new uuid per press,
+    // never reused. A retry of the same press is the caller's to make with the same key; this
+    // client makes none of its own.
     send(QStringLiteral("POST"), QStringLiteral("/api/sessions"),
-         buildSessionCreate(), true, callback);
+         buildSessionCreate(), true, callback,
+         { { "Idempotency-Key", QUuid::createUuid().toString(QUuid::WithoutBraces).toUtf8() } });
 }
 
 void ControlPlaneClient::fetchSession(const QString& sessionId, Callback callback)
@@ -980,6 +1040,41 @@ void ControlPlaneClient::fetchSessionAuthorization(const QString& sessionId, Cal
     send(QStringLiteral("GET"), QStringLiteral("/api/sessions/") + encodedPathSegment(sessionId)
              + QStringLiteral("/pairing"),
          QByteArray(), true, callback);
+}
+
+QNetworkReply* ControlPlaneClient::openAccountStream()
+{
+    // D-35/T-06.4-45: captured under the same lock every other call reads the bearer under, and
+    // handed to the caller only inside the request header - never as a value this method returns
+    // or that crosses into `SseClient` any other way.
+    QString accessToken;
+    {
+        QMutexLocker locker(&m_credentialMutex);
+        accessToken = m_accessToken;
+    }
+
+    QUrl url(m_baseUrl + QStringLiteral("/api/stream"));
+    QNetworkRequest request(url);
+    request.setHeader(QNetworkRequest::UserAgentHeader, QStringLiteral("SeatHub"));
+    request.setRawHeader("Accept", "text/event-stream");
+    if (!accessToken.isEmpty()) {
+        request.setRawHeader("Authorization", QByteArrayLiteral("Bearer ") + accessToken.toUtf8());
+    }
+    // Deliberately no `setTransferTimeout()` - see this method's header comment: it would reset
+    // on the server's own `: ping` keep-alive exactly like a genuinely live connection does, so
+    // it detects only a dead TCP connection, never a hub whose dispatcher died. `SseClient` owns
+    // the application-level L3 timer that actually covers that gap.
+    return m_streamNetwork->get(request);
+}
+
+void ControlPlaneClient::fetchAccountState(bool fallback, Callback callback)
+{
+    QHash<QByteArray, QByteArray> extraHeaders;
+    if (fallback) {
+        extraHeaders.insert("X-Stream-Fallback", "seathub");
+    }
+    send(QStringLiteral("GET"), QStringLiteral("/api/account-state"), QByteArray(), true, callback,
+         extraHeaders);
 }
 
 void ControlPlaneClient::postLiveness(const QString& sessionId, const QString& state,
@@ -1002,9 +1097,15 @@ void ControlPlaneClient::postLiveness(const QString& sessionId, const QJsonObjec
 
 void ControlPlaneClient::endSession(const QString& sessionId, bool failed, Callback callback)
 {
+    endSession(sessionId, failed, EndReport(), callback);
+}
+
+void ControlPlaneClient::endSession(const QString& sessionId, bool failed, const EndReport& report,
+                                    Callback callback)
+{
     send(QStringLiteral("POST"), QStringLiteral("/api/sessions/") + encodedPathSegment(sessionId)
              + QStringLiteral("/end"),
-         buildEndRequest(failed), true, callback);
+         buildEndRequest(failed, report), true, callback);
 }
 
 void ControlPlaneClient::postSessionQuality(const QString& sessionId, const QJsonObject& report,

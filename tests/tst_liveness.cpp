@@ -16,6 +16,7 @@
 
 #include <QtTest>
 #include <QBuffer>
+#include <QElapsedTimer>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QNetworkAccessManager>
@@ -214,8 +215,13 @@ private slots:
         QVERIFY(!payload.contains(QStringLiteral("state")));
     }
 
-    void setStage_reportsAtOnceOnAGenuineChange()
+    void setStage_reportsAtOnceOnAGenuineChangeToReconnecting()
     {
+        // 06.1-19/J-07 (Task 2): this used to assert the same for `pairing` - every genuine
+        // change reported at once. That is narrowed now to exactly the two transitions the
+        // server's own state machine acts on immediately; `otherStageChangesKeepTheirCadence`
+        // below is the test for the narrowed half, and this one moves to the transition the
+        // narrowing keeps.
         LivenessTimer timer;
         auto* client = new ControlPlaneClient(&timer);
         auto* fake = new FakeNetworkAccessManager;
@@ -230,16 +236,120 @@ private slots:
         QTRY_VERIFY(!fake->postedBodies.isEmpty());
         const int callsAfterStart = fake->calls;
 
-        timer.setStage(QStringLiteral("pairing"));
+        timer.setStage(QStringLiteral("reconnecting"));
         QTRY_VERIFY(fake->calls > callsAfterStart);
         QCOMPARE(lastPostedObject(*fake).value(QStringLiteral("stage")).toString(),
-                 QStringLiteral("pairing"));
+                 QStringLiteral("reconnecting"));
 
         // The same stage again is not a change: no extra post.
-        const int callsAfterPairing = fake->calls;
-        timer.setStage(QStringLiteral("pairing"));
+        const int callsAfterReconnecting = fake->calls;
+        timer.setStage(QStringLiteral("reconnecting"));
         QTest::qWait(20);
-        QCOMPARE(fake->calls, callsAfterPairing);
+        QCOMPARE(fake->calls, callsAfterReconnecting);
+    }
+
+    // --- 06.1-19/J-07 (Task 2): the server hears the drop and the return at once -------------
+
+    void aReconnectingStageIsReportedAtOnce()
+    {
+        LivenessTimer timer;
+        auto* client = new ControlPlaneClient(&timer);
+        auto* fake = new FakeNetworkAccessManager;
+        fake->body = sessionBody();
+        client->setNetworkAccessManager(fake);
+        timer.setControlPlane(client);
+        // Long enough that only an immediate report - never the scheduled interval - could
+        // account for a new post inside this test's 200 ms window.
+        timer.setIntervalMs(100000);
+        timer.start(QString::fromLatin1(kSessionId));
+        QTRY_VERIFY(!fake->postedBodies.isEmpty());
+        const int callsAfterStart = fake->calls;
+
+        QElapsedTimer clock;
+        clock.start();
+        timer.setStage(QStringLiteral("reconnecting"));
+        QTRY_VERIFY(fake->calls > callsAfterStart);
+        QVERIFY2(clock.elapsed() < 200, "the report must not wait for the scheduled interval");
+        QCOMPARE(lastPostedObject(*fake).value(QStringLiteral("stage")).toString(),
+                 QStringLiteral("reconnecting"));
+
+        // The interval continues from that report: a tick soon after posts again on its own.
+        timer.setIntervalMs(10);
+        const int callsAfterReconnecting = fake->calls;
+        QTRY_VERIFY(fake->calls > callsAfterReconnecting);
+    }
+
+    void theStreamingStageAfterAReconnectIsReportedAtOnce()
+    {
+        LivenessTimer timer;
+        auto* client = new ControlPlaneClient(&timer);
+        auto* fake = new FakeNetworkAccessManager;
+        fake->body = sessionBody();
+        client->setNetworkAccessManager(fake);
+        timer.setControlPlane(client);
+        timer.setIntervalMs(100000);
+        timer.start(QString::fromLatin1(kSessionId));
+        QTRY_VERIFY(!fake->postedBodies.isEmpty());
+        timer.setStage(QStringLiteral("reconnecting"));
+        QTRY_VERIFY(lastPostedObject(*fake).value(QStringLiteral("stage")).toString()
+                    == QStringLiteral("reconnecting"));
+        const int callsAfterReconnecting = fake->calls;
+
+        timer.setStage(QStringLiteral("streaming"));
+        QTRY_VERIFY(fake->calls > callsAfterReconnecting);
+        QCOMPARE(lastPostedObject(*fake).value(QStringLiteral("stage")).toString(),
+                 QStringLiteral("streaming"));
+    }
+
+    void otherStageChangesKeepTheirCadence()
+    {
+        LivenessTimer timer;
+        auto* client = new ControlPlaneClient(&timer);
+        auto* fake = new FakeNetworkAccessManager;
+        fake->body = sessionBody();
+        client->setNetworkAccessManager(fake);
+        timer.setControlPlane(client);
+        // Long enough that the scheduled tick could not possibly fire during this test's wait -
+        // any post seen would have to be the immediate report this test asserts does NOT happen.
+        timer.setIntervalMs(100000);
+
+        timer.start(QString::fromLatin1(kSessionId));
+        QTRY_VERIFY(!fake->postedBodies.isEmpty());
+        const int callsAfterStart = fake->calls;
+
+        timer.setStage(QStringLiteral("pairing"));
+        QTest::qWait(200);
+        QCOMPARE(fake->calls, callsAfterStart);
+        QCOMPARE(timer.stage(), QStringLiteral("pairing"));
+    }
+
+    void noteTerminationZeroIsGraceful()
+    {
+        // ML_ERROR_GRACEFUL_TERMINATION (0) must still be recorded like any other code - the
+        // facade's own `isReconnectEligible()` gate reads it as "not eligible", never as "no
+        // code was ever set" - and it must not be treated as a report failure: the POST itself
+        // succeeds (the fake answers 200 by default), so nothing here should look like a
+        // liveness failure.
+        LivenessTimer timer;
+        auto* client = new ControlPlaneClient(&timer);
+        auto* fake = new FakeNetworkAccessManager;
+        fake->body = sessionBody();
+        client->setNetworkAccessManager(fake);
+        timer.setControlPlane(client);
+
+        QSignalSpy failures(&timer, &LivenessTimer::livenessFailed);
+        QSignalSpy warnings(&timer, &LivenessTimer::livenessWarning);
+
+        timer.start(QString::fromLatin1(kSessionId));
+        QTRY_VERIFY(!fake->postedBodies.isEmpty());
+
+        timer.noteTermination(0);
+        QTRY_COMPARE(lastPostedObject(*fake).value(QStringLiteral("stage")).toString(),
+                     QStringLiteral("ending"));
+        QVERIFY(lastPostedObject(*fake).contains(QStringLiteral("engine_error")));
+        QCOMPARE(lastPostedObject(*fake).value(QStringLiteral("engine_error")).toInt(), 0);
+        QCOMPARE(failures.count(), 0);
+        QCOMPARE(warnings.count(), 0);
     }
 
     void setStage_ignoresAStageOutsideThe3_1_0List()

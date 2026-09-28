@@ -1,0 +1,25 @@
+{
+  "event": "rig.state",
+  "data": {
+    "topic": "rig:11111111-1111-4111-8111-111111111111",
+    "at": "2026-09-27T10:00:20.000Z",
+    "host": {
+      "id": "11111111-1111-4111-8111-111111111111",
+      "label": "zarqa not main",
+      "state": "READY",
+      "rental_mode": "single_os",
+      "current_mode": "rental",
+      "owner_present": false,
+      "owner_armed": true,
+      "arm_expires_at": "2026-09-27T16:00:00Z",
+      "interruptible": true,
+      "supported_profiles": ["1080p60"],
+      "public_ip_status": "VERIFIED",
+      "last_node_heartbeat_at": "2026-09-27T10:00:15Z",
+      "session_id": null,
+      "sunshine_version": "2026.914.2336",
+      "sunshine_tested": true,
+      "session_started_at": null
+    }
+  }
+}

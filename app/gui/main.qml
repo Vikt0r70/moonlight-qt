@@ -118,6 +118,14 @@ ApplicationWindow {
         }
     }
 
+    // D-07 (ADR-0067, the owner's design A-87): the signed-out notice lives outside the Loader,
+    // the same way the forced-update modal below does, so a view change can never take it away
+    // mid-notice.
+    SignedOutNotice {
+        id: signedOutNotice
+        client: seatHub
+    }
+
     // The forced-update modal lives outside the Loader so a view change can never take it away
     // mid-update (D-41). It renders nothing while a stream is running (Pitfall 8) and swallows
     // every event aimed at the page behind it while it is up.

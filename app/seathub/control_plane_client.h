@@ -45,6 +45,7 @@
 // is moved onto a thread with its own running event loop for the duration of a stream; the
 // accessors below are safe to call from any thread.
 
+#include <QHash>
 #include <QJsonObject>
 #include <QList>
 #include <QMutex>
@@ -89,11 +90,36 @@ struct ControlPlaneResult
     SeatHubFailure toFailure() const;
 };
 
+/// `SessionEndRequest` (contract 3.5.0, 06.1's ADR, J-22): what a pre-stream failure tells the
+/// server about itself, carried on `endSession(sessionId, true, report, callback)`. Every field
+/// is optional and independently omitted from the wire body when it is not known - the server
+/// parses this leniently and never answers 422 for it (`docs/spec/openapi.yaml`
+/// `SessionEndRequest`). `engineError` needs `hasEngineError` because `0` is a real Moonlight
+/// code, not "absent" (the same reason `LivenessReport` never used a bare `int`).
+struct EndReport
+{
+    /// `LivenessStage` (e.g. `pairing`, `connecting`). Empty when not known.
+    QString stage;
+    /// moonlight-common-c's own stage name, free text, no enum (06.1's ADR).
+    QString engineStage;
+    bool hasEngineError = false;
+    int engineError = 0;
+    QString failingPorts;
+    /// A reference an earlier error surface already gave the client (06.1's ADR, J-22). The
+    /// client never mints one; this only carries one it was already given.
+    QString errorCode;
+};
+
 /// `GET /api/sessions/{session_id}/pairing` (`SessionAuthorization`). Short-lived and scoped
 /// to one session; never contains Sunshine admin credentials.
 struct SessionAuthorization
 {
     QString sessionId;
+    /// `SessionState` (J-16 / 06.1's ADR item 3): REQUESTED ALLOCATED PREPARING READY when the
+    /// server has one to report, empty when absent (an older server, or a schema this field has
+    /// not reached). A state in `kWaitingStates` (`pairing_controller.cpp`) means the rig is
+    /// still getting ready - a wait, not a failure - even though the HTTP status is 200.
+    QString state;
     /// The control-plane-issued pairing PIN (ADR-0034), or empty when the session has not
     /// asked to pair yet. It is handed to the engine's own pairing flow and is never shown
     /// to the customer and never written to disk (STREAM-03, D-30).
@@ -134,6 +160,15 @@ struct SessionInfo
     QString saveDeadlineAt;
     QString billingStartedAt;
     QString endReason;
+    /// The reconnect grace's end while the session is held after a disconnect (06.1's ADR item
+    /// 9). Empty when the session is not in its grace.
+    QString graceDeadlineAt;
+    /// Who a failing ending is attributed to - `rig` | `connection` | `us` (`FailureBlame`,
+    /// 06.1's ADR item 4). Empty on a non-failing end, or on an older server that named none.
+    QString endBlame;
+    /// The SH- reference minted for a blame-carrying ending (ADR-0008). Empty when there is no
+    /// blame. The client never generates one of these - it only ever carries what the server sent.
+    QString endReference;
 
     /// True for COMPLETED, FAILED, EXPIRED, CANCELLED - the four terminal SessionStates
     /// (`docs/spec/state-machines.md`). Teardown waits for one of these (STREAM-10: the
@@ -342,7 +377,14 @@ public:
     static QByteArray buildSessionCreate();
     /// `SessionEndRequest` (contract 3.3.0, D-05/D-23): `{"failed": true}` when `failed`, an empty
     /// body otherwise - the same "assert the shape without a socket" rule as the builders above.
+    /// Kept for the callers this exact shape still has (tests exercising the builder directly);
+    /// forwards an empty `EndReport` to the overload below.
     static QByteArray buildEndRequest(bool failed);
+    /// Contract 3.5.0 (06.1's ADR, J-22): the full end body - `failed` plus whichever of
+    /// `report`'s fields are set, under the contract's snake_case keys. `false` still posts no
+    /// body at all, regardless of what `report` carries: only a failed end has anything to say
+    /// about why.
+    static QByteArray buildEndRequest(bool failed, const EndReport& report);
     /// The liveness body is optional and additive (ADR-0041, D-34). An empty `state` and an
     /// empty `error_code` produce the pre-1.6.0 empty body, which is still a valid report.
     static QByteArray buildLiveness(const QString& state, const QString& errorCode);
@@ -388,6 +430,10 @@ public:
     void setNetworkAccessManager(QNetworkAccessManager* manager);
 
     QNetworkAccessManager* networkAccessManager() const { return m_network; }
+
+    /// Replaces the stream's own access manager (see `m_streamNetwork`'s comment). The same test
+    /// seam `setNetworkAccessManager` is for the REST manager; production never calls it.
+    void setStreamNetworkAccessManager(QNetworkAccessManager* manager);
 
     // --- threading (see the header comment)
 
@@ -469,6 +515,26 @@ public:
     void fetchSession(const QString& sessionId, Callback callback);
     void fetchSessionAuthorization(const QString& sessionId, Callback callback);
 
+    /// `GET /api/stream` (3.5.0, ADR-0062/ADR-0067): opens the account's push channel on
+    /// `m_streamNetwork`, its own manager (never `m_network`, D-35/T-06.4-45 - a long-lived
+    /// stream sharing a connection with ordinary short REST calls would entangle their scheduling
+    /// and timeout behaviour, `06.4-RESEARCH-FORK.md` "Alternatives Considered"). The bearer is
+    /// attached here, under the same lock every other call reads it under, and never crosses into
+    /// the returned reply's caller (`SseClient`) as anything but a `QNetworkReply*`. No
+    /// `QNetworkRequest::setTransferTimeout` - that only detects a dead TCP connection (Mode A)
+    /// and resets on the server's own `: ping` keep-alive exactly like a live one does; the
+    /// dead-stream bound is `SseClient`'s own application-level L3 timer instead. Callers must be
+    /// on this object's owning thread - unlike `send()`, this is not marshalled, since
+    /// `SseClient` already lives on the same network thread this class does.
+    QNetworkReply* openAccountStream();
+
+    /// `GET /api/account-state` (3.6.0, ADR-0067): the same `AccountStateEvent` body
+    /// `GET /api/stream`'s `account.state` frame carries, for the fallback read while the live
+    /// stream is not live (D-06, `docs/spec/timing.md` L5). `fallback` true sends
+    /// `X-Stream-Fallback: seathub`; false sends no marker (an ordinary one-shot read, e.g. at
+    /// launch).
+    void fetchAccountState(bool fallback, Callback callback);
+
     /// The 10-second liveness report (D-31) carrying `state` and/or `error_code` (D-34,
     /// ADR-0041). Both are optional; both empty is the pre-1.6.0 deadline extension. Kept for the
     /// callers this exact shape still has (tests exercising the class directly); production
@@ -489,7 +555,12 @@ public:
     /// records as `CONNECT_FAILED` on a pre-ACTIVE session (and ignores on an ACTIVE one);
     /// `false` posts no body, the ordinary customer-initiated end. Every caller must say which -
     /// there is no default, so a call site can never silently mean "not a failure" by omission.
+    /// Forwards an empty `EndReport` to the overload below.
     void endSession(const QString& sessionId, bool failed, Callback callback);
+    /// Contract 3.5.0 (06.1's ADR, J-22): `endSession` with a report of what a pre-stream failure
+    /// knows about itself (`report`, ignored when `failed` is `false`). One report per `/end`.
+    void endSession(const QString& sessionId, bool failed, const EndReport& report,
+                    Callback callback);
 
     /// `POST /api/sessions/{session_id}/quality` (3.1.0, D-17, Plan 15): the parsed end-of-stream
     /// video-stats block (`stream_stats.h`'s `toQualityReport()`), posted once per session. The
@@ -505,18 +576,28 @@ signals:
     void transportFailed(const QString& message);
 
 private:
+    /// `extraHeaders` rides alongside the standard `Authorization`/`traceparent` headers - today
+    /// only `requestSession()`'s `Idempotency-Key` (ADR-0062 decision 11) uses it. Defaulted so
+    /// every other call site is unaffected.
     void send(const QString& method, const QString& path, const QByteArray& body,
-              bool authenticated, Callback callback);
+              bool authenticated, Callback callback,
+              const QHash<QByteArray, QByteArray>& extraHeaders = {});
     /// The rest of what `send()` used to do after its thread marshal, now taking the access token
     /// and trace id as parameters captured at `send()`'s own call time (WR-01) instead of reading
     /// `m_accessToken`/`m_traceId` again here, on whichever thread this runs on.
     void sendOnOwningThread(const QString& method, const QString& path, const QByteArray& body,
                             bool authenticated, const QString& accessToken, const QString& traceId,
-                            Callback callback);
+                            Callback callback,
+                            const QHash<QByteArray, QByteArray>& extraHeaders = {});
     void finishReply(QNetworkReply* reply, Callback callback);
 
     QNetworkAccessManager* m_network = nullptr;
     bool m_ownsNetwork = false;
+    /// `openAccountStream()`'s own manager, separate from `m_network` (see that method's own
+    /// comment). Parented to `this` like `m_network`, so `moveToOwnThread()` carries both to the
+    /// network thread together and `stopOwnedThread()`'s join destroys both.
+    QNetworkAccessManager* m_streamNetwork = nullptr;
+    bool m_ownsStreamNetwork = false;
     QThread* m_thread = nullptr;
     QString m_baseUrl;
 

@@ -276,9 +276,12 @@ public:
 
     /// What `GET /api/sessions/{id}` answers: the session in `state`, under `id`, with an end reason
     /// and a billed-minutes count when given. The default is a terminal session under another id,
-    /// which teardown's verification wants and the connecting stages ignore.
+    /// which teardown's verification wants and the connecting stages ignore. `endBlame` and
+    /// `endReference` (06.1's ADR item 4, J-22) ride the same optional-when-empty rule as
+    /// `endReason` - a session with no blame at all sends neither.
     void answerSession(const QString& id, const QString& state, const QString& endReason = QString(),
-                       int minutesBilled = 0)
+                       int minutesBilled = 0, const QString& endBlame = QString(),
+                       const QString& endReference = QString())
     {
         QMutexLocker lock(&m_mutex);
         QJsonObject object;
@@ -290,6 +293,12 @@ public:
         object.insert(QStringLiteral("requested_at"), QStringLiteral("2026-09-19T00:00:00Z"));
         if (!endReason.isEmpty()) {
             object.insert(QStringLiteral("end_reason"), endReason);
+        }
+        if (!endBlame.isEmpty()) {
+            object.insert(QStringLiteral("end_blame"), endBlame);
+        }
+        if (!endReference.isEmpty()) {
+            object.insert(QStringLiteral("end_reference"), endReference);
         }
         m_sessionBody = QJsonDocument(object).toJson(QJsonDocument::Compact);
     }
@@ -308,6 +317,20 @@ public:
         QMutexLocker lock(&m_mutex);
         m_usageStatus = status;
         m_usageBody = body;
+    }
+    /// What `GET /api/account-state` answers (06.4/ADR-0067, the D-06 fallback read).
+    void answerAccountState(int status, const QByteArray& body)
+    {
+        QMutexLocker lock(&m_mutex);
+        m_accountStateStatus = status;
+        m_accountStateBody = body;
+    }
+    /// The last `X-Stream-Fallback` header a request for `path` carried, or empty for a request
+    /// that carried none (an ordinary, non-fallback read).
+    QByteArray streamFallbackHeaderFor(const QString& path) const
+    {
+        QMutexLocker lock(&m_mutex);
+        return m_streamFallbackHeaders.value(path);
     }
     /// Every list reply arrives this many milliseconds after it was asked for, so a test can ask a
     /// second time while the first is still in flight.
@@ -328,6 +351,15 @@ public:
     {
         QMutexLocker lock(&m_mutex);
         return m_bodies.value(path);
+    }
+
+    /// Every body a request for `path` has carried, in order. `bodyFor()` keeps only the last one
+    /// - 06.1-19/J-07's own reconnect tests need the whole sequence of liveness reports a drop and
+    /// a return post, not just the most recent.
+    QList<QByteArray> bodiesFor(const QString& path) const
+    {
+        QMutexLocker lock(&m_mutex);
+        return m_bodyHistory.value(path);
     }
 
     /// The `Authorization` header the last request for `path` carried.
@@ -368,8 +400,11 @@ protected:
             m_queries[path].append(request.url().query(QUrl::FullyEncoded));
             m_auth.insert(path, request.rawHeader("Authorization"));
             m_traceparents.append(request.rawHeader("traceparent"));
+            m_streamFallbackHeaders.insert(path, request.rawHeader("X-Stream-Fallback"));
             if (outgoing) {
-                m_bodies.insert(path, outgoing->peek(outgoing->size()));
+                const QByteArray body = outgoing->peek(outgoing->size());
+                m_bodies.insert(path, body);
+                m_bodyHistory[path].append(body);
             }
             loginStatus = m_loginStatus;
             loginBody = m_loginBody;
@@ -418,6 +453,16 @@ protected:
                 usageBody = m_usageBody;
             }
             return new FakeReply(usageStatus, usageBody, this);
+        }
+        if (isGet && path == QLatin1String("/api/account-state")) {
+            int accountStateStatus;
+            QByteArray accountStateBody;
+            {
+                QMutexLocker lock(&m_mutex);
+                accountStateStatus = m_accountStateStatus;
+                accountStateBody = m_accountStateBody;
+            }
+            return new FakeReply(accountStateStatus, accountStateBody, this);
         }
         if (path == QLatin1String("/api/me")) {
             return new FakeReply(meStatus, meBody, this);
@@ -485,9 +530,16 @@ private:
     int m_listDelay = 0;
     int m_usageStatus = 200;
     QByteArray m_usageBody = QByteArrayLiteral("{\"minutes_played\":0,\"balance_minutes\":0}");
+    int m_accountStateStatus = 200;
+    QByteArray m_accountStateBody = QByteArrayLiteral(
+        "{\"topic\":\"account:acc-1\",\"at\":\"2026-09-27T00:00:00Z\","
+        "\"account\":{\"wallet\":{\"balance_minutes\":0},\"live_session_id\":\"\","
+        "\"open_topup_notice\":null,\"signup_stage\":\"complete\"}}");
+    QHash<QString, QByteArray> m_streamFallbackHeaders;
     QHash<QString, QByteArray> m_auth;
     QList<QByteArray> m_traceparents;
     QHash<QString, QByteArray> m_bodies;
+    QHash<QString, QList<QByteArray>> m_bodyHistory;
     int m_loginStatus = 200;
     QByteArray m_loginBody;
     int m_playStatus = 201;
@@ -577,6 +629,17 @@ void emitStatsBlock(double renderedFps)
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Global video stats");
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                 "----------------------------------------------------------\n%s", body.constData());
+}
+
+/// Fires upstream's own termination log line through the real `LogTee` singleton (06.1-19/J-07,
+/// `engine_termination.h`), exactly the one `SDL_LogError()` call `Session::clConnectionTerminated`
+/// makes - the one route to the engine's own code, unconditionally, on every ending including `0`
+/// (`ML_ERROR_GRACEFUL_TERMINATION`). Reaches every attached facade's own termination sink
+/// synchronously, on this (the test) thread, the same way `emitStatsBlock()` above does for the
+/// stats sink.
+void emitConnectionTerminated(int code)
+{
+    SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "Connection terminated: %d", code);
 }
 
 } // namespace
@@ -2979,8 +3042,12 @@ private slots:
 
         QTRY_VERIFY_WITH_TIMEOUT(
             m_fake->requestPaths().contains(QStringLiteral("/api/sessions/s-stages/end")), 15000);
-        QCOMPARE(m_fake->bodyFor(QStringLiteral("/api/sessions/s-stages/end")),
-                 QByteArrayLiteral("{\"failed\":true}"));
+        // 06.1's ADR item 4 / J-22: the end body now also carries the stage this failed at -
+        // `aPairingFailureReportsItsStage()` is the dedicated test for that; this only needs
+        // `failed` still there, unaffected by the addition.
+        const QJsonObject endBody = QJsonDocument::fromJson(
+            m_fake->bodyFor(QStringLiteral("/api/sessions/s-stages/end"))).object();
+        QCOMPARE(endBody.value(QStringLiteral("failed")).toBool(), true);
 
         // The connecting failure view stays on screen: the teardown completing does not carry the
         // customer away from what they are reading (C2's own contract).
@@ -3004,9 +3071,101 @@ private slots:
         QCOMPARE(client.appState(), QStringLiteral("error"));
         QTRY_VERIFY_WITH_TIMEOUT(
             m_fake->requestPaths().contains(QStringLiteral("/api/sessions/s-stages/end")), 15000);
-        QCOMPARE(m_fake->bodyFor(QStringLiteral("/api/sessions/s-stages/end")),
-                 QByteArrayLiteral("{\"failed\":true}"));
+        // 06.1's ADR item 4 / J-22: the end body now also carries the stage this failed at
+        // ("connecting" - pairing itself succeeded); `failed` is unaffected by the addition.
+        const QJsonObject endBody = QJsonDocument::fromJson(
+            m_fake->bodyFor(QStringLiteral("/api/sessions/s-stages/end"))).object();
+        QCOMPARE(endBody.value(QStringLiteral("failed")).toBool(), true);
         QTRY_VERIFY_WITH_TIMEOUT(!client.liveSession(), 15000);
+    }
+
+    // --- 06.1's ADR item 4 / J-22: the report goes up, the blame comes back ---------------------
+
+    void aPairingFailureReportsItsStage()
+    {
+        SeatHubClient client;
+        beginStagedSession(client);
+        QVERIFY(!QTest::currentTestFailed());
+        client.teardown()->setVerifyIntervalMs(1);
+        m_fake->answerSession(QStringLiteral("s-stages"), QStringLiteral("CANCELLED"));
+
+        emit client.pairing()->pairingFailed(
+            SeatHubFailure::local(QStringLiteral("The rig didn't finish connecting. Try again.")));
+
+        QTRY_VERIFY_WITH_TIMEOUT(
+            m_fake->requestPaths().contains(QStringLiteral("/api/sessions/s-stages/end")), 15000);
+        const QJsonObject sent = QJsonDocument::fromJson(
+            m_fake->bodyFor(QStringLiteral("/api/sessions/s-stages/end"))).object();
+        QCOMPARE(sent.value(QStringLiteral("failed")).toBool(), true);
+        QCOMPARE(sent.value(QStringLiteral("stage")).toString(), QStringLiteral("pairing"));
+    }
+
+    void aStageFailureReportsItsEngineCodeAndPorts()
+    {
+        auto* engine = new FakeEngineSession;
+        {
+            SeatHubClient client;
+            client.session()->attachSession(engine);
+            beginStagedSession(client);
+            QVERIFY(!QTest::currentTestFailed());
+            client.teardown()->setVerifyIntervalMs(1);
+            m_fake->answerSession(QStringLiteral("s-stages"), QStringLiteral("CANCELLED"));
+
+            emit engine->stageStarting(QStringLiteral("RTSP handshake"));
+            emit engine->stageFailed(QStringLiteral("RTSP handshake"), -102,
+                                     QStringLiteral("UDP 47998"));
+
+            QVERIFY(client.connectFailed());
+            QTRY_VERIFY_WITH_TIMEOUT(
+                m_fake->requestPaths().contains(QStringLiteral("/api/sessions/s-stages/end")), 15000);
+            const QJsonObject sent = QJsonDocument::fromJson(
+                m_fake->bodyFor(QStringLiteral("/api/sessions/s-stages/end"))).object();
+            QCOMPARE(sent.value(QStringLiteral("failed")).toBool(), true);
+            // D-11: the stage is `connecting` here, not the engine's own stage name - pairing
+            // already succeeded for the engine to have started at all.
+            QCOMPARE(sent.value(QStringLiteral("stage")).toString(), QStringLiteral("connecting"));
+            QCOMPARE(sent.value(QStringLiteral("engine_stage")).toString(),
+                     QStringLiteral("RTSP handshake"));
+            QCOMPARE(sent.value(QStringLiteral("engine_error")).toInt(), -102);
+            QCOMPARE(sent.value(QStringLiteral("failing_ports")).toString(),
+                     QStringLiteral("UDP 47998"));
+            // The engine's own stage name never becomes customer-facing copy (D-51) - it only
+            // rides the diagnostic end body the server sees.
+            verifyNoInternalNameIsShown(client);
+
+            client.session()->attachSession(nullptr);
+        }
+        delete engine;
+    }
+
+    void theFailureScreenShowsTheServersBlameAndReference()
+    {
+        SeatHubClient client;
+        beginStagedSession(client);
+        QVERIFY(!QTest::currentTestFailed());
+        client.teardown()->setVerifyIntervalMs(1);
+
+        // The client's own best guess, shown at once when connecting stopped.
+        emit client.pairing()->pairingFailed(
+            SeatHubFailure::local(QStringLiteral("The rig didn't finish connecting. Try again.")));
+        QVERIFY(client.connectFailed());
+
+        // The server's verdict, arriving on the terminal read teardown ends on: this exact
+        // CONNECT_FAILED ending, blamed on the connection, with the server's own reference.
+        m_fake->answerSession(QStringLiteral("s-stages"), QStringLiteral("CANCELLED"),
+                             QStringLiteral("CONNECT_FAILED"), 0, QStringLiteral("connection"),
+                             QStringLiteral("SH-4F7KQ2"));
+
+        QTRY_COMPARE_WITH_TIMEOUT(
+            client.failure().value(QStringLiteral("error")).toString(),
+            QStringLiteral("Your connection couldn't reach the rig, so the stream didn't start. "
+                           "You were not charged."),
+            15000);
+        QCOMPARE(client.reference(), QStringLiteral("SH-4F7KQ2"));
+        // The view still reads the same two properties `ConnectingScreen.qml` renders.
+        QCOMPARE(client.stalledReasonText(),
+                 QStringLiteral("Your connection couldn't reach the rig, so the stream didn't start. "
+                                "You were not charged."));
     }
 
     void aSecondFailureDoesNotEndTwice()
@@ -4893,6 +5052,730 @@ private slots:
         QVERIFY(SeatHubTelemetry::currentSessionId().isEmpty());
         QVERIFY(SeatHubTelemetry::currentHostId().isEmpty());
         QVERIFY(SeatHubTelemetry::currentTraceId().isEmpty());
+    }
+
+    // --- 06.1-19/J-07: a dropped stream comes back on the same session ---------------------------
+
+    void aConnectionDropReconnectsTheSameSession()
+    {
+        auto* engine = new FakeEngineSession;
+        SeatHubClient client;
+        WalletTicks ticks;
+        beginStreaming(client, engine, &ticks, 90, 80);
+        QVERIFY(!QTest::currentTestFailed());
+
+        emitConnectionTerminated(-1); // ENet's own "unexpected disconnect" - a network blip
+        emit engine->displayLaunchError(QStringLiteral("Connection terminated"));
+        QCOMPARE(client.appState(), QStringLiteral("connecting"));
+        QVERIFY(client.reconnecting());
+
+        emit engine->readyForDeletion();
+        QTRY_COMPARE_WITH_TIMEOUT(client.reconnectTimer()->interval(), 2000, 15000);
+        QVERIFY(client.reconnectTimer()->isActive());
+
+        // The session stays held: no `/end` for this drop.
+        QVERIFY(!m_fake->requestPaths().contains(QStringLiteral("/api/sessions/s-live/end")));
+
+        // Fire the backoff at once rather than waiting the real 2 s.
+        client.reconnectTimer()->start(0);
+        QTRY_VERIFY_WITH_TIMEOUT(
+            m_fake->requestPaths().contains(QStringLiteral("/api/sessions/s-live/pairing")), 15000);
+
+        auto* secondEngine = new FakeEngineSession;
+        client.session()->attachSession(secondEngine);
+        emit secondEngine->connectionStarted();
+        QCOMPARE(client.appState(), QStringLiteral("streaming"));
+        QVERIFY(!client.reconnecting());
+        QVERIFY2(client.liveSession(), "the same session, resumed");
+
+        // `SessionLifecycle` refuses to detach an engine it still considers active
+        // (`start()`/`readyForDeletion()` are the only two things that change that) - the same
+        // real ending every other in-stream test in this file uses to dispose of its own engine.
+        emit secondEngine->readyForDeletion();
+    }
+
+    void aGracefulQuitStillEnds()
+    {
+        auto* engine = new FakeEngineSession;
+        SeatHubClient client;
+        WalletTicks ticks;
+        beginStreaming(client, engine, &ticks, 90, 80);
+        QVERIFY(!QTest::currentTestFailed());
+        client.teardown()->setVerifyIntervalMs(1);
+        m_fake->answerSession(QStringLiteral("s-live"), QStringLiteral("COMPLETED"),
+                              QStringLiteral("CUSTOMER_ENDED"));
+
+        emitConnectionTerminated(0); // ML_ERROR_GRACEFUL_TERMINATION - a real code, not "no error"
+        emit engine->displayLaunchError(QStringLiteral("Connection terminated"));
+        QVERIFY(!client.reconnecting());
+        QCOMPARE(client.appState(), QStringLiteral("error"));
+
+        emit engine->readyForDeletion();
+        QTRY_VERIFY_WITH_TIMEOUT(
+            m_fake->requestPaths().contains(QStringLiteral("/api/sessions/s-live/end")), 15000);
+        QCOMPARE(m_fake->requestPaths().count(QStringLiteral("/api/sessions/s-live/end")), 1);
+    }
+
+    void aHostSideCodeStillEnds()
+    {
+        auto* engine = new FakeEngineSession;
+        SeatHubClient client;
+        WalletTicks ticks;
+        beginStreaming(client, engine, &ticks, 90, 80);
+        QVERIFY(!QTest::currentTestFailed());
+        client.teardown()->setVerifyIntervalMs(1);
+        m_fake->answerSession(QStringLiteral("s-live"), QStringLiteral("COMPLETED"),
+                              QStringLiteral("HOST_LOST"));
+
+        emitConnectionTerminated(-102); // ML_ERROR_UNEXPECTED_EARLY_TERMINATION - host-side
+        emit engine->displayLaunchError(QStringLiteral("Connection terminated"));
+        QVERIFY(!client.reconnecting());
+        QCOMPARE(client.appState(), QStringLiteral("error"));
+
+        emit engine->readyForDeletion();
+        QTRY_VERIFY_WITH_TIMEOUT(
+            m_fake->requestPaths().contains(QStringLiteral("/api/sessions/s-live/end")), 15000);
+        QCOMPARE(m_fake->requestPaths().count(QStringLiteral("/api/sessions/s-live/end")), 1);
+    }
+
+    void aFailedAttemptTriesAgainWithBackoff()
+    {
+        auto* engine = new FakeEngineSession;
+        SeatHubClient client;
+        WalletTicks ticks;
+        beginStreaming(client, engine, &ticks, 90, 80);
+        QVERIFY(!QTest::currentTestFailed());
+        m_fake->answerSession(QStringLiteral("s-live"), QStringLiteral("ACTIVE"));
+
+        emitConnectionTerminated(-1);
+        emit engine->displayLaunchError(QStringLiteral("Connection terminated"));
+        emit engine->readyForDeletion();
+        QTRY_COMPARE_WITH_TIMEOUT(client.reconnectTimer()->interval(), 2000, 15000);
+
+        const SeatHubFailure pairingFailure =
+            SeatHubFailure::local(QStringLiteral("The rig didn't finish connecting. Try again."));
+
+        emit client.pairing()->pairingFailed(pairingFailure);
+        QTRY_COMPARE_WITH_TIMEOUT(client.reconnectTimer()->interval(), 4000, 15000);
+        QVERIFY(client.reconnecting());
+
+        emit client.pairing()->pairingFailed(pairingFailure);
+        QTRY_COMPARE_WITH_TIMEOUT(client.reconnectTimer()->interval(), 8000, 15000);
+
+        emit client.pairing()->pairingFailed(pairingFailure);
+        QTRY_COMPARE_WITH_TIMEOUT(client.reconnectTimer()->interval(), 15000, 15000);
+
+        emit client.pairing()->pairingFailed(pairingFailure);
+        QTRY_COMPARE_WITH_TIMEOUT(client.reconnectTimer()->interval(), 15000, 15000);
+
+        QVERIFY(!m_fake->requestPaths().contains(QStringLiteral("/api/sessions/s-live/end")));
+    }
+
+    void theServerEndingTheHeldSessionStopsTheAttempts()
+    {
+        auto* engine = new FakeEngineSession;
+        SeatHubClient client;
+        WalletTicks ticks;
+        beginStreaming(client, engine, &ticks, 90, 80);
+        QVERIFY(!QTest::currentTestFailed());
+        client.teardown()->setVerifyIntervalMs(1);
+
+        // CR-06: `beginSession()` skips `beginPlayRequest()`, so it mints no trace id of its own -
+        // set one directly, standing in for the Play that would have minted it in production, so
+        // this test can prove the give-up path clears it rather than leaking it onto the next
+        // request (the same thing WR-14 already proved for `applyPlayFailure()`).
+        client.controlPlane()->setTraceId(QStringLiteral("11112222333344445555666677778888"));
+
+        emitConnectionTerminated(-1);
+        emit engine->displayLaunchError(QStringLiteral("Connection terminated"));
+        emit engine->readyForDeletion();
+        QTRY_VERIFY_WITH_TIMEOUT(client.reconnectTimer()->isActive(), 15000);
+
+        // Precondition: still the trace id this test set, unaffected by the drop/re-enter-reconnect
+        // above - so the assertion after the give-up below is not a vacuous pass.
+        QCOMPARE(client.controlPlane()->traceId(),
+                 QStringLiteral("11112222333344445555666677778888"));
+
+        SessionInfo over = sessionIn(QStringLiteral("COMPLETED"), QStringLiteral("s-live"));
+        over.endReason = QStringLiteral("GRACE_EXPIRED");
+        over.minutesBilled = 23;
+        report(client, over);
+
+        QTRY_VERIFY_WITH_TIMEOUT(client.reconnectEnded(), 15000);
+        QVERIFY(!client.reconnecting());
+        QVERIFY(!client.reconnectTimer()->isActive());
+        QVERIFY(client.connectFailed());
+        QCOMPARE(client.stalledReasonText(),
+                 QStringLiteral("We couldn't reconnect, so the session ended. You were charged "
+                                "for <font face=\"Geist Mono\">23</font> minutes."));
+
+        // CR-06: the server-gives-up ending must run STREAM-10 teardown too, exactly like every
+        // other ending path - posting `/end` and clearing the dead Play's trace id, instead of
+        // leaking it onto whatever the customer does next (Back to home -> refreshBalance()).
+        QTRY_VERIFY_WITH_TIMEOUT(
+            m_fake->requestPaths().contains(QStringLiteral("/api/sessions/s-live/end")), 15000);
+        QTRY_VERIFY_WITH_TIMEOUT(client.controlPlane()->traceId().isEmpty(), 15000);
+    }
+
+    void aDropBeforeTheStreamStartedIsNotAReconnect()
+    {
+        auto* engine = new FakeEngineSession;
+        {
+            SeatHubClient client;
+            client.session()->attachSession(engine);
+            beginStagedSession(client);
+            QVERIFY(!QTest::currentTestFailed());
+            client.teardown()->setVerifyIntervalMs(1);
+            m_fake->answerSession(QStringLiteral("s-stages"), QStringLiteral("CANCELLED"));
+
+            emitConnectionTerminated(-1);
+            emit engine->displayLaunchError(QStringLiteral("Connection terminated"));
+
+            QVERIFY2(!client.reconnecting(), "the stream never started - not a reconnect (D-05)");
+            QVERIFY(client.connectFailed());
+            QCOMPARE(client.appState(), QStringLiteral("connecting"));
+
+            emit engine->readyForDeletion();
+            QTRY_VERIFY_WITH_TIMEOUT(
+                m_fake->requestPaths().contains(QStringLiteral("/api/sessions/s-stages/end")),
+                15000);
+            // `handleReadyForDeletion()`'s ordinary (non-reconnect) path already released and
+            // `deleteLater()`d `engine` above - it is not this test's to delete a second time.
+        }
+    }
+
+    void aReconnectKeepsTheReconnectingStageUntilTheStreamIsBack()
+    {
+        auto* engine = new FakeEngineSession;
+        SeatHubClient client;
+        WalletTicks ticks;
+        beginStreaming(client, engine, &ticks, 90, 80);
+        QVERIFY(!QTest::currentTestFailed());
+
+        const QString livenessPath = QStringLiteral("/api/sessions/s-live/liveness");
+        // `beginSession()`'s own `preparing_rig` tick and `handleConnectionStarted()`'s own
+        // `streaming` report are both posted through queued calls onto the network thread
+        // (`LivenessTimer::start()`/`setStage()` self-marshal), so `beginStreaming()` returning
+        // on this (test) thread does not mean either has landed in the fake's body history yet.
+        // Settling here first means the baseline below is never contaminated by a setup-phase
+        // post arriving late and being mistaken for a second `start()`.
+        QTRY_VERIFY_WITH_TIMEOUT(
+            !m_fake->bodiesFor(livenessPath).isEmpty()
+                && QJsonDocument::fromJson(m_fake->bodiesFor(livenessPath).last()).object()
+                           .value(QStringLiteral("stage")).toString()
+                       == QStringLiteral("streaming"),
+            15000);
+        const int callsBeforeDrop = m_fake->bodiesFor(livenessPath).size();
+
+        emitConnectionTerminated(-1);
+        emit engine->displayLaunchError(QStringLiteral("Connection terminated"));
+        emit engine->readyForDeletion();
+
+        // 06.1-19 fix (found post-wave, reproduced 2/10 without extra load): `noteTermination()`
+        // (the sink, `ending`) and `enterReconnect()`'s `setStage("reconnecting")` are two
+        // SEPARATE cross-thread calls, each independently marshalled onto the network thread and
+        // each completing its own POST through the fake's own `QTimer::singleShot(0, ...)` reply.
+        // Waiting for "at least one new body" stops polling the instant the first of the two
+        // lands - `ending` alone, on an unlucky poll - so the snapshot below could be taken before
+        // `reconnecting`'s own round trip has completed, reading `sawReconnecting` as false with
+        // no bug in the production code at all. Waiting for the LAST body to actually BE
+        // `reconnecting` (the real invariant every assertion below needs) waits out both: the two
+        // calls are issued in that order from `handleDisplayLaunchError()` and each posts through
+        // the same synchronous-per-call path, so the second can never overtake the first.
+        QTRY_VERIFY_WITH_TIMEOUT(
+            m_fake->bodiesFor(livenessPath).size() > callsBeforeDrop
+                && QJsonDocument::fromJson(m_fake->bodiesFor(livenessPath).last()).object()
+                           .value(QStringLiteral("stage")).toString()
+                       == QStringLiteral("reconnecting"),
+            15000);
+        const QList<QByteArray> afterDrop = m_fake->bodiesFor(livenessPath).mid(callsBeforeDrop);
+        bool sawEnding = false;
+        bool sawReconnecting = false;
+        bool sawPreparingRigAgain = false;
+        for (const QByteArray& body : afterDrop) {
+            const QString stage =
+                QJsonDocument::fromJson(body).object().value(QStringLiteral("stage")).toString();
+            if (stage == QStringLiteral("ending")) {
+                sawEnding = true;
+            }
+            if (stage == QStringLiteral("reconnecting")) {
+                sawReconnecting = true;
+            }
+            if (stage == QStringLiteral("preparing_rig")) {
+                sawPreparingRigAgain = true;
+            }
+        }
+        // `noteTermination()` (the engine's own code) is reported before the reconnect's own
+        // `reconnecting` stage - the two are separate calls, in that order, inside
+        // `handleDisplayLaunchError()`'s sink and branch.
+        QVERIFY2(sawEnding, "the termination code itself is still reported");
+        QVERIFY2(sawReconnecting, "the reconnect's own stage is reported");
+        QVERIFY2(!sawPreparingRigAgain, "LivenessTimer::start() must not run again across a reconnect");
+        QCOMPARE(QJsonDocument::fromJson(afterDrop.last()).object()
+                     .value(QStringLiteral("stage")).toString(),
+                 QStringLiteral("reconnecting"));
+
+        client.reconnectTimer()->start(0);
+        QTRY_VERIFY_WITH_TIMEOUT(
+            m_fake->requestPaths().contains(QStringLiteral("/api/sessions/s-live/pairing")), 15000);
+
+        emit client.pairing()->authorizationGranted();
+        QTest::qWait(20);
+        QCOMPARE(QJsonDocument::fromJson(m_fake->bodiesFor(livenessPath).last()).object()
+                     .value(QStringLiteral("stage")).toString(),
+                 QStringLiteral("reconnecting"));
+
+        auto* secondEngine = new FakeEngineSession;
+        client.session()->attachSession(secondEngine);
+        emit client.pairing()->pairingCompleted(QStringLiteral("aa:bb:cc:dd:ee:11"));
+        QTest::qWait(20);
+        QCOMPARE(QJsonDocument::fromJson(m_fake->bodiesFor(livenessPath).last()).object()
+                     .value(QStringLiteral("stage")).toString(),
+                 QStringLiteral("reconnecting"));
+
+        emit secondEngine->connectionStarted();
+        QCOMPARE(client.appState(), QStringLiteral("streaming"));
+        QTRY_COMPARE_WITH_TIMEOUT(
+            QJsonDocument::fromJson(m_fake->bodiesFor(livenessPath).last()).object()
+                .value(QStringLiteral("stage")).toString(),
+            QStringLiteral("streaming"), 15000);
+
+        // `SessionLifecycle` refuses to detach an engine it still considers active - the same
+        // real ending every other in-stream test in this file uses to dispose of its own engine.
+        emit secondEngine->readyForDeletion();
+    }
+
+    // --- 06.1-19/J-07 Task 3: the Reconnecting screen's ghost End session and the two endings ----
+
+    void endSessionEndsTheHeldSession()
+    {
+        auto* engine = new FakeEngineSession;
+        SeatHubClient client;
+        WalletTicks ticks;
+        beginStreaming(client, engine, &ticks, 90, 80);
+        QVERIFY(!QTest::currentTestFailed());
+        client.teardown()->setVerifyIntervalMs(1);
+        m_fake->answerSession(QStringLiteral("s-live"), QStringLiteral("CANCELLED"),
+                              QStringLiteral("CUSTOMER_ENDED"));
+
+        emitConnectionTerminated(-1);
+        emit engine->displayLaunchError(QStringLiteral("Connection terminated"));
+        emit engine->readyForDeletion();
+        QTRY_VERIFY_WITH_TIMEOUT(client.reconnectTimer()->isActive(), 15000);
+
+        client.endHeldSession();
+
+        QVERIFY(!client.reconnecting());
+        QVERIFY(!client.reconnectTimer()->isActive());
+        QTRY_VERIFY_WITH_TIMEOUT(
+            m_fake->requestPaths().contains(QStringLiteral("/api/sessions/s-live/end")), 15000);
+        const QJsonObject sent = QJsonDocument::fromJson(
+            m_fake->bodyFor(QStringLiteral("/api/sessions/s-live/end"))).object();
+        // `buildEndRequest(false, ...)` posts no body at all - only a failed end has anything to
+        // say about why.
+        QVERIFY2(!sent.contains(QStringLiteral("failed")), "no failed flag for an ordinary end");
+        QTRY_COMPARE_WITH_TIMEOUT(client.appState(), QStringLiteral("home"), 15000);
+    }
+
+    void theEndingsShowTheirSentences()
+    {
+        struct Case
+        {
+            QString endReason;
+            int minutesBilled;
+            QString sentence;
+        };
+        const QList<Case> cases = {
+            { QStringLiteral("GRACE_EXPIRED"), 23,
+              QStringLiteral("We couldn't reconnect, so the session ended. You were charged for "
+                             "<font face=\"Geist Mono\">23</font> minutes.") },
+            { QStringLiteral("RECONNECT_LIMIT"), 41,
+              QStringLiteral("Your connection dropped too many times, so the session ended. You "
+                             "were charged for <font face=\"Geist Mono\">41</font> minutes.") },
+        };
+
+        for (const Case& testCase : cases) {
+            auto* engine = new FakeEngineSession;
+            SeatHubClient client;
+            WalletTicks ticks;
+            beginStreaming(client, engine, &ticks, 90, 80);
+            QVERIFY(!QTest::currentTestFailed());
+
+            emitConnectionTerminated(-1);
+            emit engine->displayLaunchError(QStringLiteral("Connection terminated"));
+            emit engine->readyForDeletion();
+            QTRY_VERIFY_WITH_TIMEOUT(client.reconnectTimer()->isActive(), 15000);
+
+            SessionInfo over = sessionIn(QStringLiteral("COMPLETED"), QStringLiteral("s-live"));
+            over.endReason = testCase.endReason;
+            over.minutesBilled = testCase.minutesBilled;
+            report(client, over);
+
+            QTRY_VERIFY_WITH_TIMEOUT(client.reconnectEnded(), 15000);
+            QVERIFY(client.connectFailed());
+            QCOMPARE(client.stalledReasonText(), testCase.sentence);
+        }
+    }
+
+    void aTerminalReadDuringARetrysMidLaunchReleasesTheLock()
+    {
+        // WR-14(a): a terminal session read that arrives while a retry's own engine is mid-launch
+        // - `m_session->active()` true, but `m_appState` still "connecting" (the retry has not yet
+        // reached `handleConnectionStarted()`) - must still release the Settings/updater lock
+        // `enterReconnect()` engaged, and must still notify `reconnecting` (WR-14c).
+        auto* engine = new FakeEngineSession;
+        SeatHubClient client;
+        WalletTicks ticks;
+        beginStreaming(client, engine, &ticks, 90, 80);
+        QVERIFY(!QTest::currentTestFailed());
+
+        emitConnectionTerminated(-1);
+        emit engine->displayLaunchError(QStringLiteral("Connection terminated"));
+        emit engine->readyForDeletion();
+        QTRY_VERIFY_WITH_TIMEOUT(client.reconnectTimer()->isActive(), 15000);
+        QVERIFY2(client.settings()->sessionActive(),
+                 "precondition: enterReconnect() must have engaged the Settings/updater lock");
+
+        client.reconnectTimer()->start(0);
+        QTRY_VERIFY_WITH_TIMEOUT(
+            m_fake->requestPaths().contains(QStringLiteral("/api/sessions/s-live/pairing")), 15000);
+
+        emit client.pairing()->authorizationGranted();
+        QTest::qWait(20);
+
+        auto* secondEngine = new FakeEngineSession;
+        client.session()->attachSession(secondEngine);
+        emit client.pairing()->pairingCompleted(QStringLiteral("aa:bb:cc:dd:ee:11"));
+        QTest::qWait(20);
+
+        // Precondition: the retry's own engine is mid-launch (active), but has not yet reached
+        // `handleConnectionStarted()` - `appState` is still "connecting", not "streaming". This is
+        // the specific sub-case WR-14(a) describes; the ordinary already-`"streaming"` sub-case is
+        // already correctly unlocked elsewhere and is not what this test is proving.
+        QVERIFY2(client.session()->active(), "the retry's own engine must be active for this case");
+        QCOMPARE(client.appState(), QStringLiteral("connecting"));
+        QVERIFY2(client.reconnecting(), "precondition: still reconnecting going into the terminal read");
+
+        QSignalSpy reconnectingSpy(&client, &SeatHubClient::reconnectingChanged);
+
+        SessionInfo over = sessionIn(QStringLiteral("COMPLETED"), QStringLiteral("s-live"));
+        over.endReason = QStringLiteral("HOST_LOST");
+        report(client, over);
+
+        QTRY_VERIFY_WITH_TIMEOUT(!client.reconnecting(), 15000);
+        QVERIFY2(!reconnectingSpy.isEmpty(),
+                 "WR-14(c): reconnectingChanged must fire for this branch too");
+        QVERIFY2(!client.settings()->sessionActive(),
+                 "WR-14(a): the Settings/updater lock must release once this branch clears "
+                 "m_reconnecting");
+        QCOMPARE(secondEngine->interrupts, 1);
+
+        emit secondEngine->readyForDeletion();
+    }
+
+    void signOutMidReconnectReleasesTheLockAndStopsTheTimer()
+    {
+        // WR-14(b): signing out during the backoff gap (mid-episode) stops and clears every other
+        // piece of reconnect state - but before this fix, never touched `m_reconnectTimer`, never
+        // cleared `m_reconnecting`, and never released the Settings/updater lock.
+        auto* engine = new FakeEngineSession;
+        SeatHubClient client;
+        WalletTicks ticks;
+        beginStreaming(client, engine, &ticks, 90, 80);
+        QVERIFY(!QTest::currentTestFailed());
+
+        emitConnectionTerminated(-1);
+        emit engine->displayLaunchError(QStringLiteral("Connection terminated"));
+        emit engine->readyForDeletion();
+        QTRY_VERIFY_WITH_TIMEOUT(client.reconnectTimer()->isActive(), 15000);
+
+        // Preconditions: reconnecting, the timer armed, and the lock engaged - all three of which
+        // this fix must clear/release/stop on sign-out.
+        QVERIFY2(client.reconnecting(), "precondition: still reconnecting at the moment of sign-out");
+        QVERIFY2(client.reconnectTimer()->isActive(), "precondition: the backoff timer is armed");
+        QVERIFY2(client.settings()->sessionActive(),
+                 "precondition: enterReconnect() must have engaged the Settings/updater lock");
+
+        QSignalSpy reconnectingSpy(&client, &SeatHubClient::reconnectingChanged);
+
+        client.signOut();
+
+        QVERIFY2(!client.reconnecting(), "WR-14(b): signOut() must clear m_reconnecting");
+        QVERIFY2(!client.reconnectTimer()->isActive(), "WR-14(b): signOut() must stop the timer");
+        QVERIFY2(!client.settings()->sessionActive(),
+                 "WR-14(b): signOut() must release the Settings/updater lock");
+        QVERIFY2(!reconnectingSpy.isEmpty(), "WR-14(c): reconnectingChanged must fire on sign-out too");
+        QCOMPARE(client.appState(), QStringLiteral("signed_out"));
+    }
+
+    void aSecondReconnectEpisodeStartsAsConnectingLostNotStillTrying()
+    {
+        // WR-15: `m_reconnectStillTrying` is documented as "Reset in `enterReconnect()`" but was
+        // never actually reset there - so once ANY attempt in this session's life ever reached
+        // `retryReconnectOrGiveUp()` once, a second (or later) reconnect episode's own first
+        // attempt would immediately show "Still trying" instead of "Connection lost. Reconnecting…"
+        auto* engine = new FakeEngineSession;
+        SeatHubClient client;
+        WalletTicks ticks;
+        beginStreaming(client, engine, &ticks, 90, 80);
+        QVERIFY(!QTest::currentTestFailed());
+
+        // Episode 1: drop, then let the first attempt itself fail/time out, which is exactly what
+        // sets `m_reconnectStillTrying` true (`retryReconnectOrGiveUp()`).
+        emitConnectionTerminated(-1);
+        emit engine->displayLaunchError(QStringLiteral("Connection terminated"));
+        emit engine->readyForDeletion();
+        QTRY_VERIFY_WITH_TIMEOUT(client.reconnectTimer()->isActive(), 15000);
+        QVERIFY2(!client.reconnectStillTrying(),
+                 "precondition: the very first attempt of episode 1 must not already say "
+                 "'Still trying'");
+
+        client.reconnectTimer()->start(0);
+        QTRY_VERIFY_WITH_TIMEOUT(
+            m_fake->requestPaths().contains(QStringLiteral("/api/sessions/s-live/pairing")), 15000);
+
+        const SeatHubFailure pairingFailure =
+            SeatHubFailure::local(QStringLiteral("The rig didn't finish connecting. Try again."));
+        emit client.pairing()->pairingFailed(pairingFailure);
+        QTRY_VERIFY_WITH_TIMEOUT(client.reconnectStillTrying(), 15000);
+
+        // Recover episode 1 back to streaming: a fresh retry, pairing, and a fresh engine reaching
+        // `connectionStarted()`.
+        client.reconnectTimer()->start(0);
+        QTRY_VERIFY_WITH_TIMEOUT(
+            m_fake->requestPaths().count(QStringLiteral("/api/sessions/s-live/pairing")) >= 2,
+            15000);
+        emit client.pairing()->authorizationGranted();
+        QTest::qWait(20);
+        auto* secondEngine = new FakeEngineSession;
+        client.session()->attachSession(secondEngine);
+        emit client.pairing()->pairingCompleted(QStringLiteral("aa:bb:cc:dd:ee:11"));
+        emit secondEngine->connectionStarted();
+        QTRY_COMPARE_WITH_TIMEOUT(client.appState(), QStringLiteral("streaming"), 15000);
+        // `m_reconnectStillTrying` survives the recovery back to streaming (only `enterReconnect()`
+        // resets it) - the bug this test exists to catch.
+        QVERIFY(client.reconnectStillTrying());
+
+        // Episode 2: drop again. The very first attempt of THIS episode must read "Connection lost.
+        // Reconnecting…", not "Still trying" left over from episode 1.
+        emitConnectionTerminated(-1);
+        emit secondEngine->displayLaunchError(QStringLiteral("Connection terminated"));
+        emit secondEngine->readyForDeletion();
+        QTRY_VERIFY_WITH_TIMEOUT(client.reconnectTimer()->isActive(), 15000);
+        QVERIFY2(!client.reconnectStillTrying(),
+                 "WR-15: enterReconnect() must reset m_reconnectStillTrying for the new episode");
+    }
+
+    // --- 06.4-15 Task 1: the SseClient's lifecycle and account.state wiring ------------------------
+
+    void theStreamStartsAfterSignInAndStopsAtSignOut()
+    {
+        SeatHubClient client;
+        reachHome(client, 90);
+
+        // 06.4/ADR-0067, D-01: opened the moment sign-in (here, a confirmed restore) is confirmed.
+        QTRY_VERIFY_WITH_TIMEOUT(client.sse()->state() != QStringLiteral("idle"), 15000);
+
+        client.signOut();
+
+        // `stop()` sets the state to "idle" and aborts any open reply - no stream request survives
+        // a sign-out.
+        QTRY_COMPARE_WITH_TIMEOUT(client.sse()->state(), QStringLiteral("idle"), 15000);
+    }
+
+    void aPushedAccountStateUpdatesTheBalance()
+    {
+        SeatHubClient client;
+        reachHome(client, 90);
+
+        QSignalSpy balanceSpy(&client, &SeatHubClient::balanceChanged);
+
+        // `feed()` is the test seam and the production entry point alike (sse_client.h's own
+        // header comment): a whole `account.state` frame, fed directly.
+        client.sse()->feed(QByteArrayLiteral(
+            "event: account.state\n"
+            "data: {\"topic\":\"account:acc-1\",\"at\":\"2026-09-27T00:00:00Z\","
+            "\"account\":{\"wallet\":{\"balance_minutes\":125},\"live_session_id\":\"\","
+            "\"open_topup_notice\":null,\"signup_stage\":\"complete\"}}\n"
+            "\n"));
+
+        QTRY_COMPARE_WITH_TIMEOUT(client.balanceMinutes(), qint64(125), 15000);
+        QCOMPARE(client.balanceText(), QStringLiteral("2 h 05 min"));
+        QVERIFY(!client.balanceStale());
+        QCOMPARE(balanceSpy.count(), 1);
+    }
+
+    void aChangedTopupNoticeReloadsTheProfileLists()
+    {
+        SeatHubClient client;
+        reachProfile(client, 90);
+
+        const int topupsBefore =
+            m_fake->countOfPathEndingWith(QStringLiteral("/api/topup-notices"));
+        const int usageBefore = m_fake->countOfPathEndingWith(QStringLiteral("/api/usage"));
+
+        const QByteArray noticeOpen = QByteArrayLiteral(
+            "event: account.state\n"
+            "data: {\"topic\":\"account:acc-1\",\"at\":\"2026-09-27T00:00:00Z\","
+            "\"account\":{\"wallet\":{\"balance_minutes\":90},\"live_session_id\":\"\","
+            "\"open_topup_notice\":{\"id\":\"notice-1\"},\"signup_stage\":\"complete\"}}\n"
+            "\n");
+        client.sse()->feed(noticeOpen);
+
+        QTRY_COMPARE_WITH_TIMEOUT(
+            m_fake->countOfPathEndingWith(QStringLiteral("/api/topup-notices")),
+            topupsBefore + 1, 15000);
+        QTRY_COMPARE_WITH_TIMEOUT(
+            m_fake->countOfPathEndingWith(QStringLiteral("/api/usage")), usageBefore + 1, 15000);
+
+        // The identical notice again reloads nothing a second time.
+        client.sse()->feed(noticeOpen);
+        QTest::qWait(50);
+        QCOMPARE(m_fake->countOfPathEndingWith(QStringLiteral("/api/topup-notices")),
+                 topupsBefore + 1);
+        QCOMPARE(m_fake->countOfPathEndingWith(QStringLiteral("/api/usage")), usageBefore + 1);
+    }
+
+    // --- 06.4-15 Task 2: the connecting wake-up, the paused fallback read, and the revoked -------
+    // --- notice-then-sign-out (deferred during a stream) -------------------------------------------
+
+    void aSessionStateWakesThePairingPollAtOnce()
+    {
+        SeatHubClient client;
+        beginStagedSession(client);
+        QVERIFY(!QTest::currentTestFailed());
+
+        // The first poll (from `start()`) has already landed; a very long interval means only
+        // `pollNow()` could produce another one inside this test's own window.
+        QTRY_VERIFY_WITH_TIMEOUT(
+            m_fake->requestPaths().contains(QStringLiteral("/api/sessions/s-stages/pairing")),
+            15000);
+        client.pairing()->setPollIntervalMs(60000);
+        const int pairingBefore = m_fake->countOfPathEndingWith(QStringLiteral("/pairing"));
+
+        // A session.state for a different session does not wake it.
+        emit client.sse()->sessionState(
+            sessionIn(QStringLiteral("PREPARING"), QStringLiteral("not-s-stages")));
+        QTest::qWait(100);
+        QCOMPARE(m_fake->countOfPathEndingWith(QStringLiteral("/pairing")), pairingBefore);
+
+        // A session.state for the session being connected wakes it at once.
+        emit client.sse()->sessionState(
+            sessionIn(QStringLiteral("PREPARING"), QStringLiteral("s-stages")));
+        QTRY_COMPARE_WITH_TIMEOUT(m_fake->countOfPathEndingWith(QStringLiteral("/pairing")),
+                                  pairingBefore + 1, 15000);
+    }
+
+    void aPausedStreamReadsTheAccountEveryTenSecondsWithTheMarker()
+    {
+        SeatHubClient client;
+        reachHome(client, 90);
+        client.setAccountFallbackMs(50);
+
+        QSignalSpy pausedSpy(&client, &SeatHubClient::liveUpdatesPausedChanged);
+
+        m_fake->answerAccountState(200, QByteArrayLiteral(
+            "{\"topic\":\"account:acc-1\",\"at\":\"2026-09-27T00:00:00Z\","
+            "\"account\":{\"wallet\":{\"balance_minutes\":77},\"live_session_id\":\"\","
+            "\"open_topup_notice\":null,\"signup_stage\":\"complete\"}}"));
+
+        emit client.sse()->pausedChanged(true);
+        QCOMPARE(pausedSpy.count(), 1);
+        QVERIFY(client.liveUpdatesPaused());
+
+        QTRY_COMPARE_WITH_TIMEOUT(client.balanceMinutes(), qint64(77), 15000);
+        QCOMPARE(m_fake->streamFallbackHeaderFor(QStringLiteral("/api/account-state")),
+                 QByteArrayLiteral("seathub"));
+
+        // Live again: the property clears and the reads stop.
+        const int readsBeforeLive =
+            m_fake->countOfPathEndingWith(QStringLiteral("/api/account-state"));
+        emit client.sse()->pausedChanged(false);
+        QCOMPARE(pausedSpy.count(), 2);
+        QVERIFY(!client.liveUpdatesPaused());
+        QTest::qWait(150);
+        QCOMPARE(m_fake->countOfPathEndingWith(QStringLiteral("/api/account-state")),
+                 readsBeforeLive);
+
+        // A 401 on the fallback read starts the signed-out sequence, not an immediate sign-out.
+        client.setSignedOutNoticeMs(60000);
+        m_fake->answerAccountState(401, refusedBody());
+        emit client.sse()->pausedChanged(true);
+        QTRY_VERIFY_WITH_TIMEOUT(client.signedOutNotice(), 15000);
+        QVERIFY2(client.signedIn(), "the 401 must start the notice, not sign out at once");
+    }
+
+    void aRevokedStreamShowsTheNoticeThenSignsOut()
+    {
+        SeatHubClient client;
+        reachHome(client, 90);
+        client.setSignedOutNoticeMs(200);
+
+        QSignalSpy noticeSpy(&client, &SeatHubClient::signedOutNoticeChanged);
+        emit client.sse()->revoked();
+
+        QVERIFY2(client.signedOutNotice(), "the notice must show right after revoked()");
+        QVERIFY2(client.signedIn(), "the client must still be signed in during the notice");
+
+        // A second revoked() during the wait starts no second sign-out.
+        emit client.sse()->revoked();
+        QVERIFY(client.signedIn());
+
+        QTRY_VERIFY_WITH_TIMEOUT(!client.signedIn(), 15000);
+        QVERIFY(!client.signedOutNotice());
+        QCOMPARE(client.appState(), QStringLiteral("signed_out"));
+        // The notice's own property goes true once, then false once - never a second true.
+        QCOMPARE(noticeSpy.count(), 2);
+        QCOMPARE(m_fake->requestPaths().count(QStringLiteral("/api/auth/logout")), 1);
+    }
+
+    void aRevokedStreamDuringAStreamWaitsForItsEnd()
+    {
+        auto* engine = new FakeEngineSession;
+        SeatHubClient client;
+        WalletTicks ticks;
+        beginStreaming(client, engine, &ticks, 90, 80);
+        QVERIFY(!QTest::currentTestFailed());
+        client.setSignedOutNoticeMs(200);
+        m_fake->answerSession(QStringLiteral("s-live"), QStringLiteral("CANCELLED"),
+                              QStringLiteral("CUSTOMER_ENDED"));
+
+        emit client.sse()->revoked();
+        QTest::qWait(100);
+        QVERIFY2(!client.signedOutNotice(), "the notice must wait for the stream to end");
+        QVERIFY2(client.signedIn(), "revoked() must not sign out mid-stream");
+
+        client.interrupt();
+        emit engine->sessionFinished(0);
+        emit engine->readyForDeletion();
+
+        // The same delayed sequence now runs once: the notice, then - after L9 - the sign-out.
+        // Never immediately, even once the stream has ended.
+        QVERIFY2(client.signedIn(), "must not sign out the instant the stream ends either");
+        QTRY_VERIFY_WITH_TIMEOUT(!client.signedIn(), 15000);
+        QCOMPARE(client.appState(), QStringLiteral("signed_out"));
+    }
+
+    void aSignOutDuringTheNoticeCancelsIt()
+    {
+        SeatHubClient client;
+        reachHome(client, 90);
+        client.setSignedOutNoticeMs(200);
+
+        emit client.sse()->revoked();
+        QVERIFY(client.signedOutNotice());
+
+        const int logoutsBefore =
+            m_fake->requestPaths().count(QStringLiteral("/api/auth/logout"));
+        client.signOut();
+
+        QVERIFY(!client.signedOutNotice());
+        QCOMPARE(client.appState(), QStringLiteral("signed_out"));
+
+        // Past where the notice would have elapsed on its own: no second sign-out follows.
+        QTest::qWait(400);
+        QCOMPARE(m_fake->requestPaths().count(QStringLiteral("/api/auth/logout")),
+                 logoutsBefore + 1);
     }
 };
 

@@ -17,13 +17,16 @@
 #include <QJsonObject>
 #include <QObject>
 #include <QString>
+#include <QTimer>
 #include <QUrl>
 #include <QVariantList>
 #include <QVariantMap>
 #include <QVector>
 #include <QWindow>
 
+#include <atomic>
 #include <functional>
+#include <limits>
 
 #include "authorized_through_timer.h"
 #include "control_plane_client.h"
@@ -39,6 +42,7 @@
 #include "quality_outbox.h"
 #include "session_lifecycle.h"
 #include "session_websocket.h"
+#include "sse_client.h"
 #include "stream_stats.h"
 // Included rather than forward-declared: moc needs complete types for the `SettingsBridge*` and
 // `UpdateFeedClient*` properties below (a bare forward declaration fails the pointer-metatype
@@ -161,6 +165,35 @@ class SeatHubClient : public QObject
     /// attached. The view shows its busy state (as `Play` already does) while this holds.
     Q_PROPERTY(bool retryBusy READ retryBusy NOTIFY retryBusyChanged)
 
+    /// 06.1-19/J-07: the reconnect state (D-03, `screens.md` §24). `appState` deliberately stays
+    /// "connecting" throughout - `main.qml`'s `componentForState`/`showsHeader` switches (not this
+    /// plan's to edit) know only the existing five values, so a genuinely new one would route to
+    /// the sign-in form and lose the header. The screen tells a reconnect apart from an ordinary
+    /// connect entirely through this property.
+    ///
+    /// True from the moment a connection-class engine code ends a stream that had started, until
+    /// the reconnect either succeeds (streaming again) or is given up on (`reconnectEnded`).
+    Q_PROPERTY(bool reconnecting READ reconnecting NOTIFY reconnectingChanged)
+
+    /// The server's own `reconnect_count` from the last session read, cached at read time - the
+    /// count of reconnects already committed, so the screen's "(n of 5)" is `reconnectCount + 1`.
+    Q_PROPERTY(int reconnectCount READ reconnectCount NOTIFY reconnectCountChanged)
+
+    /// Whole minutes left in the server's grace, computed once at the moment each session read is
+    /// applied (never a client timer counting down on its own) from that read's own
+    /// `grace_deadline_at` against this client's clock. `-1` until a read has named one.
+    Q_PROPERTY(int graceMinutesLeft READ graceMinutesLeft NOTIFY graceMinutesLeftChanged)
+
+    /// True once this reconnect episode's first attempt has failed or timed out - the screen's
+    /// "Still trying" line replaces "Reconnecting… (n of 5)" from here on.
+    Q_PROPERTY(bool reconnectStillTrying READ reconnectStillTrying NOTIFY reconnectStillTryingChanged)
+
+    /// True once a held session's reconnect has been given up on (the server's grace expired, or
+    /// the reconnect limit was reached) rather than succeeding or being ended by the customer -
+    /// the one case where the connecting failure view offers only `Back to home`, never
+    /// `Try again` (screens.md §24).
+    Q_PROPERTY(bool reconnectEnded READ reconnectEnded NOTIFY connectFailedChanged)
+
     /// The last session's end reason as the sentence `docs/spec/copy.md` §Session end reasons
     /// gives it, or empty. Styled text: the minute count in it is wrapped in the mono family,
     /// because every number with a unit is mono (copy.md §5). The bare enum never reaches QML.
@@ -206,6 +239,18 @@ class SeatHubClient : public QObject
     /// while this holds: there is no balance before sign-in (CUST-06, `screens.md` Common shell).
     Q_PROPERTY(bool signedIn READ signedIn NOTIFY signedInChanged)
 
+    /// True while the account push channel has not been live for L5 (10 s, `timing.md`): SeatHub
+    /// reads `GET /api/account-state` every `kAccountFallbackMs` with `X-Stream-Fallback: seathub`
+    /// until it is live again (D-04, D-06, ADR-0067). The indicator (`ui.md` §7) shows while this
+    /// holds.
+    Q_PROPERTY(bool liveUpdatesPaused READ liveUpdatesPaused NOTIFY liveUpdatesPausedChanged)
+
+    /// True for `kSignedOutNoticeMs` (3 s, L9) on the screen already open after a revoked stream
+    /// or the fallback read's own 401 (D-07, the owner's design A-87), before this client signs
+    /// out through `handleCredentialRefused()`. Deferred, notice included, until a running stream
+    /// ends (Phase 3 D-33): a control-plane channel never ends a paid stream.
+    Q_PROPERTY(bool signedOutNotice READ signedOutNotice NOTIFY signedOutNoticeChanged)
+
     /// True while the profile is showing. Like Settings it is a view inside the home state, not an
     /// appState of its own, so it keeps the signed-in header and a session that ends while it is open
     /// still lands on the right view (`screens.md` §27).
@@ -250,6 +295,9 @@ public:
     UpdateFeedClient* updates() const { return m_updates; }
     ControlPlaneClient* controlPlane() const { return m_controlPlane; }
     SessionWebSocket* sessionChannel() const { return m_sessionChannel; }
+    /// The account push channel (06.4, ADR-0067). Exposed the way `pairing()`/`teardown()`/
+    /// `liveness()` already are: so a test can drive the real object through the real facade.
+    SseClient* sse() const { return m_sse; }
     PairingController* pairing() const { return m_pairing; }
     TeardownController* teardown() const { return m_teardown; }
     /// The in-stream HUD and the liveness reporter that feeds it a balance. Exposed the way
@@ -257,6 +305,10 @@ public:
     /// facade. Nothing in the app reads them through here.
     HudOverlay* hud() { return &m_hud; }
     LivenessTimer* liveness() const { return m_liveness; }
+    /// The single-shot backoff timer between reconnect attempts. Exposed the same way: a test
+    /// reads `interval()` to check the doubling (2s, 4s, 8s, capped at 15s) without waiting for it
+    /// in real time, and restarts it at 0ms to drive the next attempt at once.
+    QTimer* reconnectTimer() const { return m_reconnectTimer; }
     QVariantMap billing() const { return m_billing; }
     QString sessionWarning() const { return m_sessionWarning; }
     bool inSettings() const { return m_inSettings; }
@@ -278,8 +330,15 @@ public:
     QString defaultCountryCode() const { return m_defaultCountryCode; }
     bool animationEffects() const { return m_animationEffects; }
     bool signedIn() const { return m_signedIn; }
+    bool liveUpdatesPaused() const { return m_liveUpdatesPaused; }
+    bool signedOutNotice() const { return m_signedOutNotice; }
     bool liveSession() const { return m_liveSession; }
     bool retryBusy() const { return m_retryBusy; }
+    bool reconnecting() const { return m_reconnecting; }
+    int reconnectCount() const { return m_reconnectCount; }
+    int graceMinutesLeft() const { return m_graceMinutesLeft; }
+    bool reconnectStillTrying() const { return m_reconnectStillTrying; }
+    bool reconnectEnded() const { return m_reconnectEnded; }
     bool inProfile() const { return m_inProfile; }
     SessionListModel* sessionHistory() const { return m_sessionHistory; }
     CreditHistoryModel* creditHistory() const { return m_creditHistory; }
@@ -305,6 +364,11 @@ public:
 
     /// D-02: end the active stream immediately.
     Q_INVOKABLE void interrupt();
+
+    /// screens.md §24 Reconnecting's ghost `End session`: ends the held session at once through
+    /// the ordinary end (not `failed`), whether an attempt's own engine is currently running, mid
+    /// re-pairing, or waiting out a backoff. A no-op unless `reconnecting`.
+    Q_INVOKABLE void endHeldSession();
 
     /// Sign-in step 1 (D-55 shell, stubbed in Plan 03-02).
     Q_INVOKABLE void requestOtp(const QString& phoneE164);
@@ -343,6 +407,13 @@ public:
     /// Replaces what opens an address (the default is the desktop's browser). A test uses this so
     /// it can see what would have been opened without launching one.
     void setUrlOpener(std::function<bool(const QUrl&)> opener) { m_urlOpener = std::move(opener); }
+
+    /// Test seam: overrides `kAccountFallbackMs` (10 s, L5, `timing.md`) for the paused-fallback
+    /// read's own repeating interval.
+    void setAccountFallbackMs(int milliseconds);
+    /// Test seam: overrides `kSignedOutNoticeMs` (3 s, L9, `timing.md`, D-07) the notice shows for
+    /// before this client signs out.
+    void setSignedOutNoticeMs(int milliseconds);
 
     /// Launch (CUST-08, D-06): reads the stored credential, confirms it with `GET /api/me`, and
     /// opens on Home. Called once by main.qml; further calls are ignored.
@@ -448,8 +519,14 @@ signals:
     void endReasonTextChanged();
     void balanceChanged();
     void signedInChanged();
+    void liveUpdatesPausedChanged();
+    void signedOutNoticeChanged();
     void liveSessionChanged();
     void retryBusyChanged();
+    void reconnectingChanged();
+    void reconnectCountChanged();
+    void graceMinutesLeftChanged();
+    void reconnectStillTryingChanged();
     void inProfileChanged();
     void totalsChanged();
     void accountStatusChanged();
@@ -483,6 +560,23 @@ private slots:
 
     // The control plane's session channel (`/ws/session/{session_id}`).
     void handleSessionState(const SessionInfo& session);
+
+    /// The account push channel's own `account.state` frame (06.4, ADR-0067, D-01): sets the
+    /// balance exactly as a successful `refreshBalance()` answer does, and - when the profile is
+    /// open and the open top-up notice changed - reloads the Top-ups list and the totals.
+    void handleAccountState(const AccountStateInfo& account);
+
+    /// The account push channel's own `session.state` frame (06.4, ADR-0067): wakes the pairing
+    /// poll for the session currently being connected (`PairingController::pollNow`), so it does
+    /// not wait out its own interval. The poll stays running as the fallback and the source of
+    /// truth; this frame is never applied to any other state - `handleSessionState()` is.
+    void handleSseSessionState(const SessionInfo& session);
+    /// `SseClient::pausedChanged` (D-04, D-06, L5): starts or stops the 10 s fallback read.
+    void handleSsePaused(bool paused);
+    /// `SseClient::revoked` (`stream.closing {reason: "revoked"}`, or a 401/403 on the stream
+    /// request itself): the D-07 signed-out sequence, deferred while the stream is running.
+    void handleSseRevoked();
+
     void handleSessionBilling(const QString& sessionId, int minutesBilled, int balanceMinutes,
                               int minuteIndex);
     void handleSessionWarning(const QString& sessionId, const QString& warning,
@@ -561,6 +655,21 @@ private:
     void resetProfileData();
     void readTotals();
     void readAccount();
+    /// L5, D-06: the 10 s fallback `GET /api/account-state` read while the account push channel
+    /// is paused. Its own 401 starts the D-07 signed-out sequence (`timing.md` L9), never an
+    /// immediate sign-out.
+    void fetchAccountStateFallback();
+    /// The D-07 signed-out sequence itself (the owner's design A-87), started by
+    /// `handleSseRevoked()`, the fallback read's own 401, or a running stream's own end applying
+    /// a deferred one (`m_pendingSignedOutNotice`, Phase 3 D-33). While the engine's stream is
+    /// running, only remembers it; otherwise shows the notice (unless one is already showing) and
+    /// starts `m_signedOutNoticeTimer`, whose timeout clears it and signs out through the one
+    /// path (`handleCredentialRefused()`).
+    void startSignedOutSequence();
+    /// `signOut()` and a successful sign-in (`adoptSignIn()`): stops the notice timer and clears
+    /// `signedOutNotice`/`m_pendingSignedOutNotice`, so a manual sign-out or a fresh sign-in during
+    /// the wait never lets a second sign-out follow.
+    void clearSignedOutNotice();
     /// The one writer of `m_signedIn`, so `signedInChanged()` can never be missed.
     void setSignedIn(bool signedIn);
     /// The one writer of `m_sessionId`, and of whether that session has ended, so `liveSession` can
@@ -581,6 +690,49 @@ private:
     /// this queues are both marshalled onto the network thread in that order, so the server
     /// records the stage before the cancel (RESEARCH-FORK C2).
     void endAttachedSessionBeforeStream(bool failed);
+
+    // --- 06.1-19/J-07: the reconnect state -------------------------------------------------------
+
+    /// True for every engine termination code except the sentinel (no code known yet), the
+    /// graceful stop (`0`) and the three host-side codes (`-102`, `-103`, `-104`) a reconnect
+    /// cannot fix - the network-loss family FORK research 1.2 narrows this to.
+    static bool isReconnectEligible(int code);
+    /// A stream that had started (`m_streamStarted`) just ended on a reconnect-eligible code
+    /// (`handleDisplayLaunchError`'s not-connecting branch): keeps the session, starts the
+    /// reconnect state and the first backoff, and reports the stage at once (`LivenessTimer`
+    /// narrows its own immediate report to exactly this transition, Task 2).
+    void enterReconnect();
+    /// `m_reconnectTimer`'s own timeout: re-runs the full pairing handshake for `m_sessionId`
+    /// (STREAM-10 forbids anything cheaper), leaving `appState` at "connecting" and the stepper at
+    /// stage 3, and never restarting `m_liveness` (it never stopped across the drop). A no-op
+    /// once the episode is no longer `m_reconnecting` (superseded by a give-up or `endHeldSession()`
+    /// while this was already queued).
+    void resumeAfterReconnect();
+    /// This reconnect attempt's own failure (a pairing failure, a stage failure, or the retry's
+    /// own engine dropping again) - doubles the backoff (capped at 15 s) and fetches the session
+    /// once before scheduling the next attempt, so a server-side ending reached during the
+    /// backoff gap (no poll runs there) is caught between attempts rather than only on the next
+    /// successful pairing poll.
+    void retryReconnectOrGiveUp();
+    /// The server has already ended the held session (a terminal read, from the pairing poll or
+    /// `retryReconnectOrGiveUp()`'s own fetch): stops the attempts and shows `session`'s own end
+    /// reason the way any other connecting failure is shown - `GRACE_EXPIRED` or
+    /// `RECONNECT_LIMIT`, with only `Back to home` offered (`reconnectEnded`).
+    void handleReconnectEnded(const SessionInfo& session);
+    /// Locks or unlocks Settings and the update check for the duration of a reconnect episode,
+    /// exactly as `setAppState()` already does for an ordinary stream (T-06.1-57: a forced-update
+    /// modal must never cover the held session's `End session` control). Called explicitly because
+    /// `appState` itself never changes across a reconnect (`reconnecting` is the only signal of
+    /// it), so `setAppState()`'s own before/after comparison never fires here.
+    void setReconnectLock(bool locked);
+    /// The last session read's `reconnect_count` and `grace_deadline_at`, cached at the moment each
+    /// read is applied - never recomputed later against a live clock, so `graceMinutesLeft` is a
+    /// deterministic answer to "what did the last read say", not a client-owned countdown.
+    void applyReconnectSessionFields(const SessionInfo& session);
+    /// Whole minutes from now until `graceDeadlineAt`, floored, never negative; `-1` for an empty
+    /// or unparseable deadline.
+    static int computeGraceMinutesLeft(const QString& graceDeadlineAt);
+
     /// D-05/C4/C7: shared by `retry()` and `start()` - a session still attached here that never
     /// streamed is ended first (idempotent if C2 already started it), with `retryBusy` held until
     /// the wait resolves, before a fresh Play goes out. Returns false (and starts nothing) with no
@@ -723,6 +875,10 @@ private:
     QString m_creditLeftText;
     QString m_totalsError;
     QString m_totalsErrorReference;
+    /// 06.4/ADR-0067, D-01: the last `open_topup_notice` id an `account.state` push named (empty
+    /// when none is open), so `handleAccountState()` reloads the Top-ups list and the totals only
+    /// on a genuine change - not on every push that leaves it the same.
+    QString m_lastOpenTopupNoticeId;
     bool m_accountFailed = false;
     QString m_accountError;
     QString m_accountErrorReference;
@@ -750,6 +906,29 @@ private:
     QString m_balanceText;
     bool m_balanceStale = false;
 
+    // --- 06.4/ADR-0067: the D-04/D-06 fallback read and the D-07 signed-out notice ---------------
+
+    /// L5, `timing.md`: 10 s. The paused-fallback read's own repeating interval, overridable for a
+    /// test (`setAccountFallbackMs()`).
+    static const int kAccountFallbackMs = 10000;
+    /// L9, `timing.md`, D-07 (the owner's design A-87): 3 s. Overridable for a test
+    /// (`setSignedOutNoticeMs()`).
+    static const int kSignedOutNoticeMs = 3000;
+    bool m_liveUpdatesPaused = false;
+    bool m_signedOutNotice = false;
+    /// D-07/D-33: a revoked stream (or the fallback read's own 401) that arrived while the
+    /// engine's stream was running - the notice and the sign-out both wait for the stream's end
+    /// (`handleReadyForDeletion()`), which starts the same sequence once, wherever it lands.
+    bool m_pendingSignedOutNotice = false;
+    int m_accountFallbackMs = kAccountFallbackMs;
+    int m_signedOutNoticeMs = kSignedOutNoticeMs;
+    /// Facade-thread timers, like `m_reconnectTimer`: neither needs to run while an engine stream
+    /// suspends this thread's event loop (D-33 - the balance element is not even shown then), and
+    /// keeping them here means starting/stopping them needs no `onClientThread()` marshal.
+    QTimer* m_accountFallbackTimer = nullptr;
+    /// Single-shot; its timeout clears `signedOutNotice` and calls `handleCredentialRefused()`.
+    QTimer* m_signedOutNoticeTimer = nullptr;
+
     QWindow* m_hostWindow = nullptr;
     SessionLifecycle* m_session = nullptr;
     SettingsBridge* m_settings = nullptr;
@@ -761,6 +940,10 @@ private:
     ControlPlaneClient* m_controlPlane = nullptr;
     TokenStore* m_tokenStore = nullptr;
     SessionWebSocket* m_sessionChannel = nullptr;
+    /// The account push channel (06.4, ADR-0067): opened after a confirmed sign-in or restore,
+    /// stopped in `signOut()`. Lives on the control-plane's network thread, like `m_liveness`/
+    /// `m_pairing` - never parented, for the same `moveToThread()` reason as those two.
+    SseClient* m_sse = nullptr;
     PairingController* m_pairing = nullptr;
     /// The production pairing seam (the gap 03-03 left open). Owned here, moved to the network
     /// thread with the controller it serves, and never exposed: it is the only object in the
@@ -837,6 +1020,44 @@ private:
     bool m_liveSession = false;
     /// D-05/C4: see the `retryBusy` Q_PROPERTY.
     bool m_retryBusy = false;
+
+    // --- 06.1-19/J-07: the reconnect state --------------------------------------------------------
+
+    /// A sentinel outside the engine's own range (`Limelight.h`'s `ML_ERROR_*` are `0` or negative,
+    /// per `engine_termination.h`'s own parser comment) - "no termination code has been seen yet
+    /// for the currently attached session", never mistaken for a real one.
+    // Parenthesised to defeat the <windows.h> `min` macro some Qt/SDL header pulls in transitively
+    // on this build (MSVC error C2589 without it): `(...)` around the member access stops the
+    // preprocessor from matching `min` as a call-like macro invocation.
+    static constexpr int kNoTerminationCode = (std::numeric_limits<int>::min)();
+    /// A-51/FORK 1.2: the engine's own termination code, written from the log-tee sink lambda that
+    /// already calls `noteTermination()` (relaxed store, no new thread crossing) and read (relaxed
+    /// load) from `handleDisplayLaunchError()` on the facade thread - the exact cross-thread read
+    /// T-06.1-56 asks for an atomic rather than a plain getter. Reset in `beginSession()`.
+    std::atomic<int> m_lastTerminationCode{kNoTerminationCode};
+    /// True from `enterReconnect()` until the reconnect succeeds, is given up on, or the customer
+    /// ends the held session (`endHeldSession()`).
+    bool m_reconnecting = false;
+    /// The next attempt's delay: 2 s initially, doubling on every failed attempt, capped at 15 s
+    /// (D-01's own reference points - ENet's ~10 s connection timeout, Sunshine's 10 s
+    /// `ping_timeout` - not a multiple of them).
+    int m_reconnectBackoffMs = 0;
+    /// Single-shot; its timeout re-enters `beginSession()`'s reconnect path for `m_sessionId`.
+    /// Lives on the facade's own thread (never moved, unlike `m_liveness`/`m_pairing`): no engine
+    /// runs between a drop and a successful reconnect, so this thread's event loop is never
+    /// suspended for the backoff to wait through.
+    QTimer* m_reconnectTimer = nullptr;
+    /// True once this reconnect episode's first attempt has failed or timed out
+    /// (`reconnectStillTrying`). Reset in `enterReconnect()`.
+    bool m_reconnectStillTrying = false;
+    /// True once a reconnect ended by being given up on rather than succeeding or being ended by
+    /// the customer (`reconnectEnded`). Reset wherever `beginSession()` starts a fresh, non-
+    /// reconnect session.
+    bool m_reconnectEnded = false;
+    /// The last session read's own count and grace deadline, cached at read time
+    /// (`applyReconnectSessionFields()`) - `reconnectCount`/`graceMinutesLeft`'s backing state.
+    int m_reconnectCount = 0;
+    int m_graceMinutesLeft = -1;
     /// What pairing returned about this client: the SHA-256 fingerprint of its own certificate,
     /// which is the identity a host-side reader of Sunshine's client list can match to this
     /// client's record. It is the only thing that identifies this client - never the rig's name,
