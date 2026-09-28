@@ -904,6 +904,15 @@ void SeatHubClient::handleReconnectEnded(const SessionInfo& session)
     setAttachedSessionEnded(true);
     m_liveness->stop();
     onClientThread(m_pairing, [this]() { m_pairing->cancel(); });
+    // CR-06: this IS an ending - the server gave up on this episode, not the customer or a locally-
+    // running engine - so it must run the same D-10/STREAM-10 disable/remove/verify sequence every
+    // other ending path runs (`endAttachedSessionBeforeStream()`, `endPreStreamSessionWithReport()`,
+    // `handleReadyForDeletion()`'s ordinary branch). Without this, the dead Play's D-27 trace id
+    // leaks onto the next request, `m_horizon` stays armed, and `m_sessionId` stays attached to a
+    // session that is over.
+    if (inControlPlaneSession() && m_teardownGuard.markStarted()) {
+        m_teardown->teardown(m_sessionId, m_clientUuid, false);
+    }
     emit reconnectingChanged();
     // The existing connecting-failure path: the stage that was active (stage 3, still active
     // throughout the whole episode) turns destructive, and `session`'s own end reason - here

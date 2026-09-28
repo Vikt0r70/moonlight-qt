@@ -5147,11 +5147,23 @@ private slots:
         WalletTicks ticks;
         beginStreaming(client, engine, &ticks, 90, 80);
         QVERIFY(!QTest::currentTestFailed());
+        client.teardown()->setVerifyIntervalMs(1);
+
+        // CR-06: `beginSession()` skips `beginPlayRequest()`, so it mints no trace id of its own -
+        // set one directly, standing in for the Play that would have minted it in production, so
+        // this test can prove the give-up path clears it rather than leaking it onto the next
+        // request (the same thing WR-14 already proved for `applyPlayFailure()`).
+        client.controlPlane()->setTraceId(QStringLiteral("11112222333344445555666677778888"));
 
         emitConnectionTerminated(-1);
         emit engine->displayLaunchError(QStringLiteral("Connection terminated"));
         emit engine->readyForDeletion();
         QTRY_VERIFY_WITH_TIMEOUT(client.reconnectTimer()->isActive(), 15000);
+
+        // Precondition: still the trace id this test set, unaffected by the drop/re-enter-reconnect
+        // above - so the assertion after the give-up below is not a vacuous pass.
+        QCOMPARE(client.controlPlane()->traceId(),
+                 QStringLiteral("11112222333344445555666677778888"));
 
         SessionInfo over = sessionIn(QStringLiteral("COMPLETED"), QStringLiteral("s-live"));
         over.endReason = QStringLiteral("GRACE_EXPIRED");
@@ -5165,6 +5177,13 @@ private slots:
         QCOMPARE(client.stalledReasonText(),
                  QStringLiteral("We couldn't reconnect, so the session ended. You were charged "
                                 "for <font face=\"Geist Mono\">23</font> minutes."));
+
+        // CR-06: the server-gives-up ending must run STREAM-10 teardown too, exactly like every
+        // other ending path - posting `/end` and clearing the dead Play's trace id, instead of
+        // leaking it onto whatever the customer does next (Back to home -> refreshBalance()).
+        QTRY_VERIFY_WITH_TIMEOUT(
+            m_fake->requestPaths().contains(QStringLiteral("/api/sessions/s-live/end")), 15000);
+        QTRY_VERIFY_WITH_TIMEOUT(client.controlPlane()->traceId().isEmpty(), 15000);
     }
 
     void aDropBeforeTheStreamStartedIsNotAReconnect()
@@ -5366,6 +5385,7 @@ private slots:
             QCOMPARE(client.stalledReasonText(), testCase.sentence);
         }
     }
+
 };
 
 QTEST_MAIN(TstFacadeWiring)
