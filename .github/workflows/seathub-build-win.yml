@@ -224,8 +224,9 @@ jobs:
             (Join-Path $sentryInstallBin 'crashpad_wer.pdb')
           )
 
-          # Collected, not hardcoded: a rebuild changes every debug id, and --require-all below
-          # must be handed the ids this exact build actually produced.
+          # Collected, not hardcoded: a rebuild changes every debug id, and --id below must be
+          # handed the ids this exact build actually produced. This loop is also the presence
+          # check: each of the four PDBs must exist, be usable and yield an id, or the step throws.
           $debugIds = @()
           foreach ($pdbPath in $filesToCheck) {
             if (-not (Test-Path -LiteralPath $pdbPath)) { throw "$pdbPath does not exist to check" }
@@ -245,8 +246,12 @@ jobs:
 
           # The two trees that must contain the four ids above: SeatHub's own build output, and
           # sentry-native's installed bin (sentry.dll, crashpad_handler.exe, crashpad_wer.dll and
-          # their PDBs). --require-all only fails when one of these four named ids is missing from
-          # what --id searches for here -- it does not, by itself, cause anything else in these
+          # their PDBs). No --require-all: sentry-cli computes it from the files uploaded in THIS
+          # call only (src/commands/debug_files/upload.rs: found_ids = uploaded), so an id already
+          # on the server - sentry-native's three PDBs, unchanged since 0.1.20 - reads as "still
+          # missing" and exits 1 on every later build (runs 36391045023, 36402692641). The loop
+          # above already proves all four files exist locally, and sentry-cli skips a file only
+          # when the server confirms it holds it. --id alone does not cause anything else in these
           # trees or in libs\windows\lib\x64 to upload (MEASURED: sentry-cli's own --id is a
           # positive filter, not merely a presence check; every debug file whose id is not in the
           # --id list is dropped from this call's upload set, logged as "Invalid debug ID" even
@@ -260,7 +265,7 @@ jobs:
           # WR-06: distinguish the ALREADY-KNOWN, owner-accepted "Project not found" project/region
           # gap (the exact failure text the real PR run hit - 06.3.1 Plan 23, GitHub Actions run
           # 36257711287 - and the one this whole warn-and-continue design was built for) from
-          # anything else. A silent regression in the --id/--require-all logic, the debug-id
+          # anything else. A silent regression in the --id logic, the debug-id
           # extraction regex, or the upload call itself would otherwise look IDENTICAL in CI (a
           # warning, build still green) to today's known, accepted gap - this function makes the
           # two cases read differently in both the log and the job summary a human actually reads,
@@ -278,7 +283,7 @@ jobs:
           }
 
           $uploadFailed = $false
-          $uploadOutputA = (& ./sentry-cli.exe debug-files upload --org $env:SENTRY_ORG --project $env:SENTRY_PROJECT --wait --require-all @idArgs @uploadPaths 2>&1 | Out-String)
+          $uploadOutputA = (& ./sentry-cli.exe debug-files upload --org $env:SENTRY_ORG --project $env:SENTRY_PROJECT --wait @idArgs @uploadPaths 2>&1 | Out-String)
           Write-Host $uploadOutputA
           if ($LASTEXITCODE -ne 0) {
             $uploadFailed = $true
