@@ -46,6 +46,7 @@ SOURCES += \
     ../app/seathub/engine_session.cpp \
     ../app/seathub/session_lifecycle.cpp \
     ../app/seathub/pairing_seam.cpp \
+    ../app/seathub/pairing_recovery.cpp \
     ../app/seathub/error_map.cpp
 
 HEADERS += \
@@ -53,4 +54,5 @@ HEADERS += \
     ../app/seathub/session_lifecycle.h \
     ../app/seathub/teardown_guard.h \
     ../app/seathub/pairing_seam.h \
+    ../app/seathub/pairing_recovery.h \
     ../app/seathub/error_map.h

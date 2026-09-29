@@ -58,6 +58,13 @@ public:
     virtual void pair(const PairingTarget& target,
                       std::function<void(bool ok, const QString& clientUuid,
                                          const QString& engineError)> done) = 0;
+
+    /// Best-effort clear of the rig's pending pairing session the target's handshake may have
+    /// left half-open (G-06.2-2). Called by `PairingController::cancel()` for the last target a
+    /// handshake was started for, and by nothing else: the in-handshake recovery path clears
+    /// inside the seam worker, where the clear is sequenced before the one retry. Fire-and-forget
+    /// from the caller's point of view - a cancel() on the UI thread never waits on the rig.
+    virtual void clearPendingPairing(const PairingTarget& target) = 0;
 };
 
 // The client half of silent pairing (D-21, D-22, D-08, STREAM-03).
@@ -178,4 +185,20 @@ private:
     int m_polls = 0;
     int m_conflictPolls = 0;
     bool m_finished = false;
+
+    // G-06.2-2 state (Plan 06.2-12 Task 1).
+    //
+    // Single-flight: a stray poll tick or a push-driven pollNow() while this session's handshake
+    // is still running must not start a second handshake for the same session - the customer's
+    // rig saw three back-to-back getservercert sequences in one second, two of them 409s, because
+    // nothing stopped the re-fire. `m_inFlightSessionId` tags which session the in-flight
+    // handshake belongs to: a fresh Play for a DIFFERENT session still supersedes through the
+    // seam's own generation gate, and is not blocked here.
+    bool m_handshakeInFlight = false;
+    QString m_inFlightSessionId;
+    // Teardown recovery: the last target a handshake was actually started for, so cancel() can
+    // ask the seam for the rig-side clear. The PIN inside dies with this controller, as it always
+    // did (D-30, D-37) - it is copied into no log, no signal and no property.
+    PairingTarget m_lastTarget;
+    bool m_handshakeStarted = false;
 };

@@ -24,11 +24,13 @@ SOURCES += \
     tst_pairing.cpp \
     ../app/seathub/pairing_controller.cpp \
     ../app/seathub/pairing_seam.cpp \
+    ../app/seathub/pairing_recovery.cpp \
     ../app/seathub/control_plane_client.cpp \
     ../app/seathub/error_map.cpp
 
 HEADERS += \
     ../app/seathub/pairing_controller.h \
     ../app/seathub/pairing_seam.h \
+    ../app/seathub/pairing_recovery.h \
     ../app/seathub/control_plane_client.h \
     ../app/seathub/error_map.h

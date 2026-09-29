@@ -66,6 +66,7 @@ SOURCES += \
     ../app/seathub/sse_client.cpp \
     ../app/seathub/pairing_controller.cpp \
     ../app/seathub/pairing_seam.cpp \
+    ../app/seathub/pairing_recovery.cpp \
     ../app/seathub/teardown_controller.cpp \
     ../app/seathub/liveness_timer.cpp \
     ../app/seathub/authorized_through_timer.cpp \

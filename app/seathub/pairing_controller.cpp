@@ -92,6 +92,10 @@ void PairingController::start(const QString& sessionId)
     m_finished = false;
     m_polls = 0;
     m_conflictPolls = 0;
+    m_lastTarget = PairingTarget();
+    m_handshakeStarted = false;
+    m_handshakeInFlight = false;
+    m_inFlightSessionId.clear();
     m_clock.start();
 
     qCInfo(seathubPairing) << "silent pairing started for session" << sessionId;
@@ -108,6 +112,20 @@ void PairingController::cancel()
     m_finished = true;
     m_clock.invalidate();
     m_sessionId.clear();
+
+    // G-06.2-2 teardown recovery: a handshake that ran leaves the rig holding a pending pairing
+    // session keyed by the shared upstream uniqueid, and the next Play from any install would
+    // collide with it (409). Ask the seam for the one rig-side clear - fire-and-forget, never a
+    // rig wait here - exactly once, for the last target a handshake was actually started for. A
+    // cancel before any handshake ran sends nothing: with no pending session of ours to clear,
+    // the request could only hit a session another install is pairing.
+    if (m_handshakeStarted) {
+        if (m_seam != nullptr) {
+            m_seam->clearPendingPairing(m_lastTarget);
+        }
+        m_handshakeStarted = false;
+        m_handshakeInFlight = false;
+    }
     setState(QString::fromLatin1(kStateIdle));
 }
 
@@ -230,6 +248,20 @@ void PairingController::handleAuthorization(const ControlPlaneResult& result)
 
     // A-68 / D-06 reversal: `authorization.qualityProfile` is parsed above but never forwarded -
     // nothing reads it any more.
+
+    // Single-flight (G-06.2-2): while this session's handshake is still in flight, a stray tick or
+    // a push-driven pollNow() that lands here must not start a second one - the customer's rig saw
+    // three back-to-back getservercert sequences in one second, two of them 409s, because nothing
+    // stopped the re-fire. One handshake at a time is the whole contract: one Play, one
+    // getservercert sequence. The handshake in flight carries its own 90 s deadline, so this is
+    // not a hang: it resolves (or times out) on its own, and the answer's `handleSeamResult`
+    // decides what happens next. No reschedule here either - nothing is being waited on.
+    const QString pairingSessionId =
+        authorization.sessionId.isEmpty() ? m_sessionId : authorization.sessionId;
+    if (m_handshakeInFlight && pairingSessionId == m_inFlightSessionId) {
+        return;
+    }
+
     emit authorizationGranted();
 
     if (authorization.pairingPin.isEmpty()) {
@@ -255,6 +287,10 @@ void PairingController::handleAuthorization(const ControlPlaneResult& result)
     target.pairingPin = authorization.pairingPin;
 
     // The engine seam gets the address and the PIN. Nothing else in this process does.
+    m_lastTarget = target;
+    m_handshakeStarted = true;
+    m_handshakeInFlight = true;
+    m_inFlightSessionId = target.sessionId;
     m_seam->pair(target, [this](bool ok, const QString& uuid, const QString& engineError) {
         handleSeamResult(ok, uuid, engineError);
     });
@@ -264,9 +300,11 @@ void PairingController::handleSeamResult(bool ok, const QString& clientUuid,
                                          const QString& engineError)
 {
     if (m_finished) {
+        m_handshakeInFlight = false;
         return;
     }
 
+    m_handshakeInFlight = false;
     m_pollTimer->stop();
 
     if (!ok) {

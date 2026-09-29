@@ -10,6 +10,7 @@
 #include "backend/nvpairingmanager.h"
 #include "backend/identitymanager.h"
 #include "moonlight_engine_session.h"
+#include "pairing_recovery.h"
 
 Q_LOGGING_CATEGORY(seathubPairingHandshake, "seathub.pairing.handshake")
 
@@ -115,6 +116,10 @@ PairingHandshakeResult runUpstreamPairingHandshake(const PairingTarget& target)
             break;
         case NvPairingManager::ALREADY_IN_PROGRESS:
             result.engineError = QString::fromLatin1(kDiagnosticInProgress);
+            // G-06.2-2: the rig refused the PIN because a pairing session is already in progress
+            // - the same half-open pending session the 409 below reports. Tagged so the seam's
+            // recovery loop knows the clear-and-retry path applies.
+            result.pairingConflict = true;
             break;
         case NvPairingManager::FAILED:
         case NvPairingManager::PAIRED: // handled above; listed so the switch stays exhaustive
@@ -125,6 +130,12 @@ PairingHandshakeResult runUpstreamPairingHandshake(const PairingTarget& target)
     catch (const GfeHttpResponseException& e) {
         result.engineError = QStringLiteral("%1: %2")
                                  .arg(QString::fromLatin1(kDiagnosticServerInfo), describe(e));
+        // G-06.2-2: HTTP 409 on the getservercert step - "A pairing session with this uniqueid
+        // already exists" (pinned Sunshine `src/nvhttp.cpp:975-997`). Every SeatHub install
+        // pairs with the same upstream hard-coded uniqueid, so a half-open session from any
+        // attempt - ours or another install's - collides with this one. Tagged for the seam's
+        // clear-and-retry recovery.
+        result.pairingConflict = e.getStatusCode() == 409;
     }
     catch (const QtNetworkReplyException& e) {
         result.engineError = QStringLiteral("%1: %2")
@@ -145,6 +156,16 @@ PairingHandshakeResult runUpstreamPairingHandshake(const PairingTarget& target)
 
     result.clientIdentity.clear();
     result.ok = false;
+
+    // G-06.2-2: every non-PAIRED outcome leaves the rig holding a pending pairing session keyed
+    // by the shared upstream uniqueid - whether this attempt created it, collided with one from
+    // an earlier attempt, or hit one from another SeatHub install. Send the one client-reachable
+    // clear (Sunshine has no /unpair route in this build; `GET /pair?uniqueid=...&phrase=cancel`
+    // drives `pair()`'s else branch, whose handler erases the map entry). Best-effort and
+    // bounded: the seam's retry logic runs after this returns, whatever the clear did.
+    const bool cleared = sendPairingCancelRequest(target.hostAddress, kPairingControlPort);
+    qCInfo(seathubPairingHandshake)
+        << "pairing cancel request" << (cleared ? "answered" : "not answered");
 
     qCWarning(seathubPairingHandshake) << "upstream pairing handshake did not complete";
     return result;
