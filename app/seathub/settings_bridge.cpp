@@ -208,11 +208,17 @@ const Setting kSettings[] = {
       "of its own." },
 
     // ---- Not on the engine's own settings page (completeness audit only, D-47) -----------------
-    // OD-06: the owner dropped this row because the engine's own stock page does not show it.
-    // Not forced - the stored value is untouched and keeps working, exactly as OD-06 asks.
-    { "packetsize", "advanced", "Packet size (bytes)", KindInt, nullptr, 0, nullptr, false, false,
+    // OD-06 dropped this row because the engine's own stock page does not show it.
+    // D-09/D-10: forced - the packet size is a fixed transport parameter SeatHub controls, not a
+    // quality setting a customer edits (A-68). `applyForcedValues()` corrects any other value on
+    // every load and before every stream, so a non-zero `packetSize` makes the engine take
+    // STREAM_CFG_LOCAL with 1392 instead of remote-mode 1024-byte capping.
+    { "packetsize", "advanced", "Packet size (bytes)", KindInt, nullptr, 0, nullptr, false, true,
       "Not on the engine's own stock settings page (`moonlight stream` CLI only). The owner "
-      "dropped this row (OD-06); the stored value is untouched and keeps working." },
+      "dropped this row (OD-06). Forced to SeatHub's fixed transport value on every load (D-09/"
+      "D-10): no exposed control can set it, and a hand-edited store or a stray upstream writer "
+      "must not silently cap the stream at remote-mode 1024 bytes (A-68: quality settings decide "
+      "the stream; this hidden transport value is not one of them)." },
     { "defaultver", "advanced", "Preference-format version", KindFixed, nullptr, 0, nullptr,
       false, false,
       "Internal upstream migration marker, never on the engine's own settings page. SeatHub "
@@ -1174,9 +1180,11 @@ void SettingsBridge::applySeatHubDefaults()
 
 void SettingsBridge::applyForcedValues()
 {
-    // D-25(b)/(c), T-05-45: re-applied on every load, not only the first, so a value edited by
-    // hand in the store between sessions is corrected before the engine reads it. `hostaudio` is
-    // deliberately absent (D-25a amendment) - it stays user-editable at upstream's own default.
+    // D-25(b)/(c), T-05-45; D-09/D-10 (A-68): re-applied on every load, not only the first, so a
+    // value edited by hand in the store between sessions is corrected before the engine reads it.
+    // `hostaudio` is deliberately absent (D-25a amendment) - it stays user-editable at upstream's
+    // own default. Six forced keys now: language, richPresence, enableMdns, detectNetworkBlocking,
+    // quitAppAfter and packetSize.
     bool changed = false;
 
     if (m_preferences->language != StreamingPreferences::LANG_EN) {
@@ -1197,6 +1205,15 @@ void SettingsBridge::applyForcedValues()
     }
     if (m_preferences->quitAppAfter) {
         m_preferences->quitAppAfter = false;
+        changed = true;
+    }
+    // D-09: 1392 is SeatHub's fixed transport packet size. With packetSize non-zero the engine
+    // takes STREAM_CFG_LOCAL at that size (session.cpp's packetSize != 0 branch); leaving it 0
+    // lets remote-mode detection cap the video packets at 1024 bytes. Corrected here because the
+    // row is not rendered (OD-06), so only a hand-edited store or a stray upstream writer can
+    // hold anything else.
+    if (m_preferences->packetSize != 1392) {
+        m_preferences->packetSize = 1392;
         changed = true;
     }
 

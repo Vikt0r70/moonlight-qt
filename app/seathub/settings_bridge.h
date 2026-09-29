@@ -78,9 +78,9 @@ public:
     Q_INVOKABLE bool isDropped(const QString& key) const;
     Q_INVOKABLE QString dropReason(const QString& key) const;
     Q_INVOKABLE QStringList droppedKeys() const;
-    /// True for the five D-25(b)/(c) keys corrected back to their fixed value on every load -
-    /// distinct from a key that is merely not rendered (`packetsize`, `defaultver`, OD-06),
-    /// whose stored value is left exactly as it is.
+    /// True for the six keys corrected back to their fixed value on every load (D-25(b)/(c) and
+    /// D-09/D-10's `packetsize`) - distinct from a key that is merely not rendered (`defaultver`,
+    /// OD-06), whose stored value is left exactly as it is.
     Q_INVOKABLE bool isForced(const QString& key) const;
 
     // ------------------------------------------------------------- read and write (STREAM-02)
