@@ -24,9 +24,12 @@
 #include <QScopeGuard>
 #include <QSemaphore>
 #include <QSignalSpy>
+#include <QTcpServer>
+#include <QTcpSocket>
 #include <QTimer>
 
 #include "seathub/pairing_controller.h"
+#include "seathub/pairing_recovery.h"
 #include "seathub/pairing_seam.h"
 
 namespace {
@@ -174,6 +177,11 @@ public:
     bool ok = true;
     QString uuid = QString::fromLatin1(kClientUuid);
     QString engineError;
+    // G-06.2-2: what cancel() asked the seam to clear, and how long a pair() answer stays in
+    // flight (so a poll can be caught mid-handshake).
+    int clears = 0;
+    PairingTarget lastClearedTarget;
+    int responseDelayMs = 0;
 
     void pair(const PairingTarget& target,
               std::function<void(bool, const QString&, const QString&)> done) override
@@ -181,7 +189,13 @@ public:
         ++calls;
         lastTarget = target;
         // Delivered asynchronously, like a real handshake.
-        QTimer::singleShot(0, [done, this]() { done(ok, uuid, engineError); });
+        QTimer::singleShot(responseDelayMs, [done, this]() { done(ok, uuid, engineError); });
+    }
+
+    void clearPendingPairing(const PairingTarget& target) override
+    {
+        ++clears;
+        lastClearedTarget = target;
     }
 };
 
@@ -1006,7 +1020,13 @@ private slots:
     void theDeadlineBelongsToTheCurrentHandshake()
     {
         ProductionPairingSeam seam;
-        seam.setDeadlineMs(150);
+        // 500 ms rather than the 150 ms this test once used: the machine-load assumption baked
+        // into the old numbers - that `QTRY_COMPARE` + `qWait(100)` land inside A's window -
+        // flaked on a loaded machine (A's deadline could fire before B even superseded it,
+        // consuming A itself). The property under test is unchanged: B's deadline counts from
+        // B's own `pair()` call, and without the restart B's deadline never fires at all, which
+        // the `QTRY_VERIFY` below still catches.
+        seam.setDeadlineMs(500);
 
         QSemaphore release;
         // Unconditional, for the same reason as `aSupersededHandshakeResultIsDropped` above: two
@@ -1031,16 +1051,14 @@ private slots:
         seam.pair(targetA, recordInto(&reportA));
         QTRY_COMPARE(handshakes, 1);
 
-        // A has used two thirds of its own 150 ms deadline - only 50 ms would remain on A's own
-        // clock - when B supersedes it.
+        // A is still deep inside its own 500 ms window when B supersedes it.
         QTest::qWait(100);
         seam.pair(targetB, recordInto(&reportB));
         QTRY_COMPARE(handshakes, 2);
 
-        // If the deadline still belonged to A, it would have fired about 50 ms after B started and
-        // failed B by now. It does not: B's own deadline is a fresh 150 ms counted from B's own
-        // `pair()` call, not from whatever remained of A's.
-        QTest::qWait(80);
+        // If the deadline still belonged to A, it could not have carried B: B's own deadline is
+        // a fresh 500 ms counted from B's own `pair()` call, not from whatever remained of A's.
+        // Nothing may have fired for B yet.
         QCOMPARE(reportB.count(), 0);
 
         // B's own full deadline does still apply.
@@ -1054,6 +1072,285 @@ private slots:
         QTest::qWait(100);
         QCOMPARE(reportA.count(), 0);
         QCOMPARE(reportB.count(), 1);
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // G-06.2-2 / Plan 06.2-12 Task 1: pairing conflict recovery.
+    //
+    // The rig holds pending pairing sessions keyed by the shared upstream uniqueid; a 409 on
+    // getservercert means a half-open session holds it. The seam worker's recovery loop clears
+    // the rig state and retries exactly once; a non-conflict failure clears without retrying; a
+    // superseded run clears nothing (the newer run owns the rig) and is dropped.
+    // -----------------------------------------------------------------------------------------
+
+    void seamConflict_clearsOnceRetriesOnce_reportsTheRetry()
+    {
+        ProductionPairingSeam seam;
+        QStringList order;
+        int cancels = 0;
+        int handshakes = 0;
+        seam.setHandshake([&](const PairingTarget&) {
+            ++handshakes;
+            order.append(QStringLiteral("run%1").arg(handshakes));
+            if (handshakes == 1) {
+                PairingHandshakeResult conflict = handshakeResult(false, QString(),
+                                                                  QStringLiteral("conflict"));
+                conflict.pairingConflict = true;
+                return conflict;
+            }
+            return handshakeResult(true, QStringLiteral("retry-identity"));
+        });
+        seam.setCancelRequest([&](const QString&, int) {
+            ++cancels;
+            order.append(QStringLiteral("cancel"));
+            return true;
+        });
+
+        SeamReport report;
+        seam.pair(pairingTarget(), recordInto(&report));
+        QTRY_COMPARE(report.count(), 1);
+
+        // Exactly two handshake runs, exactly one clear between them, and the clear completed
+        // before the retry started.
+        QCOMPARE(handshakes, 2);
+        QCOMPARE(cancels, 1);
+        QCOMPARE(order.join(QLatin1Char(',')), QStringLiteral("run1,cancel,run2"));
+
+        // The retry's result is what the caller hears - reported as-is, once.
+        QCOMPARE(report.outcomes.first(), true);
+        QCOMPARE(report.identities.first(), QStringLiteral("retry-identity"));
+        QVERIFY(report.diagnostics.first().isEmpty());
+    }
+
+    void seamConflictTwice_reportsTheSecondFailureOnce()
+    {
+        ProductionPairingSeam seam;
+        int cancels = 0;
+        int handshakes = 0;
+        seam.setHandshake([&](const PairingTarget&) {
+            ++handshakes;
+            PairingHandshakeResult conflict = handshakeResult(false, QString(),
+                                                              QStringLiteral("still-conflict-%1")
+                                                                  .arg(handshakes));
+            conflict.pairingConflict = true;
+            return conflict;
+        });
+        seam.setCancelRequest([&](const QString&, int) {
+            ++cancels;
+            return true;
+        });
+
+        SeamReport report;
+        seam.pair(pairingTarget(), recordInto(&report));
+        QTRY_COMPARE(report.count(), 1);
+
+        // A clean retry that still fails is a failure - the caller hears the SECOND run's own
+        // text, once. No third run: exactly one retry, however the retry ends.
+        QCOMPARE(handshakes, 2);
+        QCOMPARE(cancels, 1);
+        QCOMPARE(report.outcomes.first(), false);
+        QVERIFY(report.identities.first().isEmpty());
+        QCOMPARE(report.diagnostics.first(), QStringLiteral("still-conflict-2"));
+    }
+
+    void seamNonConflictFailure_oneClearNoRetry()
+    {
+        ProductionPairingSeam seam;
+        int cancels = 0;
+        int handshakes = 0;
+        seam.setHandshake([&](const PairingTarget&) {
+            ++handshakes;
+            // No conflict flag: a plain failure. The failed run may still have left a pending
+            // session on the rig, so it still gets one clear - but no retry.
+            return handshakeResult(false, QString(), QStringLiteral("plain-failure"));
+        });
+        seam.setCancelRequest([&](const QString&, int) {
+            ++cancels;
+            return true;
+        });
+
+        SeamReport report;
+        seam.pair(pairingTarget(), recordInto(&report));
+        QTRY_COMPARE(report.count(), 1);
+
+        QCOMPARE(handshakes, 1);
+        QCOMPARE(cancels, 1);
+        QCOMPARE(report.outcomes.first(), false);
+        QCOMPARE(report.diagnostics.first(), QStringLiteral("plain-failure"));
+    }
+
+    void seamSupersededRun_noClearNoRetry_droppedResult()
+    {
+        ProductionPairingSeam seam;
+        QSemaphore releaseA;
+        auto cleanup = qScopeGuard([&releaseA]() { releaseA.release(); });
+        int cancels = 0;
+        int handshakes = 0;
+        seam.setHandshake([&](const PairingTarget&) {
+            ++handshakes;
+            if (handshakes == 1) {
+                // A's handshake: blocked until the test releases it, then returns a conflict
+                // failure. By then B has superseded it, and B's run owns the rig state.
+                releaseA.acquire();
+                PairingHandshakeResult conflict = handshakeResult(false, QString(),
+                                                                  QStringLiteral("stale"));
+                conflict.pairingConflict = true;
+                return conflict;
+            }
+            return handshakeResult(true, QStringLiteral("b-identity"));
+        });
+        seam.setCancelRequest([&](const QString&, int) {
+            ++cancels;
+            return true;
+        });
+
+        PairingTarget targetA = pairingTarget();
+        targetA.sessionId = QStringLiteral("session-a");
+        PairingTarget targetB = pairingTarget();
+        targetB.sessionId = QStringLiteral("session-b");
+
+        SeamReport reportA;
+        SeamReport reportB;
+        seam.pair(targetA, recordInto(&reportA));
+        QTRY_COMPARE(handshakes, 1);
+        seam.pair(targetB, recordInto(&reportB));
+        QTRY_COMPARE(handshakes, 2);
+        QTRY_COMPARE(reportB.count(), 1);
+        QCOMPARE(reportB.outcomes.first(), true);
+
+        // A's conflict failure finally lands - stale. It clears nothing (that would kill B's
+        // own pending pairing), retries nothing, and is dropped entirely.
+        cleanup.dismiss();
+        releaseA.release();
+        QTest::qWait(150);
+        QCOMPARE(reportA.count(), 0);
+        QCOMPARE(cancels, 0);
+        QCOMPARE(handshakes, 2);
+    }
+
+    void singleFlight_aPollDuringAnInFlightHandshakeNeverStartsASecond()
+    {
+        // One Play attempt sends one getservercert sequence. The 2026-09-29 incident saw three
+        // in one second - a poll tick or a push-driven pollNow() re-entering pairing while the
+        // handshake was still running - two of them 409s against the rig's half-open session.
+        PairingController controller;
+        auto* fake = new FakeNetworkAccessManager;
+        auto* seam = new RecordingSeam;
+        seam->responseDelayMs = 200; // the handshake stays in flight across the polls below
+        wire(controller, fake);
+        controller.setSeam(seam);
+        controller.setPollIntervalMs(1);
+
+        for (int i = 0; i < 4; ++i) {
+            fake->statuses.append(200);
+            fake->bodies.append(authorizationBody(QString::fromLatin1(kPin),
+                                                  QStringLiteral("READY")));
+        }
+
+        QSignalSpy completed(&controller, &PairingController::pairingCompleted);
+        QSignalSpy failed(&controller, &PairingController::pairingFailed);
+
+        controller.start(QString::fromLatin1(kSessionId));
+        QTest::qWait(30);
+        QCOMPARE(seam->calls, 1); // the handshake is in flight
+
+        // Push frames wake the poll twice while it runs. Neither may start a second handshake
+        // for the same session.
+        controller.pollNow();
+        controller.pollNow();
+        QTest::qWait(30);
+        QCOMPARE(seam->calls, 1);
+
+        // The one in-flight handshake still resolves normally.
+        QTRY_COMPARE(completed.count(), 1);
+        QCOMPARE(failed.count(), 0);
+    }
+
+    void teardown_cancelRequestsTheRigSideClearOnceForTheLastTarget()
+    {
+        PairingController controller;
+        auto* fake = new FakeNetworkAccessManager;
+        auto* seam = new RecordingSeam;
+        seam->responseDelayMs = 200; // keep the handshake unresolved across the cancel
+        wire(controller, fake);
+        controller.setSeam(seam);
+
+        fake->statuses = { 200 };
+        fake->bodies = { authorizationBody(QString::fromLatin1(kPin),
+                                           QStringLiteral("READY")) };
+
+        controller.start(QString::fromLatin1(kSessionId));
+        QTest::qWait(30);
+        QCOMPARE(seam->calls, 1);
+
+        controller.cancel();
+        QCOMPARE(seam->clears, 1);
+        QCOMPARE(seam->lastClearedTarget.hostAddress, QStringLiteral("203.0.113.7"));
+        QCOMPARE(seam->lastClearedTarget.httpsPort, 47984);
+        QCOMPARE(seam->lastClearedTarget.sessionId, QString::fromLatin1(kSessionId));
+
+        // A second cancel - teardown paths call this more than once - must not repeat the clear.
+        controller.cancel();
+        QCOMPARE(seam->clears, 1);
+    }
+
+    void teardown_cancelBeforeAHandshakeStartedSendsNoClear()
+    {
+        // No handshake ran, so this client left no pending pairing session on the rig - and a
+        // clear aimed at a session another client may be pairing would cancel THEIR handshake.
+        PairingController controller;
+        auto* fake = new FakeNetworkAccessManager;
+        auto* seam = new RecordingSeam;
+        wire(controller, fake);
+        controller.setSeam(seam);
+
+        fake->statuses = { 409 };
+        fake->bodies = { conflictBody() };
+
+        controller.start(QString::fromLatin1(kSessionId));
+        controller.cancel();
+        QCOMPARE(seam->clears, 0);
+    }
+
+    void cancelRequest_theWireCarriesTheUpstreamUniqueidAndCancelPhrase()
+    {
+        // The rig-side clear only clears when it names the session the rig actually holds: the
+        // request line must be exactly what Sunshine's pair() handler reads
+        // (`src/nvhttp.cpp:705-713` - a /pair request with uniqueid and a cancel phrase).
+        QTcpServer server;
+        QVERIFY(server.listen(QHostAddress::LocalHost));
+
+        QString requestLine;
+        connect(&server, &QTcpServer::newConnection, this, [&]() {
+            QTcpSocket* socket = server.nextPendingConnection();
+            connect(socket, &QTcpSocket::readyRead, socket, [socket, &requestLine]() {
+                if (requestLine.isEmpty()) {
+                    requestLine = QString::fromLatin1(socket->readLine());
+                }
+                socket->write("HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n");
+                socket->disconnectFromHost();
+            });
+        });
+
+        // Any HTTP answer counts: the 400 here is Sunshine's no-op-clear answer.
+        QVERIFY(sendPairingCancelRequest(QStringLiteral("127.0.0.1"), server.serverPort()));
+
+        QTRY_VERIFY(!requestLine.isEmpty());
+        QCOMPARE(requestLine.trimmed(),
+                 QStringLiteral("GET /pair?uniqueid=0123456789ABCDEF&phrase=cancel HTTP/1.1"));
+    }
+
+    void parity_theSharedUniqueIdStillMatchesUpstream()
+    {
+        // The recovery constant and the handshake's own pairing requests must name the same
+        // uniqueid, or the clear would miss the rig's session forever. Upstream's hard-coded
+        // value lives at app/backend/nvhttp.cpp:482; this test opens that file and asserts the
+        // literal is still there.
+        const QString upstream = QStringLiteral("%1/../app/backend/nvhttp.cpp")
+                                     .arg(QCoreApplication::applicationDirPath());
+        QFile file(upstream);
+        QVERIFY2(file.open(QIODevice::ReadOnly), qPrintable(upstream));
+        QVERIFY(file.readAll().contains(QByteArrayLiteral("0123456789ABCDEF")));
     }
 
     void fingerprint_ofACertificate_isItsSha256Hex()

@@ -59,6 +59,13 @@ struct PairingHandshakeResult
     /// Diagnostics only: raw upstream text for the log and for support. Never rendered (D-51),
     /// and never contains the PIN.
     QString engineError;
+    /// True when the attempt hit the rig's already-pairing surface: the HTTP 409 the rig answers
+    /// the getservercert step with when a half-open pending session holds the shared uniqueid
+    /// (Sunshine `src/nvhttp.cpp:975-997`), or `NvPairingManager::ALREADY_IN_PROGRESS` from the
+    /// handshake's own five-phase flow. Recovery plumbing for the seam worker's clear-and-retry
+    /// loop (G-06.2-2, Plan 06.2-12 Task 1) - never rendered, never logged, never leaves this
+    /// process on a signal (D-51).
+    bool pairingConflict = false;
 };
 
 // Declared for the same reason as `SeatHubFailure` and `TeardownStage`: the handshake result
@@ -83,6 +90,11 @@ QString clientCertificateFingerprint(const QByteArray& pem);
 /// touch any UI, and it must not call the control plane.
 using PairingHandshake = std::function<PairingHandshakeResult(const PairingTarget&)>;
 
+/// One best-effort clear of the rig's pending pairing session for `hostAddress`. Blocking on the
+/// calling thread, bounded, best-effort: the production default is `sendPairingCancelRequest`
+/// (`pairing_recovery.h`); tests inject a counting fake. `port` is the plain-HTTP control port.
+using PairingCancelRequest = std::function<bool(const QString& hostAddress, int port)>;
+
 class ProductionPairingSeam : public QObject, public PairingSeam
 {
     Q_OBJECT
@@ -102,6 +114,9 @@ public:
     void setHandshake(PairingHandshake handshake);
     /// Test seam. Same clock either way.
     void setDeadlineMs(int milliseconds);
+    /// Test seam: the clear request the recovery loop (and `clearPendingPairing()`) runs.
+    /// Defaults to `sendPairingCancelRequest` (`pairing_recovery.h`).
+    void setCancelRequest(PairingCancelRequest cancel);
 
     /// Start one handshake. `done` is called exactly once, on this object's thread, with
     /// `(ok, clientIdentity, engineError)`. See `pairing_controller.h` for what the identity is
@@ -109,6 +124,13 @@ public:
     void pair(const PairingTarget& target,
               std::function<void(bool ok, const QString& clientUuid,
                                  const QString& engineError)> done) override;
+
+    /// Best-effort clear of the rig's pending pairing session the target's handshake may have
+    /// left half-open (G-06.2-2): one `sendPairingCancelRequest`, fire-and-forget on the pool
+    /// thread, so a cancel() on the UI thread never waits on the rig. Never called from
+    /// `pair()`'s own path - the worker's recovery loop clears inline, where completion is
+    /// sequenced before the retry.
+    void clearPendingPairing(const PairingTarget& target) override;
 
 signals:
     /// The host the handshake resolved, tagged with the session id of the `pair()` call it answers
@@ -133,7 +155,14 @@ private:
     void finish(quint64 generation, const PairingHandshakeResult& result);
 
     PairingHandshake m_handshake;
+    PairingCancelRequest m_cancelRequest;
     std::function<void(bool, const QString&, const QString&)> m_done;
+    /// The generation token the pool thread reads without touching this object: bumped and
+    /// stored here by every `pair()` call, captured by the worker as a `shared_ptr` copy, and
+    /// consulted by the worker's recovery loop (a superseded run sends no clear and no retry -
+    /// G-06.2-2). An atomic the worker outlives the object with, never a raw `this` (the plan's
+    /// T-06.2-12-02 mitigation for the loop-spin and lifetime hazards).
+    std::shared_ptr<std::atomic<quint64>> m_currentGeneration;
     QTimer* m_deadline = nullptr;
     int m_deadlineMs = kDeadlineMs;
     bool m_pending = false;

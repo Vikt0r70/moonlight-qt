@@ -6,6 +6,11 @@
 #include <QSslCertificate>
 #include <QThreadPool>
 
+#include <atomic>
+#include <memory>
+
+#include "pairing_recovery.h"
+
 Q_LOGGING_CATEGORY(seathubPairingSeam, "seathub.pairing.seam")
 
 namespace {
@@ -29,8 +34,14 @@ class HandshakeTask : public QObject, public QRunnable
     Q_OBJECT
 
 public:
-    HandshakeTask(PairingHandshake handshake, PairingTarget target, quint64 generation)
-        : m_handshake(std::move(handshake)), m_target(std::move(target)), m_generation(generation)
+    HandshakeTask(PairingHandshake handshake, PairingCancelRequest cancelRequest,
+                  PairingTarget target, quint64 generation,
+                  std::shared_ptr<std::atomic<quint64>> currentGeneration)
+        : m_handshake(std::move(handshake)),
+          m_cancelRequest(std::move(cancelRequest)),
+          m_target(std::move(target)),
+          m_generation(generation),
+          m_currentGeneration(std::move(currentGeneration))
     {
     }
 
@@ -41,7 +52,27 @@ public:
         // (T-06.6-53) can be told apart from the current one - upstream's own blocking call cannot
         // be aborted, so this task keeps running to completion regardless; only its result's fate
         // changes. Nothing copies the target anywhere else, and nothing logs it.
-        emit finished(m_generation, m_handshake(m_target));
+        PairingHandshakeResult result = m_handshake(m_target);
+
+        // G-06.2-2 recovery, once (T-06.2-12-02: one retry, never a loop). A conflicting failure -
+        // the rig's 409 on getservercert, or ALREADY_IN_PROGRESS out of the handshake - means a
+        // half-open pending pairing session holds the shared upstream uniqueid on the rig. Clear
+        // it (the clear must COMPLETE before the retry, so the rig's answer is seen first), then
+        // run the handshake exactly once more and report whatever that produced, as-is.
+        //
+        // The generation gate makes the whole block a no-op for a superseded run: a fresh
+        // `pair()` has since stored its own generation in the shared atomic, this run's number no
+        // longer matches, and the stale run sends no clear and no retry - a clear aimed by a dead
+        // run could cancel the very session that superseded it. The atomic is read and written
+        // without touching `this`, which the worker outlives.
+        if (!result.ok && m_generation == m_currentGeneration->load()) {
+            m_cancelRequest(m_target.hostAddress, kPairingControlPort);
+            if (result.pairingConflict && m_generation == m_currentGeneration->load()) {
+                result = m_handshake(m_target);
+            }
+        }
+
+        emit finished(m_generation, result);
     }
 
 signals:
@@ -49,8 +80,10 @@ signals:
 
 private:
     PairingHandshake m_handshake;
+    PairingCancelRequest m_cancelRequest;
     PairingTarget m_target;
     quint64 m_generation;
+    std::shared_ptr<std::atomic<quint64>> m_currentGeneration;
 };
 
 } // namespace
@@ -73,7 +106,11 @@ QString clientCertificateFingerprint(const QByteArray& pem)
 
 ProductionPairingSeam::ProductionPairingSeam(QObject* parent)
     : QObject(parent),
-      m_deadline(new QTimer(this))
+      m_deadline(new QTimer(this)),
+      m_currentGeneration(std::make_shared<std::atomic<quint64>>(0)),
+      m_cancelRequest([](const QString& hostAddress, int port) {
+          return sendPairingCancelRequest(hostAddress, port);
+      })
 {
     // Both arrive from the handshake's thread as queued connections.
     qRegisterMetaType<PairingHandshakeResult>("PairingHandshakeResult");
@@ -105,6 +142,11 @@ void ProductionPairingSeam::setDeadlineMs(int milliseconds)
     m_deadlineMs = qMax(1, milliseconds);
 }
 
+void ProductionPairingSeam::setCancelRequest(PairingCancelRequest cancel)
+{
+    m_cancelRequest = std::move(cancel);
+}
+
 void ProductionPairingSeam::pair(const PairingTarget& target,
                                  std::function<void(bool, const QString&, const QString&)> done)
 {
@@ -130,6 +172,7 @@ void ProductionPairingSeam::pair(const PairingTarget& target,
     // that safe.
     ++m_generation;
     const quint64 generation = m_generation;
+    m_currentGeneration->store(generation);
 
     m_pending = true;
     // 06.6-18/T-06.6-52: recorded before the handshake starts, so a late `hostResolved` always
@@ -140,9 +183,26 @@ void ProductionPairingSeam::pair(const PairingTarget& target,
     // it now counts down 90 s from THIS `pair()` call, not from whatever remained of the old one.
     m_deadline->start(m_deadlineMs);
 
-    HandshakeTask* task = new HandshakeTask(m_handshake, target, generation);
+    HandshakeTask* task = new HandshakeTask(m_handshake, m_cancelRequest, target, generation,
+                                            m_currentGeneration);
     connect(task, &HandshakeTask::finished, this, &ProductionPairingSeam::handleHandshakeResult);
     QThreadPool::globalInstance()->start(task);
+}
+
+void ProductionPairingSeam::clearPendingPairing(const PairingTarget& target)
+{
+    if (target.hostAddress.isEmpty()) {
+        return;
+    }
+
+    // Fire-and-forget: one clear on the pool thread, so the caller (the UI thread calling
+    // `cancel()`) never waits on the rig. Best-effort by construction - `sendPairingCancelRequest`
+    // reports its outcome in the log and returns a result nobody reads here. The task dies with
+    // its own copy of the request and the target, exactly like `HandshakeTask` above.
+    QThreadPool::globalInstance()->start(
+        [cancelRequest = m_cancelRequest, target]() mutable {
+            cancelRequest(target.hostAddress, kPairingControlPort);
+        });
 }
 
 void ProductionPairingSeam::handleHandshakeResult(quint64 generation, const PairingHandshakeResult& result)
