@@ -325,7 +325,7 @@ void TstSettingsBridge::forcedValuesAreCorrectedOnEveryLoadNotOnlyTheFirst()
 void TstSettingsBridge::hostSpeakerRowStaysEditableAtUpstreamsDefault()
 {
     // D-25a: NOT forced, and a hand-edit survives a fresh load exactly because it is not one of
-    // the five corrected keys - the opposite of the previous test, on purpose.
+    // the six corrected keys - the opposite of the previous test, on purpose.
     StreamingPreferences* prefs = StreamingPreferences::get();
     prefs->playAudioOnHost = false; // upstream default -> the row shows checked (muted)
     prefs->save();
