@@ -182,6 +182,8 @@ void TstSettingsBridge::bridgeWritesThroughAndPersists()
     // An unknown key, and a value the setting cannot hold, are both refused rather than stored.
     QVERIFY(!m_bridge->setValue(QStringLiteral("not-a-key"), 1));
     QVERIFY(!m_bridge->setValue(QStringLiteral("fps"), 0));
+    // D-09: `packetsize` is now a forced key, so this write is refused for being forced - not by
+    // the 1024 floor (the assertion outcome is unchanged; only the reason moved).
     QVERIFY(!m_bridge->setValue(QStringLiteral("packetsize"), 512)); // upstream floor is 1024
 }
 
@@ -263,15 +265,16 @@ void TstSettingsBridge::writesRefusedDuringStream()
 
 void TstSettingsBridge::forcedValuesAreCorrectedOnEveryLoadNotOnlyTheFirst()
 {
-    // D-25(b)/(c), T-05-45: exactly these five keys are forced, matching D-25a's amendment that
-    // excludes `hostaudio`.
+    // D-25(b)/(c), T-05-45; D-09/D-10 (A-68): exactly these six keys are forced, matching
+    // D-25a's amendment that excludes `hostaudio`. `packetsize` is forced since 06.2 (D-09):
+    // 1392 is SeatHub's fixed transport packet size, not a customer control.
     QVERIFY(m_bridge->isForced(QStringLiteral("language")));
     QVERIFY(m_bridge->isForced(QStringLiteral("richpresence")));
     QVERIFY(m_bridge->isForced(QStringLiteral("mdns")));
     QVERIFY(m_bridge->isForced(QStringLiteral("detectnetblocking")));
     QVERIFY(m_bridge->isForced(QStringLiteral("quitAppAfter")));
+    QVERIFY(m_bridge->isForced(QStringLiteral("packetsize")));
     QVERIFY(!m_bridge->isForced(QStringLiteral("hostaudio")));
-    QVERIFY(!m_bridge->isForced(QStringLiteral("packetsize")));
     QVERIFY(!m_bridge->isForced(QStringLiteral("defaultver")));
     QVERIFY(!m_bridge->isForced(QStringLiteral("showperfoverlay")));
 
@@ -281,16 +284,20 @@ void TstSettingsBridge::forcedValuesAreCorrectedOnEveryLoadNotOnlyTheFirst()
     // The construction pass already forced everything once; edit the store BY HAND, behind the
     // bridge's back (`StreamingPreferences` directly, the way a stray INI edit or an upstream
     // code path would), and prove a fresh "load" corrects it - this is the exact scenario T-05-45
-    // names, and the exact call `SeatHubClient` makes before every connect attempt.
+    // names, and the exact call `SeatHubClient` makes before every connect attempt. D-09/D-10:
+    // 0 is what a customer-facing writer or a stray store edit would leave `packetSize` at, and
+    // the value whose remote-mode 1024-byte cap SeatHub removes by forcing 1392 (A-68).
     StreamingPreferences* prefs = StreamingPreferences::get();
     prefs->language = StreamingPreferences::LANG_AUTO;
     prefs->richPresence = true;
     prefs->enableMdns = true;
     prefs->detectNetworkBlocking = true;
     prefs->quitAppAfter = true;
+    prefs->packetSize = 0;
     prefs->save();
 
     QCOMPARE(prefs->language, StreamingPreferences::LANG_AUTO);
+    QCOMPARE(prefs->packetSize, 0);
 
     m_bridge->prepareForSession();
 
@@ -301,6 +308,8 @@ void TstSettingsBridge::forcedValuesAreCorrectedOnEveryLoadNotOnlyTheFirst()
     QCOMPARE(m_bridge->getValue(QStringLiteral("mdns")).toBool(), false);
     QCOMPARE(m_bridge->getValue(QStringLiteral("detectnetblocking")).toBool(), false);
     QCOMPARE(m_bridge->getValue(QStringLiteral("quitAppAfter")).toBool(), false);
+    QCOMPARE(m_bridge->getValue(QStringLiteral("packetsize")).value<int>(), 1392);
+    QCOMPARE(prefs->packetSize, 1392);
 
     // And the correction is actually persisted, not just held in memory - a fresh reload from
     // disk still reads the fixed value.
@@ -310,6 +319,7 @@ void TstSettingsBridge::forcedValuesAreCorrectedOnEveryLoadNotOnlyTheFirst()
     QCOMPARE(prefs->enableMdns, false);
     QCOMPARE(prefs->detectNetworkBlocking, false);
     QCOMPARE(prefs->quitAppAfter, false);
+    QCOMPARE(prefs->packetSize, 1392);
 }
 
 void TstSettingsBridge::hostSpeakerRowStaysEditableAtUpstreamsDefault()
