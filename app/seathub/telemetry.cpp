@@ -16,6 +16,8 @@
 #include <QJsonParseError>
 #include <QJsonValue>
 #include <QLoggingCategory>
+#include <QMutex>
+#include <QMutexLocker>
 #include <QSaveFile>
 #include <QStandardPaths>
 #include <QString>
@@ -56,6 +58,8 @@ QString s_lastCrashEventId;
 /// handler paths, release and callbacks never drift between the first init and the re-init
 /// (SEATHUB § C.2's code sketch: "the same options plus the DSN").
 SeatHubTelemetry::Options s_lastOptions;
+QMutex s_deliveryMutex;
+QString s_retryDirectory;
 /// True when this process's `startWith()` ran with an empty `dsn`. Only such a process ever
 /// re-inits (C.3 rule 2); a process that started with a cached DSN keeps it for the whole run.
 bool s_startedWithNoDsn = false;
@@ -523,6 +527,7 @@ void removeLegacyDumps(const QString& dir)
 
 bool startWith(const Options& options)
 {
+    { QMutexLocker lock(&s_deliveryMutex); s_retryDirectory = options.databaseDir; }
     s_lastOptions = options;
     s_startedWithNoDsn = options.dsn.isEmpty();
     s_adoptedFirstDsn = false;
@@ -769,6 +774,62 @@ void emitStepMetric(const QString& step, const QString& outcome, const QString& 
         sentry_value_new_attribute(sentry_value_new_string(outcomeUtf8.constData()), nullptr));
     sentry_metrics_distribution("seathub.play.step_duration", elapsedMs,
         SENTRY_UNIT_MILLISECOND, durationAttributes);
+}
+
+void emitRollupMetrics(const QJsonObject& attrs)
+{
+    // ADR-0072, D-11, Plan 13 Task 1: emit the 17 frozen stream gauge names.
+    // Each gauge uses sentry_value_new_null() attributes (no per-session dimensions).
+    // Units: SENTRY_UNIT_MILLISECOND for all timing and RTT fields; no unit for fps
+    // and the two drop percentages (they are already %-of-frames, not ms). Absent
+    // fields in attrs are simply not emitted.
+
+    struct GaugeDef {
+        const char* key;        // key in the roll-up attrs QJsonObject
+        const char* name;       // seathub.stream.* gauge name
+        const char* unit;       // SENTRY_UNIT_MILLISECOND or nullptr
+    };
+
+    static const GaugeDef kGauges[] = {
+        { "fps_avg",         "seathub.stream.fps.avg",         nullptr                  },
+        { "fps_min",         "seathub.stream.fps.min",         nullptr                  },
+        { "net_drop_avg",    "seathub.stream.net_drop.avg",    nullptr                  },
+        { "net_drop_p95",    "seathub.stream.net_drop.p95",    nullptr                  },
+        { "jitter_drop_avg", "seathub.stream.jitter_drop.avg", nullptr                  },
+        { "jitter_drop_p95", "seathub.stream.jitter_drop.p95", nullptr                  },
+        { "rtt_avg",         "seathub.stream.rtt.avg",         SENTRY_UNIT_MILLISECOND  },
+        { "rtt_p95",         "seathub.stream.rtt.p95",         SENTRY_UNIT_MILLISECOND  },
+        { "decode_avg",      "seathub.stream.decode.avg",      SENTRY_UNIT_MILLISECOND  },
+        { "decode_p95",      "seathub.stream.decode.p95",      SENTRY_UNIT_MILLISECOND  },
+        { "queue_avg",       "seathub.stream.queue.avg",       SENTRY_UNIT_MILLISECOND  },
+        { "queue_p95",       "seathub.stream.queue.p95",       SENTRY_UNIT_MILLISECOND  },
+        { "render_avg",      "seathub.stream.render.avg",      SENTRY_UNIT_MILLISECOND  },
+        { "render_p95",      "seathub.stream.render.p95",      SENTRY_UNIT_MILLISECOND  },
+        { "host_avg",        "seathub.stream.host.avg",        SENTRY_UNIT_MILLISECOND  },
+        { "host_p95",        "seathub.stream.host.p95",        SENTRY_UNIT_MILLISECOND  },
+        { "n",               "seathub.stream.samples",         nullptr                  },
+    };
+
+    for (const GaugeDef& g : kGauges) {
+        const QString key = QString::fromLatin1(g.key);
+        if (!attrs.contains(key)) {
+            continue;
+        }
+        const double value = attrs.value(key).toDouble();
+        sentry_value_t gaugeAttrs = sentry_value_new_null();
+        sentry_metrics_gauge(g.name, value, g.unit, gaugeAttrs);
+    }
+}
+
+QJsonObject rollupDeliveryHealth()
+{
+    QString directory;
+    { QMutexLocker lock(&s_deliveryMutex); directory = s_retryDirectory; }
+    const int retries = directory.isEmpty() ? 0
+        : QDir(directory + QStringLiteral("/cache"))
+              .entryList({QStringLiteral("*.envelope")}, QDir::Files).size();
+    return {{"backlog_spool_lines", LogShipper::instance().backlogSpoolLines()},
+            {"backlog_retry_files", retries}};
 }
 
 void emitLaunchMetric()

@@ -37,6 +37,7 @@
 #include "error_map.h"
 #include "hud_overlay.h"
 #include "liveness_timer.h"
+#include "stream_quality_sampler.h"
 #include "log_tee.h"
 #include "moonlight_engine_session.h"
 #include "pairing_controller.h"
@@ -987,6 +988,10 @@ private:
     StatsWatcher* m_statsWatcher = nullptr;
     LogTee::SinkHandle m_statsSinkHandle = 0;
     LogTee::SinkHandle m_terminationSinkHandle = 0;
+    /// D-11, Plan 13 Task 1: the 60-second roll-up sampler. Lives on the control-plane's
+    /// network thread (moved alongside `m_liveness` in `startNetworkThreads()`). The compositor
+    /// taps each parsed stats block into it via a function-pointer installed by the facade.
+    StreamQualitySampler* m_sampler = nullptr;
     /// WR-04: combines every decoder segment's own block (a fullscreen toggle, a display
     /// move/resize, or a renderer reset each recreate the decoder mid-stream) into one report for
     /// the whole session. Started at `handleConnectionStarted()`, fed by every

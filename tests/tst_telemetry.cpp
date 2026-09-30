@@ -73,6 +73,9 @@
 #define SDL_MAIN_HANDLED
 
 #include "seathub/telemetry.h"
+#include "seathub/stream_quality_sampler.h"
+#include <QEventLoop>
+#include <QTimer>
 #include "seathub/pairing_controller.h"
 #include "seathub/error_map.h"
 #include "hostile_fixtures.h"
@@ -322,6 +325,7 @@ int runLogsChild(int argc, char* argv[])
 /// a line AND a metric that must produce no envelope at all.
 int runDiagChild(int argc, char* argv[])
 {
+    QCoreApplication application(argc, argv);
     const QString scenario = argc > 2 ? QString::fromLocal8Bit(argv[2]) : QString();
     const QString dsn = argc > 3 ? QString::fromLocal8Bit(argv[3]) : QString();
     const QString dbDir = argc > 4 ? QString::fromLocal8Bit(argv[4]) : QString();
@@ -389,7 +393,35 @@ int runDiagChild(int argc, char* argv[])
         SeatHubTelemetry::emitStepMetric(step, outcome, failureClass, 23.0);
     };
 
-    if (scenario == QLatin1String("play-step")) {
+    if (scenario == QLatin1String("rollup") || scenario == QLatin1String("rollup-no-rtt")) {
+        StreamQualitySampler sampler;
+        sampler.setWindowMs(40);
+        sampler.start(QStringLiteral("session-diag-child"));
+        VideoStats stats;
+        const QString block = QStringLiteral(
+            "Video stream: 1920x1080 60.00 FPS (Codec: H264)\n"
+            "Incoming frame rate from network: 60.00 FPS\n"
+            "Decoding frame rate: 59.98 FPS\n"
+            "Rendering frame rate: 59.96 FPS\n"
+            "Host processing latency min/max/average: 1.0/2.0/1.6 ms\n"
+            "Frames dropped by your network connection: 0.42%\n"
+            "Frames dropped due to network jitter: 0.10%\n"
+            "Average network latency: %1\n"
+            "Average decoding time: 3.21 ms\n"
+            "Average frame queue delay: 1.05 ms\n"
+            "Average rendering time (including monitor V-sync latency): 2.77 ms\n")
+            .arg(scenario == QLatin1String("rollup") ? QStringLiteral("23 ms (variance: 4 ms)")
+                                                       : QStringLiteral("N/A"));
+        if (!parseVideoStatsBlock(block, &stats)) return 2;
+        sampler.feed(stats);
+        QEventLoop loop;
+        QObject::connect(&sampler, &StreamQualitySampler::rollupEmitted, &loop, &QEventLoop::quit);
+        QTimer::singleShot(5000, &loop, &QEventLoop::quit);
+        loop.exec();
+        sampler.finish();
+        if (sampler.rollups() != 1) return 3;
+    }
+    else if (scenario == QLatin1String("play-step")) {
         // ADR-0072 item 2: the local diagnostic a real failure would carry, PIN and all. It is
         // built HERE and handed to nothing - the emission below receives only vocabulary tokens
         // and numbers, which is exactly what the assertion on the other side proves.
@@ -766,6 +798,8 @@ struct ParsedMetric
 {
     QString name;
     QString type;
+    QString unit;
+    double value = 0;
     QJsonObject attributes;
     QString traceId;
 };
@@ -807,6 +841,8 @@ QList<ParsedMetric> parseMetricItems(const QByteArray& envelopeBody)
             ParsedMetric parsed;
             parsed.name = metric.value(QStringLiteral("name")).toString();
             parsed.type = metric.value(QStringLiteral("type")).toString();
+            parsed.unit = metric.value(QStringLiteral("unit")).toString();
+            parsed.value = metric.value(QStringLiteral("value")).toDouble();
             parsed.attributes = metric.value(QStringLiteral("attributes")).toObject();
             parsed.traceId = metric.value(QStringLiteral("trace_id")).toString();
             metrics.append(parsed);
@@ -1945,6 +1981,55 @@ private slots:
         for (const QByteArray& envelope : envelopes) {
             QVERIFY2(!envelope.contains("4821"),
                      "the PIN sentinel reached the envelope bytes");
+        }
+    }
+
+    void aRollupReachesTheEnvelopeWithItsGauges()
+    {
+        for (const QString& scenario : {QStringLiteral("rollup"), QStringLiteral("rollup-no-rtt")}) {
+            QTemporaryDir db, spool, runState;
+            QTcpServer server;
+            QList<QByteArray> envelopes, headers;
+            wireEnvelopeCollector(&server, &envelopes, &headers);
+            QVERIFY(server.listen(QHostAddress::LocalHost, 0));
+            QProcess child;
+            child.setProgram(m_appPath);
+            child.setArguments({"--diag-child", scenario,
+                QStringLiteral("http://publickey@127.0.0.1:%1/1").arg(server.serverPort()),
+                db.path(), m_handlerPath, spool.path(), runState.path()});
+            child.start();
+            QVERIFY(child.waitForStarted(5000));
+            QTRY_VERIFY_WITH_TIMEOUT(child.state() != QProcess::Running, 20000);
+            QCOMPARE(child.exitCode(), 0);
+            const auto scan = scanEnvelopes(envelopes);
+            int logs = 0, gauges = 0;
+            for (const auto& log : scan.logs) {
+                if (log.body != QLatin1String("stream.rollup")) continue;
+                ++logs;
+                QVERIFY(log.attributes.contains("backlog_spool_lines"));
+                QVERIFY(log.attributes.contains("backlog_retry_files"));
+                if (scenario == QLatin1String("rollup-no-rtt")) {
+                    QVERIFY(!log.attributes.contains("rtt_avg"));
+                    QVERIFY(!log.attributes.contains("rtt_p95"));
+                }
+            }
+            QSet<QString> names;
+            for (const auto& metric : scan.metrics) {
+                if (!metric.name.startsWith(QLatin1String("seathub.stream."))) continue;
+                ++gauges; names.insert(metric.name);
+                QCOMPARE(metric.type, QStringLiteral("gauge"));
+                QVERIFY(!metric.attributes.contains("session_id"));
+                QVERIFY(!metric.attributes.contains("host_id"));
+                QVERIFY(!metric.attributes.contains("user.id"));
+                const bool time = metric.name.contains(".rtt.") || metric.name.contains(".decode.")
+                    || metric.name.contains(".queue.") || metric.name.contains(".render.")
+                    || metric.name.contains(".host.");
+                QCOMPARE(metric.unit, time ? QStringLiteral("millisecond") : QString());
+                if (metric.name == QLatin1String("seathub.stream.samples")) QCOMPARE(metric.value, 1.0);
+            }
+            QCOMPARE(logs, 1);
+            QCOMPARE(gauges, scenario == QLatin1String("rollup") ? 17 : 15);
+            QCOMPARE(names.size(), gauges);
         }
     }
 

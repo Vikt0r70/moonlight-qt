@@ -169,6 +169,12 @@ OsdCompositor::State OsdCompositor::snapshot() const
     return m_state;
 }
 
+void OsdCompositor::setStatsTap(StatsTapFn tap)
+{
+    QMutexLocker locker(&m_mutex);
+    m_statsTap = std::move(tap);
+}
+
 SDL_Surface* OsdCompositor::rasterize(Overlay::OverlayType type, const char* text, bool enabled,
                                        SDL_Color color, void* context)
 {
@@ -221,6 +227,27 @@ SDL_Surface* OsdCompositor::rasterizeStats(const char* text, bool enabled) const
         return nullptr;
     }
 
+    VideoStats stats;
+    const QString block = QString::fromUtf8(text != nullptr ? text : "");
+    if (!parseVideoStatsBlock(block, &stats)) {
+        return nullptr;
+    }
+
+    // D-11, Plan 13 Task 1: feed the sampler BEFORE the labels-empty OD-04 gate so the
+    // sampler always receives data even when no rows are visible to the customer. The tap
+    // is a plain function-pointer (sentry-free), installed by the facade via setStatsTap().
+    // No sentry.h, no facade include crosses the compositor boundary.
+    {
+        StatsTapFn tap;
+        {
+            QMutexLocker locker(&m_mutex);
+            tap = m_statsTap;
+        }
+        if (tap) {
+            tap(stats);
+        }
+    }
+
     QStringList labels;
     int windowHeight;
     {
@@ -231,12 +258,6 @@ SDL_Surface* OsdCompositor::rasterizeStats(const char* text, bool enabled) const
     if (labels.isEmpty()) {
         // OD-04: with every row off, nothing is drawn - even though the slot itself is enabled
         // and the raw text carries every line.
-        return nullptr;
-    }
-
-    VideoStats stats;
-    const QString block = QString::fromUtf8(text != nullptr ? text : "");
-    if (!parseVideoStatsBlock(block, &stats)) {
         return nullptr;
     }
 

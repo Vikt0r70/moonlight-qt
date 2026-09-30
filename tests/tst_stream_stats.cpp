@@ -57,6 +57,8 @@ namespace SeatHubTelemetry {
 void emitDiagnostic(const QString& body, LogLevel, const QJsonObject& attrs)
 { if (body == QLatin1String("stream.rollup")) rollupLogs.append(attrs); }
 void emitRollupMetrics(const QJsonObject& attrs) { rollupMetrics.append(attrs); }
+QJsonObject rollupDeliveryHealth()
+{ return {{"backlog_spool_lines", 0}, {"backlog_retry_files", 0}}; }
 }
 
 namespace {

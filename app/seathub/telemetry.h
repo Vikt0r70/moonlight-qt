@@ -250,6 +250,35 @@ bool flush(uint64_t timeoutMs);
 void emitStepMetric(const QString& step, const QString& outcome, const QString& failureClass,
                     double elapsedMs);
 
+/// Emits the 17 `seathub.stream.*` Sentry gauges derived from a `stream.rollup` window
+/// (ADR-0072, D-11, Plan 13 Task 1). The gauge names and units are frozen by the ADR; call
+/// immediately after `emitDiagnostic("stream.rollup", ...)` with the SAME attrs object.
+/// No attributes beyond the SDK's own defaults are added to each gauge (plan 13 threat
+/// T-06.7-61: `before_send_metric` strips session_id/host_id/user.id). Absent fields stay
+/// absent — a gauge is only emitted when its key is present in `attrs`.
+///
+/// Gauge names / units (frozen by ADR-0072):
+///   seathub.stream.fps.avg         (none)
+///   seathub.stream.fps.min         (none)
+///   seathub.stream.net_drop.avg    (none)
+///   seathub.stream.net_drop.p95    (none)
+///   seathub.stream.jitter_drop.avg (none)
+///   seathub.stream.jitter_drop.p95 (none)
+///   seathub.stream.rtt.avg         (millisecond)
+///   seathub.stream.rtt.p95         (millisecond)
+///   seathub.stream.decode.avg      (millisecond)
+///   seathub.stream.decode.p95      (millisecond)
+///   seathub.stream.queue.avg       (millisecond)
+///   seathub.stream.queue.p95       (millisecond)
+///   seathub.stream.render.avg      (millisecond)
+///   seathub.stream.render.p95      (millisecond)
+///   seathub.stream.host.avg        (millisecond)
+///   seathub.stream.host.p95        (millisecond)
+///   seathub.stream.samples         (none)
+void emitRollupMetrics(const QJsonObject& attrs);
+// Cross-thread delivery snapshot; no identity or SDK handles leave this TU.
+QJsonObject rollupDeliveryHealth();
+
 /// `seathub.client.launch` (count) - one per process, emitted the first time this client can
 /// actually ship, so the metric never counts a launch the gate then threw away (ADR-0072 item 8).
 void emitLaunchMetric();

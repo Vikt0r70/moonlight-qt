@@ -136,6 +136,7 @@ LogSpool::LogSpool(const QString& directory)
 {
     QDir().mkpath(directory);
     m_path = QDir(directory).filePath(spoolFileName(currentProcessId()));
+    m_pendingLines.store(readSpoolFile(m_path).size());
     m_lock = std::make_unique<QLockFile>(m_path + QStringLiteral(".lock"));
     // Our own pid should never collide with a lock another live process holds - this is a very
     // short, effectively non-blocking wait in practice.
@@ -189,6 +190,7 @@ void LogSpool::append(const ShippedLine& newLine)
             // denied, an antivirus lock) so a silently dropped spool write leaves a trail.
             qCWarning(seathubLogShipper) << "could not commit the log spool write to" << m_path;
         }
+        else { m_pendingLines.store(encoded.size() - dropFrom); }
     }
     else {
         qCWarning(seathubLogShipper) << "could not open the log spool for writing:" << m_path;
@@ -198,7 +200,7 @@ void LogSpool::append(const ShippedLine& newLine)
 QList<ShippedLine> LogSpool::takeAll()
 {
     const QList<ShippedLine> lines = readSpoolFile(m_path);
-    QFile::remove(m_path);
+    if (QFile::remove(m_path)) m_pendingLines.store(0);
 
     const double cutoff
         = currentEpochSeconds() - static_cast<double>(kSpoolMaxAgeDays) * 24.0 * 3600.0;
@@ -459,6 +461,7 @@ public:
     qint64 capReachedTotal() const { return capReachedCount.load(); }
     int adoptedLines() const { return adoptedSpoolLines.load(); }
     int droppedSpoolAgeTotal() const { return spool ? spool->droppedAgeLines() : 0; }
+    int backlogSpoolLines() const { return spool ? spool->pendingLines() : 0; }
 
     void setPauseTimeoutForTests(int milliseconds) { pauseTimeoutMsOverride.store(milliseconds); }
 
@@ -826,6 +829,11 @@ void LogShipper::enqueueDiagnostic(const QString& body, LogLevel level, const QJ
 qint64 LogShipper::droppedQueueCount() const
 {
     return m_impl->droppedQueueTotal();
+}
+
+int LogShipper::backlogSpoolLines() const
+{
+    return m_impl->backlogSpoolLines();
 }
 
 qint64 LogShipper::droppedSpoolAgeCount() const

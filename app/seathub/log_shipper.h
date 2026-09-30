@@ -120,6 +120,7 @@ public:
     /// - a plain `int` there would be a data race. Cumulative over this object's life; the
     /// launch record's `dropped_spool_age` reads it through `LogShipper::droppedSpoolAgeCount()`.
     int droppedAgeLines() const { return m_droppedAgeLines.load(); }
+    int pendingLines() const { return m_pendingLines.load(); }
 
     /// Scans `directory` for `spool-*.jsonl` files this process did not create, adopts (reads,
     /// then deletes) any whose owning process is no longer running - proven by a failed-to-lock
@@ -133,6 +134,7 @@ private:
     QString m_path;
     std::unique_ptr<QLockFile> m_lock;
     std::atomic<int> m_droppedAgeLines{ 0 };
+    std::atomic<int> m_pendingLines{ 0 };
 };
 
 /// The one process-lifetime sink `SeatHubTelemetry::start()` registers (D-14). A singleton -
@@ -233,6 +235,7 @@ public:
     /// diagnostic lane's count cap) was reached in this run. Each is a count, not a flag: a run
     /// that hits a cap once and a run that hits it a thousand times are told apart by it.
     qint64 droppedQueueCount() const;
+    int backlogSpoolLines() const;
     qint64 droppedSpoolAgeCount() const;
     qint64 capReachedCount() const;
     /// D-13 / plan 09: how many lines `start()` adopted from spool files left by processes that

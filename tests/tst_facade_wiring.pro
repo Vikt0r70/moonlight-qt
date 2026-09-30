@@ -75,6 +75,7 @@ SOURCES += \
     ../app/seathub/log_shipper.cpp \
     ../app/seathub/telemetry.cpp \
     ../app/seathub/stream_stats.cpp \
+    ../app/seathub/stream_quality_sampler.cpp \
     ../app/seathub/engine_termination.cpp \
     ../app/seathub/quality_outbox.cpp \
     ../app/seathub/hud_overlay.cpp \
@@ -114,6 +115,7 @@ HEADERS += \
     ../app/seathub/log_shipper.h \
     ../app/seathub/telemetry.h \
     ../app/seathub/stream_stats.h \
+    ../app/seathub/stream_quality_sampler.h \
     ../app/seathub/engine_termination.h \
     ../app/seathub/quality_outbox.h \
     ../app/seathub/hud_overlay.h \

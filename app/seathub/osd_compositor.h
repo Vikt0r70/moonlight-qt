@@ -22,6 +22,7 @@
 // 11) - `windowWidth`/`windowHeight` are only ever set by `setWindowSize()`, never read from SDL.
 
 #include "osd_renderer.h"
+#include "stream_stats.h"
 #include "streaming/video/overlaymanager.h"
 
 #include <QMutex>
@@ -30,10 +31,23 @@
 
 #include <SDL.h>
 
+#include <functional>
+
 class OsdCompositor
 {
 public:
     OsdCompositor();
+
+    /// Install the stats-tap callback used by the sampler (D-11, Plan 13 Task 1).
+    /// Called once by the facade after creating the sampler, before streams start.
+    /// The compositor invokes this after every successful `parseVideoStatsBlock` call,
+    /// BEFORE the labels-empty early return (OD-04), so the sampler receives data even
+    /// when no stats rows are visible to the customer. No sentry.h, no facade header
+    /// crosses the compositor boundary — only the sentry-free VideoStats struct.
+    ///
+    /// Pass nullptr to detach (e.g. at stream end).
+    using StatsTapFn = std::function<void(const VideoStats&)>;
+    void setStatsTap(StatsTapFn tap);
 
     /// Learns the stream window's client size (D-14). Defaults to 1920x1080 until this is
     /// called - the same base `docs/spec/ui.md` §7 sizes from.
@@ -74,4 +88,5 @@ private:
 
     mutable QMutex m_mutex;
     State m_state;
+    StatsTapFn m_statsTap; // guarded by m_mutex
 };

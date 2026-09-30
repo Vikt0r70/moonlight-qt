@@ -410,6 +410,12 @@ SeatHubClient::SeatHubClient(QObject* parent)
     connect(m_statsWatcher, &StatsWatcher::videoStatsParsed,
             this, &SeatHubClient::handleVideoStatsParsed);
 
+    // D-11, Plan 13 Task 1 + Task 2: the 60s roll-up sampler and the connection-status sink.
+    // The sampler lives on the network thread (moved in `startNetworkThreads()`). The status
+    // sink only parses and marshals onto that thread via queued invoke — it never touches
+    // timer state directly (same discipline as the termination sink above).
+    m_sampler = new StreamQualitySampler(nullptr);
+
     // The sign-in field's data: read from the binary, never fetched (Phase 5 D-02).
     qRegisterMetaType<SessionInfo>("SessionInfo");
     qRegisterMetaType<AccountStateInfo>("AccountStateInfo");
@@ -571,6 +577,7 @@ SeatHubClient::SeatHubClient(QObject* parent)
 
 SeatHubClient::~SeatHubClient()
 {
+    m_hud.compositor().setStatsTap(nullptr);
     // D-17/A-51: unregister both `LogTee` sinks FIRST, before anything either lambda captures -
     // `this` (the termination sink calls `m_liveness->noteTermination()`) and `m_statsWatcher`
     // (owned by the stats sink) - is destroyed. `LogTee`'s sink list is process-global and
@@ -626,8 +633,8 @@ SeatHubClient::~SeatHubClient()
             delete controlPlane;
         }
         else {
-            const QList<QObject*> workers = { m_pairingSeam, m_pairing, m_liveness, m_horizon,
-                                              m_sessionChannel, m_teardown, m_sse };
+            const QList<QObject*> workers = { m_pairingSeam, m_pairing, m_liveness, m_sampler,
+                                              m_horizon, m_sessionChannel, m_teardown, m_sse };
             const QThread* home = QThread::currentThread();
             // Blocking, and issued through an object that lives on the worker thread: a move is
             // only accepted when it comes from the object's own thread, and this is the last point
@@ -652,6 +659,7 @@ SeatHubClient::~SeatHubClient()
     delete m_pairingSeam;
     delete m_pairing;
     delete m_liveness;
+    delete m_sampler;  // D-11, Plan 13 Task 1
     delete m_horizon;
     delete m_sessionChannel;
     delete m_teardown;
@@ -689,6 +697,7 @@ void SeatHubClient::startNetworkThreads()
     }
 
     m_liveness->moveToThread(networkThread);
+    m_sampler->moveToThread(networkThread);  // D-11, Plan 13: sampler lives on the network thread alongside liveness
     m_horizon->moveToThread(networkThread);
     m_sessionChannel->moveToThread(networkThread);
     // 06.4/ADR-0067: `SseClient::start()`'s own `openAccountStream()` call requires being on this
@@ -2313,6 +2322,11 @@ void SeatHubClient::handleConnectionStarted()
         m_hud.seedCreditMinutes(m_balanceMinutes);
     }
 
+    // D-11, Plan 13 Task 1: the sampler's 60s roll-up window starts when the stream truly begins
+    // (same anchor as `m_statsAggregator.start()` above). The sampler already lives on the
+    // network thread; `start()` re-invokes itself queued when called from another thread.
+    m_sampler->start(m_sessionId);
+
     // D-31/D-34/D-11: liveness itself started at `beginSession()` (session begin, not the stream's
     // first frame - RESEARCH Q1); from here it keeps reporting every 10 s, now with `state`
     // "streaming" (ADR-0041's meaning is unchanged, only the moment `start()` itself runs has
@@ -2393,6 +2407,8 @@ void SeatHubClient::handleQuitStarting()
 
 void SeatHubClient::handleSessionFinished(int portTestResult)
 {
+    m_hud.compositor().setStatsTap(nullptr);
+    m_sampler->finish();
     // D-56: the duration timer stops here, which is the interval the plan specifies.
     m_hud.endSession();
 
@@ -3209,6 +3225,14 @@ void SeatHubClient::handleHostResolved(const QString& sessionId, const PairedHos
     // header comment).
     engine->setTextRasterizer(&OsdCompositor::rasterize, &m_hud.compositor());
 
+    // D-11, Plan 13 Task 1: install the sampler tap on the compositor so every successful
+    // `parseVideoStatsBlock()` call feeds the 60-second roll-up window, even when no stats
+    // rows are visible. The tap is removed at stream end (handleTeardownCompleted clears it
+    // by passing nullptr). The compositor holds the function-pointer behind its own mutex.
+    m_hud.compositor().setStatsTap([this](const VideoStats& stats) {
+        m_sampler->feed(stats);
+    });
+
     // D-26 (Plan 14): the compositor's own stats-label choice, set alongside the filter above.
     // Plan 16 is what actually draws the stats block through it. There is only this one call
     // site today - settings are read-only while a stream is active (T-05-52, same reason
@@ -3543,6 +3567,11 @@ void SeatHubClient::handleTeardownCompleted(const SessionInfo& finalSession)
     }
 
     m_liveness->stop();
+    // D-11, Plan 13 Task 1: flush any partial roll-up window and stop the sampler. Also clear
+    // the compositor's stats tap so the render thread stops feeding into a stopped sampler.
+    // `finish()` re-invokes itself queued onto the network thread, consistent with `stop()`.
+    m_hud.compositor().setStatsTap(nullptr);
+    m_sampler->finish();
     m_horizon->disarm();
     m_sessionChannel->close();
     // D-27: the Play this trace id covered is over; the next one (`beginPlayRequest`) mints its
