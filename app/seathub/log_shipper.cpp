@@ -70,6 +70,11 @@ QJsonObject lineToJson(const ShippedLine& line)
     obj.insert(QStringLiteral("session_id"), line.sessionId);
     obj.insert(QStringLiteral("host_id"), line.hostId);
     obj.insert(QStringLiteral("trace_id"), line.traceId);
+    // Plan 09 (ADR-0072 item 7): the diagnostic lane's own fields. Written unconditionally, so a
+    // reader that predates them still sees an ordinary line as ordinary (`attrs` empty, flag
+    // false) and never has to guess from a missing key.
+    obj.insert(QStringLiteral("attrs"), line.attrs);
+    obj.insert(QStringLiteral("diagnostic"), line.diagnostic);
     return obj;
 }
 
@@ -89,6 +94,10 @@ std::optional<ShippedLine> lineFromJson(const QJsonObject& obj)
     line.sessionId = obj.value(QStringLiteral("session_id")).toString();
     line.hostId = obj.value(QStringLiteral("host_id")).toString();
     line.traceId = obj.value(QStringLiteral("trace_id")).toString();
+    // Old spool files - written by the release before the diagnostic lane existed - carry neither
+    // key: both default to their empty/false values, which is exactly what an ordinary line is.
+    line.attrs = obj.value(QStringLiteral("attrs")).toObject();
+    line.diagnostic = obj.value(QStringLiteral("diagnostic")).toBool(false);
     return line;
 }
 
@@ -199,6 +208,11 @@ QList<ShippedLine> LogSpool::takeAll()
         if (line.loggedAt >= cutoff) {
             fresh.append(line);
         }
+        else {
+            // D-13: a line dropped for age is a line this run will never deliver. Counted, not
+            // logged - the launch record's `dropped_spool_age` is where a reader finds it.
+            ++m_droppedAgeLines;
+        }
     }
     return fresh;
 }
@@ -295,6 +309,10 @@ public:
         handOffFn = std::move(handOff);
         shippedBytes.store(0);
         capReached.store(false);
+        droppedQueueCount.store(0);
+        capReachedCount.store(0);
+        diagnosticEnqueued.store(0);
+        adoptedSpoolLines.store(0);
         canShip.store(false);
         handOffPaused.store(false);
         holdForTests.store(false);
@@ -316,6 +334,7 @@ public:
         // Adopt leftovers BEFORE this run's own spool file exists, so `adoptLeftovers()` never
         // sees (and skips) our own about-to-be-created file.
         QList<ShippedLine> adopted = LogSpool::adoptLeftovers(directory);
+        adoptedSpoolLines.store(adopted.size());
 
         spool = std::make_unique<LogSpool>(directory);
         for (const ShippedLine& line : adopted) {
@@ -413,6 +432,13 @@ public:
 
     qint64 shippedBytesForTests() const { return shippedBytes.load(); }
 
+    // D-13 / plan 09: the launch record's counters. Each is an informational count read from
+    // whichever thread asks (the launch record reads them at start, a test after a run).
+    qint64 droppedQueueTotal() const { return droppedQueueCount.load(); }
+    qint64 capReachedTotal() const { return capReachedCount.load(); }
+    int adoptedLines() const { return adoptedSpoolLines.load(); }
+    int droppedSpoolAgeTotal() const { return spool ? spool->droppedAgeLines() : 0; }
+
     void setPauseTimeoutForTests(int milliseconds) { pauseTimeoutMsOverride.store(milliseconds); }
 
 private:
@@ -452,6 +478,9 @@ private:
                 // processedSequence once even a single line has ever been dropped by this cap -
                 // permanently desynchronizing the two counters for the rest of the process's life.
                 enqueueSequence.fetch_sub(1);
+                // D-13 (plan 09): counted for the launch record - a line the queue dropped is a
+                // line this run will never deliver, and a reader has to be able to see that.
+                droppedQueueCount.fetch_add(1);
             }
             queue.push_back(std::move(line));
             enqueueSequence.fetch_add(1);
@@ -459,6 +488,62 @@ private:
         queueCv.notify_one();
     }
 
+public:
+    /// ADR-0072 item 7 / plan 09: the diagnostic lane's entry point. The line joins the same
+    /// queue as a tee line - same scrub, same `canShip`/pause/spool rules, same drop-oldest
+    /// queue cap - and differs only in its bounds: it is counted against
+    /// `kDiagnosticLinesPerRun` here and exempt from the byte caps in `handOffOne()`.
+    void enqueueDiagnostic(const QString& body, LogLevel level, const QJsonObject& attrs)
+    {
+        if (!accepting.load(std::memory_order_acquire)) {
+            return;
+        }
+        if (level == LogLevel::Debug) {
+            // The same rule the tee's own sink applies: debug never leaves this machine.
+            return;
+        }
+        if (s_onWorkerThread) {
+            return;
+        }
+
+        // V30: the lane's per-run bound is a COUNT, checked before the line is built. The cap is
+        // counted once - the trip, not every line it then drops - so `cap_reached` reads "a cap
+        // was reached N times", the same shape as the byte cap's own trip.
+        const int queued = diagnosticEnqueued.fetch_add(1) + 1;
+        if (queued > LogShipper::kDiagnosticLinesPerRun) {
+            if (queued == LogShipper::kDiagnosticLinesPerRun + 1) {
+                capReachedCount.fetch_add(1);
+            }
+            return;
+        }
+
+        ShippedLine line;
+        line.level = level;
+        line.body = body;
+        line.loggedAt = currentEpochSeconds();
+        line.attrs = attrs;
+        line.diagnostic = true;
+        const std::shared_ptr<const Ids> ids = std::atomic_load(&currentIds);
+        if (ids) {
+            line.sessionId = ids->sessionId;
+            line.hostId = ids->hostId;
+            line.traceId = ids->traceId;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(queueMutex);
+            if (queue.size() >= static_cast<size_t>(LogShipper::kQueueLines)) {
+                queue.pop_front();
+                enqueueSequence.fetch_sub(1);
+                droppedQueueCount.fetch_add(1);
+            }
+            queue.push_back(std::move(line));
+            enqueueSequence.fetch_add(1);
+        }
+        queueCv.notify_one();
+    }
+
+private:
     void run()
     {
         s_onWorkerThread = true;
@@ -552,6 +637,14 @@ private:
 
     bool handOffOne(const ShippedLine& line)
     {
+        // ADR-0072 item 7 / plan 09: a diagnostic line is exempt from the byte caps entirely. It
+        // was already bounded at enqueue by `kDiagnosticLinesPerRun`, and the two byte bounds
+        // below exist for the open-ended tee traffic - applied to the diagnostic lane they would
+        // silence exactly the structured record of what failed, most of all the cap line itself.
+        if (line.diagnostic) {
+            return callHandOff(line);
+        }
+
         if (capReached.load()) {
             // E.2: past the per-run cap, every line is silently dropped (not re-spooled - a
             // spool that could never drain again would only grow without bound for the rest of
@@ -562,6 +655,9 @@ private:
         const qint64 bodyBytes = line.body.toUtf8().size();
         if (shippedBytes.load() + bodyBytes > LogShipper::kShippedBytesPerRun) {
             if (!capReached.exchange(true)) {
+                // D-13: the launch record's `cap_reached` counts the trips, and this is the one
+                // the byte cap can make in a run.
+                capReachedCount.fetch_add(1);
                 ShippedLine capLine;
                 capLine.level = LogLevel::Warning;
                 capLine.body = QStringLiteral("log cap reached");
@@ -613,6 +709,16 @@ private:
     std::atomic<bool> workerRunning{ false };
     std::atomic<qint64> shippedBytes{ 0 };
     std::atomic<bool> capReached{ false };
+    /// D-13 (plan 09): the three cumulative counters the launch record reports. `droppedQueue`
+    /// counts lines the queue's own drop-oldest cap popped, `capReachedCount` counts every cap
+    /// trip (the 8 MiB byte cap and the diagnostic lane's count cap alike), and
+    /// `diagnosticEnqueued` is what `kDiagnosticLinesPerRun` is measured against.
+    std::atomic<qint64> droppedQueueCount{ 0 };
+    std::atomic<qint64> capReachedCount{ 0 };
+    std::atomic<int> diagnosticEnqueued{ 0 };
+    /// How many lines `start()` adopted from dead processes' spool files (D-13's
+    /// `spool_lines_adopted`).
+    std::atomic<int> adoptedSpoolLines{ 0 };
     std::atomic<quint64> enqueueSequence{ 0 };
     std::atomic<quint64> processedSequence{ 0 };
 
@@ -689,6 +795,31 @@ void LogShipper::stop()
 void LogShipper::publishIds(const QString& sessionId, const QString& hostId, const QString& traceId)
 {
     m_impl->publishIds(sessionId, hostId, traceId);
+}
+
+void LogShipper::enqueueDiagnostic(const QString& body, LogLevel level, const QJsonObject& attrs)
+{
+    m_impl->enqueueDiagnostic(body, level, attrs);
+}
+
+qint64 LogShipper::droppedQueueCount() const
+{
+    return m_impl->droppedQueueTotal();
+}
+
+qint64 LogShipper::droppedSpoolAgeCount() const
+{
+    return m_impl->droppedSpoolAgeTotal();
+}
+
+qint64 LogShipper::capReachedCount() const
+{
+    return m_impl->capReachedTotal();
+}
+
+int LogShipper::adoptedSpoolLines() const
+{
+    return m_impl->adoptedLines();
 }
 
 void LogShipper::setSpoolDirectoryForTests(const QString& directory)

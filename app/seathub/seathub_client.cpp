@@ -560,7 +560,22 @@ SeatHubClient::~SeatHubClient()
     // singleton at its own static destruction would call `std::terminate()`. A no-op, cheaply,
     // when `LogShipper` was never started (`tst_facade_wiring.cpp` constructs and destroys a
     // `SeatHubClient` once per test and never calls `SeatHubTelemetry::start()`).
+    // Plan 09 (ADR-0072 item 9, V31) inserts the quit-time flush between a drain and that stop:
+    // `drainBeforeSignOut()` first, so every line this run captured has reached the SDK or the
+    // spool, then `flush(2000)` - `sentry_flush()` only, never `sentry_close()` (SPIKE T11: a
+    // crash after close is captured without its fatal event, hooks or marker) - then the stop
+    // takes the hand-off path away. Both the drain and the flush are cheap no-ops in a process
+    // that never started telemetry: `drainBeforeSignOut()` returns when no worker was ever
+    // started, and `sentry_flush()` finds no options and returns at once (`tst_facade_wiring`
+    // constructs and destroys a `SeatHubClient` per test without ever starting telemetry).
+    LogShipper::instance().drainBeforeSignOut();
+    SeatHubTelemetry::flush(2000);
     LogShipper::instance().stop();
+
+    // Plan 09 (ADR-0072 item 5): the last act of a CLEAN quit - this destructor is the only thing
+    // that ever reaches it. The next launch reads `clean` because this line ran, `crash` or
+    // `unknown` because it never did (a crash, a kill and a power loss all leave the marker).
+    SeatHubTelemetry::markCleanExit();
 
     // Order matters. Everything that was moved to the control-plane thread is brought home *from
     // inside that thread* first, the thread is then stopped and joined, and only then is anything
@@ -3053,15 +3068,41 @@ void SeatHubClient::clearThisPlaysTraceIdAfterAnyQueuedLivenessReport()
 
 void SeatHubClient::handlePairingFailed(const SeatHubFailure& failure)
 {
+    // Plan 09 (ADR-0072): the classification the seam reported for THIS failure, consumed here -
+    // one failure, one classification, so a later failure from a run that never classified itself
+    // can never inherit this run's step. Neither `failure.diagnostic` nor the seam's
+    // `engineError` is read anywhere below: the class is a vocabulary token or it is nothing
+    // (item 2), and the local diagnostic stays on the failure the error screen renders from.
+    const PairingHandshakeResult classification = m_pairingClassification;
+    m_pairingClassification = PairingHandshakeResult();
+
     if (m_reconnecting) {
         // 06.1-19/J-07: a pairing failure during a reconnect attempt - nothing streams on this
         // attempt, but the session is still the server's to end, not this client's: schedule the
         // next attempt instead of the ordinary pre-stream teardown below, which would end a
         // session J-07 exists to keep. The liveness stage stays `reconnecting` (no `reportFailure`
         // call here, unlike the ordinary path) for the same reason `handlePairingCompleted()`'s
-        // own reconnect branch leaves it alone.
+        // own reconnect branch leaves it alone. No `play.step` either: the step a reconnect
+        // attempt fails is `reconnect`, and every reconnect emission is plan 22's.
         retryReconnectOrGiveUp();
         return;
+    }
+
+    // Plan 09 (ADR-0072 item 1): one `play.step` per classified pairing failure, WARN because it
+    // failed, with only allow-listed attributes. `elapsed_ms` rides "where known" (item 6) - the
+    // pairing path does not time its step yet, so it is absent rather than invented. Emitted
+    // through the shipper's diagnostic lane, so the three kill switches reach it like every other
+    // line, and the body is the fixed token `play.step`, never customer or engine text.
+    if (!classification.attemptStep.isEmpty()) {
+        QJsonObject stepAttributes;
+        stepAttributes.insert(QStringLiteral("step"), classification.attemptStep);
+        stepAttributes.insert(QStringLiteral("outcome"), QStringLiteral("failed"));
+        if (!classification.stepClass.isEmpty()) {
+            stepAttributes.insert(QStringLiteral("failure_class"), classification.stepClass);
+        }
+        stepAttributes.insert(QStringLiteral("attempt"), classification.attempts);
+        SeatHubTelemetry::emitDiagnostic(QStringLiteral("play.step"), LogLevel::Warning,
+                                         stepAttributes);
     }
 
     // D-11: a pairing timeout or a control-plane refusal of the pairing read, neither with an
@@ -3085,6 +3126,11 @@ void SeatHubClient::handlePairingFailed(const SeatHubFailure& failure)
         setAttachedSessionEnded(true);
         EndReport report;
         report.stage = QStringLiteral("pairing");
+        // ADR-0072 item 1 / plan 09: the failing step rides `/end` (contract 3.8.0) - and only
+        // the step. An unclassified pairing failure (the controller's own deadline, a
+        // control-plane refusal) leaves this empty and the field absent from the body, because a
+        // step the client never classified is a step it must not invent.
+        report.attemptStep = classification.attemptStep;
         endPreStreamSessionWithReport(m_teardownGuard, m_teardown, m_sessionId, m_clientUuid,
                                       report);
     }

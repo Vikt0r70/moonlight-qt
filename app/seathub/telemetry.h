@@ -39,6 +39,7 @@
 #include <QJsonObject>
 #include <QString>
 
+#include <cstdint>
 #include <optional>
 
 namespace SeatHubTelemetry {
@@ -218,6 +219,59 @@ int initCallCount();
 /// process's whole life (C.1 fact 7: SeatHub never closes the SDK except inside the one first-DSN
 /// re-init and at quit, and quit never reaches this code).
 int closeCallCount();
+
+// --- Plan 09 (ADR-0072): the diagnostic lane, the metric hooks, the flush and the launch record
+// ---
+//
+// The one TU that touches `sentry.h` owns all of it, exactly as above: `emitDiagnostic()` is a
+// thin front door onto `LogShipper::enqueueDiagnostic()` (so it inherits `canShip`, the spool and
+// every kill switch for free), the emitters below call `sentry_metrics_*` directly, and
+// `flush()` wraps `sentry_flush()` - never `sentry_close()` (ADR-0072 item 9, SPIKE T11).
+
+/// Queues one structured diagnostic line - a fixed-token body (`play.step`,
+/// `client.telemetry`, ...) with scalar attributes - through the shipper's diagnostic lane
+/// (ADR-0072 item 7). Attributes must be within the ADR-0072 allow-list; the caller is what
+/// chooses them, and no caller ever passes `PairingHandshakeResult::engineError`,
+/// `SeatHubFailure::diagnostic` or any other raw text as one (item 2). No-op before `start()`,
+/// like any other line.
+void emitDiagnostic(const QString& body, LogLevel level, const QJsonObject& attributes);
+
+/// `sentry_flush(timeoutMs)` behind this fork's one telemetry door (ADR-0072 item 9, V31): a 2 s
+/// budget at quit and 2 s after a terminal summary, `sentry_close()` never. Returns true when the
+/// flush completed inside the budget. Safe to call in a process that never initialised the SDK -
+/// `sentry_flush()` finds no options and returns at once - which is what lets `~SeatHubClient()`
+/// call it unconditionally.
+bool flush(uint64_t timeoutMs);
+
+/// `seathub.play.step_result` (count: `step`, `outcome`, `failure_class`) and
+/// `seathub.play.step_duration` (distribution in milliseconds: `step`, `outcome`) - the fleet
+/// view of one attempt step's outcome (ADR-0072 item 6). Discarded by `before_send_metric` while
+/// this client is not shipping (item 7), so calling it signed out is harmless and silent.
+void emitStepMetric(const QString& step, const QString& outcome, const QString& failureClass,
+                    double elapsedMs);
+
+/// `seathub.client.launch` (count) - one per process, emitted the first time this client can
+/// actually ship, so the metric never counts a launch the gate then threw away (ADR-0072 item 8).
+void emitLaunchMetric();
+
+/// The per-launch `client.telemetry` record (ADR-0072 item 8, D-13): one INFO diagnostic line
+/// carrying `dsn_source`, `logs_enabled`, `signed_in`, `crashed_last_run`, `prev_exit`,
+/// `spool_lines_adopted`, `retry_files`, `dropped_queue`, `dropped_spool_age` and `cap_reached`,
+/// plus this run's own clean-exit marker written for the next launch to read. Called once, from
+/// `start()`, after the cache read and the shipper's own start, so every counter it reports is
+/// this launch's own.
+void noteLaunch();
+
+/// Removes this run's clean-exit marker `run-state` - the last act of a CLEAN quit (called from
+/// `~SeatHubClient()`), which is what makes the next launch's `prev_exit` read `clean`. A crash,
+/// a kill or a power loss never reaches it, so the marker the next launch finds is exactly an
+/// unclean one.
+void markCleanExit();
+
+/// Test seam: the directory the `run-state` marker lives in (production:
+/// `QStandardPaths::AppLocalDataLocation`, i.e. `%LOCALAPPDATA%\Seven Hills\SeatHub`). Call
+/// before `start()`/`noteLaunch()`.
+void setRunStateDirectoryForTests(const QString& directory);
 
 #ifdef SEATHUB_TEST_ALLOW_LOOPBACK_DSN
 /// Test-only (CR-01 regression), compile-time gated exactly like `acceptDsn()`'s own

@@ -662,6 +662,12 @@ QByteArray ControlPlaneClient::buildEndRequest(bool failed, const EndReport& rep
     if (!report.errorCode.isEmpty()) {
         object.insert(QStringLiteral("error_code"), report.errorCode);
     }
+    // ADR-0072 item 1 / plan 09 (contract 3.8.0): the failing step, present only when the client
+    // classified one - the same optional-field rule as everything above, and the ONLY new field
+    // this plan adds. The failure class never travels: it stays in Sentry (D-12).
+    if (!report.attemptStep.isEmpty()) {
+        object.insert(QStringLiteral("attempt_step"), report.attemptStep);
+    }
     return QJsonDocument(object).toJson(QJsonDocument::Compact);
 }
 
