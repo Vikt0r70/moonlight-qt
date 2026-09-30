@@ -302,6 +302,115 @@ int runLogsChild(int argc, char* argv[])
     return 0;
 }
 
+// --- Plan 09 (ADR-0072): the diagnostic lane's own child role -----------------------------
+
+/// `tst_telemetry --diag-child <scenario> <dsn> <db> <handler> <spool-dir> <run-state-dir>`:
+/// one fresh process per scenario, so each assertion below is about a new SDK, a new shipper and
+/// a new gate - the state the three kill switches and the launch record are actually about.
+///
+/// Scenarios: `play-step` (one structured `play.step`, with the PIN sentinel present ONLY in a
+/// local `engineError`-shaped string the emission never receives), `step-metric` (one
+/// `seathub.play.step_result` + `seathub.play.step_duration` while signed in with a session, a
+/// host and a trace), `flush` (one line, then a timed `flush(2000)` reported on stdout),
+/// `launch` (the `client.telemetry` launch record), and the three `kill-*` scenarios, which emit
+/// a line AND a metric that must produce no envelope at all.
+int runDiagChild(int argc, char* argv[])
+{
+    const QString scenario = argc > 2 ? QString::fromLocal8Bit(argv[2]) : QString();
+    const QString dsn = argc > 3 ? QString::fromLocal8Bit(argv[3]) : QString();
+    const QString dbDir = argc > 4 ? QString::fromLocal8Bit(argv[4]) : QString();
+    const QString handler = argc > 5 ? QString::fromLocal8Bit(argv[5]) : QString();
+    const QString spoolDir = argc > 6 ? QString::fromLocal8Bit(argv[6]) : QString();
+    const QString runStateDir = argc > 7 ? QString::fromLocal8Bit(argv[7]) : QString();
+
+    SeatHubTelemetry::Options options;
+    options.databaseDir = dbDir;
+    options.handlerPath = handler;
+    options.environment = QStringLiteral("test");
+    options.release = QStringLiteral("seathub@0.0.0-diag");
+    // The `kill-no-dsn` scenario is the control plane's handout turning telemetry OFF: an empty
+    // DSN from the start, which is what an off handout looks like to `startWith()`.
+    options.dsn = scenario == QLatin1String("kill-no-dsn") ? QString() : dsn;
+
+    LogTee::install();
+    LogShipper::instance().setSpoolDirectoryForTests(spoolDir);
+    LogShipper::instance().start(SeatHubTelemetry::logShipperHandOff());
+    SeatHubTelemetry::setRunStateDirectoryForTests(runStateDir);
+    SeatHubTelemetry::startWith(options);
+    SeatHubTelemetry::setSession(QStringLiteral("session-diag-child"),
+                                 QStringLiteral("host-diag-child"));
+
+    SeatHubTelemetry::Handout handout;
+    handout.dsn = options.dsn;
+    handout.environment = QStringLiteral("test");
+    handout.logs = scenario != QLatin1String("kill-logs-false");
+    SeatHubTelemetry::applyHandout(handout);
+
+    if (scenario != QLatin1String("kill-signed-out")) {
+        SeatHubTelemetry::setUser(QStringLiteral("acct-diag-child"));
+    }
+
+    QJsonObject stepAttributes;
+    stepAttributes.insert(QStringLiteral("step"), QStringLiteral("pair_handshake"));
+    stepAttributes.insert(QStringLiteral("outcome"), QStringLiteral("failed"));
+    stepAttributes.insert(QStringLiteral("failure_class"), QStringLiteral("pin_rejected"));
+    stepAttributes.insert(QStringLiteral("attempt"), 1);
+
+    if (scenario == QLatin1String("play-step")) {
+        // ADR-0072 item 2: the local diagnostic a real failure would carry, PIN and all. It is
+        // built HERE and handed to nothing - the emission below receives only vocabulary tokens
+        // and numbers, which is exactly what the assertion on the other side proves.
+        const QString engineError = QStringLiteral("the rig rejected the pairing PIN 4821");
+        QJsonObject attributes = stepAttributes;
+        attributes.insert(QStringLiteral("elapsed_ms"), 812);
+        SeatHubTelemetry::emitDiagnostic(QStringLiteral("play.step"), LogLevel::Warning,
+                                         attributes);
+        if (engineError.isEmpty()) { // never true: keeps the sentinel in scope, not in the emission
+            return 1;
+        }
+    }
+    else if (scenario == QLatin1String("step-metric")) {
+        SeatHubTelemetry::setTrace(QStringLiteral("trace-diag-child"));
+        SeatHubTelemetry::emitStepMetric(QStringLiteral("pair_handshake"),
+                                         QStringLiteral("failed"),
+                                         QStringLiteral("pin_rejected"), 812.0);
+    }
+    else if (scenario == QLatin1String("flush")) {
+        SeatHubTelemetry::emitDiagnostic(QStringLiteral("play.step"), LogLevel::Warning,
+                                         stepAttributes);
+    }
+    else if (scenario == QLatin1String("launch")) {
+        SeatHubTelemetry::noteLaunch();
+    }
+    else if (scenario.startsWith(QLatin1String("kill-"))) {
+        // Both lanes at once: the kill switch has to reach the diagnostic line (the shipper's
+        // own gate) and the metric (`before_send_metric`'s atomic gate) or one of them would
+        // still report while telemetry is off.
+        SeatHubTelemetry::emitDiagnostic(QStringLiteral("play.step"), LogLevel::Warning,
+                                         stepAttributes);
+        SeatHubTelemetry::emitStepMetric(QStringLiteral("pair_handshake"),
+                                         QStringLiteral("failed"),
+                                         QStringLiteral("pin_rejected"), 812.0);
+    }
+
+    LogShipper::instance().drainBeforeSignOut();
+    const qint64 flushStartedAt = QDateTime::currentMSecsSinceEpoch();
+    const bool flushed = SeatHubTelemetry::flush(2000);
+    const qint64 flushElapsed = QDateTime::currentMSecsSinceEpoch() - flushStartedAt;
+    if (scenario == QLatin1String("flush")) {
+        // The parent reads this: the call must return inside its 2000 ms budget.
+        fprintf(stdout, "FLUSH_MS=%lld FLUSH_OK=%d\n", static_cast<long long>(flushElapsed),
+                flushed ? 1 : 0);
+        fflush(stdout);
+    }
+    LogShipper::instance().stop();
+    // A marker after the one call that can block on another thread, so a parent that reports a
+    // child "still running" can tell where it stopped rather than guessing.
+    fprintf(stdout, "STOPPED=1\n");
+    fflush(stdout);
+    return 0;
+}
+
 // --- the fake Sentry endpoint --------------------------------------------------------------
 
 /// Wires `server` to answer every request with `200 {}` and record the request line's path in
@@ -448,6 +557,215 @@ ParsedLogItem parseFirstLogItem(const QByteArray& envelopeBody)
         }
     }
     return result;
+}
+
+/// Like `wireLogEnvelopeListener()` but keeps EVERY envelope instead of the last one written:
+/// plan 09's runs send more than one (the launch record, the `play.step` and the metrics can
+/// each arrive as their own request), and a test that has to prove "zero envelopes" or find one
+/// item among several cannot do it through a single overwritten buffer. Same body-complete rule,
+/// same `Connection: close` answer - one request per connection, so nothing is ever concatenated.
+void wireEnvelopeCollector(QTcpServer* server, QList<QByteArray>* envelopes)
+{
+    QObject::connect(server, &QTcpServer::newConnection, server, [server, envelopes]() {
+        while (QTcpSocket* socket = server->nextPendingConnection()) {
+            auto buffer = std::make_shared<QByteArray>();
+            auto responded = std::make_shared<bool>(false);
+            QObject::connect(socket, &QTcpSocket::readyRead, socket,
+                             [socket, buffer, responded, envelopes]() {
+                                 *buffer += socket->readAll();
+                                 if (*responded) {
+                                     return;
+                                 }
+                                 const int headerEnd = buffer->indexOf("\r\n\r\n");
+                                 if (headerEnd < 0) {
+                                     return;
+                                 }
+                                 qint64 contentLength = 0;
+                                 for (const QByteArray& line : buffer->left(headerEnd).split('\n')) {
+                                     const QByteArray trimmed = line.trimmed();
+                                     if (trimmed.toLower().startsWith("content-length:")) {
+                                         contentLength = trimmed.mid(trimmed.indexOf(':') + 1)
+                                                             .trimmed()
+                                                             .toLongLong();
+                                         break;
+                                     }
+                                 }
+                                 const int bodyStart = headerEnd + 4;
+                                 if (buffer->size() - bodyStart < contentLength) {
+                                     return;
+                                 }
+                                 envelopes->append(
+                                     buffer->mid(bodyStart, static_cast<int>(contentLength)));
+                                 *responded = true;
+                                 static const QByteArray body = QByteArrayLiteral("{}");
+                                 QByteArray response
+                                     = QByteArrayLiteral("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                                                        "Content-Length: ")
+                                     + QByteArray::number(body.size())
+                                     + QByteArrayLiteral("\r\nConnection: close\r\n\r\n") + body;
+                                 socket->write(response);
+                                 socket->flush();
+                                 socket->disconnectFromHost();
+                             });
+            QObject::connect(socket, &QTcpSocket::disconnected, socket, &QTcpSocket::deleteLater);
+        }
+    });
+}
+
+/// Every `log` item in one envelope - the same walk `parseFirstLogItem()` does, kept going past
+/// the first item so a run whose envelope batches several lines can still be searched by body.
+QList<ParsedLogItem> parseLogItems(const QByteArray& envelopeBody)
+{
+    QList<ParsedLogItem> items;
+    int pos = envelopeBody.indexOf('\n');
+    if (pos < 0) {
+        return items;
+    }
+    pos += 1;
+    while (pos < envelopeBody.size()) {
+        const int headerLineEnd = envelopeBody.indexOf('\n', pos);
+        if (headerLineEnd < 0) {
+            break;
+        }
+        QJsonParseError error;
+        const QJsonObject itemHeader =
+            QJsonDocument::fromJson(envelopeBody.mid(pos, headerLineEnd - pos), &error).object();
+        if (error.error != QJsonParseError::NoError) {
+            break;
+        }
+        const qint64 length = itemHeader.value(QStringLiteral("length")).toVariant().toLongLong();
+        const QString type = itemHeader.value(QStringLiteral("type")).toString();
+        pos = headerLineEnd + 1;
+        const QByteArray payload = envelopeBody.mid(pos, static_cast<int>(length));
+        pos += static_cast<int>(length);
+        if (pos < envelopeBody.size() && envelopeBody.at(pos) == '\n') {
+            ++pos;
+        }
+        if (type != QLatin1String("log")) {
+            continue;
+        }
+        const QJsonArray entries =
+            QJsonDocument::fromJson(payload).object().value(QStringLiteral("items")).toArray();
+        for (const QJsonValue& entry : entries) {
+            const QJsonObject log = entry.toObject();
+            ParsedLogItem parsed;
+            parsed.found = true;
+            parsed.body = log.value(QStringLiteral("body")).toString();
+            parsed.attributes = log.value(QStringLiteral("attributes")).toObject();
+            items.append(parsed);
+        }
+    }
+    return items;
+}
+
+/// One `trace_metric` entry (ADR-0072 item 6): the item type is `trace_metric`, its payload is
+/// the same `{items: [...]}` shape the log item uses (`sentry__envelope_add_metrics` ->
+/// `add_telemetry()` in the pinned `sentry_envelope.c`), and each entry carries `name`, `type`,
+/// `value`, its `attributes` object and - when the Play's trace is live - a top-level `trace_id`
+/// (P-3: a field of the metric, never one of its attributes).
+struct ParsedMetric
+{
+    QString name;
+    QString type;
+    QJsonObject attributes;
+    QString traceId;
+};
+
+QList<ParsedMetric> parseMetricItems(const QByteArray& envelopeBody)
+{
+    QList<ParsedMetric> metrics;
+    int pos = envelopeBody.indexOf('\n');
+    if (pos < 0) {
+        return metrics;
+    }
+    pos += 1;
+    while (pos < envelopeBody.size()) {
+        const int headerLineEnd = envelopeBody.indexOf('\n', pos);
+        if (headerLineEnd < 0) {
+            break;
+        }
+        QJsonParseError error;
+        const QJsonObject itemHeader =
+            QJsonDocument::fromJson(envelopeBody.mid(pos, headerLineEnd - pos), &error).object();
+        if (error.error != QJsonParseError::NoError) {
+            break;
+        }
+        const qint64 length = itemHeader.value(QStringLiteral("length")).toVariant().toLongLong();
+        const QString type = itemHeader.value(QStringLiteral("type")).toString();
+        pos = headerLineEnd + 1;
+        const QByteArray payload = envelopeBody.mid(pos, static_cast<int>(length));
+        pos += static_cast<int>(length);
+        if (pos < envelopeBody.size() && envelopeBody.at(pos) == '\n') {
+            ++pos;
+        }
+        if (type != QLatin1String("trace_metric")) {
+            continue;
+        }
+        const QJsonArray entries =
+            QJsonDocument::fromJson(payload).object().value(QStringLiteral("items")).toArray();
+        for (const QJsonValue& entry : entries) {
+            const QJsonObject metric = entry.toObject();
+            ParsedMetric parsed;
+            parsed.name = metric.value(QStringLiteral("name")).toString();
+            parsed.type = metric.value(QStringLiteral("type")).toString();
+            parsed.attributes = metric.value(QStringLiteral("attributes")).toObject();
+            parsed.traceId = metric.value(QStringLiteral("trace_id")).toString();
+            metrics.append(parsed);
+        }
+    }
+    return metrics;
+}
+
+/// Everything a run sent, flattened across every captured envelope.
+struct EnvelopeScan
+{
+    QList<ParsedLogItem> logs;
+    QList<ParsedMetric> metrics;
+};
+
+EnvelopeScan scanEnvelopes(const QList<QByteArray>& envelopes)
+{
+    EnvelopeScan scan;
+    for (const QByteArray& envelope : envelopes) {
+        scan.logs.append(parseLogItems(envelope));
+        scan.metrics.append(parseMetricItems(envelope));
+    }
+    return scan;
+}
+
+/// The first log whose body is exactly `body`, or a default-constructed (not found) item.
+ParsedLogItem findLog(const EnvelopeScan& scan, const QString& body)
+{
+    for (const ParsedLogItem& item : scan.logs) {
+        if (item.body == body) {
+            return item;
+        }
+    }
+    return ParsedLogItem();
+}
+
+/// The first metric with this name, or `nullptr`.
+const ParsedMetric* findMetric(const EnvelopeScan& scan, const QString& name)
+{
+    for (const ParsedMetric& metric : scan.metrics) {
+        if (metric.name == name) {
+            return &metric;
+        }
+    }
+    return nullptr;
+}
+
+/// Convenience predicates over the whole capture - a `QTRY_` on these also gives the event loop
+/// the time it needs to read an envelope that the child sent just before it exited (the listener
+/// only ever reads on the event loop, and `QProcess::waitForFinished()` blocks it).
+bool hasLog(const QList<QByteArray>& envelopes, const QString& body)
+{
+    return findLog(scanEnvelopes(envelopes), body).found;
+}
+
+bool hasMetric(const QList<QByteArray>& envelopes, const QString& name)
+{
+    return findMetric(scanEnvelopes(envelopes), name) != nullptr;
 }
 
 /// One "event" envelope item (CR-01 regression: `captureTestMessageForTests()`'s plain message
@@ -692,8 +1010,8 @@ private slots:
         QVERIFY(spoolDir.isValid());
 
         QTcpServer server;
-        QByteArray envelopeBody;
-        wireLogEnvelopeListener(&server, &envelopeBody);
+        QList<QByteArray> envelopes;
+        wireEnvelopeCollector(&server, &envelopes);
         QVERIFY2(server.listen(QHostAddress::LocalHost, 0),
                  "the fake Sentry listener must bind 127.0.0.1:0");
         const QString dsn = QStringLiteral("http://publickey@127.0.0.1:%1/1").arg(server.serverPort());
@@ -708,12 +1026,18 @@ private slots:
         child.start();
         QVERIFY2(child.waitForStarted(5000), "the logs-child process must start");
 
-        QTRY_VERIFY_WITH_TIMEOUT(!envelopeBody.isEmpty(), 15000);
+        // Plan 09: this run also emits `seathub.client.launch`, whose `trace_metric` envelope can
+        // arrive before (and in any case separately from) the log envelope - so wait for the
+        // envelope that actually carries the marker line, across every envelope captured.
+        QTRY_VERIFY_WITH_TIMEOUT(
+            findLog(scanEnvelopes(envelopes), QStringLiteral("logs-child-line-marker")).found,
+            15000);
 
         QVERIFY(child.waitForFinished(10000));
         QCOMPARE(child.exitCode(), 0);
 
-        const ParsedLogItem item = parseFirstLogItem(envelopeBody);
+        const ParsedLogItem item =
+            findLog(scanEnvelopes(envelopes), QStringLiteral("logs-child-line-marker"));
         QVERIFY2(item.found, "no log item found in the captured envelope");
         QVERIFY2(item.body.contains(QStringLiteral("logs-child-line-marker")),
                  qPrintable(QStringLiteral("unexpected log body: %1").arg(item.body)));
@@ -1162,6 +1486,336 @@ private slots:
         qunsetenv("SEATHUB_TEST_CRASH");
     }
 
+    // --- Plan 09 (ADR-0072): the diagnostic lane end to end ---------------------------------
+
+    void metricsCarryNoSessionHostOrUserIdAndKeepTheTraceId()
+    {
+        QTemporaryDir dbDir;
+        QVERIFY(dbDir.isValid());
+        QTemporaryDir spoolDir;
+        QVERIFY(spoolDir.isValid());
+        QTemporaryDir runStateDir;
+        QVERIFY(runStateDir.isValid());
+
+        QTcpServer server;
+        QList<QByteArray> envelopes;
+        wireEnvelopeCollector(&server, &envelopes);
+        QVERIFY2(server.listen(QHostAddress::LocalHost, 0),
+                 "the fake Sentry listener must bind 127.0.0.1:0");
+        const QString dsn =
+            QStringLiteral("http://publickey@127.0.0.1:%1/1").arg(server.serverPort());
+
+        QProcess child;
+        child.setProgram(m_appPath);
+        child.setArguments({ QStringLiteral("--diag-child"), QStringLiteral("step-metric"), dsn,
+                             dbDir.path(), m_handlerPath, spoolDir.path(), runStateDir.path() });
+        child.start();
+        QVERIFY2(child.waitForStarted(5000), "the diag-child process must start");
+        QTRY_VERIFY_WITH_TIMEOUT(!envelopes.isEmpty(), 20000);
+        // QTRY, never `waitForFinished()`: the latter blocks this process's event loop, and the
+        // fake Sentry listener only ever reads ON that loop. A child waiting for its envelope to
+        // be acknowledged would then be waiting for a parent that is waiting for it - the two
+        // deadlocking until the timeout below. `state()` flips from the process's own notifier,
+        // which the same event loop delivers, so this wait also lets every envelope in.
+        QTRY_VERIFY_WITH_TIMEOUT(child.state() != QProcess::Running, 20000);
+        QCOMPARE(child.exitCode(), 0);
+
+        // The listener only reads on the event loop, which `waitForFinished()` just blocked -
+        // give an envelope the child sent on its way out its turn to be read.
+        QTRY_VERIFY_WITH_TIMEOUT(
+            hasMetric(envelopes, QStringLiteral("seathub.play.step_result")), 10000);
+
+        const EnvelopeScan scan = scanEnvelopes(envelopes);
+        const ParsedMetric* result =
+            findMetric(scan, QStringLiteral("seathub.play.step_result"));
+        QVERIFY2(result != nullptr, "no seathub.play.step_result metric reached the listener");
+
+        // Exactly `step`, `outcome`, `failure_class` plus the SDK's own `sentry.*` / `os.*`
+        // (ADR-0072 item 6) - and above all none of the per-session identities the scope attaches
+        // to every metric (item 7, T-06.7-36).
+        const QStringList attributeKeys = result->attributes.keys();
+        QVERIFY2(!attributeKeys.isEmpty(), "the metric carries no attributes at all");
+        for (const QString& key : attributeKeys) {
+            const bool named = key == QLatin1String("step") || key == QLatin1String("outcome")
+                || key == QLatin1String("failure_class");
+            const bool sdk = key.startsWith(QLatin1String("sentry."))
+                || key.startsWith(QLatin1String("os."));
+            QVERIFY2(named || sdk, qPrintable(QStringLiteral("metric attribute outside the allow-list: %1").arg(key)));
+        }
+        QVERIFY(result->attributes.contains(QStringLiteral("step")));
+        QVERIFY(result->attributes.contains(QStringLiteral("outcome")));
+        QVERIFY(result->attributes.contains(QStringLiteral("failure_class")));
+        QVERIFY2(!result->attributes.contains(QStringLiteral("session_id")),
+                 "session_id must never be a metric dimension");
+        QVERIFY2(!result->attributes.contains(QStringLiteral("host_id")),
+                 "host_id must never be a metric dimension");
+        QVERIFY2(!result->attributes.contains(QStringLiteral("user.id")),
+                 "user.id must never be a metric dimension");
+        QVERIFY2(!result->traceId.isEmpty(),
+                 "the top-level trace_id field is what links a fleet metric to its Play (P-3)");
+
+        const ParsedMetric* duration =
+            findMetric(scan, QStringLiteral("seathub.play.step_duration"));
+        QVERIFY2(duration != nullptr, "no seathub.play.step_duration metric reached the listener");
+        QCOMPARE(duration->type, QStringLiteral("distribution"));
+        QVERIFY(duration->attributes.contains(QStringLiteral("step")));
+        QVERIFY(duration->attributes.contains(QStringLiteral("outcome")));
+        QVERIFY2(!duration->attributes.contains(QStringLiteral("failure_class")),
+                 "the duration distribution is dimensioned by step and outcome only");
+    }
+
+    void theKillSwitchesAlsoStopMetricsAndDiagnosticLines()
+    {
+        const QStringList scenarios = { QStringLiteral("kill-no-dsn"),
+                                         QStringLiteral("kill-logs-false"),
+                                         QStringLiteral("kill-signed-out") };
+        for (const QString& scenario : scenarios) {
+            QTemporaryDir dbDir;
+            QVERIFY(dbDir.isValid());
+            QTemporaryDir spoolDir;
+            QVERIFY(spoolDir.isValid());
+            QTemporaryDir runStateDir;
+            QVERIFY(runStateDir.isValid());
+
+            QTcpServer server;
+            QList<QByteArray> envelopes;
+            wireEnvelopeCollector(&server, &envelopes);
+            QVERIFY2(server.listen(QHostAddress::LocalHost, 0),
+                     "the fake Sentry listener must bind 127.0.0.1:0");
+            const QString dsn =
+                QStringLiteral("http://publickey@127.0.0.1:%1/1").arg(server.serverPort());
+
+            QProcess child;
+            child.setProgram(m_appPath);
+            child.setArguments({ QStringLiteral("--diag-child"), scenario, dsn, dbDir.path(),
+                                 m_handlerPath, spoolDir.path(), runStateDir.path() });
+            child.start();
+            QVERIFY2(child.waitForStarted(5000), qPrintable(scenario + " must start"));
+            // Event-loop wait for the same reason as everywhere else in this file: the listener
+            // only reads on the loop (and these children send nothing to read, but a blocked loop
+            // would still be the wrong way to wait for one).
+            QTRY_VERIFY_WITH_TIMEOUT(child.state() != QProcess::Running, 30000);
+            QCOMPARE(child.exitCode(), 0);
+
+            // Anything the SDK was still going to send would be on the wire by the time the
+            // child exits (its own `flush(2000)` runs before it does); a moment longer only
+            // makes the negative claim harder to satisfy, never easier.
+            QTest::qWait(1500);
+            QVERIFY2(envelopes.isEmpty(),
+                     qPrintable(QStringLiteral("%1 still shipped %2 envelope(s)")
+                                    .arg(scenario)
+                                    .arg(envelopes.size())));
+        }
+    }
+
+    void flushDeliversTheLastLineWithinBudget()
+    {
+        QTemporaryDir dbDir;
+        QVERIFY(dbDir.isValid());
+        QTemporaryDir spoolDir;
+        QVERIFY(spoolDir.isValid());
+        QTemporaryDir runStateDir;
+        QVERIFY(runStateDir.isValid());
+
+        QTcpServer server;
+        QList<QByteArray> envelopes;
+        wireEnvelopeCollector(&server, &envelopes);
+        QVERIFY2(server.listen(QHostAddress::LocalHost, 0),
+                 "the fake Sentry listener must bind 127.0.0.1:0");
+        const QString dsn =
+            QStringLiteral("http://publickey@127.0.0.1:%1/1").arg(server.serverPort());
+
+        QProcess child;
+        child.setProgram(m_appPath);
+        child.setArguments({ QStringLiteral("--diag-child"), QStringLiteral("flush"), dsn,
+                             dbDir.path(), m_handlerPath, spoolDir.path(), runStateDir.path() });
+        child.start();
+        QVERIFY2(child.waitForStarted(5000), "the diag-child process must start");
+
+        // The child exits immediately after its own `flush(2000)`, so an envelope can only be
+        // here if the flush put it on the wire - the SDK's own 5 s batcher interval would fire
+        // long after the process is gone (ADR-0072 item 9, V31).
+        QTRY_VERIFY_WITH_TIMEOUT(!envelopes.isEmpty(), 20000);
+        // QTRY, never `waitForFinished()`: the latter blocks this process's event loop, and the
+        // fake Sentry listener only ever reads ON that loop. A child waiting for its envelope to
+        // be acknowledged would then be waiting for a parent that is waiting for it - the two
+        // deadlocking until the timeout below. `state()` flips from the process's own notifier,
+        // which the same event loop delivers, so this wait also lets every envelope in.
+        QTRY_VERIFY_WITH_TIMEOUT(child.state() != QProcess::Running, 20000);
+        QCOMPARE(child.exitCode(), 0);
+
+        const QString report = QString::fromUtf8(child.readAllStandardOutput());
+        const QRegularExpressionMatch match =
+            QRegularExpression(QStringLiteral("FLUSH_MS=(\\d+)")).match(report);
+        QVERIFY2(match.hasMatch(), qPrintable(QStringLiteral("no flush timing in: %1").arg(report)));
+        const qint64 flushMs = match.captured(1).toLongLong();
+        QVERIFY2(flushMs <= 2500,
+                 qPrintable(QStringLiteral("flush(2000) took %1 ms - outside its budget").arg(flushMs)));
+
+        QTRY_VERIFY_WITH_TIMEOUT(hasLog(envelopes, QStringLiteral("play.step")), 10000);
+
+        const EnvelopeScan scan = scanEnvelopes(envelopes);
+        const ParsedLogItem item = findLog(scan, QStringLiteral("play.step"));
+        QVERIFY2(item.found, "the line emitted before the flush never reached the listener");
+    }
+
+    void theLaunchRecordCarriesTheDeliveryHealthAttributes()
+    {
+        QTemporaryDir dbDir;
+        QVERIFY(dbDir.isValid());
+        QTemporaryDir spoolDir;
+        QVERIFY(spoolDir.isValid());
+        QTemporaryDir runStateDir;
+        QVERIFY(runStateDir.isValid());
+
+        QTcpServer server;
+        QList<QByteArray> envelopes;
+        wireEnvelopeCollector(&server, &envelopes);
+        QVERIFY2(server.listen(QHostAddress::LocalHost, 0),
+                 "the fake Sentry listener must bind 127.0.0.1:0");
+        const QString dsn =
+            QStringLiteral("http://publickey@127.0.0.1:%1/1").arg(server.serverPort());
+
+        QProcess child;
+        child.setProgram(m_appPath);
+        child.setArguments({ QStringLiteral("--diag-child"), QStringLiteral("launch"), dsn,
+                             dbDir.path(), m_handlerPath, spoolDir.path(), runStateDir.path() });
+        child.start();
+        QVERIFY2(child.waitForStarted(5000), "the diag-child process must start");
+        QTRY_VERIFY_WITH_TIMEOUT(!envelopes.isEmpty(), 20000);
+        // QTRY, never `waitForFinished()`: the latter blocks this process's event loop, and the
+        // fake Sentry listener only ever reads ON that loop. A child waiting for its envelope to
+        // be acknowledged would then be waiting for a parent that is waiting for it - the two
+        // deadlocking until the timeout below. `state()` flips from the process's own notifier,
+        // which the same event loop delivers, so this wait also lets every envelope in.
+        QTRY_VERIFY_WITH_TIMEOUT(child.state() != QProcess::Running, 20000);
+        QCOMPARE(child.exitCode(), 0);
+
+        QTRY_VERIFY_WITH_TIMEOUT(hasLog(envelopes, QStringLiteral("client.telemetry")), 10000);
+
+        const EnvelopeScan scan = scanEnvelopes(envelopes);
+        const ParsedLogItem item = findLog(scan, QStringLiteral("client.telemetry"));
+        QVERIFY2(item.found, "the launch record never reached the listener");
+
+        int records = 0;
+        for (const ParsedLogItem& log : scan.logs) {
+            if (log.body == QLatin1String("client.telemetry")) {
+                ++records;
+            }
+        }
+        QVERIFY2(records == 1, qPrintable(QStringLiteral("expected one launch record, found %1").arg(records)));
+
+        const QStringList expected = {
+            QStringLiteral("dsn_source"),           QStringLiteral("logs_enabled"),
+            QStringLiteral("signed_in"),            QStringLiteral("crashed_last_run"),
+            QStringLiteral("prev_exit"),            QStringLiteral("spool_lines_adopted"),
+            QStringLiteral("retry_files"),          QStringLiteral("dropped_queue"),
+            QStringLiteral("dropped_spool_age"),    QStringLiteral("cap_reached"),
+        };
+        for (const QString& key : expected) {
+            QVERIFY2(item.attributes.contains(key),
+                     qPrintable(QStringLiteral("the launch record is missing %1").arg(key)));
+        }
+
+        const auto value = [&item](const QString& key) {
+            return item.attributes.value(key).toObject().value(QStringLiteral("value"));
+        };
+        const QString dsnSource = value(QStringLiteral("dsn_source")).toString();
+        QVERIFY2(dsnSource == QLatin1String("cache") || dsnSource == QLatin1String("handout")
+                     || dsnSource == QLatin1String("none"),
+                 qPrintable(QStringLiteral("dsn_source is not one of the three: %1").arg(dsnSource)));
+        QCOMPARE(value(QStringLiteral("prev_exit")).toString(), QStringLiteral("clean"));
+        QVERIFY(value(QStringLiteral("logs_enabled")).toBool());
+        QVERIFY(value(QStringLiteral("signed_in")).toBool());
+        QVERIFY(!value(QStringLiteral("crashed_last_run")).toBool());
+        QVERIFY(value(QStringLiteral("spool_lines_adopted")).toInt() >= 0);
+        QVERIFY(value(QStringLiteral("retry_files")).toInt() >= 0);
+        QVERIFY(value(QStringLiteral("dropped_queue")).toInt() >= 0);
+        QVERIFY(value(QStringLiteral("dropped_spool_age")).toInt() >= 0);
+        QVERIFY(value(QStringLiteral("cap_reached")).toInt() >= 0);
+    }
+
+    void thePlayStepCarriesOnlyAllowListedAttributesAndNeverThePin()
+    {
+        QTemporaryDir dbDir;
+        QVERIFY(dbDir.isValid());
+        QTemporaryDir spoolDir;
+        QVERIFY(spoolDir.isValid());
+        QTemporaryDir runStateDir;
+        QVERIFY(runStateDir.isValid());
+
+        QTcpServer server;
+        QList<QByteArray> envelopes;
+        wireEnvelopeCollector(&server, &envelopes);
+        QVERIFY2(server.listen(QHostAddress::LocalHost, 0),
+                 "the fake Sentry listener must bind 127.0.0.1:0");
+        const QString dsn =
+            QStringLiteral("http://publickey@127.0.0.1:%1/1").arg(server.serverPort());
+
+        QProcess child;
+        child.setProgram(m_appPath);
+        child.setArguments({ QStringLiteral("--diag-child"), QStringLiteral("play-step"), dsn,
+                             dbDir.path(), m_handlerPath, spoolDir.path(), runStateDir.path() });
+        child.start();
+        QVERIFY2(child.waitForStarted(5000), "the diag-child process must start");
+        QTRY_VERIFY_WITH_TIMEOUT(!envelopes.isEmpty(), 20000);
+        // QTRY, never `waitForFinished()`: the latter blocks this process's event loop, and the
+        // fake Sentry listener only ever reads ON that loop. A child waiting for its envelope to
+        // be acknowledged would then be waiting for a parent that is waiting for it - the two
+        // deadlocking until the timeout below. `state()` flips from the process's own notifier,
+        // which the same event loop delivers, so this wait also lets every envelope in.
+        QTRY_VERIFY_WITH_TIMEOUT(child.state() != QProcess::Running, 20000);
+        QCOMPARE(child.exitCode(), 0);
+
+        QTRY_VERIFY_WITH_TIMEOUT(hasLog(envelopes, QStringLiteral("play.step")), 10000);
+
+        const EnvelopeScan scan = scanEnvelopes(envelopes);
+        const ParsedLogItem item = findLog(scan, QStringLiteral("play.step"));
+        QVERIFY2(item.found, "the one failed pair_handshake step never reached the listener");
+
+        int steps = 0;
+        for (const ParsedLogItem& log : scan.logs) {
+            if (log.body == QLatin1String("play.step")) {
+                ++steps;
+            }
+        }
+        QVERIFY2(steps == 1, qPrintable(QStringLiteral("expected one play.step, found %1").arg(steps)));
+
+        // Every key within the ADR-0072 allow-list (item 1/7): SeatHub's own, the keys the
+        // shipper and the SDK attach, and nothing else.
+        const QSet<QString> allowed = {
+            QStringLiteral("step"),           QStringLiteral("outcome"),
+            QStringLiteral("failure_class"),  QStringLiteral("http_status"),
+            QStringLiteral("net_error"),      QStringLiteral("engine_error"),
+            QStringLiteral("engine_stage"),   QStringLiteral("failing_ports"),
+            QStringLiteral("elapsed_ms"),     QStringLiteral("attempt"),
+            QStringLiteral("end_reason"),     QStringLiteral("exit_path"),
+            QStringLiteral("last_step"),      QStringLiteral("reason"),
+            QStringLiteral("session_id"),     QStringLiteral("host_id"),
+            QStringLiteral("seathub.trace_id"), QStringLiteral("seathub.logged_at"),
+            QStringLiteral("user.id"),
+        };
+        for (const QString& key : item.attributes.keys()) {
+            QVERIFY2(allowed.contains(key) || key.startsWith(QLatin1String("sentry."))
+                         || key.startsWith(QLatin1String("os.")),
+                     qPrintable(QStringLiteral("play.step attribute outside the allow-list: %1").arg(key)));
+        }
+        QCOMPARE(item.attributes.value(QStringLiteral("step")).toObject()
+                     .value(QStringLiteral("value")).toString(),
+                 QStringLiteral("pair_handshake"));
+        QCOMPARE(item.attributes.value(QStringLiteral("failure_class")).toObject()
+                     .value(QStringLiteral("value")).toString(),
+                 QStringLiteral("pin_rejected"));
+
+        // The child built an `engineError` holding the PIN sentinel `4821`; the emission never
+        // receives it, so not one byte of it may appear anywhere in what was sent
+        // (ADR-0072 item 2, T-06.7-35). The wider hostile fixture over every emitter is plan 22.
+        for (const QByteArray& envelope : envelopes) {
+            QVERIFY2(!envelope.contains("4821"),
+                     "the PIN sentinel reached the envelope bytes");
+        }
+    }
+
 private:
     QTemporaryDir m_handlerDir;
     QString m_handlerPath;
@@ -1203,6 +1857,9 @@ int main(int argc, char* argv[])
     }
     if (argc > 1 && std::strcmp(argv[1], "--logs-child") == 0) {
         return runLogsChild(argc, argv);
+    }
+    if (argc > 1 && std::strcmp(argv[1], "--diag-child") == 0) {
+        return runDiagChild(argc, argv);
     }
 
     QCoreApplication app(argc, argv);

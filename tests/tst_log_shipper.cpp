@@ -621,6 +621,108 @@ private slots:
         QVERIFY(LogShipper::instance().shippedBytesForTests() <= LogShipper::kShippedBytesPerRun);
     }
 
+    void diagnosticLinesSurviveTheSpoolWithAttributesAndOldLinesStillRead()
+    {
+        // (1) The diagnostic lane's own fields survive the spool, and a line written by the
+        // release BEFORE this one - no `attrs`, no `diagnostic` key, which is exactly what
+        // `appendRawSpoolLine()` writes - still reads back as the ordinary line it is.
+        QTemporaryDir spoolDir;
+        QVERIFY(spoolDir.isValid());
+        {
+            LogSpool spool(spoolDir.path());
+            ShippedLine diagnostic;
+            diagnostic.level = LogLevel::Warning;
+            diagnostic.body = QStringLiteral("play.step");
+            diagnostic.loggedAt = epochSecondsNow();
+            diagnostic.diagnostic = true;
+            diagnostic.attrs.insert(QStringLiteral("step"), QStringLiteral("pair_handshake"));
+            diagnostic.attrs.insert(QStringLiteral("attempt"), 2);
+            spool.append(diagnostic);
+        }
+        appendRawSpoolLine(spoolDir.path(), QStringLiteral("old-release-line"), epochSecondsNow());
+
+        {
+            LogSpool spool(spoolDir.path());
+            const QList<ShippedLine> lines = spool.takeAll();
+            QCOMPARE(lines.size(), 2);
+
+            const ShippedLine& diagnostic = lines.at(0);
+            QVERIFY2(diagnostic.diagnostic, "the diagnostic flag did not survive the spool");
+            QCOMPARE(diagnostic.body, QStringLiteral("play.step"));
+            QCOMPARE(diagnostic.attrs.value(QStringLiteral("step")).toString(),
+                     QStringLiteral("pair_handshake"));
+            QCOMPARE(diagnostic.attrs.value(QStringLiteral("attempt")).toInt(), 2);
+
+            const ShippedLine& old = lines.at(1);
+            QVERIFY2(!old.diagnostic, "a line from the previous release must not read as a diagnostic");
+            QVERIFY(old.attrs.isEmpty());
+            QCOMPARE(old.body, QStringLiteral("old-release-line"));
+        }
+
+        // (2) Past the 8 MiB byte cap an ordinary line is dropped in silence - a diagnostic line
+        // is exempt: it was already bounded by count at enqueue, and the byte cap would silence
+        // exactly the structured record of what failed.
+        {
+            QTemporaryDir capDir;
+            QVERIFY(capDir.isValid());
+            StubHandOff stub;
+            StopShipperOnScopeExit stopGuard;
+
+            LogShipper::instance().setSpoolDirectoryForTests(capDir.path());
+            LogShipper::instance().start([&stub](const ShippedLine& line) { return stub(line); });
+            LogShipper::instance().setCanShip(true);
+
+            const QString bigBody(500 * 1024, QLatin1Char('y'));
+            for (int i = 0; i < 17; ++i) {
+                qInfo().noquote() << QStringLiteral("big-line-%1 %2").arg(i).arg(bigBody);
+            }
+            qInfo() << "after-byte-cap";
+            QTRY_VERIFY_WITH_TIMEOUT(stub.countMatching(QStringLiteral("log cap reached")) >= 1,
+                                     10000);
+            QCOMPARE(stub.countMatching(QStringLiteral("after-byte-cap")), 0);
+            QCOMPARE(LogShipper::instance().capReachedCount(), 1);
+
+            QJsonObject attributes;
+            attributes.insert(QStringLiteral("step"), QStringLiteral("pair_handshake"));
+            attributes.insert(QStringLiteral("failure_class"), QStringLiteral("pin_rejected"));
+            LogShipper::instance().enqueueDiagnostic(QStringLiteral("play.step"),
+                                                     LogLevel::Warning, attributes);
+
+            QTRY_VERIFY_WITH_TIMEOUT(
+                stub.countMatching(QStringLiteral("play.step")) == 1, 5000);
+        }
+
+        // (3) The lane's own per-run bound: 1,000 diagnostics, then silence, with the trip
+        // counted once - the launch record's `cap_reached` is what a reader sees (V30).
+        {
+            QTemporaryDir capDir;
+            QVERIFY(capDir.isValid());
+            StubHandOff stub;
+            StopShipperOnScopeExit stopGuard;
+
+            LogShipper::instance().setSpoolDirectoryForTests(capDir.path());
+            LogShipper::instance().start([&stub](const ShippedLine& line) { return stub(line); });
+            LogShipper::instance().setCanShip(true);
+            // Hold the worker so the whole burst is enqueued before a single line is handled -
+            // the cap is an ENQUEUE bound, and this is the only way to see it trip at once.
+            LogShipper::instance().holdWorkerForTests(true);
+
+            QJsonObject attributes;
+            attributes.insert(QStringLiteral("step"), QStringLiteral("pair_handshake"));
+            for (int i = 0; i < 1005; ++i) {
+                LogShipper::instance().enqueueDiagnostic(QStringLiteral("play.step"),
+                                                         LogLevel::Warning, attributes);
+            }
+            QCOMPARE(LogShipper::instance().capReachedCount(), 1);
+
+            LogShipper::instance().holdWorkerForTests(false);
+            QTRY_VERIFY_WITH_TIMEOUT(stub.countMatching(QStringLiteral("play.step")) >= 1000,
+                                     20000);
+            QTest::qWait(300);
+            QCOMPARE(stub.countMatching(QStringLiteral("play.step")), 1000);
+        }
+    }
+
 private:
     QString m_appPath;
 };

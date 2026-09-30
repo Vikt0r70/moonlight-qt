@@ -1247,6 +1247,46 @@ private slots:
         QCOMPARE(seam.lastResult().engineError, QStringLiteral("the rig rejected the pairing PIN"));
     }
 
+    void theEndBodyCarriesTheAttemptStepAndNoOtherNewField()
+    {
+        // ADR-0072 item 1 / plan 09: the classified step is the ONE thing this plan sends to the
+        // server - `attempt_step` on `POST /api/sessions/{id}/end` (contract 3.8.0) - and only
+        // when the client classified one. `buildEndRequest` is the exact builder `endSession()`
+        // posts, so what it produces here is what the wire carries.
+        EndReport report;
+        report.stage = QStringLiteral("pairing");
+        report.attemptStep = QStringLiteral("pair_handshake");
+
+        const QJsonObject object =
+            QJsonDocument::fromJson(ControlPlaneClient::buildEndRequest(true, report)).object();
+        QCOMPARE(object.value(QStringLiteral("attempt_step")).toString(),
+                 QStringLiteral("pair_handshake"));
+        QCOMPARE(object.value(QStringLiteral("failed")).toBool(), true);
+        QCOMPARE(object.value(QStringLiteral("stage")).toString(), QStringLiteral("pairing"));
+
+        // No OTHER field joined the body: the key set is exactly the report's own known fields
+        // plus `attempt_step`. The failure class never travels (D-12) - it stays in Sentry.
+        QStringList keys = object.keys();
+        keys.sort();
+        QStringList expected{ QStringLiteral("attempt_step"), QStringLiteral("failed"),
+                              QStringLiteral("stage") };
+        expected.sort();
+        QCOMPARE(keys, expected);
+
+        // An unclassified failure - the controller's own deadline, or a control-plane refusal -
+        // leaves the field out entirely: an absent field is not the same as an empty or a guessed
+        // one on this leniently-parsed body.
+        EndReport unclassified;
+        unclassified.stage = QStringLiteral("pairing");
+        const QJsonObject without = QJsonDocument::fromJson(
+            ControlPlaneClient::buildEndRequest(true, unclassified)).object();
+        QVERIFY2(!without.contains(QStringLiteral("attempt_step")),
+                 "a step the client never classified must not be invented on the wire");
+
+        // And a customer-initiated end still posts no body at all (contract 3.3.0).
+        QVERIFY(ControlPlaneClient::buildEndRequest(false, report).isEmpty());
+    }
+
     void seamSupersededRun_noClearNoRetry_droppedResult()
     {
         ProductionPairingSeam seam;
