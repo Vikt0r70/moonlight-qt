@@ -161,6 +161,34 @@ class TstStreamStats : public QObject
     Q_OBJECT
 
 private slots:
+    void aSimulatedHourStaysInsideTheDiagnosticBudget()
+    {
+        rollupLogs.clear(); rollupMetrics.clear(); qualityLogs.clear();
+        qint64 now = 0;
+        StreamQualitySampler sampler(nullptr, [&]() { return now; });
+        sampler.start(QStringLiteral("hour"));
+        VideoStats stats;
+        stats.renderedFps = OptionalMetric::of(60);
+        stats.rttMs = OptionalMetric::of(23);
+        QTimer* timer = sampler.findChild<QTimer*>();
+        QVERIFY(timer);
+        for (int second = 1; second <= 3600; ++second) {
+            now = second * 1000;
+            sampler.feed(stats);
+            // Frequent engine transitions stress suppression independently of rollup cadence.
+            sampler.noteConnectionStatus(second % 2);
+            if (second % 60 == 0) QVERIFY(QMetaObject::invokeMethod(timer, "timeout", Qt::DirectConnection));
+        }
+        sampler.finish();
+        QCOMPARE(rollupLogs.size(), 60);
+        QCOMPARE(rollupMetrics.size(), 60);
+        int bad = 0;
+        for (const auto& log : qualityLogs) if (log.body == QLatin1String("stream.quality_bad")) ++bad;
+        QCOMPARE(bad, 20);
+        QVERIFY(rollupLogs.size() + qualityLogs.size() + 1 < 1000);
+        QCOMPARE(sampler.rollups(), 60);
+    }
+
     void poorStateEmitsQualityBadAtOnceAndOkOnRecovery()
     {
         qualityLogs.clear();

@@ -393,6 +393,33 @@ int runDiagChild(int argc, char* argv[])
         SeatHubTelemetry::emitStepMetric(step, outcome, failureClass, 23.0);
     };
 
+    const auto emitStreamDiagnostics = []() {
+        qint64 now = 0;
+        StreamQualitySampler sampler(nullptr, [&]() { return now; });
+        sampler.start(QStringLiteral("diagnostic-play"));
+        VideoStats stats;
+        stats.renderedFps = OptionalMetric::of(59.0);
+        stats.networkDroppedFramePct = OptionalMetric::of(0.42);
+        stats.jitterDroppedFramePct = OptionalMetric::of(0.10);
+        stats.rttMs = OptionalMetric::of(23.0);
+        stats.decodeTimeMs = OptionalMetric::of(3.21);
+        stats.queueTimeMs = OptionalMetric::of(1.05);
+        stats.renderTimeMs = OptionalMetric::of(2.77);
+        stats.hostProcessingAvgMs = OptionalMetric::of(1.6);
+        stats.videoWidth = OptionalMetric::of(1920); stats.videoHeight = OptionalMetric::of(1080);
+        for (int i = 0; i < 60; ++i) { now = i * 1000; sampler.feed(stats); }
+        sampler.noteConnectionStatus(1);
+        now = 60000;
+        sampler.noteConnectionStatus(0);
+        sampler.finish();
+        SeatHubTelemetry::emitDiagnostic(QStringLiteral("play.summary"), LogLevel::Info,
+            {{"exit_path", "ended"}, {"outcome", "ok"}, {"last_step", "stream"},
+             {"failure_class", "graceful"}, {"t_first_frame_ms", 23}, {"stream_s", 60},
+             {"rollups", sampler.rollups()}, {"bad_episodes", sampler.badEpisodes()},
+             {"bad_seconds", sampler.badSeconds()}, {"sampling_gap_s", sampler.samplingGapS()},
+             {"reconnects", 0}, {"cfg_res", "1920x1080"}, {"cfg_fps", 60}, {"cfg_bitrate_kbps", 20000}});
+    };
+
     if (scenario == QLatin1String("rollup") || scenario == QLatin1String("rollup-no-rtt")) {
         StreamQualitySampler sampler;
         sampler.setWindowMs(40);
@@ -502,11 +529,16 @@ int runDiagChild(int argc, char* argv[])
         }
         emitStep(QStringLiteral("pair_handshake"), QStringLiteral("ok"),
                  QStringLiteral("in_progress"), 2);
+        emitStreamDiagnostics();
         SeatHubTelemetry::noteLaunch();
     }
     else if (scenario == QLatin1String("offline-queue")) {
+        QElapsedTimer emission;
+        emission.start();
         emitStep(QStringLiteral("pair_handshake"), QStringLiteral("failed"),
                  QStringLiteral("pin_rejected"));
+        emitStreamDiagnostics();
+        fprintf(stdout, "EMISSION_MS=%lld\n", static_cast<long long>(emission.elapsed()));
     }
     else if (scenario == QLatin1String("offline-drain")) {
         // Startup adopts the previous process's spool before this scenario reaches the exit drain.
@@ -521,6 +553,7 @@ int runDiagChild(int argc, char* argv[])
         SeatHubTelemetry::emitStepMetric(QStringLiteral("pair_handshake"),
                                          QStringLiteral("failed"),
                                          QStringLiteral("pin_rejected"), 812.0);
+        emitStreamDiagnostics();
     }
 
     LogShipper::instance().drainBeforeSignOut();
@@ -2169,6 +2202,13 @@ private slots:
             {QStringLiteral("teardown"), {QStringLiteral("failed_net"), QStringLiteral("failed_api"),
                 QStringLiteral("failed_auth"), QStringLiteral("failed_local"), QStringLiteral("ok")}},
         };
+        const QSet<QString> streamLogKeys = {
+            "n", "coverage_pct", "dropped_samples", "partial", "res", "fps_avg", "fps_min",
+            "net_drop_avg", "net_drop_p95", "jitter_drop_avg", "jitter_drop_p95", "rtt_avg", "rtt_p95",
+            "decode_avg", "decode_p95", "queue_avg", "queue_p95", "render_avg", "render_p95",
+            "host_avg", "host_p95", "backlog_spool_lines", "backlog_retry_files", "bad_s",
+            "stream_s", "reconnects", "rollups", "bad_episodes", "bad_seconds", "sampling_gap_s",
+            "cfg_res", "cfg_fps", "cfg_bitrate_kbps", "t_first_frame_ms"};
         const QSet<QString> allowedLogKeys = {
             QStringLiteral("step"), QStringLiteral("outcome"), QStringLiteral("failure_class"),
             QStringLiteral("http_status"), QStringLiteral("net_error"),
@@ -2191,6 +2231,22 @@ private slots:
             QStringLiteral("CLIENT_ABSENT")};
         for (const ParsedLogItem& log : scan.logs) {
             if (log.body != QLatin1String("play.step")) {
+                if (log.body == QLatin1String("stream.rollup") || log.body == QLatin1String("stream.quality_bad")
+                    || log.body == QLatin1String("stream.quality_ok") || log.body == QLatin1String("play.summary")) {
+                    for (const auto& key : log.attributes.keys()) {
+                        QVERIFY2(allowedLogKeys.contains(key) || streamLogKeys.contains(key)
+                            || key.startsWith("sentry.") || key.startsWith("os."), qPrintable(key));
+                    }
+                    if (log.body == QLatin1String("play.summary")) {
+                        QCOMPARE(log.attributes.value("exit_path").toObject().value("value").toString(), QStringLiteral("ended"));
+                        QCOMPARE(log.attributes.value("outcome").toObject().value("value").toString(), QStringLiteral("ok"));
+                        QCOMPARE(log.attributes.value("last_step").toObject().value("value").toString(), QStringLiteral("stream"));
+                        QCOMPARE(log.attributes.value("failure_class").toObject().value("value").toString(), QStringLiteral("graceful"));
+                    }
+                    if (log.body.startsWith("stream.quality_")) {
+                        QCOMPARE(log.attributes.value("reason").toObject().value("value").toString(), QStringLiteral("engine_poor"));
+                    }
+                }
                 continue;
             }
             for (const QString& key : log.attributes.keys()) {
@@ -2226,7 +2282,8 @@ private slots:
         for (const ParsedMetric& metric : scan.metrics) {
             QVERIFY(metric.name == QLatin1String("seathub.play.step_result")
                     || metric.name == QLatin1String("seathub.play.step_duration")
-                    || metric.name == QLatin1String("seathub.client.launch"));
+                    || metric.name == QLatin1String("seathub.client.launch")
+                    || metric.name.startsWith(QLatin1String("seathub.stream.")));
             for (const QString& key : metric.attributes.keys()) {
                 QVERIFY2(allowedMetricKeys.contains(key) || key.startsWith(QLatin1String("sentry."))
                              || key.startsWith(QLatin1String("os.")),
@@ -2317,6 +2374,11 @@ private slots:
         QTRY_VERIFY_WITH_TIMEOUT(offlineChild.state() != QProcess::Running, 20000);
         QCOMPARE(offlineChild.exitStatus(), QProcess::NormalExit);
         QCOMPARE(offlineChild.exitCode(), 0);
+        const QByteArray offlineOutput = offlineChild.readAllStandardOutput();
+        const QRegularExpression emitted(QStringLiteral("EMISSION_MS=(\\d+)"));
+        const auto emissionMatch = emitted.match(QString::fromUtf8(offlineOutput));
+        QVERIFY(emissionMatch.hasMatch());
+        QVERIFY(emissionMatch.captured(1).toLongLong() < 2000);
         const QStringList queuedFiles =
             QDir(spoolDir.path()).entryList({QStringLiteral("spool-*.jsonl")}, QDir::Files);
         QVERIFY2(!queuedFiles.isEmpty(),
