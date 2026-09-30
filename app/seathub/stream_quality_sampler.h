@@ -6,6 +6,7 @@
 #include <QObject>
 #include <QTimer>
 #include <atomic>
+#include <functional>
 
 // ADR-0072: bounded render-thread feed; timer/emission on the network thread.
 class StreamQualitySampler : public QObject
@@ -19,7 +20,8 @@ public:
     static constexpr int kRttOutCount = 10;
     static constexpr int kBadCapPerPlay = 20;
     static constexpr int kBadSpacingMs = 30000;
-    explicit StreamQualitySampler(QObject* parent = nullptr);
+    using Clock = std::function<qint64()>;
+    explicit StreamQualitySampler(QObject* parent = nullptr, Clock clock = {});
     void setWindowMs(int ms);
     void start(const QString& sessionId);
     void finish();
@@ -28,6 +30,9 @@ public:
     // Snapshot and detach under the mutex; aggregation happens outside it.
     QJsonObject takeWindow(bool partial);
     int rollups() const { return m_rollups.load(); }
+    int badEpisodes() const { return 0; }
+    double badSeconds() const { return 0; }
+    double samplingGapS() const { return 0; }
 signals:
     void rollupEmitted();
 private:

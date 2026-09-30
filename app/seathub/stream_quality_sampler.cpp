@@ -52,7 +52,7 @@ QJsonObject aggregate(const QVector<VideoStats>& samples, int dropped, bool part
 }
 }
 
-StreamQualitySampler::StreamQualitySampler(QObject* parent)
+StreamQualitySampler::StreamQualitySampler(QObject* parent, Clock)
     : QObject(parent), m_timer(new QTimer(this))
 {
     m_buffer.reserve(kMaxSamplesPerWindow);
