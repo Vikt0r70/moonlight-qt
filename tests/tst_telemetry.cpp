@@ -352,7 +352,8 @@ int runDiagChild(int argc, char* argv[])
     handout.logs = scenario != QLatin1String("kill-logs-false");
     SeatHubTelemetry::applyHandout(handout);
 
-    if (scenario != QLatin1String("kill-signed-out")) {
+    if (scenario != QLatin1String("kill-signed-out")
+        && scenario != QLatin1String("offline-queue")) {
         SeatHubTelemetry::setUser(QStringLiteral("acct-diag-child"));
     }
 
@@ -470,6 +471,7 @@ int runDiagChild(int argc, char* argv[])
     }
     else if (scenario == QLatin1String("offline-drain")) {
         // Startup adopts the previous process's spool before this scenario reaches the exit drain.
+        SeatHubTelemetry::noteLaunch();
     }
     else if (scenario.startsWith(QLatin1String("kill-"))) {
         // Both lanes at once: the kill switch has to reach the diagnostic line (the shipper's
@@ -2192,6 +2194,14 @@ private slots:
         QTRY_VERIFY_WITH_TIMEOUT(offlineChild.state() != QProcess::Running, 20000);
         QCOMPARE(offlineChild.exitStatus(), QProcess::NormalExit);
         QCOMPARE(offlineChild.exitCode(), 0);
+        const QStringList queuedFiles =
+            QDir(spoolDir.path()).entryList({QStringLiteral("spool-*.jsonl")}, QDir::Files);
+        QVERIFY2(!queuedFiles.isEmpty(),
+                 "the offline process must persist its diagnostic before exiting");
+        QFile queuedFile(QDir(spoolDir.path()).filePath(queuedFiles.first()));
+        QVERIFY(queuedFile.open(QIODevice::ReadOnly));
+        QVERIFY2(queuedFile.readAll().contains("play.step"),
+                 "the persisted offline line must be the expected diagnostic");
 
         QTcpServer server;
         QList<QByteArray> envelopes;
@@ -2210,6 +2220,11 @@ private slots:
         QTRY_VERIFY_WITH_TIMEOUT(drainChild.state() != QProcess::Running, 20000);
         QCOMPARE(drainChild.exitStatus(), QProcess::NormalExit);
         QCOMPARE(drainChild.exitCode(), 0);
+        const ParsedLogItem launch = findLog(scanEnvelopes(envelopes), QStringLiteral("client.telemetry"));
+        QVERIFY2(launch.found, "the drain process must report its adoption snapshot");
+        const int adopted = launch.attributes.value(QStringLiteral("spool_lines_adopted"))
+                                .toObject().value(QStringLiteral("value")).toInt();
+        QVERIFY2(adopted >= 1, "the second process must adopt the prior spool file");
         QVERIFY2(hasLog(envelopes, QStringLiteral("play.step")),
                  "the next process did not deliver the prior offline play.step");
     }
