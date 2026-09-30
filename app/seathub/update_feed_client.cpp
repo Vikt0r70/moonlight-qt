@@ -230,6 +230,14 @@ bool UpdateFeedClient::verifyFileChecksum(const QString& path, const QString& ex
 }
 
 // ------------------------------------------------------------------------------------- checks
+bool UpdateFeedClient::mandatory() const { return false; }
+bool UpdateFeedClient::optionalOffer() const { return false; }
+QString UpdateFeedClient::nextAttemptText() const { return {}; }
+QString UpdateFeedClient::manualDownloadUrl() const { return {}; }
+QString UpdateFeedClient::installerArguments(const QString&, int) { return {}; }
+void UpdateFeedClient::dismissOptional() {}
+bool UpdateFeedClient::openManualDownload() { return false; }
+bool UpdateFeedClient::tryAgain() { return false; }
 
 bool UpdateFeedClient::checkForUpdates()
 {

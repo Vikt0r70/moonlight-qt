@@ -28,8 +28,12 @@ win32: LIBS += -lshell32
 
 SOURCES += tst_update_feed.cpp \
     ../app/seathub/update_feed_client.cpp \
+    ../app/seathub/update_retry_state.cpp \
+    ../app/seathub/install_journal.cpp \
     ../app/seathub/error_map.cpp
 
 HEADERS += ../app/seathub/update_feed_client.h \
+    ../app/seathub/update_retry_state.h \
+    ../app/seathub/install_journal.h \
     ../app/seathub/error_map.h \
     ../app/seathub/seathub_version.h

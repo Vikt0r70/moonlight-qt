@@ -3,6 +3,9 @@
 #include <QObject>
 #include <QString>
 #include <QVariantMap>
+#include <QUrl>
+#include "update_retry_state.h"
+#include "install_journal.h"
 
 #include <functional>
 
@@ -47,6 +50,11 @@ class UpdateFeedClient : public QObject
     Q_PROPERTY(bool blockedBySession READ blockedBySession NOTIFY blockedBySessionChanged)
     /// True once a verified package is on disk and waiting to be run.
     Q_PROPERTY(bool readyToInstall READ readyToInstall NOTIFY readyToInstallChanged)
+    Q_PROPERTY(bool mandatory READ mandatory NOTIFY availableUpdateChanged)
+    Q_PROPERTY(bool optionalOffer READ optionalOffer NOTIFY availableUpdateChanged)
+    Q_PROPERTY(bool exhausted READ exhausted NOTIFY retryChanged)
+    Q_PROPERTY(QString nextAttemptText READ nextAttemptText NOTIFY retryChanged)
+    Q_PROPERTY(QString manualDownloadUrl READ manualDownloadUrl NOTIFY availableUpdateChanged)
 
 public:
     explicit UpdateFeedClient(QObject* parent = nullptr);
@@ -85,6 +93,23 @@ public:
     /// Runs by itself once a download verifies (one press, D-41). Callers only need it to retry
     /// a launch that failed - a declined UAC prompt - while the verified package is still on disk.
     Q_INVOKABLE bool installDownloaded();
+    Q_INVOKABLE void dismissOptional();
+    Q_INVOKABLE bool openManualDownload();
+    Q_INVOKABLE bool tryAgain();
+    bool mandatory() const;
+    bool optionalOffer() const;
+    bool exhausted() const { return m_retry.exhausted(); }
+    QString nextAttemptText() const;
+    QString manualDownloadUrl() const;
+    static QString installerArguments(const QString& installed, int attempt);
+    using UrlOpener = std::function<bool(const QUrl&)>;
+    void setUrlOpener(UrlOpener opener) { m_urlOpener = std::move(opener); }
+    using InstallerReporter = std::function<bool(const InstallJournalRecord&)>;
+    void setInstallerReporter(InstallerReporter reporter) { m_reporter = std::move(reporter); }
+    void setRetryStatePath(const QString& path) { m_retryStatePath = path; m_retry = UpdateRetryState::load(path); }
+    void setJournalFolder(const QString& folder) { m_journalFolder = folder; }
+    void setRetryClock(std::function<QDateTime()> clock) { m_retry.setClock(std::move(clock)); }
+    UpdateRetryState retryState() const { return m_retry; }
 
     QString state() const { return m_state; }
     QVariantMap availableUpdate() const { return m_available; }
@@ -121,6 +146,7 @@ signals:
     void blockedBySessionChanged();
     void readyToInstallChanged();
     void checkFinished();
+    void retryChanged();
     /// Emitted after a verified download. The client starts the installer itself straight after;
     /// nothing has to answer this for the update to proceed.
     void verified(QString version, QString path);
@@ -156,4 +182,9 @@ private:
     int m_progress = 0;
     QVariantMap m_available;
     QVariantMap m_failure;
+    UpdateRetryState m_retry;
+    QString m_retryStatePath = UpdateRetryState::defaultPath(), m_journalFolder;
+    bool m_optionalDismissed = false, m_manualAttempt = false;
+    UrlOpener m_urlOpener;
+    InstallerReporter m_reporter;
 };

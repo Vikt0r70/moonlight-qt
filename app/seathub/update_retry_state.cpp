@@ -60,3 +60,10 @@ void UpdateRetryState::rememberReport(const QString& id)
     // V37 / ADR-0070 item 6: persist only the last 16 handed-off attempt ids.
     while (reportedIds.size() > 16) reportedIds.removeFirst();
 }
+qint64 UpdateRetryState::nextDelayFor(int) const { return -1; }
+void UpdateRetryState::noteFailure(const QString&, bool, bool, bool) {}
+void UpdateRetryState::noteDecline() {}
+void UpdateRetryState::noteSuccess() {}
+bool UpdateRetryState::automaticAttemptAllowed(const QDateTime&, bool) const { return false; }
+bool UpdateRetryState::exhausted() const { return false; }
+bool UpdateRetryState::reset(const QString&, const QString&) { return false; }

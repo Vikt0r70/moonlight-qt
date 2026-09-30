@@ -17,6 +17,8 @@
 #include <QDir>
 #include <QFile>
 #include <QFont>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QQmlComponent>
 #include <QQmlEngine>
 #include <QQuickItem>
@@ -170,6 +172,11 @@ private slots:
     void aVerifiedDownloadStartsTheInstallerWithoutASecondPress();
     void aFailedLaunchIsShownAndTryAgainRetriesTheLaunch();
     void forcedUpdateModalOnlySaysStartingWhileTheInstallerIsLaunched();
+    void releaseFloorIsNumericAndNullMeansMandatory();
+    void additiveInstallerArgumentsAreExact();
+    void optionalFailureAndManualUrlStayAboveTheFloor();
+    void aPendingLaunchInfersNoResultAndRetriesOnlyOnNextLaunch();
+    void integrityExhaustionIsReportedOnceAcrossRestart();
 
 private:
     QTemporaryDir m_dir;
@@ -604,6 +611,113 @@ void TstUpdateFeed::forcedUpdateModalOnlySaysStartingWhileTheInstallerIsLaunched
     QMetaObject::invokeMethod(action, "clicked");
     QCOMPARE(updates.downloads(), downloadsBefore + 1);
     QCOMPARE(updates.installs(), installsBefore + 1);
+}
+
+void TstUpdateFeed::releaseFloorIsNumericAndNullMeansMandatory()
+{
+    auto row = QJsonDocument::fromJson(feedRow("0.10.0")).object();
+    row.insert("min_version", "0.9.0");
+    QCOMPARE(UpdateFeedClient::parseRelease(QJsonDocument(row).toJson(), "0.8.0", {})
+                 .value("mandatory").toBool(), true);
+    QCOMPARE(UpdateFeedClient::parseRelease(QJsonDocument(row).toJson(), "0.9.0", {})
+                 .value("mandatory").toBool(), false);
+    QCOMPARE(UpdateFeedClient::parseRelease(QJsonDocument(row).toJson(), "0.9.9", {})
+                 .value("mandatory").toBool(), false);
+    row.insert("min_version", QJsonValue::Null);
+    QVERIFY(UpdateFeedClient::parseRelease(QJsonDocument(row).toJson(), "0.9.9", {})
+                .value("mandatory").toBool());
+    row.remove("min_version");
+    QVERIFY(UpdateFeedClient::parseRelease(QJsonDocument(row).toJson(), "0.9.9", {})
+                .value("mandatory").toBool());
+}
+void TstUpdateFeed::additiveInstallerArgumentsAreExact()
+{
+    QCOMPARE(UpdateFeedClient::installerArguments("0.1.24", 3),
+             QString("SeatHubFromVersion=0.1.24 SeatHubAttempt=3"));
+}
+namespace {
+QString writeLocalFeed(const QString& folder, const QString& url, const QString& floor,
+                       const QString& digest = QString::fromLatin1(kAbcSha256))
+{
+    QDir().mkpath(folder + "/api/releases");
+    QFile file(folder + "/api/releases/client");
+    if (!file.open(QIODevice::WriteOnly)) return {};
+    const QJsonObject row{{"version", "0.2.0"}, {"url", url}, {"min_version", floor}, {"sha256", digest}};
+    if (file.write(QJsonDocument(row).toJson()) <= 0) return {};
+    return QUrl::fromLocalFile(folder).toString();
+}
+}
+void TstUpdateFeed::optionalFailureAndManualUrlStayAboveTheFloor()
+{
+    QTemporaryDir dir; QVERIFY(dir.isValid());
+    const auto package = writeAbcPackage(dir.path(), "optional.exe");
+    UpdateFeedClient client; client.setRetryStatePath(dir.filePath("retry-state.json"));
+    client.setInstalledVersion("0.1.0");
+    client.setBaseUrl(writeLocalFeed(dir.path(), QUrl::fromLocalFile(package).toString(), "0.1.0"));
+    client.setInstallerLauncher([](const QString&){ return false; });
+    QVERIFY(client.checkForUpdates()); QTRY_COMPARE(client.state(), QString("available"));
+    QVERIFY(!client.mandatory()); QVERIFY(client.optionalOffer());
+    QVERIFY(client.downloadUpdate()); QTRY_COMPARE(client.state(), QString("failed"));
+    QVERIFY(!client.mandatory()); QVERIFY(!client.optionalOffer());
+    QCOMPARE(client.retryState().attemptsFailed, 0); QCOMPARE(client.retryState().declines, 1);
+    const auto trusted = QString("https://api-sevenhills.damra.co/releases/client/SeatHub.exe");
+    client.setBaseUrl(writeLocalFeed(dir.path(), trusted, "0.1.0"));
+    int opened = 0;
+    client.setUrlOpener([&](const QUrl& url){ ++opened; return url.toString() == trusted; });
+    QVERIFY(client.checkForUpdates()); QTRY_COMPARE(client.state(), QString("available"));
+    QCOMPARE(client.manualDownloadUrl(), trusted); QVERIFY(client.openManualDownload()); QCOMPARE(opened, 1);
+    for (const auto& hostile : QStringList{"http://api-sevenhills.damra.co/a", "file:///C:/private",
+                                         "https://evil.invalid/a", "https://api-sevenhills.damra.co.evil.invalid/a"}) {
+        client.setBaseUrl(writeLocalFeed(dir.path(), hostile, "0.1.0"));
+        QVERIFY(client.checkForUpdates()); QTRY_COMPARE(client.state(), QString("available"));
+        QVERIFY(client.manualDownloadUrl().isEmpty()); QVERIFY(!client.openManualDownload());
+    }
+    QCOMPARE(opened, 1);
+    client.dismissOptional(); QVERIFY(!client.optionalOffer());
+}
+void TstUpdateFeed::aPendingLaunchInfersNoResultAndRetriesOnlyOnNextLaunch()
+{
+    QTemporaryDir dir; QVERIFY(dir.isValid());
+    const auto path = dir.filePath("retry-state.json");
+    UpdateRetryState pending; pending.target = "0.2.0"; pending.launched = true; QVERIFY(pending.save(path));
+    UpdateFeedClient client; client.setRetryStatePath(path); client.setInstalledVersion("0.1.0");
+    client.setJournalFolder(dir.filePath("no-journal"));
+    const auto package = writeAbcPackage(dir.path(), "no-result.exe");
+    client.setBaseUrl(writeLocalFeed(dir.path(), QUrl::fromLocalFile(package).toString(), "0.2.0"));
+    int reports = 0, launches = 0; bool durableAtLaunch = false;
+    client.setInstallerReporter([&](const InstallJournalRecord& r){
+        if (r.failureClass == "installer.no_result") ++reports;
+        return true;
+    });
+    client.setInstallerLauncher([&](const QString&){
+        ++launches; durableAtLaunch = UpdateRetryState::load(path).launched; return false;
+    });
+    QVERIFY(client.checkForUpdates()); QTRY_COMPARE(launches, 1);
+    QVERIFY(durableAtLaunch); QCOMPARE(reports, 1);
+    QCOMPARE(client.retryState().attemptsFailed, 1); QCOMPARE(client.retryState().declines, 1);
+    QVERIFY(!UpdateRetryState::load(path).launched);
+    QVERIFY(client.checkForUpdates()); QTRY_VERIFY(client.state() != "checking");
+    QCOMPARE(reports, 1); QCOMPARE(launches, 1); // declined elevation pauses this launch.
+}
+void TstUpdateFeed::integrityExhaustionIsReportedOnceAcrossRestart()
+{
+    QTemporaryDir dir; QVERIFY(dir.isValid());
+    const auto path = dir.filePath("retry-state.json");
+    const auto package = writeAbcPackage(dir.path(), "missing-digest.exe");
+    const auto base = writeLocalFeed(dir.path(), QUrl::fromLocalFile(package).toString(), "0.2.0", {});
+    int reports = 0;
+    for (int launch = 0; launch < 2; ++launch) {
+        UpdateFeedClient client; client.setRetryStatePath(path); client.setInstalledVersion("0.1.0");
+        client.setBaseUrl(base);
+        client.setInstallerReporter([&](const InstallJournalRecord& r){
+            if (r.failureClass == "installer.retries_exhausted") ++reports;
+            return true;
+        });
+        QVERIFY(client.checkForUpdates()); QTRY_VERIFY(client.state() != "checking");
+        if (launch == 0) QVERIFY(!client.downloadUpdate());
+        QVERIFY(client.exhausted()); QVERIFY(client.mandatory());
+        QCOMPARE(reports, 1); QVERIFY(UpdateRetryState::load(path).exhaustedReported);
+    }
 }
 
 QTEST_MAIN(TstUpdateFeed)

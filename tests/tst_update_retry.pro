@@ -1,0 +1,11 @@
+QT += core testlib
+CONFIG += console testcase c++17
+CONFIG -= app_bundle debug_and_release debug
+TEMPLATE = app
+TARGET = tst_update_retry
+DESTDIR = $$OUT_PWD
+OBJECTS_DIR = obj-tst_update_retry
+MOC_DIR = obj-tst_update_retry
+INCLUDEPATH += $$PWD/../app
+SOURCES += tst_update_retry.cpp ../app/seathub/update_retry_state.cpp
+HEADERS += ../app/seathub/update_retry_state.h
