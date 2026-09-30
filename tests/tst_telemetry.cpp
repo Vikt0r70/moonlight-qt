@@ -70,6 +70,7 @@
 #define SDL_MAIN_HANDLED
 
 #include "seathub/telemetry.h"
+#include "hostile_fixtures.h"
 
 #ifndef SEATHUB_SENTRY_BIN_DIR
 #error "SEATHUB_SENTRY_BIN_DIR must be defined by the .pro file (the sentry-native install's bin folder)"
@@ -512,6 +513,7 @@ struct ParsedLogItem
 {
     bool found = false;
     QString body;
+    QString level;
     QJsonObject attributes;
 };
 
@@ -551,6 +553,7 @@ ParsedLogItem parseFirstLogItem(const QByteArray& envelopeBody)
                 const QJsonObject firstLog = items.first().toObject();
                 result.found = true;
                 result.body = firstLog.value(QStringLiteral("body")).toString();
+                result.level = firstLog.value(QStringLiteral("level")).toString();
                 result.attributes = firstLog.value(QStringLiteral("attributes")).toObject();
                 return result;
             }
@@ -651,6 +654,7 @@ QList<ParsedLogItem> parseLogItems(const QByteArray& envelopeBody)
             ParsedLogItem parsed;
             parsed.found = true;
             parsed.body = log.value(QStringLiteral("body")).toString();
+            parsed.level = log.value(QStringLiteral("level")).toString();
             parsed.attributes = log.value(QStringLiteral("attributes")).toObject();
             items.append(parsed);
         }
@@ -1846,6 +1850,87 @@ private slots:
         for (const QByteArray& envelope : envelopes) {
             QVERIFY2(!envelope.contains("4821"),
                      "the PIN sentinel reached the envelope bytes");
+        }
+    }
+
+    void hostileFixtureEmissionsReachTheRealEnvelopeCollector()
+    {
+        QTemporaryDir dbDir;
+        QVERIFY(dbDir.isValid());
+        QTemporaryDir spoolDir;
+        QVERIFY(spoolDir.isValid());
+        QTemporaryDir runStateDir;
+        QVERIFY(runStateDir.isValid());
+
+        QTcpServer server;
+        QList<QByteArray> envelopes;
+        wireEnvelopeCollector(&server, &envelopes);
+        QVERIFY(server.listen(QHostAddress::LocalHost, 0));
+        const QString dsn =
+            QStringLiteral("http://publickey@127.0.0.1:%1/1").arg(server.serverPort());
+
+        QProcess child;
+        child.setProgram(m_appPath);
+        child.setArguments({ QStringLiteral("--diag-child"), QStringLiteral("hostile-all"), dsn,
+                             dbDir.path(), m_handlerPath, spoolDir.path(), runStateDir.path() });
+        child.start();
+        QVERIFY2(child.waitForStarted(5000), "the hostile diag-child process must start");
+        QTRY_VERIFY_WITH_TIMEOUT(child.state() != QProcess::Running, 20000);
+        QCOMPARE(child.exitStatus(), QProcess::NormalExit);
+        QCOMPARE(child.exitCode(), 0);
+        QVERIFY2(!envelopes.isEmpty(), "hostile-all must send real diagnostic envelopes");
+
+        const EnvelopeScan scan = scanEnvelopes(envelopes);
+        QStringList emittedSteps;
+        bool hasRecoveredPairing = false;
+        for (const ParsedLogItem& log : scan.logs) {
+            if (log.body != QLatin1String("play.step")) {
+                continue;
+            }
+            const auto value = [&log](const QString& key) {
+                return log.attributes.value(key).toObject().value(QStringLiteral("value"));
+            };
+            emittedSteps.append(value(QStringLiteral("step")).toString());
+            if (value(QStringLiteral("step")).toString() == QLatin1String("pair_handshake")
+                && value(QStringLiteral("outcome")).toString() == QLatin1String("ok")
+                && value(QStringLiteral("failure_class")).toString() == QLatin1String("in_progress")
+                && value(QStringLiteral("attempt")).toInt() == 2
+                && log.level == QLatin1String("info")) {
+                hasRecoveredPairing = true;
+            }
+        }
+        for (const QString& step : { QStringLiteral("allocate"), QStringLiteral("rig_wait"),
+                                     QStringLiteral("pair_authorize"),
+                                     QStringLiteral("pair_server_info"),
+                                     QStringLiteral("pair_handshake"),
+                                     QStringLiteral("engine_prepare"),
+                                     QStringLiteral("engine_connect"), QStringLiteral("stream"),
+                                     QStringLiteral("reconnect"), QStringLiteral("teardown") }) {
+            QVERIFY2(emittedSteps.contains(step),
+                     qPrintable(QStringLiteral("hostile-all omitted play.step for %1").arg(step)));
+        }
+        QVERIFY2(hasRecoveredPairing,
+                 "hostile-all omitted the single frozen recovered-pairing INFO record");
+        QVERIFY2(findLog(scan, QStringLiteral("client.telemetry")).found,
+                 "hostile-all omitted client.telemetry");
+        QVERIFY2(findMetric(scan, QStringLiteral("seathub.play.step_result")) != nullptr,
+                 "hostile-all omitted step-result metrics");
+        QVERIFY2(findMetric(scan, QStringLiteral("seathub.play.step_duration")) != nullptr,
+                 "hostile-all omitted step-duration metrics");
+
+        const QList<QByteArray> hostileValues = {
+            QByteArray(HostileFixtures::RigAddress), QByteArray(HostileFixtures::RigAddressWithPort),
+            QByteArray(HostileFixtures::Pin), QByteArray(HostileFixtures::Bearer),
+            QByteArray(HostileFixtures::PemHeader), QByteArray(HostileFixtures::Email),
+            QByteArray(HostileFixtures::Phone), QByteArray(HostileFixtures::PairingSecret),
+            QByteArray(HostileFixtures::ResponseFragment),
+        };
+        for (const QByteArray& envelope : envelopes) {
+            for (const QByteArray& hostile : hostileValues) {
+                QVERIFY2(!envelope.contains(hostile),
+                         qPrintable(QStringLiteral("hostile value reached a Sentry envelope: %1")
+                                        .arg(QString::fromLatin1(hostile))));
+            }
         }
     }
 
