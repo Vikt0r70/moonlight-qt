@@ -2624,6 +2624,31 @@ private slots:
         QCOMPARE(stages.count(), 3);
     }
 
+    void aServerEndedFailureStillPostsOneEndWithTheStep()
+    {
+        SeatHubClient client;
+        beginStagedSession(client);
+        QVERIFY(!QTest::currentTestFailed());
+        report(client, sessionIn(QStringLiteral("PREPARING")));
+        client.teardown()->setVerifyIntervalMs(1);
+
+        SessionInfo over = sessionIn(QStringLiteral("FAILED"));
+        over.endReason = QStringLiteral("READINESS_TIMEOUT");
+        report(client, over);
+
+        QTRY_VERIFY_WITH_TIMEOUT(
+            m_fake->requestPaths().contains(QStringLiteral("/api/sessions/s-stages/end")), 15000);
+        QCOMPARE(m_fake->requestPaths().count(QStringLiteral("/api/sessions/s-stages/end")), 1);
+        const QJsonObject body = QJsonDocument::fromJson(
+            m_fake->bodyFor(QStringLiteral("/api/sessions/s-stages/end"))).object();
+        QCOMPARE(body.value(QStringLiteral("failed")).toBool(), true);
+        QCOMPARE(body.value(QStringLiteral("attempt_step")).toString(), QStringLiteral("rig_wait"));
+
+        report(client, over);
+        QTest::qWait(25);
+        QCOMPARE(m_fake->requestPaths().count(QStringLiteral("/api/sessions/s-stages/end")), 1);
+    }
+
     void aLateReplyCarryingAnEarlierStateChangesNothing()
     {
         SeatHubClient client;
