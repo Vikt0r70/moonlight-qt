@@ -14,6 +14,7 @@
 
 #include <QtTest>
 #include <QBuffer>
+#include <QDir>
 #include <QElapsedTimer>
 #include <QFile>
 #include <QJsonDocument>
@@ -21,12 +22,15 @@
 #include <QNetworkAccessManager>
 #include <QNetworkReply>
 #include <QNetworkRequest>
+#include <QRegularExpression>
 #include <QScopeGuard>
 #include <QSemaphore>
 #include <QSignalSpy>
 #include <QTcpServer>
 #include <QTcpSocket>
 #include <QTimer>
+
+#include <type_traits>
 
 #include "seathub/attempt_vocab.h"
 #include "seathub/pairing_controller.h"
@@ -1595,6 +1599,69 @@ private slots:
         QVERIFY(clientCertificateFingerprint(
                     QByteArray("-----BEGIN CERTIFICATE-----\nnope\n-----END CERTIFICATE-----\n"))
                     .isEmpty());
+    }
+
+    void noTelemetryEmitterAcceptsFreeText()
+    {
+        using StepFailureSignal =
+            void (PairingController::*)(const QString&, const QString&, qint64);
+        static_assert(std::is_same_v<decltype(&PairingController::stepFailed), StepFailureSignal>,
+                      "pairing diagnostics may carry only closed tokens and elapsed time");
+
+        const QString clientPath = QDir(QCoreApplication::applicationDirPath())
+                                       .filePath(QStringLiteral("../app/seathub/seathub_client.cpp"));
+        const QString headerPath = QDir(QCoreApplication::applicationDirPath())
+                                       .filePath(QStringLiteral("../app/seathub/seathub_client.h"));
+        QFile headerFile(headerPath);
+        QVERIFY2(headerFile.open(QIODevice::ReadOnly), qPrintable(headerPath));
+        const QString headerSource = QString::fromUtf8(headerFile.readAll());
+        const QRegularExpression helperSignature(
+            QStringLiteral("void\\s+noteStepOutcome\\s*\\(([^)]*)\\)\\s*;"));
+        const QRegularExpressionMatch helperMatch = helperSignature.match(headerSource);
+        QVERIFY2(helperMatch.hasMatch(), "noteStepOutcome declaration was not found");
+        QString parameterTypes = helperMatch.captured(1);
+        parameterTypes.remove(QRegularExpression(QStringLiteral("\\s+")));
+        QCOMPARE(parameterTypes,
+                 QStringLiteral("constQString&step,constQString&outcome,constQString&failureClass,"
+                                "qint64elapsedMs,intattempt=0,constQString&endReason={}"));
+
+        QFile clientFile(clientPath);
+        QVERIFY2(clientFile.open(QIODevice::ReadOnly), qPrintable(clientPath));
+        const QString clientSource = QString::fromUtf8(clientFile.readAll());
+        QVERIFY(QRegularExpression(
+                    QStringLiteral("isClosedFailureClass\\s*\\(\\s*closedStep\\s*,\\s*failureClass\\s*\\)"))
+                    .match(clientSource).hasMatch());
+
+        const QRegularExpression callStart(QStringLiteral("\\bnoteStepOutcome\\s*\\("));
+        auto match = callStart.globalMatch(clientSource);
+        int checkedCalls = 0;
+        const QRegularExpression forbidden(QStringLiteral("\\b(engineError|diagnostic|errorString)\\b"));
+        while (match.hasNext()) {
+            const QRegularExpressionMatch current = match.next();
+            int open = clientSource.indexOf(QLatin1Char('('), current.capturedStart());
+            int depth = 1;
+            int close = open + 1;
+            for (; close < clientSource.size() && depth > 0; ++close) {
+                if (clientSource.at(close) == QLatin1Char('(')) {
+                    ++depth;
+                } else if (clientSource.at(close) == QLatin1Char(')')) {
+                    --depth;
+                }
+            }
+            QVERIFY(depth == 0);
+            int after = close;
+            while (after < clientSource.size() && clientSource.at(after).isSpace()) {
+                ++after;
+            }
+            if (after < clientSource.size() && clientSource.at(after) == QLatin1Char('{')) {
+                continue; // the helper definition, not an emitter call
+            }
+            const QString arguments = clientSource.mid(open + 1, close - open - 2);
+            QVERIFY2(!forbidden.match(arguments).hasMatch(),
+                     "a play-step emitter call must never receive raw engine or failure text");
+            ++checkedCalls;
+        }
+        QVERIFY(checkedCalls > 0);
     }
 };
 

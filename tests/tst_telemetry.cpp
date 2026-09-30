@@ -40,6 +40,7 @@
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
+#include <QHash>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -47,6 +48,7 @@
 #include <QProcessEnvironment>
 #include <QStandardPaths>
 #include <QStringList>
+#include <QSet>
 #include <QTcpServer>
 #include <QTcpSocket>
 #include <QTemporaryDir>
@@ -54,6 +56,7 @@
 #include <cstdio>
 #include <cstring>
 #include <memory>
+#include <stdexcept>
 
 #include "seathub/token_store.h"
 
@@ -70,6 +73,8 @@
 #define SDL_MAIN_HANDLED
 
 #include "seathub/telemetry.h"
+#include "seathub/pairing_controller.h"
+#include "seathub/error_map.h"
 #include "hostile_fixtures.h"
 
 #ifndef SEATHUB_SENTRY_BIN_DIR
@@ -357,6 +362,32 @@ int runDiagChild(int argc, char* argv[])
     stepAttributes.insert(QStringLiteral("failure_class"), QStringLiteral("pin_rejected"));
     stepAttributes.insert(QStringLiteral("attempt"), 1);
 
+    const auto emitStep = [](const QString& step, const QString& outcome,
+                             const QString& failureClass, int attempt = 1,
+                             const QString& endReason = QString(), int numericDetail = 0) {
+        QJsonObject attributes;
+        attributes.insert(QStringLiteral("step"), step);
+        attributes.insert(QStringLiteral("outcome"), outcome);
+        attributes.insert(QStringLiteral("failure_class"), failureClass);
+        attributes.insert(QStringLiteral("elapsed_ms"), 23);
+        if (attempt > 0) {
+            attributes.insert(QStringLiteral("attempt"), attempt);
+        }
+        if (!endReason.isEmpty()) {
+            attributes.insert(QStringLiteral("end_reason"), endReason);
+        }
+        if (step == QLatin1String("allocate")) {
+            attributes.insert(QStringLiteral("http_status"), numericDetail);
+        } else if (step == QLatin1String("stream")) {
+            attributes.insert(QStringLiteral("engine_error"), numericDetail);
+        }
+        SeatHubTelemetry::emitDiagnostic(QStringLiteral("play.step"),
+                                         outcome == QLatin1String("ok") ? LogLevel::Info
+                                                                          : LogLevel::Warning,
+                                         attributes);
+        SeatHubTelemetry::emitStepMetric(step, outcome, failureClass, 23.0);
+    };
+
     if (scenario == QLatin1String("play-step")) {
         // ADR-0072 item 2: the local diagnostic a real failure would carry, PIN and all. It is
         // built HERE and handed to nothing - the emission below receives only vocabulary tokens
@@ -382,6 +413,63 @@ int runDiagChild(int argc, char* argv[])
     }
     else if (scenario == QLatin1String("launch")) {
         SeatHubTelemetry::noteLaunch();
+    }
+    else if (scenario == QLatin1String("hostile-all")) {
+        PairingTarget target;
+        target.sessionId = QStringLiteral("session-hostile");
+        target.hostAddress = QString::fromLatin1(HostileFixtures::RigAddress);
+        target.httpsPort = 48010;
+        target.pairingPin = QString::fromLatin1(HostileFixtures::Pin);
+        SeatHubFailure failure;
+        failure.error = QStringLiteral("Host %1 not found").arg(target.hostAddress);
+        failure.diagnostic = QStringLiteral("PIN %1, %2, %3")
+                                 .arg(target.pairingPin, QString::fromLatin1(HostileFixtures::Email),
+                                      QString::fromLatin1(HostileFixtures::Phone));
+        const QString rawNetworkText = QStringLiteral("Host %1 not found").arg(target.hostAddress);
+        const QString pem = QString::fromLatin1(HostileFixtures::PemHeader);
+        const QString pairingSecret = QString::fromLatin1(HostileFixtures::PairingSecret);
+        const QString responseFragment = QString::fromLatin1(HostileFixtures::ResponseFragment);
+        const std::runtime_error exception(
+            QStringLiteral("Bearer %1").arg(QString::fromLatin1(HostileFixtures::Bearer))
+                .toUtf8().constData());
+        if (target.hostAddress != QString::fromLatin1(HostileFixtures::RigAddress)
+            || target.httpsPort != 48010 || failure.diagnostic.isEmpty()
+            || !rawNetworkText.contains(target.hostAddress) || pem.isEmpty()
+            || pairingSecret.isEmpty() || responseFragment.isEmpty()
+            || !QString::fromUtf8(exception.what()).contains(QString::fromLatin1(HostileFixtures::Bearer))) {
+            return 2;
+        }
+
+        SeatHubTelemetry::setTrace(QStringLiteral("trace-hostile"));
+        const QList<QPair<QString, QString>> outcomes = {
+            {QStringLiteral("allocate"), QStringLiteral("refused_balance")},
+            {QStringLiteral("rig_wait"), QStringLiteral("server_ended")},
+            {QStringLiteral("pair_authorize"), QStringLiteral("unreachable_deadline")},
+            {QStringLiteral("pair_server_info"), QStringLiteral("net_timeout")},
+            {QStringLiteral("pair_handshake"), QStringLiteral("pin_rejected")},
+            {QStringLiteral("engine_prepare"), QStringLiteral("no_app")},
+            {QStringLiteral("engine_connect"), QStringLiteral("rtsp_handshake")},
+            {QStringLiteral("stream"), QStringLiteral("no_video_frame")},
+            {QStringLiteral("reconnect"), QStringLiteral("grace_expired")},
+            {QStringLiteral("teardown"), QStringLiteral("failed_auth")},
+        };
+        for (const auto& item : outcomes) {
+            emitStep(item.first, QStringLiteral("failed"), item.second, 1,
+                     item.first == QLatin1String("rig_wait")
+                         ? QStringLiteral("READINESS_TIMEOUT") : QString(),
+                     item.first == QLatin1String("allocate") ? 402
+                         : item.first == QLatin1String("stream") ? -101 : 0);
+        }
+        emitStep(QStringLiteral("pair_handshake"), QStringLiteral("ok"),
+                 QStringLiteral("in_progress"), 2);
+        SeatHubTelemetry::noteLaunch();
+    }
+    else if (scenario == QLatin1String("offline-queue")) {
+        emitStep(QStringLiteral("pair_handshake"), QStringLiteral("failed"),
+                 QStringLiteral("pin_rejected"));
+    }
+    else if (scenario == QLatin1String("offline-drain")) {
+        // Startup adopts the previous process's spool before this scenario reaches the exit drain.
     }
     else if (scenario.startsWith(QLatin1String("kill-"))) {
         // Both lanes at once: the kill switch has to reach the diagnostic line (the shipper's
@@ -567,14 +655,16 @@ ParsedLogItem parseFirstLogItem(const QByteArray& envelopeBody)
 /// each arrive as their own request), and a test that has to prove "zero envelopes" or find one
 /// item among several cannot do it through a single overwritten buffer. Same body-complete rule,
 /// same `Connection: close` answer - one request per connection, so nothing is ever concatenated.
-void wireEnvelopeCollector(QTcpServer* server, QList<QByteArray>* envelopes)
+void wireEnvelopeCollector(QTcpServer* server, QList<QByteArray>* envelopes,
+                           QList<QByteArray>* requestHeaders = nullptr)
 {
-    QObject::connect(server, &QTcpServer::newConnection, server, [server, envelopes]() {
+    QObject::connect(server, &QTcpServer::newConnection, server,
+                     [server, envelopes, requestHeaders]() {
         while (QTcpSocket* socket = server->nextPendingConnection()) {
             auto buffer = std::make_shared<QByteArray>();
             auto responded = std::make_shared<bool>(false);
             QObject::connect(socket, &QTcpSocket::readyRead, socket,
-                             [socket, buffer, responded, envelopes]() {
+                              [socket, buffer, responded, envelopes, requestHeaders]() {
                                  *buffer += socket->readAll();
                                  if (*responded) {
                                      return;
@@ -597,8 +687,11 @@ void wireEnvelopeCollector(QTcpServer* server, QList<QByteArray>* envelopes)
                                  if (buffer->size() - bodyStart < contentLength) {
                                      return;
                                  }
-                                 envelopes->append(
-                                     buffer->mid(bodyStart, static_cast<int>(contentLength)));
+                                  envelopes->append(
+                                      buffer->mid(bodyStart, static_cast<int>(contentLength)));
+                                  if (requestHeaders) {
+                                      requestHeaders->append(buffer->left(headerEnd));
+                                  }
                                  *responded = true;
                                  static const QByteArray body = QByteArrayLiteral("{}");
                                  QByteArray response
@@ -1864,7 +1957,8 @@ private slots:
 
         QTcpServer server;
         QList<QByteArray> envelopes;
-        wireEnvelopeCollector(&server, &envelopes);
+        QList<QByteArray> requestHeaders;
+        wireEnvelopeCollector(&server, &envelopes, &requestHeaders);
         QVERIFY(server.listen(QHostAddress::LocalHost, 0));
         const QString dsn =
             QStringLiteral("http://publickey@127.0.0.1:%1/1").arg(server.serverPort());
@@ -1879,10 +1973,15 @@ private slots:
         QCOMPARE(child.exitStatus(), QProcess::NormalExit);
         QCOMPARE(child.exitCode(), 0);
         QVERIFY2(!envelopes.isEmpty(), "hostile-all must send real diagnostic envelopes");
+        QVERIFY2(requestHeaders.size() == envelopes.size(), "every envelope must have captured request headers");
+        for (const QByteArray& headers : requestHeaders) {
+            QVERIFY2(!headers.toLower().contains("content-encoding:"),
+                     "diagnostic envelope unexpectedly used Content-Encoding");
+        }
 
         const EnvelopeScan scan = scanEnvelopes(envelopes);
         QStringList emittedSteps;
-        bool hasRecoveredPairing = false;
+        int recoveredPairingRecords = 0;
         for (const ParsedLogItem& log : scan.logs) {
             if (log.body != QLatin1String("play.step")) {
                 continue;
@@ -1896,7 +1995,7 @@ private slots:
                 && value(QStringLiteral("failure_class")).toString() == QLatin1String("in_progress")
                 && value(QStringLiteral("attempt")).toInt() == 2
                 && log.level == QLatin1String("info")) {
-                hasRecoveredPairing = true;
+                ++recoveredPairingRecords;
             }
         }
         for (const QString& step : { QStringLiteral("allocate"), QStringLiteral("rig_wait"),
@@ -1907,16 +2006,150 @@ private slots:
                                      QStringLiteral("engine_connect"), QStringLiteral("stream"),
                                      QStringLiteral("reconnect"), QStringLiteral("teardown") }) {
             QVERIFY2(emittedSteps.contains(step),
-                     qPrintable(QStringLiteral("hostile-all omitted play.step for %1").arg(step)));
+                         qPrintable(QStringLiteral("hostile-all omitted play.step for %1").arg(step)));
         }
-        QVERIFY2(hasRecoveredPairing,
-                 "hostile-all omitted the single frozen recovered-pairing INFO record");
+        QVERIFY2(!emittedSteps.contains(QStringLiteral("first_frame")),
+                 "first_frame remains deferred to the quality sampler");
+
+        const QHash<QString, QSet<QString>> closedClasses = {
+            {QStringLiteral("allocate"), {QStringLiteral("no_host"), QStringLiteral("refused_balance"),
+                QStringLiteral("refused_state"), QStringLiteral("unreachable"),
+                QStringLiteral("server_error"), QStringLiteral("bad_response")}},
+            {QStringLiteral("rig_wait"), {QStringLiteral("ok"), QStringLiteral("server_ended")}},
+            {QStringLiteral("pair_authorize"), {QStringLiteral("deadline"), QStringLiteral("refused"),
+                QStringLiteral("bad_response"), QStringLiteral("no_seam"),
+                QStringLiteral("unreachable_deadline")}},
+            {QStringLiteral("pair_server_info"), {QStringLiteral("no_address"), QStringLiteral("net_refused"),
+                QStringLiteral("net_closed"), QStringLiteral("net_host_not_found"),
+                QStringLiteral("net_timeout"), QStringLiteral("net_tls"), QStringLiteral("net_proxy"),
+                QStringLiteral("net_other"), QStringLiteral("http_4xx"), QStringLiteral("http_5xx")}},
+            {QStringLiteral("pair_handshake"), {QStringLiteral("pin_rejected"), QStringLiteral("in_progress"),
+                QStringLiteral("failed"), QStringLiteral("net_refused"), QStringLiteral("net_closed"),
+                QStringLiteral("net_host_not_found"), QStringLiteral("net_timeout"),
+                QStringLiteral("net_tls"), QStringLiteral("net_proxy"), QStringLiteral("net_other"),
+                QStringLiteral("http_4xx"), QStringLiteral("http_5xx"), QStringLiteral("crypto_init"),
+                QStringLiteral("other")}},
+            {QStringLiteral("engine_prepare"), {QStringLiteral("no_app"), QStringLiteral("app_count"),
+                QStringLiteral("engine_create"), QStringLiteral("start_refused"),
+                QStringLiteral("app_list_failed")}},
+            {QStringLiteral("engine_connect"), {QStringLiteral("platform_init"),
+                QStringLiteral("name_resolution"), QStringLiteral("audio_init"),
+                QStringLiteral("rtsp_handshake"), QStringLiteral("control_init"),
+                QStringLiteral("video_init"), QStringLiteral("input_init"),
+                QStringLiteral("control_start"), QStringLiteral("video_start"),
+                QStringLiteral("audio_start"), QStringLiteral("input_start"),
+                QStringLiteral("launch_error")}},
+            {QStringLiteral("stream"), {QStringLiteral("graceful"), QStringLiteral("no_video_traffic"),
+                QStringLiteral("no_video_frame"), QStringLiteral("early_termination"),
+                QStringLiteral("protected_content"), QStringLiteral("frame_conversion"),
+                QStringLiteral("net_other")}},
+            {QStringLiteral("reconnect"), {QStringLiteral("attempt_pair_failed"),
+                QStringLiteral("attempt_engine_failed"), QStringLiteral("grace_expired"),
+                QStringLiteral("reconnect_limit"), QStringLiteral("ok")}},
+            {QStringLiteral("teardown"), {QStringLiteral("failed_net"), QStringLiteral("failed_api"),
+                QStringLiteral("failed_auth"), QStringLiteral("failed_local"), QStringLiteral("ok")}},
+        };
+        const QSet<QString> allowedLogKeys = {
+            QStringLiteral("step"), QStringLiteral("outcome"), QStringLiteral("failure_class"),
+            QStringLiteral("http_status"), QStringLiteral("net_error"),
+            QStringLiteral("engine_error"), QStringLiteral("engine_stage"),
+            QStringLiteral("failing_ports"), QStringLiteral("elapsed_ms"),
+            QStringLiteral("attempt"), QStringLiteral("end_reason"),
+            QStringLiteral("exit_path"), QStringLiteral("last_step"),
+            QStringLiteral("reason"), QStringLiteral("session_id"),
+            QStringLiteral("host_id"), QStringLiteral("seathub.trace_id"),
+            QStringLiteral("seathub.logged_at"), QStringLiteral("user.id")};
+        const QSet<QString> closedEndReasons = {
+            QStringLiteral("READINESS_TIMEOUT"), QStringLiteral("CONNECT_FAILED"),
+            QStringLiteral("GRACE_EXPIRED"), QStringLiteral("RECONNECT_LIMIT"),
+            QStringLiteral("HOST_LOST"), QStringLiteral("SESSION_LOST"),
+            QStringLiteral("LEASE_GUARD_LOST"), QStringLiteral("OWNER_RESERVATION"),
+            QStringLiteral("MODE_BOOT_TIMEOUT"), QStringLiteral("CONNECT_TIMEOUT"),
+            QStringLiteral("CUSTOMER_ENDED"), QStringLiteral("WALLET_EMPTY"),
+            QStringLiteral("OPERATOR_FORCED"), QStringLiteral("CLIENT_SILENT"),
+            QStringLiteral("BALANCE_EXHAUSTED"), QStringLiteral("TEARDOWN_TIMEOUT"),
+            QStringLiteral("CLIENT_ABSENT")};
+        for (const ParsedLogItem& log : scan.logs) {
+            if (log.body != QLatin1String("play.step")) {
+                continue;
+            }
+            for (const QString& key : log.attributes.keys()) {
+                QVERIFY2(allowedLogKeys.contains(key) || key.startsWith(QLatin1String("sentry."))
+                             || key.startsWith(QLatin1String("os.")),
+                         qPrintable(QStringLiteral("play.step attribute outside closed set: %1").arg(key)));
+            }
+            const auto value = [&log](const QString& key) {
+                return log.attributes.value(key).toObject().value(QStringLiteral("value")).toString();
+            };
+            const QString step = value(QStringLiteral("step"));
+            const QString outcome = value(QStringLiteral("outcome"));
+            const QString failureClass = value(QStringLiteral("failure_class"));
+            QVERIFY2(closedClasses.contains(step), qPrintable(QStringLiteral("unknown step token: %1").arg(step)));
+            QVERIFY2(closedClasses.value(step).contains(failureClass),
+                     qPrintable(QStringLiteral("unknown %1 failure_class: %2").arg(step, failureClass)));
+            QVERIFY(outcome == QLatin1String("failed") || outcome == QLatin1String("cancelled")
+                    || outcome == QLatin1String("ok"));
+            if (log.attributes.contains(QStringLiteral("attempt"))) {
+                const int attempt = log.attributes.value(QStringLiteral("attempt")).toObject()
+                                       .value(QStringLiteral("value")).toInt(-1);
+                QVERIFY(attempt == 1 || attempt == 2);
+            }
+            if (log.attributes.contains(QStringLiteral("end_reason"))) {
+                const QString endReason = log.attributes.value(QStringLiteral("end_reason")).toObject()
+                                              .value(QStringLiteral("value")).toString();
+                QVERIFY2(closedEndReasons.contains(endReason),
+                         qPrintable(QStringLiteral("unknown end_reason token: %1").arg(endReason)));
+            }
+        }
+        const QSet<QString> allowedMetricKeys = {QStringLiteral("step"), QStringLiteral("outcome"),
+                                                  QStringLiteral("failure_class")};
+        for (const ParsedMetric& metric : scan.metrics) {
+            QVERIFY(metric.name == QLatin1String("seathub.play.step_result")
+                    || metric.name == QLatin1String("seathub.play.step_duration")
+                    || metric.name == QLatin1String("seathub.client.launch"));
+            for (const QString& key : metric.attributes.keys()) {
+                QVERIFY2(allowedMetricKeys.contains(key) || key.startsWith(QLatin1String("sentry."))
+                             || key.startsWith(QLatin1String("os.")),
+                         qPrintable(QStringLiteral("metric dimension outside closed set: %1").arg(key)));
+            }
+            QVERIFY(!metric.attributes.contains(QStringLiteral("session_id")));
+            QVERIFY(!metric.attributes.contains(QStringLiteral("host_id")));
+            QVERIFY(!metric.attributes.contains(QStringLiteral("user.id")));
+            if (metric.attributes.contains(QStringLiteral("step"))) {
+                const QString step = metric.attributes.value(QStringLiteral("step")).toObject()
+                                         .value(QStringLiteral("value")).toString();
+                QVERIFY(closedClasses.contains(step));
+            }
+            if (metric.attributes.contains(QStringLiteral("failure_class"))) {
+                const QString step = metric.attributes.value(QStringLiteral("step")).toObject()
+                                         .value(QStringLiteral("value")).toString();
+                const QString failureClass = metric.attributes.value(QStringLiteral("failure_class"))
+                                                 .toObject().value(QStringLiteral("value")).toString();
+                QVERIFY(closedClasses.value(step).contains(failureClass));
+            }
+        }
+        QCOMPARE(recoveredPairingRecords, 1);
         QVERIFY2(findLog(scan, QStringLiteral("client.telemetry")).found,
                  "hostile-all omitted client.telemetry");
         QVERIFY2(findMetric(scan, QStringLiteral("seathub.play.step_result")) != nullptr,
                  "hostile-all omitted step-result metrics");
         QVERIFY2(findMetric(scan, QStringLiteral("seathub.play.step_duration")) != nullptr,
                  "hostile-all omitted step-duration metrics");
+        int recoveredMetrics = 0;
+        for (const ParsedMetric& metric : scan.metrics) {
+            if (metric.name != QLatin1String("seathub.play.step_result")) {
+                continue;
+            }
+            const auto value = [&metric](const QString& key) {
+                return metric.attributes.value(key).toObject().value(QStringLiteral("value")).toString();
+            };
+            if (value(QStringLiteral("step")) == QLatin1String("pair_handshake")
+                && value(QStringLiteral("outcome")) == QLatin1String("ok")
+                && value(QStringLiteral("failure_class")) == QLatin1String("in_progress")) {
+                ++recoveredMetrics;
+            }
+        }
+        QCOMPARE(recoveredMetrics, 1);
 
         const QList<QByteArray> hostileValues = {
             QByteArray(HostileFixtures::RigAddress), QByteArray(HostileFixtures::RigAddressWithPort),
@@ -1932,6 +2165,53 @@ private slots:
                                         .arg(QString::fromLatin1(hostile))));
             }
         }
+    }
+
+    void offlineDiagnosticsAreDeliveredByTheNextProcess()
+    {
+        QTemporaryDir dbDir;
+        QVERIFY(dbDir.isValid());
+        QTemporaryDir spoolDir;
+        QVERIFY(spoolDir.isValid());
+        QTemporaryDir runStateDir;
+        QVERIFY(runStateDir.isValid());
+
+        QTcpServer closedPort;
+        QVERIFY(closedPort.listen(QHostAddress::LocalHost, 0));
+        const quint16 unavailablePort = closedPort.serverPort();
+        closedPort.close();
+        const QString offlineDsn =
+            QStringLiteral("http://publickey@127.0.0.1:%1/1").arg(unavailablePort);
+        QProcess offlineChild;
+        offlineChild.setProgram(m_appPath);
+        offlineChild.setArguments({QStringLiteral("--diag-child"), QStringLiteral("offline-queue"),
+                                   offlineDsn, dbDir.path(), m_handlerPath, spoolDir.path(),
+                                   runStateDir.path()});
+        offlineChild.start();
+        QVERIFY(offlineChild.waitForStarted(5000));
+        QTRY_VERIFY_WITH_TIMEOUT(offlineChild.state() != QProcess::Running, 20000);
+        QCOMPARE(offlineChild.exitStatus(), QProcess::NormalExit);
+        QCOMPARE(offlineChild.exitCode(), 0);
+
+        QTcpServer server;
+        QList<QByteArray> envelopes;
+        wireEnvelopeCollector(&server, &envelopes);
+        QVERIFY(server.listen(QHostAddress::LocalHost, 0));
+        const QString onlineDsn =
+            QStringLiteral("http://publickey@127.0.0.1:%1/1").arg(server.serverPort());
+        QProcess drainChild;
+        drainChild.setProgram(m_appPath);
+        drainChild.setArguments({QStringLiteral("--diag-child"), QStringLiteral("offline-drain"),
+                                 onlineDsn, dbDir.path(), m_handlerPath, spoolDir.path(),
+                                 runStateDir.path()});
+        drainChild.start();
+        QVERIFY(drainChild.waitForStarted(5000));
+        QTRY_VERIFY_WITH_TIMEOUT(!envelopes.isEmpty(), 20000);
+        QTRY_VERIFY_WITH_TIMEOUT(drainChild.state() != QProcess::Running, 20000);
+        QCOMPARE(drainChild.exitStatus(), QProcess::NormalExit);
+        QCOMPARE(drainChild.exitCode(), 0);
+        QVERIFY2(hasLog(envelopes, QStringLiteral("play.step")),
+                 "the next process did not deliver the prior offline play.step");
     }
 
 private:

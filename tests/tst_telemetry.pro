@@ -75,4 +75,5 @@ HEADERS += \
     ../app/seathub/log_shipper.h \
     ../app/seathub/token_store.h \
     ../app/seathub/error_map.h \
-    ../app/path.h
+    ../app/path.h \
+    hostile_fixtures.h
