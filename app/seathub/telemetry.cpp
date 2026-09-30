@@ -5,6 +5,7 @@
 #include "path.h"
 #include "seathub_version.h"
 #include "token_store.h"
+#include "update_retry_state.h"
 
 #include <QByteArray>
 #include <QDebug>
@@ -152,7 +153,8 @@ sentry_value_t seatHubOnCrash(const sentry_ucontext_t*, sentry_value_t event, se
 /// D-11: only unexpected errors reach Sentry - unhandled exceptions, 5xx, panics and crashes. A
 /// crash event's level is always `"fatal"`; anything else that reaches this callback (a captured
 /// message, a non-fatal event this SDK does not currently send at all) is dropped rather than
-/// uploaded. Per `on_crash`/`before_send` mutual exclusion (SPIKE Q5), a real crash never reaches
+/// uploaded, except the named installer_update exception (ADR-0070 item 7). Per
+/// `on_crash`/`before_send` mutual exclusion (SPIKE Q5), a real crash never reaches
 /// this function - `seatHubOnCrash` above already handled it - so this is defence in depth, not
 /// the crash path.
 sentry_value_t seatHubBeforeSend(sentry_value_t event, sentry_hint_t*, void*)
@@ -160,6 +162,11 @@ sentry_value_t seatHubBeforeSend(sentry_value_t event, sentry_hint_t*, void*)
     sentry_value_t level = sentry_value_get_by_key(event, "level");
     const char* levelStr = sentry_value_as_string(level);
     if (levelStr && QString::fromUtf8(levelStr) == QLatin1String("fatal")) {
+        return event;
+    }
+    const auto tags = sentry_value_get_by_key(event, "tags");
+    const auto kind = sentry_value_get_by_key(tags, "kind");
+    if (QString::fromUtf8(sentry_value_as_string(kind)) == QLatin1String("installer_update")) {
         return event;
     }
     sentry_value_decref(event);
@@ -832,8 +839,65 @@ QJsonObject rollupDeliveryHealth()
             {"backlog_retry_files", retries}};
 }
 
-bool emitInstallerEvent(const InstallJournalRecord&) { return false; }
-void adoptInstallerJournal(const QString&, const QString&, const QDateTime&) {}
+bool emitInstallerEvent(const InstallJournalRecord& record)
+{
+    const auto cached = readCache();
+    if (!started() || s_lastOptions.dsn.isEmpty() || !cached || cached->dsn.isEmpty()
+        || !acceptDsn(cached->dsn)
+        || (record.outcome != QLatin1String("failed") && record.outcome != QLatin1String("recovered")))
+        return false;
+    auto event = sentry_value_new_message_event(record.outcome == QLatin1String("failed")
+        ? SENTRY_LEVEL_ERROR : SENTRY_LEVEL_WARNING, nullptr, "installer_update");
+    auto tags = sentry_value_new_object();
+    const QJsonObject tagValues{{"kind", "installer_update"}, {"step", record.step},
+        {"class", record.failureClass}, {"from", record.from}, {"to", record.to}, {"mode", record.mode}};
+    for (auto it = tagValues.constBegin(); it != tagValues.constEnd(); ++it) {
+        const auto key = it.key().toUtf8(); const auto value = it.value().toString().toUtf8();
+        sentry_value_set_by_key(tags, key.constData(), sentry_value_new_string(value.constData()));
+    }
+    sentry_value_set_by_key(event, "tags", tags);
+    auto fingerprint = sentry_value_new_list();
+    for (const auto& item : QStringList{"installer-update", record.step, record.failureClass}) {
+        const auto bytes = item.toUtf8();
+        sentry_value_append(fingerprint, sentry_value_new_string(bytes.constData()));
+    }
+    sentry_value_set_by_key(event, "fingerprint", fingerprint);
+    auto details = sentry_value_new_object();
+    const auto json = record.toJson();
+    for (auto it = json.constBegin(); it != json.constEnd(); ++it) {
+        const auto key = it.key().toUtf8();
+        sentry_value_t value;
+        if (it.value().isString()) value = sentry_value_new_string(it.value().toString().toUtf8().constData());
+        else if (it.value().isBool()) value = sentry_value_new_bool(it.value().toBool());
+        else if (it.value().isDouble()) value = sentry_value_new_double(it.value().toDouble());
+        else {
+            value = sentry_value_new_object();
+            const auto ms = it.value().toObject();
+            for (auto duration = ms.constBegin(); duration != ms.constEnd(); ++duration)
+                sentry_value_set_by_key(value, duration.key().toUtf8().constData(),
+                                       sentry_value_new_double(duration.value().toDouble()));
+        }
+        sentry_value_set_by_key(details, key.constData(), value);
+    }
+    auto extra = sentry_value_new_object();
+    sentry_value_set_by_key(extra, "installer", details);
+    sentry_value_set_by_key(event, "extra", extra);
+    const auto id = sentry_capture_event(event); // event ownership moves into the SDK.
+    return !sentry_uuid_is_nil(&id);
+}
+void adoptInstallerJournal(const QString& folder, const QString& retryStatePath, const QDateTime& now)
+{
+    const auto cached = readCache();
+    if (!started() || !cached || cached->dsn.isEmpty() || !acceptDsn(cached->dsn)) return;
+    auto state = UpdateRetryState::load(retryStatePath);
+    for (const auto& record : InstallJournal::adopt(folder, now)) {
+        if (state.reportedIds.contains(record.attempt)) continue;
+        if (emitInstallerEvent(record)) {
+            state.rememberReport(record.attempt); // only AFTER SDK handoff.
+            state.save(retryStatePath);
+        }
+    }
+}
 QString installerJournalDirectory()
 {
     return QDir(qEnvironmentVariable("ProgramData")).filePath("SeatHubSetup/install-journal");

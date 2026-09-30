@@ -778,6 +778,8 @@ private:
     /// `AccountInfo::displayName`/`username`/etc. worth re-filling `m_account`/`m_identity` from a
     /// second time, having just set both from what the customer typed).
     void setAccount(const AccountInfo& account);
+    void adoptJournal();
+    bool m_journalAdopted = false;
     /// D-17/Plan 30: resends every quality report this outbox is holding for `m_accountId`, once
     /// both it and an access token are known. A no-op otherwise (see `QualityOutbox::drain()`'s
     /// own no-op conditions, including one already in flight and a token generation an earlier

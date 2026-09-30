@@ -24,6 +24,7 @@
 #include "settings_bridge.h"
 #include "stream_stats.h"
 #include "telemetry.h"
+#include "update_retry_state.h"
 #include "update_feed_client.h"
 #include "web_origin.h"
 
@@ -318,6 +319,16 @@ void onClientThread(QObject* owner, Fn fn)
     QMetaObject::invokeMethod(owner, std::move(fn), Qt::QueuedConnection);
 }
 
+void SeatHubClient::adoptJournal()
+{
+    const auto cached = SeatHubTelemetry::readCache();
+    if (m_journalAdopted || !SeatHubTelemetry::started() || !cached || cached->dsn.isEmpty()
+        || !SeatHubTelemetry::acceptDsn(cached->dsn)) return;
+    m_journalAdopted = true;
+    SeatHubTelemetry::adoptInstallerJournal(SeatHubTelemetry::installerJournalDirectory(),
+        UpdateRetryState::defaultPath(), QDateTime::currentDateTimeUtc());
+}
+
 SeatHubClient::SeatHubClient(QObject* parent)
     : QObject(parent),
       // Entered before anything else is shown: the sign-in form must never flash while the stored
@@ -350,6 +361,7 @@ SeatHubClient::SeatHubClient(QObject* parent)
     // same process (as `tst_facade_wiring.cpp` does, once per test) is a no-op
     // (`LogTee::install()`'s own header comment).
     LogTee::install();
+    adoptJournal();
 
     // D-09/D-15 (Plan 14): the bundled Open Sans SemiBold, registered once here - never from
     // `app/main.cpp`, which 06.3.1 edits (RESEARCH-FORK.md §3, Pitfall 12) - so every path that
@@ -1464,7 +1476,7 @@ void SeatHubClient::beginPlayRequest()
 
     // Plan 15 (D-01, D-18 SV-C3): one of the three moments SeatHub refreshes its DSN handout.
     m_controlPlane->fetchTelemetry([this](const ControlPlaneResult& result) {
-        onClientThread(this, [this, result]() { applyTelemetryResult(result); });
+        onClientThread(this, [this, result]() { applyTelemetryResult(result); adoptJournal(); });
     });
 }
 
@@ -1763,6 +1775,7 @@ bool SeatHubClient::adoptSignIn(const AuthTokenPair& pair, const QString& identi
                 return;
             }
             applyTelemetryResult(result);
+            adoptJournal();
         });
     });
 
@@ -2049,6 +2062,7 @@ void SeatHubClient::applyRestoreResult(const ControlPlaneResult& result)
                         return;
                     }
                     applyTelemetryResult(telemetryResult);
+                    adoptJournal();
                 });
             });
             return;
