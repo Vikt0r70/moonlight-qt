@@ -322,8 +322,10 @@ void onClientThread(QObject* owner, Fn fn)
 void SeatHubClient::adoptJournal()
 {
     const auto cached = SeatHubTelemetry::readCache();
-    if (m_journalAdopted || !SeatHubTelemetry::started() || !cached || cached->dsn.isEmpty()
+    if (!SeatHubTelemetry::started() || !cached || cached->dsn.isEmpty()
         || !SeatHubTelemetry::acceptDsn(cached->dsn)) return;
+    m_updates->reportPendingInstallerEvents();
+    if (m_journalAdopted) return;
     m_journalAdopted = true;
     SeatHubTelemetry::adoptInstallerJournal(SeatHubTelemetry::installerJournalDirectory(),
         UpdateRetryState::defaultPath(), QDateTime::currentDateTimeUtc());
@@ -361,6 +363,7 @@ SeatHubClient::SeatHubClient(QObject* parent)
     // same process (as `tst_facade_wiring.cpp` does, once per test) is a no-op
     // (`LogTee::install()`'s own header comment).
     LogTee::install();
+    m_updates->setInstallerReporter(&SeatHubTelemetry::emitInstallerEvent);
     adoptJournal();
 
     // D-09/D-15 (Plan 14): the bundled Open Sans SemiBold, registered once here - never from

@@ -106,10 +106,11 @@ public:
     void setUrlOpener(UrlOpener opener) { m_urlOpener = std::move(opener); }
     using InstallerReporter = std::function<bool(const InstallJournalRecord&)>;
     void setInstallerReporter(InstallerReporter reporter) { m_reporter = std::move(reporter); }
-    void setRetryStatePath(const QString& path) { m_retryStatePath = path; m_retry = UpdateRetryState::load(path); }
+    void setRetryStatePath(const QString& path);
     void setJournalFolder(const QString& folder) { m_journalFolder = folder; }
     void setRetryClock(std::function<QDateTime()> clock) { m_retry.setClock(std::move(clock)); }
     UpdateRetryState retryState() const { return m_retry; }
+    void reportPendingInstallerEvents() { reportExhaustion(); }
 
     QString state() const { return m_state; }
     QVariantMap availableUpdate() const { return m_available; }
@@ -155,7 +156,14 @@ signals:
 
 private:
     /// The production launcher: an elevated start of the per-machine installer (D-42).
-    static bool launchInstaller(const QString& path);
+    static bool launchInstaller(const QString& path, const QString& arguments);
+    void adoptOffer(const QVariantMap& offer);
+    void persistRetry();
+    void inspectPendingLaunch();
+    void maybeAutomaticAttempt();
+    void recordFailure(const QString& failureClass, bool permanent = false);
+    void reportInference(const QString& failureClass);
+    void reportExhaustion();
 
     void setState(const QString& state);
     void setFailure(const QVariantMap& failure);
@@ -185,6 +193,7 @@ private:
     UpdateRetryState m_retry;
     QString m_retryStatePath = UpdateRetryState::defaultPath(), m_journalFolder;
     bool m_optionalDismissed = false, m_manualAttempt = false;
+    bool m_outcomeChecked = false, m_silentRetry = false;
     UrlOpener m_urlOpener;
     InstallerReporter m_reporter;
 };

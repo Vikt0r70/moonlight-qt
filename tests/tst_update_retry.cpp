@@ -53,6 +53,8 @@ private slots:
         state.launched = true; state.noteDecline();
         QCOMPARE(state.attemptsFailed, 0); QCOMPARE(state.declines, 1); QVERIFY(!state.launched);
         QVERIFY(!state.automaticAttemptAllowed(clock.addDays(30), false));
+        state.noteFailure("installer.verify_failed", true, true);
+        state.noteDecline(); QVERIFY(state.exhausted()); QCOMPARE(state.attemptsFailed, 0);
     }
     void permanentIntegrityFailureExhaustsWithoutResettingOnTime()
     {

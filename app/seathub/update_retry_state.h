@@ -18,6 +18,8 @@ public:
     int attemptsFailed = 0, declines = 0;
     QDateTime firstFailedAt, lastFailedAt, nextAllowedAt;
     bool exhaustedReported = false, launched = false;
+    // Keep manual Try again free across a process exit before its result arrives.
+    bool launchedManual = false;
     QStringList reportedIds;
     QVariantMap lastOffer;
 

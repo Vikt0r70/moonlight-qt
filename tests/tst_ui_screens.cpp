@@ -2898,6 +2898,11 @@ void TstUiScreens::updateWindowShowsTheFrozenVariantsInARealWindow()
     QVERIFY(findVisibleTextItem(modal.data(), "Version 9.9.9 is ready. Update now, or later."));
     QTRY_VERIFY(modal->findChild<QQuickItem*>("notNowAction"));
     auto* later = modal->findChild<QQuickItem*>("notNowAction");
+    auto* primary = modal->findChild<QQuickItem*>("updateAction");
+    // A variant's bindings update before Row's next polish. Click only after its real layout
+    // has placed the two controls side by side, and assert they do not overlap.
+    QTRY_VERIFY(later->mapToScene(QPointF()).x()
+                >= primary->mapToScene(QPointF()).x() + primary->width());
     QTest::mouseClick(&window, Qt::LeftButton, Qt::NoModifier,
                      later->mapToScene(QPointF(later->width()/2, later->height()/2)).toPoint());
     QTRY_VERIFY(!item->isVisible());

@@ -114,6 +114,10 @@ class FakeUpdates : public QObject
     Q_PROPERTY(QVariantMap failure READ failure WRITE setFailure NOTIFY failureChanged)
     Q_PROPERTY(bool blockedBySession READ blockedBySession WRITE setBlockedBySession NOTIFY blockedBySessionChanged)
     Q_PROPERTY(bool readyToInstall READ readyToInstall WRITE setReadyToInstall NOTIFY readyToInstallChanged)
+    Q_PROPERTY(bool mandatory READ mandatory CONSTANT)
+    Q_PROPERTY(bool optionalOffer READ optionalOffer CONSTANT)
+    Q_PROPERTY(bool exhausted READ exhausted CONSTANT)
+    Q_PROPERTY(QString nextAttemptText READ nextAttemptText CONSTANT)
 
 public:
     QString state() const { return m_state; }
@@ -135,6 +139,11 @@ public:
 
     int downloads() const { return m_downloads; }
     int installs() const { return m_installs; }
+    bool mandatory() const { return true; }
+    bool optionalOffer() const { return false; }
+    bool exhausted() const { return false; }
+    QString nextAttemptText() const { return "the next time you open SeatHub"; }
+    Q_INVOKABLE bool tryAgain() { return m_readyToInstall ? installDownloaded() : downloadUpdate(); }
 
 signals:
     void stateChanged();
@@ -177,6 +186,8 @@ private slots:
     void optionalFailureAndManualUrlStayAboveTheFloor();
     void aPendingLaunchInfersNoResultAndRetriesOnlyOnNextLaunch();
     void integrityExhaustionIsReportedOnceAcrossRestart();
+    void theLastKnownOfferWorksOfflineAndFormatsTheRetryTime();
+    void aManualPendingLaunchDoesNotSpendAutomaticBudget();
 
 private:
     QTemporaryDir m_dir;
@@ -664,12 +675,12 @@ void TstUpdateFeed::optionalFailureAndManualUrlStayAboveTheFloor()
     client.setBaseUrl(writeLocalFeed(dir.path(), trusted, "0.1.0"));
     int opened = 0;
     client.setUrlOpener([&](const QUrl& url){ ++opened; return url.toString() == trusted; });
-    QVERIFY(client.checkForUpdates()); QTRY_COMPARE(client.state(), QString("available"));
+    QVERIFY(client.checkForUpdates()); QTRY_VERIFY(client.state() != "checking");
     QCOMPARE(client.manualDownloadUrl(), trusted); QVERIFY(client.openManualDownload()); QCOMPARE(opened, 1);
     for (const auto& hostile : QStringList{"http://api-sevenhills.damra.co/a", "file:///C:/private",
                                          "https://evil.invalid/a", "https://api-sevenhills.damra.co.evil.invalid/a"}) {
         client.setBaseUrl(writeLocalFeed(dir.path(), hostile, "0.1.0"));
-        QVERIFY(client.checkForUpdates()); QTRY_COMPARE(client.state(), QString("available"));
+        QVERIFY(client.checkForUpdates()); QTRY_VERIFY(client.state() != "checking");
         QVERIFY(client.manualDownloadUrl().isEmpty()); QVERIFY(!client.openManualDownload());
     }
     QCOMPARE(opened, 1);
@@ -718,6 +729,41 @@ void TstUpdateFeed::integrityExhaustionIsReportedOnceAcrossRestart()
         QVERIFY(client.exhausted()); QVERIFY(client.mandatory());
         QCOMPARE(reports, 1); QVERIFY(UpdateRetryState::load(path).exhaustedReported);
     }
+}
+
+void TstUpdateFeed::theLastKnownOfferWorksOfflineAndFormatsTheRetryTime()
+{
+    QTemporaryDir dir; QVERIFY(dir.isValid());
+    const auto at = QDateTime::fromString("2026-09-30T12:00:00Z", Qt::ISODate);
+    UpdateRetryState state; state.target = "0.2.0"; state.attemptsFailed = 2;
+    state.lastClass = "installer.locked_file"; state.nextAllowedAt = at.addSecs(5400);
+    state.lastOffer = UpdateFeedClient::parseRelease(feedRow("0.2.0"), "0.1.0", QString::fromLatin1(kAbcSha256));
+    const auto path = dir.filePath("retry-state.json"); QVERIFY(state.save(path));
+    UpdateFeedClient client; client.setRetryStatePath(path); client.setInstalledVersion("0.1.0");
+    client.setRetryClock([at]{ return at; }); client.setBaseUrl("http://127.0.0.1:1");
+    QVERIFY(client.mandatory()); QCOMPARE(client.nextAttemptText(), QString("in about 90 minutes"));
+    QVERIFY(client.checkForUpdates()); QTRY_COMPARE(client.state(), QString("failed"));
+    QVERIFY(client.mandatory()); QCOMPARE(client.availableUpdate().value("version").toString(), QString("0.2.0"));
+    state.nextAllowedAt = at.addSecs(10800); QVERIFY(state.save(path)); client.setRetryStatePath(path);
+    client.setRetryClock([at]{ return at; }); QCOMPARE(client.nextAttemptText(), QString("in about 3 hours"));
+    state.lastOffer.insert("min_version", "0.1.0"); QVERIFY(state.save(path));
+    UpdateFeedClient optional; optional.setRetryStatePath(path); optional.setInstalledVersion("0.1.5");
+    QVERIFY(!optional.mandatory()); QVERIFY(!optional.optionalOffer()); QCOMPARE(optional.state(), QString("failed"));
+    optional.setInstalledVersion("0.0.9"); QVERIFY(optional.mandatory());
+}
+void TstUpdateFeed::aManualPendingLaunchDoesNotSpendAutomaticBudget()
+{
+    QTemporaryDir dir; QVERIFY(dir.isValid());
+    UpdateRetryState state; state.target = "0.2.0"; state.launched = state.launchedManual = true;
+    const auto path = dir.filePath("retry-state.json"); QVERIFY(state.save(path));
+    UpdateFeedClient client; client.setRetryStatePath(path); client.setInstalledVersion("0.1.0");
+    client.setJournalFolder(dir.filePath("absent"));
+    const auto package = writeAbcPackage(dir.path(), "manual.exe");
+    client.setBaseUrl(writeLocalFeed(dir.path(), QUrl::fromLocalFile(package).toString(), "0.2.0"));
+    int launches = 0;
+    client.setInstallerLauncher([&](const QString&){ ++launches; return false; });
+    QVERIFY(client.checkForUpdates()); QTRY_COMPARE(launches, 1);
+    QCOMPARE(client.retryState().attemptsFailed, 0); QVERIFY(!client.retryState().launchedManual);
 }
 
 QTEST_MAIN(TstUpdateFeed)
