@@ -971,6 +971,7 @@ private:
     EngineLaunchReason m_engineLaunchReason = EngineLaunchReason::Started;
     QString m_lastFailedStep;
     QElapsedTimer m_playElapsed;
+    QString m_samplerPlayId;
     QHash<QString, QVariantMap> m_stepTimings;
     TeardownController* m_teardown = nullptr;
 

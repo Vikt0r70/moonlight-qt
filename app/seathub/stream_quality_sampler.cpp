@@ -52,10 +52,11 @@ QJsonObject aggregate(const QVector<VideoStats>& samples, int dropped, bool part
 }
 }
 
-StreamQualitySampler::StreamQualitySampler(QObject* parent, Clock)
-    : QObject(parent), m_timer(new QTimer(this))
+StreamQualitySampler::StreamQualitySampler(QObject* parent, Clock clock)
+    : QObject(parent), m_clock(std::move(clock)), m_timer(new QTimer(this))
 {
     m_buffer.reserve(kMaxSamplesPerWindow);
+    m_recent.reserve(kRecentSamples);
     m_timer->setTimerType(Qt::PreciseTimer);
     connect(m_timer, &QTimer::timeout, this, &StreamQualitySampler::tick);
 }
@@ -70,17 +71,31 @@ void StreamQualitySampler::setWindowMs(int ms)
     Q_ASSERT(!m_running.load() && ms > 0);
     m_windowMs = ms;
 }
-void StreamQualitySampler::start(const QString& sessionId)
+void StreamQualitySampler::start(const QString& playId)
 {
     if (!onOwnThread()) {
-        QMetaObject::invokeMethod(this, [this, sessionId]() { start(sessionId); }, Qt::QueuedConnection);
+        QMetaObject::invokeMethod(this, [this, playId]() { start(playId); }, Qt::QueuedConnection);
         return;
     }
     if (m_running.load()) return;
-    { QMutexLocker lock(&m_mutex); m_buffer.clear(); m_dropped.store(0); }
-    m_rollups.store(0);
-    m_windowClock.start();
+    {
+        QMutexLocker lock(&m_mutex);
+        m_buffer.clear(); m_recent.clear(); m_dropped.store(0);
+        m_rttIn = m_rttOut = 0; m_feedRttPoor = false;
+    }
+    if (!m_hasPlay || m_playId != playId) {
+        m_hasPlay = true; m_playId = playId;
+        m_rollups.store(0); m_badEpisodes.store(0); m_badSeconds.store(0);
+        m_samples.store(0); m_finishedMs.store(0);
+        m_badLines = 0; m_lastBadLineMs = -kBadSpacingMs;
+        m_playClock.start();
+        m_clockOrigin = m_clock ? m_clock() : 0;
+    }
+    m_badSinceMs.store(-1); m_generation.fetch_add(1);
+    m_enginePoor = m_rttPoor = false;
+    m_badReason.clear();
     m_running.store(true);
+    m_windowStartMs.store(nowMs());
     m_timer->start(m_windowMs);
 }
 void StreamQualitySampler::finish()
@@ -89,8 +104,11 @@ void StreamQualitySampler::finish()
         QMetaObject::invokeMethod(this, [this]() { finish(); }, Qt::QueuedConnection);
         return;
     }
-    if (!m_running.exchange(false)) return;
+    if (!m_running.load()) return;
+    m_finishedMs.store(nowMs());
+    m_running.store(false);
     m_timer->stop();
+    closeBadEpisode();
     emitWindow(true);
 }
 void StreamQualitySampler::feed(const VideoStats& stats)
@@ -98,17 +116,91 @@ void StreamQualitySampler::feed(const VideoStats& stats)
     if (!m_running.load()) return;
     // The render thread never waits for window extraction or another producer.
     if (!m_mutex.tryLock()) { m_dropped.fetch_add(1); return; }
-    if (m_buffer.size() < kMaxSamplesPerWindow) m_buffer.append(stats);
+    if (m_buffer.size() < kMaxSamplesPerWindow) { m_buffer.append(stats); m_samples.fetch_add(1); }
     else m_dropped.fetch_add(1);
+    if (m_recent.size() == kRecentSamples) m_recent.removeFirst();
+    m_recent.append(stats);
+    bool changed = false;
+    if (!stats.rttMs.present) {
+        m_rttIn = m_rttOut = 0;
+    } else if (stats.rttMs.value >= kRttThresholdMs) {
+        m_rttOut = 0;
+        m_rttIn = std::min(kRttInCount, m_rttIn + 1);
+        if (!m_feedRttPoor && m_rttIn == kRttInCount) { m_feedRttPoor = true; changed = true; }
+    } else {
+        m_rttIn = 0;
+        m_rttOut = std::min(kRttOutCount, m_rttOut + 1);
+        if (m_feedRttPoor && m_rttOut == kRttOutCount) { m_feedRttPoor = false; changed = true; }
+    }
+    const bool poor = m_feedRttPoor;
+    const auto generation = m_generation.load();
     m_mutex.unlock();
+    if (changed) {
+        // No diagnostics, timers or network calls on the producer thread.
+        QMetaObject::invokeMethod(this, [this, poor, generation]() {
+            if (generation == m_generation.load()) noteRttState(poor);
+        }, Qt::QueuedConnection);
+    }
 }
-void StreamQualitySampler::noteConnectionStatus(int) {}
+qint64 StreamQualitySampler::nowMs() const
+{
+    if (!m_running.load()) return m_finishedMs.load();
+    return m_clock ? m_clock() - m_clockOrigin : m_playClock.elapsed();
+}
+double StreamQualitySampler::badSeconds() const
+{
+    const auto since = m_badSinceMs.load();
+    return m_badSeconds.load() + (since < 0 ? 0.0 : (nowMs() - since) / 1000.0);
+}
+double StreamQualitySampler::samplingGapS() const
+{ return std::max(0.0, nowMs() / 1000.0 - m_samples.load()); }
+void StreamQualitySampler::noteConnectionStatus(int status)
+{
+    if (!onOwnThread()) {
+        QMetaObject::invokeMethod(this, [this, status]() { noteConnectionStatus(status); }, Qt::QueuedConnection);
+        return;
+    }
+    if (!m_running.load()) return;
+    m_enginePoor = status == 1; // Limelight.h: OKAY=0, POOR=1
+    updateQuality(QStringLiteral("engine_poor"));
+}
+void StreamQualitySampler::noteRttState(bool poor)
+{
+    if (!m_running.load()) return;
+    m_rttPoor = poor;
+    updateQuality(QStringLiteral("rtt_high"));
+}
+void StreamQualitySampler::closeBadEpisode()
+{
+    const auto since = m_badSinceMs.exchange(-1);
+    if (since >= 0) m_badSeconds.store(m_badSeconds.load() + (nowMs() - since) / 1000.0);
+}
+void StreamQualitySampler::updateQuality(const QString& reason)
+{
+    const bool poor = m_enginePoor || m_rttPoor;
+    if (poor && m_badSinceMs.load() < 0) {
+        const auto now = nowMs();
+        m_badSinceMs.store(now); m_badEpisodes.fetch_add(1); m_badReason = reason;
+        if (m_badLines >= kBadCapPerPlay || now - m_lastBadLineMs < kBadSpacingMs) return;
+        QVector<VideoStats> recent;
+        { QMutexLocker lock(&m_mutex); recent = m_recent; }
+        auto attrs = aggregate(recent, 0, true, kRecentSamples);
+        attrs.insert("reason", reason);
+        SeatHubTelemetry::emitDiagnostic(QStringLiteral("stream.quality_bad"), LogLevel::Warning, attrs);
+        ++m_badLines; m_lastBadLineMs = now;
+    } else if (!poor && m_badSinceMs.load() >= 0) {
+        const double seconds = (nowMs() - m_badSinceMs.load()) / 1000.0;
+        closeBadEpisode();
+        SeatHubTelemetry::emitDiagnostic(QStringLiteral("stream.quality_ok"), LogLevel::Info,
+                                        {{"reason", m_badReason}, {"bad_s", rounded(seconds, 2)}});
+    }
+}
 QJsonObject StreamQualitySampler::takeWindow(bool partial)
 {
     QVector<VideoStats> samples;
     int dropped;
     { QMutexLocker lock(&m_mutex); samples.swap(m_buffer); dropped = m_dropped.exchange(0); }
-    const double seconds = partial ? std::max(0.001, m_windowClock.elapsed() / 1000.0)
+    const double seconds = partial ? std::max(0.001, (nowMs() - m_windowStartMs.load()) / 1000.0)
                                    : m_windowMs / 1000.0;
     return aggregate(samples, dropped, partial, seconds);
 }
@@ -116,7 +208,7 @@ void StreamQualitySampler::tick()
 {
     if (!m_running.load()) return;
     emitWindow(false);
-    m_windowClock.restart();
+    m_windowStartMs.store(nowMs());
 }
 void StreamQualitySampler::emitWindow(bool partial)
 {

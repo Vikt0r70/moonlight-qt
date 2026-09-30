@@ -3,16 +3,13 @@
 // engine_status (D-11, ADR-0072, Plan 13 Task 2): the pure matcher for Moonlight's
 // "Connection status update: N" log line.
 //
-// `ControlStream.c` calls `SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-// "Connection status update: %d", status)` (moonlight-common-c ControlStream.c:431-462,
-// read-only). The integer is Moonlight's own CONN_STATUS_* value:
+// `Session::clConnectionStatusUpdate` logs the status at APPLICATION/INFO
+// (app/streaming/session.cpp:180-184, read-only). ControlStream.c calls that callback.
+// The integer is Moonlight's own CONN_STATUS_* value:
 //   0 = CONN_STATUS_OKAY
 //   1 = CONN_STATUS_POOR
 //
-// Reading this line through the tee is the only route that reaches the code without
-// editing ControlStream.c.
-
-#include <QtGlobal>
+// The tee reads this without modifying the streaming engine.
 
 /// Matches upstream's exact "Connection status update: %d" line:
 /// `SDL_LOG_CATEGORY_APPLICATION`, `SDL_LOG_PRIORITY_INFO`, the fixed prefix

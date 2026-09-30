@@ -747,6 +747,7 @@ void SeatHubClient::beginSession(const QString& sessionId)
     m_engineLaunchReason = EngineLaunchReason::Started;
     m_stepTimings.clear();
     m_playElapsed.start();
+    m_samplerPlayId = randomTraceId();
     m_clientUuid.clear();
     // A new session's teardown has not been asked for yet. Without this the second and later
     // sessions in one run never tear down (defect F-9; `teardown_guard.h`).
@@ -1361,6 +1362,7 @@ bool SeatHubClient::endAttachedSessionBeforePlay()
 
 void SeatHubClient::beginLocalAttempt()
 {
+    m_samplerPlayId = randomTraceId();
     clearFailure();
     setEndReasonText(QString());
     setHomeStatus(QString::fromLatin1(kHomeReady));
@@ -2337,7 +2339,7 @@ void SeatHubClient::handleConnectionStarted()
     // D-11, Plan 13 Task 1: the sampler's 60s roll-up window starts when the stream truly begins
     // (same anchor as `m_statsAggregator.start()` above). The sampler already lives on the
     // network thread; `start()` re-invokes itself queued when called from another thread.
-    m_sampler->start(m_sessionId);
+    m_sampler->start(m_samplerPlayId);
 
     // D-31/D-34/D-11: liveness itself started at `beginSession()` (session begin, not the stream's
     // first frame - RESEARCH Q1); from here it keeps reporting every 10 s, now with `state`

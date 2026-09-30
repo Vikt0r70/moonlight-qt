@@ -235,7 +235,7 @@ SDL_Surface* OsdCompositor::rasterizeStats(const char* text, bool enabled) const
 
     // D-11, Plan 13 Task 1: feed the sampler BEFORE the labels-empty OD-04 gate so the
     // sampler always receives data even when no rows are visible to the customer. The tap
-    // is a plain function-pointer (sentry-free), installed by the facade via setStatsTap().
+    // is a sentry-free callback, installed by the facade via setStatsTap().
     // No sentry.h, no facade include crosses the compositor boundary.
     {
         StatsTapFn tap;

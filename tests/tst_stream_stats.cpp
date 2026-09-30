@@ -236,6 +236,12 @@ private slots:
         QCOMPARE(sampler.badEpisodes(), 22);
         QCOMPARE(sampler.badSeconds(), 0.022);
         sampler.finish();
+        now += 30000;
+        sampler.start("caps"); // a reconnect is still the same Play
+        cycle();
+        QCOMPARE(badCount(), 20);
+        QCOMPARE(sampler.badEpisodes(), 23);
+        sampler.finish();
         sampler.start("next-play");
         cycle();
         QCOMPARE(badCount(), 21);
@@ -259,6 +265,29 @@ private slots:
         now = 90000;
         QCOMPARE(sampler.badSeconds(), 10.0);
         QCOMPARE(sampler.samplingGapS(), 15.0);
+    }
+
+    void absentRttBreaksTheStreakAndBothSourcesMustRecover()
+    {
+        qualityLogs.clear();
+        StreamQualitySampler sampler;
+        sampler.start("sources");
+        VideoStats stats; stats.rttMs = OptionalMetric::of(80);
+        const auto feed = [&]() { sampler.feed(stats); QCoreApplication::processEvents(); };
+        for (int i = 0; i < 4; ++i) feed();
+        stats.rttMs = OptionalMetric::none(); feed();
+        stats.rttMs = OptionalMetric::of(80);
+        for (int i = 0; i < 4; ++i) feed();
+        QVERIFY(qualityLogs.isEmpty());
+        feed();
+        QCOMPARE(qualityLogs.size(), 1);
+        sampler.noteConnectionStatus(1);
+        stats.rttMs = OptionalMetric::of(79);
+        for (int i = 0; i < 10; ++i) feed();
+        QCOMPARE(qualityLogs.size(), 1);
+        sampler.noteConnectionStatus(0);
+        QCOMPARE(qualityLogs.size(), 2);
+        sampler.finish();
     }
 
     void rollupNearestRankP95()
@@ -368,6 +397,30 @@ private slots:
         QVERIFY(rollupLogs.last().value("partial").toBool());
         sampler.finish();
         QCOMPARE(sampler.rollups(), 2);
+    }
+
+    void rollupTimerRunsOnTheSamplerWorker()
+    {
+        QThread worker;
+        auto sampler = new StreamQualitySampler;
+        sampler->moveToThread(&worker);
+        connect(&worker, &QThread::finished, sampler, &QObject::deleteLater);
+        QSemaphore emitted;
+        QThread* emissionThread = nullptr;
+        connect(sampler, &StreamQualitySampler::rollupEmitted, sampler, [&]() {
+            emissionThread = QThread::currentThread(); emitted.release();
+        });
+        worker.start();
+        QMetaObject::invokeMethod(sampler, [sampler]() {
+            sampler->setWindowMs(20); sampler->start("worker");
+        }, Qt::BlockingQueuedConnection);
+        VideoStats stats; stats.renderedFps = OptionalMetric::of(60);
+        sampler->feed(stats);
+        const bool received = emitted.tryAcquire(1, 5000);
+        QMetaObject::invokeMethod(sampler, [sampler]() { sampler->finish(); }, Qt::BlockingQueuedConnection);
+        worker.quit(); worker.wait();
+        QVERIFY(received);
+        QCOMPARE(emissionThread, &worker);
     }
 
     // --- LogTee. This must run first: `LogTee::install()` only ever captures "the previous
