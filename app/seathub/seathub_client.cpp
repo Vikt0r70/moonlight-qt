@@ -5,6 +5,7 @@
 #include <QDir>
 #include <QLoggingCategory>
 #include <QRandomGenerator>
+#include <QSettings>
 #include <QStringList>
 #include <QThread>
 #include <QWindow>
@@ -51,6 +52,8 @@ const char* kStateHome = "home";
 const char* kStateConnecting = "connecting";
 const char* kStateStreaming = "streaming";
 const char* kStateError = "error";
+// Widening the frozen wording requires an ADR-0070 amendment and a version bump.
+constexpr int kDiagnosticsNoticeVersion = 1;
 
 // 06.1-19/J-07: the reconnect backoff (D-01's own reference points - ENet's ~10 s connection
 // timeout, Sunshine's 10 s `ping_timeout` - not a multiple of them).
@@ -365,6 +368,10 @@ SeatHubClient::SeatHubClient(QObject* parent)
     LogTee::install();
     m_updates->setInstallerReporter(&SeatHubTelemetry::emitInstallerEvent);
     adoptJournal();
+    m_diagnosticsNoticeAcknowledged = QSettings().value(
+        QStringLiteral("diagnosticsNoticeVersion"), 0).toInt() >= kDiagnosticsNoticeVersion;
+    connect(m_updates, &UpdateFeedClient::availableUpdateChanged,
+            this, &SeatHubClient::updateDiagnosticsNotice);
 
     // D-09/D-15 (Plan 14): the bundled Open Sans SemiBold, registered once here - never from
     // `app/main.cpp`, which 06.3.1 edits (RESEARCH-FORK.md §3, Pitfall 12) - so every path that
@@ -885,6 +892,7 @@ void SeatHubClient::setAppState(const QString& state)
     }
 
     emit appStateChanged();
+    updateDiagnosticsNotice();
 
     // The balance is read on every arrival at Home: after a restore, after a sign-in, and when a
     // session or a failure hands the customer back (CUST-06). A no-op unless signed in.
@@ -900,6 +908,27 @@ void SeatHubClient::setSignedIn(bool signedIn)
     }
     m_signedIn = signedIn;
     emit signedInChanged();
+    updateDiagnosticsNotice();
+}
+
+void SeatHubClient::updateDiagnosticsNotice()
+{
+    const bool pending = !m_diagnosticsNoticeAcknowledged && m_signedIn
+        && m_appState == QLatin1String(kStateHome) && !m_inSettings
+        && m_updates->availableUpdate().isEmpty();
+    if (m_diagnosticsNoticePending == pending) return;
+    m_diagnosticsNoticePending = pending;
+    emit diagnosticsNoticePendingChanged();
+}
+
+void SeatHubClient::acknowledgeDiagnosticsNotice()
+{
+    QSettings settings;
+    settings.setValue(QStringLiteral("diagnosticsNoticeVersion"), kDiagnosticsNoticeVersion);
+    settings.sync();
+    // A failed local write is retried next launch, never surfaced as an upload/Play failure.
+    m_diagnosticsNoticeAcknowledged = true;
+    updateDiagnosticsNotice();
 }
 
 void SeatHubClient::setAttachedSession(const QString& sessionId)
@@ -1175,6 +1204,7 @@ void SeatHubClient::setInSettings(bool inSettings)
     }
     m_inSettings = inSettings;
     emit inSettingsChanged();
+    updateDiagnosticsNotice();
 }
 
 void SeatHubClient::setInProfile(bool inProfile)

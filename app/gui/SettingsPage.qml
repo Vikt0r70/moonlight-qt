@@ -107,12 +107,12 @@ Item {
                 font.weight: Font.DemiBold
             }
 
-            // D-14, ADR-0063, screens.md § 27 permitted change 4: the one plain-text disclosure
+            // D-14, ADR-0063, ADR-0070 item 9, ADR-0072: the one plain-text disclosure
             // sentence under the page title. No switch, no link - the same tokens as the
             // "Changes are saved immediately" line right below, no new component.
             Text {
                 width: parent.width
-                text: qsTr("SeatHub sends diagnostic logs and crash reports to SevenHills so we can fix problems.")
+                text: qsTr("SeatHub sends diagnostic logs, stream quality numbers and crash reports to SevenHills so we can fix problems.")
                 wrapMode: Text.Wrap
                 color: Tokens.foregroundMutedDefault
                 font.family: Tokens.fontSansDefault

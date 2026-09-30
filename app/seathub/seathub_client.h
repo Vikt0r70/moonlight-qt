@@ -254,6 +254,8 @@ class SeatHubClient : public QObject
     /// out through `handleCredentialRefused()`. Deferred, notice included, until a running stream
     /// ends (Phase 3 D-33): a control-plane channel never ends a paid stream.
     Q_PROPERTY(bool signedOutNotice READ signedOutNotice NOTIFY signedOutNoticeChanged)
+    /// ADR-0070 item 9: local acknowledgement only; never an upload gate.
+    Q_PROPERTY(bool diagnosticsNoticePending READ diagnosticsNoticePending NOTIFY diagnosticsNoticePendingChanged)
 
     /// True while the profile is showing. Like Settings it is a view inside the home state, not an
     /// appState of its own, so it keeps the signed-in header and a session that ends while it is open
@@ -342,6 +344,8 @@ public:
     bool signedIn() const { return m_signedIn; }
     bool liveUpdatesPaused() const { return m_liveUpdatesPaused; }
     bool signedOutNotice() const { return m_signedOutNotice; }
+    bool diagnosticsNoticePending() const { return m_diagnosticsNoticePending; }
+    Q_INVOKABLE void acknowledgeDiagnosticsNotice();
     bool liveSession() const { return m_liveSession; }
     bool retryBusy() const { return m_retryBusy; }
     bool reconnecting() const { return m_reconnecting; }
@@ -531,6 +535,7 @@ signals:
     void signedInChanged();
     void liveUpdatesPausedChanged();
     void signedOutNoticeChanged();
+    void diagnosticsNoticePendingChanged();
     void liveSessionChanged();
     void retryBusyChanged();
     void reconnectingChanged();
@@ -687,6 +692,7 @@ private:
     void clearSignedOutNotice();
     /// The one writer of `m_signedIn`, so `signedInChanged()` can never be missed.
     void setSignedIn(bool signedIn);
+    void updateDiagnosticsNotice();
     /// The one writer of `m_sessionId`, and of whether that session has ended, so `liveSession` can
     /// never be left stale by a path that forgot to say so.
     void setAttachedSession(const QString& sessionId);
@@ -914,6 +920,8 @@ private:
     /// offline restore cannot fill - is what "signed in" means: the screens a session ends on
     /// (Home or sign-in) follow it.
     bool m_signedIn = false;
+    bool m_diagnosticsNoticePending = false;
+    bool m_diagnosticsNoticeAcknowledged = false;
     bool m_restoreStarted = false;
     /// Bumped by every sign-in, restore result and sign-out. A reply issued under an older value
     /// (a wallet read, a sign-out's own revoke) must not touch what a newer one set up.

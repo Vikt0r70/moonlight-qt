@@ -52,7 +52,7 @@
 #include <QScopeGuard>
 #include <QScopedPointer>
 #include <QSignalSpy>
- #include <QSettings>
+#include <QSettings>
 #include <QTemporaryDir>
 #include <QThread>
 #include <QTimeZone>
@@ -1267,10 +1267,25 @@ private slots:
             QVERIFY(!client.property("diagnosticsNoticePending").toBool());
             reachHome(client, 90); QVERIFY(!QTest::currentTestFailed());
             QVERIFY(client.property("diagnosticsNoticePending").toBool());
+            const QString feedPath = m_dir->path() + "/feed/api/releases";
+            QVERIFY(QDir().mkpath(feedPath));
+            client.updates()->setBaseUrl(QUrl::fromLocalFile(m_dir->path() + "/feed").toString());
+            client.updates()->setInstalledVersion("2.0.0");
+            client.updates()->setRetryStatePath(m_dir->path() + "/retry.json");
+            client.updates()->setJournalFolder(m_dir->path() + "/journal");
             client.openSettings(); QVERIFY(!client.property("diagnosticsNoticePending").toBool());
             client.closeSettings(); QVERIFY(client.property("diagnosticsNoticePending").toBool());
             client.openProfile(); QVERIFY(client.property("diagnosticsNoticePending").toBool());
             client.closeProfile();
+            QTemporaryDir spool;
+            QMutex shippedMutex;
+            QStringList shipped;
+            LogShipper::instance().setSpoolDirectoryForTests(spool.path());
+            LogShipper::instance().start([&](const ShippedLine& line) {
+                QMutexLocker lock(&shippedMutex); shipped.append(line.body); return true;
+            });
+            LogShipper::instance().setCanShip(true);
+            StopShipperOnScopeExit stopShipper;
             auto* engine = new FakeEngineSession;
             client.session()->attachSession(engine);
             m_fake->answerPairing(409, playRefusalBody("The rig is not ready yet.", "SH-2K2XQ1"));
@@ -1283,8 +1298,31 @@ private slots:
             client.interrupt(); emit engine->sessionFinished(0); emit engine->readyForDeletion();
             QTRY_COMPARE_WITH_TIMEOUT(client.appState(), QStringLiteral("home"), 15000);
             QVERIFY(client.property("diagnosticsNoticePending").toBool());
-            // An offer, even optional, takes precedence. Drive the real property notifier.
-            QVERIFY(client.updates()->setProperty("availableUpdate", QVariantMap{{"version", "9.9.9"}}) == false);
+            LogShipper::instance().drainBeforeSignOut();
+            {
+                QMutexLocker lock(&shippedMutex);
+                QVERIFY2(shipped.contains("play.summary"), "actual diagnostic hand-off must not wait for OK");
+            }
+            QVERIFY(!QSettings().contains(key));
+            // Drive actual feed replies, including optional/required precedence and clearing.
+            for (const bool required : {true, false}) {
+                QFile feed(feedPath + "/client"); QVERIFY(feed.open(QIODevice::WriteOnly));
+                feed.write(required
+                    ? QByteArrayLiteral("{\"version\":\"3.0.0\",\"url\":\"https://example.invalid/setup.exe\"}")
+                    : QByteArrayLiteral("{\"version\":\"3.0.0\",\"min_version\":\"1.0.0\",\"url\":\"https://example.invalid/setup.exe\"}"));
+                feed.close();
+                QSignalSpy checked(client.updates(), &UpdateFeedClient::checkFinished);
+                QTRY_VERIFY(client.updates()->state() != QStringLiteral("checking"));
+                checked.clear(); // exclude the stream-end check that was already in flight
+                QVERIFY(client.updates()->checkForUpdates());
+                QTRY_VERIFY(!checked.isEmpty());
+                QCOMPARE(client.updates()->mandatory(), required);
+                QVERIFY(!client.property("diagnosticsNoticePending").toBool());
+                QVERIFY(feed.open(QIODevice::WriteOnly)); feed.write("{\"version\":\"2.0.0\"}"); feed.close();
+                checked.clear(); QVERIFY(client.updates()->checkForUpdates());
+                QTRY_VERIFY(!checked.isEmpty());
+                QVERIFY(client.property("diagnosticsNoticePending").toBool());
+            }
             QVERIFY(QMetaObject::invokeMethod(&client, "acknowledgeDiagnosticsNotice"));
             QVERIFY(!client.property("diagnosticsNoticePending").toBool());
             QSettings disk; QCOMPARE(disk.value(key, 0).toInt(), 1);
