@@ -35,11 +35,13 @@ SOURCES += \
     ../app/seathub/stream_stats.cpp \
     ../app/seathub/engine_termination.cpp \
     ../app/seathub/quality_outbox.cpp \
+    ../app/seathub/stream_quality_sampler.cpp \
     ../app/seathub/liveness_timer.cpp \
     ../app/seathub/control_plane_client.cpp \
     ../app/seathub/error_map.cpp
 
 HEADERS += \
+    ../app/seathub/stream_quality_sampler.h \
     ../app/seathub/log_tee.h \
     ../app/seathub/stream_stats.h \
     ../app/seathub/engine_termination.h \
