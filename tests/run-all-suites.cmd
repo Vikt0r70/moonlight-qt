@@ -69,6 +69,7 @@ set "FAILED="
 
 if not "%~1"=="" goto :named
 
+call :suite tst_attempt_vocab
 call :suite tst_control_plane
 call :suite tst_engine_seam
 call :suite tst_error_map

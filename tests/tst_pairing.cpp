@@ -28,6 +28,7 @@
 #include <QTcpSocket>
 #include <QTimer>
 
+#include "seathub/attempt_vocab.h"
 #include "seathub/pairing_controller.h"
 #include "seathub/pairing_recovery.h"
 #include "seathub/pairing_seam.h"
@@ -1177,6 +1178,73 @@ private slots:
         QCOMPARE(cancels, 1);
         QCOMPARE(report.outcomes.first(), false);
         QCOMPARE(report.diagnostics.first(), QStringLiteral("plain-failure"));
+    }
+
+    void aWrongPinFailureCarriesStepAndClassButNeverTheDiagnostic()
+    {
+        // ADR-0072 items 1-2: a failed handshake reports WHICH step failed and WHY as closed
+        // vocabulary tokens, while `engineError` keeps its local diagnostic for support only.
+        // The fake handshake builds exactly what `pairing_handshake.cpp` builds for
+        // `NvPairingManager::PIN_WRONG` (the mapper itself is asserted in
+        // `tst_attempt_vocab::pairStateMapsToClosedClasses`, which this suite does not link);
+        // what is under test here is that the classification survives the seam and reaches the
+        // facade as separate members, and that it is never the diagnostic text.
+        ProductionPairingSeam seam;
+        seam.setHandshake([](const PairingTarget&) {
+            PairingHandshakeResult rejected;
+            rejected.engineError = QStringLiteral("the rig rejected the pairing PIN");
+            rejected.attemptStep = QStringLiteral("pair_handshake");
+            rejected.stepClass = QStringLiteral("pin_rejected");
+            rejected.attempts = 1;
+            return rejected;
+        });
+        seam.setCancelRequest([](const QString&, int) { return true; });
+
+        QSignalSpy classified(&seam, &ProductionPairingSeam::failureClassified);
+        QVERIFY(classified.isValid());
+
+        SeamReport report;
+        seam.pair(pairingTarget(), recordInto(&report));
+        QTRY_COMPARE(report.count(), 1);
+
+        // The failure itself: not ok, no identity, and the local diagnostic unchanged - it is
+        // still there for support, and it is still the only text in the result.
+        QCOMPARE(report.outcomes.first(), false);
+        QVERIFY(report.identities.first().isEmpty());
+        QCOMPARE(report.diagnostics.first(), QStringLiteral("the rig rejected the pairing PIN"));
+
+        // The classification handed to the facade, as separate members.
+        QTRY_COMPARE(classified.count(), 1);
+        const PairingHandshakeResult delivered =
+            classified.at(0).at(0).value<PairingHandshakeResult>();
+        QCOMPARE(delivered.attemptStep, QStringLiteral("pair_handshake"));
+        QCOMPARE(delivered.stepClass, QStringLiteral("pin_rejected"));
+        QCOMPARE(delivered.attempts, 1);
+
+        // The step is one of the 11 frozen tokens, read from the header block the vocabulary
+        // script checks - a step outside it could never reach `/end` or a Sentry query.
+        bool stepIsFrozen = false;
+        for (int i = 0; i < kAttemptStepCount; ++i) {
+            if (delivered.attemptStep == QLatin1String(kAttemptStepTokens[i])) {
+                stepIsFrozen = true;
+            }
+        }
+        QVERIFY2(stepIsFrozen, "the step must be one of the 11 frozen attempt-step tokens");
+
+        // Never the diagnostic: the class is a token in its own right, and the local text stays
+        // out of it (the redaction rule, ADR-0072 item 2).
+        QVERIFY(!delivered.engineError.isEmpty());
+        QVERIFY2(delivered.stepClass != delivered.engineError,
+                 qPrintable(QStringLiteral("the class must not be the diagnostic: %1")
+                                .arg(delivered.stepClass)));
+        QVERIFY2(!delivered.stepClass.contains(delivered.engineError),
+                 "the diagnostic must not leak into the class");
+
+        // The same classification on the accessor the facade reads once `pairingFailed` lands.
+        QCOMPARE(seam.lastResult().attemptStep, QStringLiteral("pair_handshake"));
+        QCOMPARE(seam.lastResult().stepClass, QStringLiteral("pin_rejected"));
+        QCOMPARE(seam.lastResult().attempts, 1);
+        QCOMPARE(seam.lastResult().engineError, QStringLiteral("the rig rejected the pairing PIN"));
     }
 
     void seamSupersededRun_noClearNoRetry_droppedResult()
