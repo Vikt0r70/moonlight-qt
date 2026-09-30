@@ -35,6 +35,7 @@
 // it here does not widen who touches the SDK.
 
 #include "log_shipper.h"
+#include "install_journal.h"
 
 #include <QJsonObject>
 #include <QString>
@@ -108,6 +109,12 @@ void removeLegacyDumps(const QString& dir);
 /// True once a `startWith()` call has returned `sentry_init(...) == 0`. False before any call, and
 /// false if the only call so far failed.
 bool started();
+
+/// ADR-0070: the named non-fatal installer exception, independent of sign-in/logs.
+bool emitInstallerEvent(const InstallJournalRecord& record);
+void adoptInstallerJournal(const QString& folder, const QString& retryStatePath,
+                           const QDateTime& now);
+QString installerJournalDirectory();
 
 /// The `HandOff` `start()` registers with `LogShipper::instance()`: builds `seathub.logged_at`
 /// (and, when set, `session_id`/`host_id`/`seathub.trace_id`) attributes from `line` and calls
@@ -310,7 +317,7 @@ void setRunStateDirectoryForTests(const QString& directory);
 /// (D-11 only lets fatal-level events through). This is the only way a test can observe the
 /// scope's LIVE user/tags/trace after `adoptFirstDsn()`'s re-init - a crash-based test cannot,
 /// short of decoding crashpad's own gzipped, msgpack-encoded minidump upload.
-void captureTestMessageForTests(const QString& message);
+void captureTestMessageForTests(const QString& message, bool fatal = true);
 #endif
 
 // --- identity (D-09, D-13, G.4): state SeatHub keeps itself, so a test can assert it without a

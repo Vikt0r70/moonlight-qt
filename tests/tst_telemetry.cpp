@@ -33,6 +33,7 @@
  *****************************************************************************/
 
 #include <QtTest>
+#include "seathub/update_retry_state.h"
 
 #include <QByteArray>
 #include <QCoreApplication>
@@ -975,6 +976,7 @@ void writeLeftoverSpoolLine(const QString& directory, qint64 deadPid, const QStr
 struct ParsedEventItem
 {
     bool found = false;
+    QJsonObject json;
     QString body;
     QJsonObject tags;
     QJsonObject user;
@@ -1013,6 +1015,7 @@ ParsedEventItem parseFirstEventItem(const QByteArray& envelopeBody)
         if (type == QStringLiteral("event")) {
             const QJsonObject event = QJsonDocument::fromJson(payload).object();
             result.found = true;
+            result.json = event;
             result.tags = event.value(QStringLiteral("tags")).toObject();
             result.user = event.value(QStringLiteral("user")).toObject();
             result.body = event.value(QStringLiteral("message")).toObject()
@@ -1049,6 +1052,97 @@ class TstTelemetry : public QObject
     Q_OBJECT
 
 private slots:
+    void anInstallerFailureBecomesOneMessageEventAndIsDeduplicated_data()
+    {
+        QTest::addColumn<QString>("outcome"); QTest::addColumn<QString>("level");
+        QTest::newRow("failed") << QString("failed") << QString("error");
+        QTest::newRow("recovered") << QString("recovered") << QString("warning");
+    }
+    void anInstallerFailureBecomesOneMessageEventAndIsDeduplicated()
+    {
+        QFETCH(QString, outcome); QFETCH(QString, level);
+        QTemporaryDir journal, db, state;
+        QVERIFY(journal.isValid() && db.isValid() && state.isValid());
+        const QString id = "0123456789abcdef";
+        const auto now = QDateTime::currentDateTimeUtc();
+        QJsonObject row{{"v", 1}, {"attempt", id}, {"from", "0.1.24"}, {"to", "0.1.25"},
+            {"mode", "staged"}, {"started", now.addSecs(-100).toString(Qt::ISODate)},
+            {"ended", now.addSecs(-10).toString(Qt::ISODate)}, {"outcome", outcome},
+            {"step", "swap_aside"}, {"class", "installer.locked_file"}, {"code", 5},
+            {"rollback", "not_needed"}, {"state", "old_intact"},
+            {"ms", QJsonObject{{"stage", 2}, {"swap", 3}, {"total", 5}}}, {"elevated", true},
+            {"private_path", "C:/Users/DO_NOT_SHIP"}};
+        QFile file(journal.filePath("attempt-" + id + ".end.json"));
+        QVERIFY(file.open(QIODevice::WriteOnly)); file.write(QJsonDocument(row).toJson()); file.close();
+        const auto mtime = QFileInfo(file).lastModified(); const auto bytes = QFileInfo(file).size();
+        QTcpServer server; QList<QByteArray> envelopes;
+        wireEnvelopeCollector(&server, &envelopes);
+        QVERIFY(server.listen(QHostAddress::LocalHost, 0));
+        const QString dsn = QString("http://publickey@127.0.0.1:%1/1").arg(server.serverPort());
+        const QString retry = state.filePath("retry-state.json");
+        for (int run = 0; run < 2; ++run) {
+            QProcess child; child.setProgram(m_appPath);
+            child.setArguments({"--installer-child", dsn, db.path(), m_handlerPath,
+                                journal.path(), retry});
+            child.start(); QVERIFY(child.waitForStarted(5000));
+            QTRY_VERIFY_WITH_TIMEOUT(child.state() != QProcess::Running, 15000);
+            QCOMPARE(child.exitCode(), 0);
+        }
+        QList<ParsedEventItem> events;
+        for (const auto& envelope : envelopes) {
+            const auto item = parseFirstEventItem(envelope);
+            if (item.found) events.append(item);
+            QVERIFY(!envelope.contains("DO_NOT_SHIP"));
+        }
+        QCOMPARE(events.size(), 1);
+        const auto event = events.first();
+        QCOMPARE(event.json.value("level").toString(), level);
+        QCOMPARE(event.tags.value("kind").toString(), QString("installer_update"));
+        QCOMPARE(event.tags.value("step").toString(), QString("swap_aside"));
+        QCOMPARE(event.tags.value("class").toString(), QString("installer.locked_file"));
+        QCOMPARE(event.tags.value("mode").toString(), QString("staged"));
+        QCOMPARE(event.tags.value("from").toString(), QString("0.1.24"));
+        QCOMPARE(event.tags.value("to").toString(), QString("0.1.25"));
+        QCOMPARE(event.json.value("fingerprint").toArray(),
+                 QJsonArray({"installer-update", "swap_aside", "installer.locked_file"}));
+        QCOMPARE(UpdateRetryState::load(retry).reportedIds, QStringList{id});
+        QCOMPARE(QFileInfo(file).lastModified(), mtime); QCOMPARE(QFileInfo(file).size(), bytes);
+    }
+    void noDsnKeepsTheFilesAndSendsNothing()
+    {
+        QTemporaryDir journal, db, state;
+        QFile sentinel(journal.filePath("attempt-0123456789abcdef.end.json"));
+        QVERIFY(sentinel.open(QIODevice::WriteOnly)); sentinel.write("unread sentinel"); sentinel.close();
+        const auto mtime = QFileInfo(sentinel).lastModified();
+        const QString retry = state.filePath("retry-state.json");
+        QProcess child; child.setProgram(m_appPath);
+        child.setArguments({"--installer-child", "", db.path(), m_handlerPath, journal.path(), retry});
+        child.start(); QVERIFY(child.waitForStarted(5000));
+        QTRY_VERIFY_WITH_TIMEOUT(child.state() != QProcess::Running, 15000);
+        QCOMPARE(child.exitCode(), 0);
+        QVERIFY(!QFileInfo::exists(retry));
+        QCOMPARE(QFileInfo(sentinel).lastModified(), mtime);
+        QCOMPARE(QFileInfo(sentinel).size(), qint64(15));
+    }
+    void retryStateRoundTripsAndCapsTheLastSixteenIds()
+    {
+        QTemporaryDir dir; const QString path = dir.filePath("retry-state.json");
+        UpdateRetryState state; state.target = "0.1.25"; state.attemptsFailed = 3; state.declines = 2;
+        state.firstFailedAt = QDateTime::currentDateTimeUtc().addSecs(-30);
+        state.lastFailedAt = state.firstFailedAt.addSecs(10); state.nextAllowedAt = state.lastFailedAt.addSecs(3600);
+        state.lastClass = "installer.locked_file"; state.exhaustedReported = true; state.launched = true;
+        for (int i = 0; i < 20; ++i) state.rememberReport(QString::number(i, 16).rightJustified(16, '0'));
+        QVERIFY(state.save(path));
+        const auto loaded = UpdateRetryState::load(path);
+        QCOMPARE(loaded.target, state.target); QCOMPARE(loaded.attemptsFailed, 3); QCOMPARE(loaded.declines, 2);
+        QCOMPARE(loaded.firstFailedAt.toSecsSinceEpoch(), state.firstFailedAt.toSecsSinceEpoch());
+        QCOMPARE(loaded.lastFailedAt.toSecsSinceEpoch(), state.lastFailedAt.toSecsSinceEpoch());
+        QCOMPARE(loaded.nextAllowedAt.toSecsSinceEpoch(), state.nextAllowedAt.toSecsSinceEpoch());
+        QCOMPARE(loaded.lastClass, state.lastClass); QVERIFY(loaded.exhaustedReported && loaded.launched);
+        QCOMPARE(loaded.reportedIds.size(), 16); QCOMPARE(loaded.reportedIds.first(), QString("0000000000000004"));
+        QFile file(path); QVERIFY(file.open(QIODevice::WriteOnly)); file.write("corrupt"); file.close();
+        QVERIFY(UpdateRetryState::load(path).reportedIds.isEmpty());
+    }
     void initTestCase()
     {
         // Behaviour 4: the handler folder these tests use is a temp copy holding
@@ -2439,6 +2533,25 @@ int main(int argc, char* argv[])
     QCoreApplication::setOrganizationName(QStringLiteral("Seven Hills"));
     QCoreApplication::setApplicationName(QStringLiteral("SeatHub"));
     QStandardPaths::setTestModeEnabled(true);
+
+    if (argc > 1 && std::strcmp(argv[1], "--installer-child") == 0) {
+        QCoreApplication app(argc, argv);
+        SeatHubTelemetry::deleteCache();
+        SeatHubTelemetry::Options options;
+        options.dsn = QString::fromLocal8Bit(argv[2]);
+        options.databaseDir = QString::fromLocal8Bit(argv[3]);
+        options.handlerPath = QString::fromLocal8Bit(argv[4]);
+        options.environment = "test"; options.release = "seathub@0.0.0-installer";
+        if (!options.dsn.isEmpty()) SeatHubTelemetry::writeCache({options.dsn, "test", false});
+        if (!SeatHubTelemetry::startWith(options)) return 2;
+        const QString folder = QString::fromLocal8Bit(argv[5]);
+        const QString retry = QString::fromLocal8Bit(argv[6]);
+        SeatHubTelemetry::adoptInstallerJournal(folder, retry, QDateTime::currentDateTimeUtc());
+        SeatHubTelemetry::adoptInstallerJournal(folder, retry, QDateTime::currentDateTimeUtc());
+        SeatHubTelemetry::captureTestMessageForTests("ordinary-nonfatal-must-not-arrive", false);
+        SeatHubTelemetry::flush(2000);
+        return 0;
+    }
 
     if (argc > 1 && std::strcmp(argv[1], "--crash-child") == 0) {
         return runCrashChild(argc, argv);

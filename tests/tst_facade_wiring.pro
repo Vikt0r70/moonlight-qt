@@ -74,6 +74,8 @@ SOURCES += \
     ../app/seathub/log_tee.cpp \
     ../app/seathub/log_shipper.cpp \
     ../app/seathub/telemetry.cpp \
+    ../app/seathub/install_journal.cpp \
+    ../app/seathub/update_retry_state.cpp \
     ../app/seathub/stream_stats.cpp \
     ../app/seathub/stream_quality_sampler.cpp \
     ../app/seathub/engine_termination.cpp \
@@ -115,6 +117,8 @@ HEADERS += \
     ../app/seathub/log_tee.h \
     ../app/seathub/log_shipper.h \
     ../app/seathub/telemetry.h \
+    ../app/seathub/install_journal.h \
+    ../app/seathub/update_retry_state.h \
     ../app/seathub/stream_stats.h \
     ../app/seathub/stream_quality_sampler.h \
     ../app/seathub/engine_termination.h \

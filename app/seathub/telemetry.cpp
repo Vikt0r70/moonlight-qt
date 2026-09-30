@@ -832,6 +832,13 @@ QJsonObject rollupDeliveryHealth()
             {"backlog_retry_files", retries}};
 }
 
+bool emitInstallerEvent(const InstallJournalRecord&) { return false; }
+void adoptInstallerJournal(const QString&, const QString&, const QDateTime&) {}
+QString installerJournalDirectory()
+{
+    return QDir(qEnvironmentVariable("ProgramData")).filePath("SeatHubSetup/install-journal");
+}
+
 void emitLaunchMetric()
 {
     // One count per process, no dimensions (ADR-0072 item 6 lists only the name). Called from
@@ -916,11 +923,12 @@ void setRunStateDirectoryForTests(const QString& directory)
 }
 
 #ifdef SEATHUB_TEST_ALLOW_LOOPBACK_DSN
-void captureTestMessageForTests(const QString& message)
+void captureTestMessageForTests(const QString& message, bool fatal)
 {
     const QByteArray messageUtf8 = message.toUtf8();
     sentry_value_t event
-        = sentry_value_new_message_event(SENTRY_LEVEL_FATAL, nullptr, messageUtf8.constData());
+        = sentry_value_new_message_event(fatal ? SENTRY_LEVEL_FATAL : SENTRY_LEVEL_ERROR,
+                                         nullptr, messageUtf8.constData());
     sentry_capture_event(event);
 }
 #endif
