@@ -1,0 +1,11 @@
+QT += core testlib
+CONFIG += console testcase c++17
+CONFIG -= app_bundle debug_and_release debug
+TEMPLATE = app
+TARGET = tst_install_journal
+DESTDIR = $$OUT_PWD
+OBJECTS_DIR = obj-tst_install_journal
+MOC_DIR = obj-tst_install_journal
+INCLUDEPATH += $$PWD/../app
+SOURCES += tst_install_journal.cpp ../app/seathub/install_journal.cpp
+HEADERS += ../app/seathub/install_journal.h
