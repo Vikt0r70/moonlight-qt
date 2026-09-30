@@ -2270,6 +2270,11 @@ private slots:
             }
         }
         QCOMPARE(recoveredMetrics, 1);
+        for (const QString& body : {QStringLiteral("stream.rollup"), QStringLiteral("stream.quality_bad"),
+                                   QStringLiteral("stream.quality_ok"), QStringLiteral("play.summary")}) {
+            QVERIFY2(findLog(scan, body).found, qPrintable(QStringLiteral("hostile-all omitted %1").arg(body)));
+        }
+        QVERIFY(findMetric(scan, QStringLiteral("seathub.stream.fps_avg")) != nullptr);
 
         const QList<QByteArray> hostileValues = {
             QByteArray(HostileFixtures::RigAddress), QByteArray(HostileFixtures::RigAddressWithPort),
@@ -2318,8 +2323,11 @@ private slots:
                  "the offline process must persist its diagnostic before exiting");
         QFile queuedFile(QDir(spoolDir.path()).filePath(queuedFiles.first()));
         QVERIFY(queuedFile.open(QIODevice::ReadOnly));
-        QVERIFY2(queuedFile.readAll().contains("play.step"),
+        const QByteArray queued = queuedFile.readAll();
+        QVERIFY2(queued.contains("play.step"),
                  "the persisted offline line must be the expected diagnostic");
+        QVERIFY(queued.contains("stream.rollup"));
+        QVERIFY(queued.contains("play.summary"));
 
         QTcpServer server;
         QList<QByteArray> envelopes;
@@ -2345,6 +2353,8 @@ private slots:
         QVERIFY2(adopted >= 1, "the second process must adopt the prior spool file");
         QVERIFY2(hasLog(envelopes, QStringLiteral("play.step")),
                  "the next process did not deliver the prior offline play.step");
+        QVERIFY(hasLog(envelopes, QStringLiteral("stream.rollup")));
+        QVERIFY(hasLog(envelopes, QStringLiteral("play.summary")));
     }
 
 private:
