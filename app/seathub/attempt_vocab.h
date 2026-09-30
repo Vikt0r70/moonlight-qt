@@ -16,9 +16,10 @@
 // mapper's default arm is a vocabulary token, never text.
 //
 // The token block below is read mechanically: `scripts/check_attempt_vocabulary.py --require
-// client,fork --fork <path>` takes the string literals between the `attempt-steps-begin` and
-// `attempt-steps-end` markers and asserts they equal `docs/spec/client.md` "Attempt steps", in
-// order (ADR-0072 "Frozen names").
+// client,fork --fork <path>` takes the string literals between the two `attempt-steps` markers
+// and asserts they equal `docs/spec/client.md` "Attempt steps", in order (ADR-0072 "Frozen
+// names"). The script finds each marker with a plain substring search, so the marker words appear
+// in this file only on the block itself - never in a comment above it.
 
 #include <QString>
 #include <QStringList>

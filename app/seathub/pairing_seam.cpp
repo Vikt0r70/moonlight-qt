@@ -66,9 +66,22 @@ public:
         // run could cancel the very session that superseded it. The atomic is read and written
         // without touching `this`, which the worker outlives.
         if (!result.ok && m_generation == m_currentGeneration->load()) {
+            // The classification the clear is about to remove, kept for the recovered record
+            // (ADR-0072 item 2): a pairing that succeeds only after the clear reports the class
+            // that was cleared, at attempt 2.
+            const QString clearedStep = result.attemptStep;
+            const QString clearedClass = result.stepClass;
             m_cancelRequest(m_target.hostAddress, kPairingControlPort);
             if (result.pairingConflict && m_generation == m_currentGeneration->load()) {
                 result = m_handshake(m_target);
+                // A second try of the same step in this Play is attempt 2, whether the retry
+                // succeeds (with the cleared class) or fails (with the class of its own last
+                // failure, which the second run computed for itself).
+                result.attempts = 2;
+                if (result.ok) {
+                    result.attemptStep = clearedStep;
+                    result.stepClass = clearedClass;
+                }
             }
         }
 
@@ -232,6 +245,13 @@ void ProductionPairingSeam::finish(quint64 generation, const PairingHandshakeRes
         // `ok == false` it receives here. The identity is empty on every failure path. Nothing is
         // logged here: the deadline and the missing identity each log their own reason above, and
         // a handshake that failed logged its own.
+        //
+        // The classification leaves ahead of `done`, on the same thread, so a queued connection
+        // to the facade receives it before the controller's own `pairingFailed` for this run
+        // (ADR-0072, Plan 09): `handlePairingFailed()` then has the step and the class while it
+        // is still handling this failure.
+        m_lastResult = result;
+        emit failureClassified(result);
         done(false, QString(), result.engineError);
         return;
     }
@@ -241,6 +261,8 @@ void ProductionPairingSeam::finish(quint64 generation, const PairingHandshakeRes
         // there is nothing to verify a teardown against, and the whole reason this value is
         // reported is that verification (fail closed, Pitfall 3).
         qCWarning(seathubPairingSeam) << "upstream reported success with no client identity";
+        m_lastResult = result;
+        emit failureClassified(result);
         done(false, QString(), result.engineError);
         return;
     }

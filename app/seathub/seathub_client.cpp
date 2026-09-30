@@ -499,6 +499,15 @@ SeatHubClient::SeatHubClient(QObject* parent)
     connect(m_pairingSeam, &ProductionPairingSeam::hostResolved,
             this, &SeatHubClient::handleHostResolved);
 
+    // The classified pairing failure (ADR-0072, Plan 09), emitted by the seam immediately before
+    // it reports the failure itself - hence always ahead of the controller's `pairingFailed` for
+    // the same run, on either connection type. `handlePairingFailed()` reads the step and the
+    // class from here; the seam's own `engineError` is deliberately not part of it.
+    connect(m_pairingSeam, &ProductionPairingSeam::failureClassified, this,
+            [this](const PairingHandshakeResult& result) {
+                m_pairingClassification = result;
+            });
+
     connect(m_teardown, &TeardownController::teardownCompleted,
             this, &SeatHubClient::handleTeardownCompleted);
     connect(m_teardown, &TeardownController::teardownFailed,

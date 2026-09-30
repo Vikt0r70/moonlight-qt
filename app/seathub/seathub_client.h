@@ -299,6 +299,12 @@ public:
     /// `liveness()` already are: so a test can drive the real object through the real facade.
     SseClient* sse() const { return m_sse; }
     PairingController* pairing() const { return m_pairing; }
+    /// The classification of the pairing failure the seam last reported (ADR-0072, Plan 09):
+    /// `attemptStep`, `stepClass` and `attempts` as separate members of one
+    /// `PairingHandshakeResult` - never `engineError`, which stays a local diagnostic. Copied
+    /// from `ProductionPairingSeam::failureClassified`, which always leaves the seam ahead of the
+    /// `pairingFailed` it belongs to, and read by `handlePairingFailed()`.
+    const PairingHandshakeResult& pairingClassification() const { return m_pairingClassification; }
     TeardownController* teardown() const { return m_teardown; }
     /// The in-stream HUD and the liveness reporter that feeds it a balance. Exposed the way
     /// `session()` and `teardown()` are: so a test can drive the real objects through the real
@@ -949,6 +955,10 @@ private:
     /// thread with the controller it serves, and never exposed: it is the only object in the
     /// process that ever holds the PIN, and it holds it only for the length of one handshake.
     ProductionPairingSeam* m_pairingSeam = nullptr;
+    /// What that seam's last reported failure carried (ADR-0072, Plan 09): the step and the class
+    /// `handlePairingFailed()` needs, copied from `failureClassified` on whichever thread the
+    /// seam reports from. Empty until a classified failure arrives.
+    PairingHandshakeResult m_pairingClassification;
     TeardownController* m_teardown = nullptr;
 
     // D-31/D-34 and D-33. Both must outlive the stream and neither is a Q_PROPERTY: the UI has

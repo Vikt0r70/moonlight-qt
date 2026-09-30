@@ -5,6 +5,7 @@
 
 #include <memory>
 
+#include "attempt_vocab.h"
 #include "backend/nvcomputer.h"
 #include "backend/nvhttp.h"
 #include "backend/nvpairingmanager.h"
@@ -26,6 +27,13 @@ const char* const kDiagnosticPinRejected = "the rig rejected the pairing PIN";
 const char* const kDiagnosticInProgress = "another pairing attempt is already in progress on the rig";
 const char* const kDiagnosticFailed = "the pairing handshake failed";
 
+// The two attempt steps this function can fail at (ADR-0072 item 1): everything up to and
+// including `getServerInfo()` is `pair_server_info`, the five-phase handshake and everything it
+// constructs are `pair_handshake`. Both halves share the single try block below, so the catches
+// read the step from a local rather than guessing which half of the sequence threw.
+const char* const kStepServerInfo = "pair_server_info";
+const char* const kStepHandshake = "pair_handshake";
+
 QString describe(const GfeHttpResponseException& e)
 {
     return QStringLiteral("%1 (HTTP %2)").arg(QString::fromLatin1(e.getStatusMessage()))
@@ -43,7 +51,14 @@ PairingHandshakeResult runUpstreamPairingHandshake(const PairingTarget& target)
 {
     PairingHandshakeResult result;
 
+    // Which half of the sequence is running (ADR-0072 item 1). `pair_server_info` from the
+    // start through `getServerInfo()`; `pair_handshake` from the moment `NvPairingManager` is
+    // built, because every failure after that point belongs to the five-phase handshake.
+    QString step = QLatin1String(kStepServerInfo);
+
     if (target.hostAddress.isEmpty()) {
+        result.attemptStep = step;
+        result.stepClass = QStringLiteral("no_address");
         result.engineError = QString::fromLatin1(kDiagnosticNoAddress);
         return result;
     }
@@ -81,6 +96,9 @@ PairingHandshakeResult runUpstreamPairingHandshake(const PairingTarget& target)
             std::make_shared<MoonlightPairedHost>(http, serverInfo);
         NvComputer& computer = *host->computer();
 
+        // Past this point every failure belongs to the five-phase handshake (ADR-0072 item 1).
+        step = QLatin1String(kStepHandshake);
+
         // Step 4: upstream's five-phase handshake with the control-plane PIN (ADR-0034). The
         // pinned server certificate it produces is upstream's own MITM protection, which
         // `ComputerManager::saveHost()` writes to `QSettings`. Nothing is written here: STREAM-10
@@ -110,6 +128,12 @@ PairingHandshakeResult runUpstreamPairingHandshake(const PairingTarget& target)
             return result;
         }
 
+        // The step and class of a non-PAIRED state, computed once for every arm below: from the
+        // `PairState` enum alone, never from the diagnostic text each arm records for support
+        // (ADR-0072 item 2). `PAIRED` returned above, so this is always a failure here.
+        result.attemptStep = step;
+        result.stepClass = classForPairState(static_cast<int>(state));
+
         switch (state) {
         case NvPairingManager::PIN_WRONG:
             result.engineError = QString::fromLatin1(kDiagnosticPinRejected);
@@ -128,6 +152,10 @@ PairingHandshakeResult runUpstreamPairingHandshake(const PairingTarget& target)
         }
     }
     catch (const GfeHttpResponseException& e) {
+        // The HTTP status is the whole class (ADR-0072 item 2): `http_4xx` / `http_5xx` from the
+        // integer bucket, never from `getStatusMessage()`.
+        result.attemptStep = step;
+        result.stepClass = classForHttpStatus(e.getStatusCode());
         result.engineError = QStringLiteral("%1: %2")
                                  .arg(QString::fromLatin1(kDiagnosticServerInfo), describe(e));
         // G-06.2-2: HTTP 409 on the getservercert step - "A pairing session with this uniqueid
@@ -138,6 +166,10 @@ PairingHandshakeResult runUpstreamPairingHandshake(const PairingTarget& target)
         result.pairingConflict = e.getStatusCode() == 409;
     }
     catch (const QtNetworkReplyException& e) {
+        // The Qt error enum integer is the whole class (`net_*`); `toQString()` - which carries
+        // the peer name Qt built into the message - stays in `engineError` for support alone.
+        result.attemptStep = step;
+        result.stepClass = classForNetworkError(static_cast<int>(e.getError()));
         result.engineError = QStringLiteral("%1: %2")
                                  .arg(QString::fromLatin1(kDiagnosticServerInfo), describe(e));
     }
@@ -146,11 +178,25 @@ PairingHandshakeResult runUpstreamPairingHandshake(const PairingTarget& target)
         // certificate or private key cannot be parsed; anything else from OpenSSL lands here too.
         // An exception escaping the pool thread would take the process down, so this catch is
         // load-bearing, not politeness.
+        //
+        // The class is `crypto_init` for the handshake's own construction failure and the family
+        // default for the same shape thrown by the server-info half - `e.what()` names neither
+        // and is never read for a class (ADR-0072 item 2).
+        result.attemptStep = step;
+        result.stepClass = (step == QLatin1String(kStepHandshake))
+                               ? QStringLiteral("crypto_init")
+                               : QStringLiteral("net_other");
         result.engineError = QStringLiteral("%1: %2")
                                  .arg(QString::fromLatin1(kDiagnosticFailed),
                                       QString::fromLatin1(e.what()));
     }
     catch (...) {
+        // An exception with no type at all: the same split, the same rule - a token from where
+        // it happened, never a message.
+        result.attemptStep = step;
+        result.stepClass = (step == QLatin1String(kStepHandshake))
+                               ? QStringLiteral("other")
+                               : QStringLiteral("net_other");
         result.engineError = QString::fromLatin1(kDiagnosticFailed);
     }
 

@@ -239,6 +239,7 @@ SOURCES += \
     seathub/log_shipper.cpp \
     seathub/stream_stats.cpp \
     seathub/engine_termination.cpp \
+    seathub/attempt_vocab.cpp \
     seathub/quality_outbox.cpp \
     seathub/telemetry.cpp \
     seathub/osd_renderer.cpp \
@@ -312,6 +313,7 @@ HEADERS += \
     seathub/log_shipper.h \
     seathub/stream_stats.h \
     seathub/engine_termination.h \
+    seathub/attempt_vocab.h \
     seathub/quality_outbox.h \
     seathub/telemetry.h \
     seathub/osd_renderer.h \
