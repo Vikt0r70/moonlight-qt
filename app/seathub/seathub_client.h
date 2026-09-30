@@ -672,6 +672,8 @@ private:
     void noteStepOutcome(const QString& step, const QString& outcome,
                          const QString& failureClass, qint64 elapsedMs, int attempt = 0,
                          const QString& endReason = {});
+    void finishPlay(const QString& exitPath, const QString& outcome,
+                    const QString& lastStep = {}, const QString& failureClass = {});
     /// The D-07 signed-out sequence itself (the owner's design A-87), started by
     /// `handleSseRevoked()`, the fallback read's own 401, or a running stream's own end applying
     /// a deferred one (`m_pendingSignedOutNotice`, Phase 3 D-33). While the engine's stream is
@@ -973,6 +975,12 @@ private:
     QElapsedTimer m_playElapsed;
     QString m_samplerPlayId;
     QHash<QString, QVariantMap> m_stepTimings;
+    QString m_lastFailureClass;
+    bool m_playSummaryPending = false;
+    QJsonObject m_playConfiguration;
+    qint64 m_streamStartMs = -1;
+    std::atomic<qint64> m_firstFrameMs{-1};
+    std::atomic<quint64> m_playGeneration{0};
     TeardownController* m_teardown = nullptr;
 
     // D-31/D-34 and D-33. Both must outlive the stream and neither is a Q_PROPERTY: the UI has

@@ -587,6 +587,8 @@ SeatHubClient::SeatHubClient(QObject* parent)
 
 SeatHubClient::~SeatHubClient()
 {
+    const bool summarisedAtQuit = m_playSummaryPending;
+    finishPlay(QStringLiteral("app_quit"), QStringLiteral("cancelled"));
     m_hud.compositor().setStatsTap(nullptr);
     if (m_statusSinkHandle != 0) LogTee::removeSink(m_statusSinkHandle);
     m_statusSinkHandle = 0;
@@ -617,7 +619,7 @@ SeatHubClient::~SeatHubClient()
     // started, and `sentry_flush()` finds no options and returns at once (`tst_facade_wiring`
     // constructs and destroys a `SeatHubClient` per test without ever starting telemetry).
     LogShipper::instance().drainBeforeSignOut();
-    SeatHubTelemetry::flush(2000);
+    if (!summarisedAtQuit) SeatHubTelemetry::flush(2000);
     LogShipper::instance().stop();
 
     // Plan 09 (ADR-0072 item 5): the last act of a CLEAN quit - this destructor is the only thing
@@ -745,9 +747,24 @@ void SeatHubClient::beginSession(const QString& sessionId)
     setAttachedSessionEnded(false);
     m_lastFailedStep.clear();
     m_engineLaunchReason = EngineLaunchReason::Started;
-    m_stepTimings.clear();
-    m_playElapsed.start();
-    m_samplerPlayId = randomTraceId();
+    if (!m_playSummaryPending) {
+        m_stepTimings.clear();
+        m_playElapsed.start();
+        m_samplerPlayId = randomTraceId();
+        m_playSummaryPending = true;
+        m_firstFrameMs.store(-1);
+        m_playGeneration.fetch_add(1);
+        m_streamStartMs = -1;
+        m_lastFailureClass.clear();
+        m_controlPlane->setTraceId(m_samplerPlayId);
+        SeatHubTelemetry::setTrace(m_samplerPlayId);
+    }
+    m_playConfiguration = {
+        {"cfg_res", QStringLiteral("%1x%2").arg(m_settings->getValue(QStringLiteral("width")).toInt())
+                                            .arg(m_settings->getValue(QStringLiteral("height")).toInt())},
+        {"cfg_fps", m_settings->getValue(QStringLiteral("fps")).toInt()},
+        {"cfg_bitrate_kbps", m_settings->getValue(QStringLiteral("bitrate")).toInt()}
+    };
     m_clientUuid.clear();
     // A new session's teardown has not been asked for yet. Without this the second and later
     // sessions in one run never tear down (defect F-9; `teardown_guard.h`).
@@ -1042,6 +1059,8 @@ void SeatHubClient::handleReconnectEnded(const SessionInfo& session)
         noteStepOutcome(m_lastFailedStep, QStringLiteral("failed"), reconnectClass,
                         m_playElapsed.isValid() ? m_playElapsed.elapsed() : -1, 1);
     }
+    finishPlay(QStringLiteral("reconnect_ended"), QStringLiteral("failed"),
+               QStringLiteral("reconnect"), reconnectClass);
     // CR-06: this IS an ending - the server gave up on this episode, not the customer or a locally-
     // running engine - so it must run the same D-10/STREAM-10 disable/remove/verify sequence every
     // other ending path runs (`endAttachedSessionBeforeStream()`, `endPreStreamSessionWithReport()`,
@@ -1105,6 +1124,7 @@ void SeatHubClient::endHeldSession()
     if (!m_reconnecting) {
         return;
     }
+    finishPlay(QStringLiteral("ended_held"), QStringLiteral("cancelled"), QStringLiteral("reconnect"));
     m_reconnectTimer->stop();
     m_reconnecting = false;
     m_reconnectBackoffMs = 0;
@@ -1363,6 +1383,15 @@ bool SeatHubClient::endAttachedSessionBeforePlay()
 void SeatHubClient::beginLocalAttempt()
 {
     m_samplerPlayId = randomTraceId();
+    m_playSummaryPending = true;
+    m_stepTimings.clear();
+    m_playElapsed.start();
+    m_firstFrameMs.store(-1);
+    m_playGeneration.fetch_add(1);
+    m_streamStartMs = -1;
+    m_lastFailureClass.clear();
+    m_playConfiguration = {};
+    SeatHubTelemetry::setTrace(m_samplerPlayId);
     clearFailure();
     setEndReasonText(QString());
     setHomeStatus(QString::fromLatin1(kHomeReady));
@@ -1391,6 +1420,15 @@ void SeatHubClient::beginPlayRequest()
     // create - and every later request of the same Play, through to teardown
     // (`handleTeardownCompleted` clears it).
     const QString playTraceId = randomTraceId();
+    m_samplerPlayId = playTraceId;
+    m_playSummaryPending = true;
+    m_stepTimings.clear();
+    m_playElapsed.start();
+    m_firstFrameMs.store(-1);
+    m_playGeneration.fetch_add(1);
+    m_streamStartMs = -1;
+    m_lastFailureClass.clear();
+    m_playConfiguration = {};
     m_controlPlane->setTraceId(playTraceId);
     SeatHubTelemetry::setTrace(playTraceId);
 
@@ -1408,6 +1446,10 @@ void SeatHubClient::beginPlayRequest()
 
             const QString sessionId = result.body.value(QStringLiteral("id")).toString();
             if (sessionId.isEmpty()) {
+                noteStepOutcome(QStringLiteral("allocate"), QStringLiteral("failed"),
+                                QStringLiteral("bad_response"), m_playElapsed.elapsed());
+                finishPlay(QStringLiteral("refused"), QStringLiteral("failed"),
+                           QStringLiteral("allocate"), QStringLiteral("bad_response"));
                 // A 2xx that carries no session is a contract violation, not a home state.
                 setHomeStatus(QString::fromLatin1(kHomeReady));
                 raiseFailure(SeatHubFailure::generic());
@@ -1416,6 +1458,7 @@ void SeatHubClient::beginPlayRequest()
 
             setHomeStatus(QString::fromLatin1(kHomeReady));
             beginSession(sessionId);
+            noteStepOutcome(QStringLiteral("allocate"), QStringLiteral("ok"), {}, m_playElapsed.elapsed());
         });
     });
 
@@ -1449,6 +1492,7 @@ void SeatHubClient::applyPlayFailure(const ControlPlaneResult& result)
     m_lastFailedStep = QStringLiteral("allocate");
     noteStepOutcome(m_lastFailedStep, QStringLiteral("failed"), allocationClass,
                     m_playElapsed.isValid() ? m_playElapsed.elapsed() : -1, 1);
+    finishPlay(QStringLiteral("refused"), QStringLiteral("failed"), m_lastFailedStep, allocationClass);
 
     // WR-01: a refused Play (a balance floor, a duplicate session, or an unreachable control
     // plane) is a Play end too - the trace id `beginPlayRequest()` minted must not leak onto the
@@ -1528,6 +1572,7 @@ void SeatHubClient::interrupt()
     // false` (C6: no charge either way, the server's call to make), and returns Home at once -
     // not once the network answers (`screens.md` §24).
     if (!m_session->active()) {
+        finishPlay(QStringLiteral("cancelled"), QStringLiteral("cancelled"), m_lastFailedStep);
         onClientThread(m_pairing, [this]() { m_pairing->cancel(); });
         m_liveness->stop();
         endAttachedSessionBeforeStream(false);
@@ -1824,6 +1869,7 @@ QVariantMap SeatHubClient::readAgentConfigFile(const QUrl& fileUrl)
 
 void SeatHubClient::signOut()
 {
+    finishPlay(QStringLiteral("signed_out"), QStringLiteral("cancelled"));
     // CR-02: a report still pending when the customer signs out (mid-teardown, or between
     // `handleVideoStatsParsed()` and a teardown outcome) is written to the outbox under the
     // account that is about to be cleared below - never dropped just because nobody is waiting
@@ -2264,6 +2310,7 @@ void SeatHubClient::handleStageFailed(const QString& stage, int errorCode, const
     m_lastFailedStep = QStringLiteral("engine_connect");
     noteStepOutcome(m_lastFailedStep, QStringLiteral("failed"), stageClass,
                     m_playElapsed.isValid() ? m_playElapsed.elapsed() : -1, 1);
+    finishPlay(QStringLiteral("stage_failed"), QStringLiteral("failed"), m_lastFailedStep, stageClass);
     // Before the stream started the customer is on the connecting view: it stopped there, at the stage
     // the engine was in, and says so in the deck's words rather than sending them to the error view.
     if (connectingSession()) {
@@ -2294,6 +2341,23 @@ void SeatHubClient::handleStageFailed(const QString& stage, int errorCode, const
 
 void SeatHubClient::handleConnectionStarted()
 {
+    const bool firstConnection = m_streamStartMs < 0;
+    if (firstConnection) m_streamStartMs = m_playElapsed.elapsed();
+    const auto generation = m_playGeneration.load();
+    const QElapsedTimer clock = m_playElapsed;
+    m_hud.compositor().setStatsTap([this, generation, clock](const VideoStats& stats) {
+        if (generation != m_playGeneration.load()) return;
+        m_sampler->feed(stats);
+        qint64 absent = -1;
+        if (stats.renderedFps.present && stats.renderedFps.value > 0
+            && m_firstFrameMs.compare_exchange_strong(absent, clock.elapsed())) {
+            const double elapsed = static_cast<double>(m_firstFrameMs.load());
+            QMetaObject::invokeMethod(m_sampler, [elapsed]() {
+                SeatHubTelemetry::emitStepMetric(QStringLiteral("first_frame"), QStringLiteral("ok"),
+                                                QStringLiteral("ok"), elapsed);
+            }, Qt::QueuedConnection);
+        }
+    });
     // 06.1-19/J-07: the reconnect (if this was one) just succeeded - the stream is back before
     // anything else here runs.
     if (m_reconnecting) {
@@ -2327,7 +2391,7 @@ void SeatHubClient::handleConnectionStarted()
     // WR-04: the moment the stream truly begins is the right anchor for the first decoder
     // segment's own duration - not `beginSession()`, which can run well before the first frame
     // while pairing and connecting happen and would otherwise overstate it.
-    m_statsAggregator.start();
+    if (firstConnection) m_statsAggregator.start();
 
     // The last balance read before the stream (D-16: the seed never shows Time left, however low
     // it is - it can be old, so it arms no reminder; the report below reads the wallet at once and
@@ -2374,6 +2438,8 @@ void SeatHubClient::handleDisplayLaunchError(const QString& text)
         noteStepOutcome(m_lastFailedStep, QStringLiteral("failed"),
                         QStringLiteral("launch_error"),
                         m_playElapsed.isValid() ? m_playElapsed.elapsed() : -1, 1);
+        finishPlay(QStringLiteral("launch_failed"), QStringLiteral("failed"),
+                   m_lastFailedStep, QStringLiteral("launch_error"));
         if (inControlPlaneSession()) {
             EndReport report;
             report.stage = QStringLiteral("connecting");
@@ -2401,6 +2467,8 @@ void SeatHubClient::handleDisplayLaunchError(const QString& text)
         return;
     }
 
+    finishPlay(QStringLiteral("terminated"), QStringLiteral("failed"),
+               QStringLiteral("stream"), classForStreamError(terminationCode));
     raiseFailure(mapLaunchError(text));
 }
 
@@ -2450,6 +2518,10 @@ void SeatHubClient::handleReadyForDeletion()
         return;
     }
 
+    finishPlay(m_streamStarted ? QStringLiteral("ended") : QStringLiteral("cancelled"),
+               m_streamStarted ? QStringLiteral("ok") : QStringLiteral("cancelled"),
+               m_streamStarted ? QStringLiteral("stream") : m_lastFailedStep,
+               m_streamStarted ? QStringLiteral("graceful") : QString());
     // SDL destruction is proven by the time this arrives (D-03), so the Qt window may come
     // back and the appState may leave "streaming". SessionSegue.qml performs the actual
     // `window.visible = true`.
@@ -2799,6 +2871,7 @@ void SeatHubClient::handleSessionState(const SessionInfo& session)
         }
         m_liveness->stop();
         if (m_session->active() || m_appState == QLatin1String(kStateStreaming)) {
+            finishPlay(QStringLiteral("server_ended"), QStringLiteral("ok"), QStringLiteral("stream"));
             // 06.1-19/J-07: if this engine belongs to a reconnect attempt that just resumed
             // streaming, this same terminal read still wins - clear `m_reconnecting` first, so
             // `handleReadyForDeletion()`, once this interrupt reaches it, takes the ordinary end
@@ -2828,6 +2901,8 @@ void SeatHubClient::handleSessionState(const SessionInfo& session)
                 noteStepOutcome(m_lastFailedStep, QStringLiteral("failed"),
                                 QStringLiteral("server_ended"), m_playElapsed.elapsed(), 0,
                                 session.endReason);
+                finishPlay(QStringLiteral("server_ended_pre"), QStringLiteral("failed"),
+                           m_lastFailedStep, QStringLiteral("server_ended"));
                 EndReport report;
                 report.stage = QStringLiteral("connecting");
                 report.attemptStep = m_lastFailedStep;
@@ -2867,6 +2942,7 @@ void SeatHubClient::noteStepOutcome(const QString& step, const QString& outcome,
         timing.insert(QStringLiteral("elapsed_ms"), elapsedMs);
     }
     m_stepTimings.insert(closedStep, timing);
+    if (outcome == QLatin1String("failed")) m_lastFailureClass = failureClass;
 
     const QString closedClass = failureClass;
     SeatHubTelemetry::emitStepMetric(closedStep, outcome, closedClass,
@@ -2898,6 +2974,72 @@ void SeatHubClient::noteStepOutcome(const QString& step, const QString& outcome,
                                      outcome == QLatin1String("failed") ? LogLevel::Warning
                                                                          : LogLevel::Info,
                                      attributes);
+}
+
+void SeatHubClient::finishPlay(const QString& exitPath, const QString& outcome,
+                              const QString& lastStep, const QString& failureClass)
+{
+    if (!m_playSummaryPending) return;
+    m_playSummaryPending = false;
+    // The renderer only feeds/captures the first-frame timestamp. Final aggregation, shipping
+    // and the bounded SDK flush never run on that hot thread.
+    m_hud.compositor().setStatsTap(nullptr);
+    QJsonObject attributes = m_playConfiguration;
+    attributes.insert("exit_path", exitPath);
+    attributes.insert("outcome", outcome);
+    QString reached = lastStep.isEmpty()
+        ? (m_lastFailedStep.isEmpty() && m_streamStartMs >= 0 ? QStringLiteral("stream") : m_lastFailedStep)
+        : lastStep;
+    QString classified = failureClass.isEmpty() ? m_lastFailureClass : failureClass;
+    const qint64 firstFrame = m_firstFrameMs.load();
+    if (m_streamStartMs >= 0 && firstFrame < 0) {
+        reached = QStringLiteral("first_frame");
+        classified = QStringLiteral("no_first_frame");
+    }
+    if (coerceStep(reached) != QLatin1String("other")) attributes.insert("last_step", reached);
+    if (!classified.isEmpty() && isClosedFailureClass(reached, classified)) {
+        attributes.insert("failure_class", classified);
+    }
+    for (auto it = m_stepTimings.cbegin(); it != m_stepTimings.cend(); ++it) {
+        if (it.value().contains(QStringLiteral("elapsed_ms"))) {
+            attributes.insert(QStringLiteral("t_%1_ms").arg(it.key()),
+                              QJsonValue::fromVariant(it.value().value(QStringLiteral("elapsed_ms"))));
+        }
+    }
+    if (firstFrame >= 0) attributes.insert("t_first_frame_ms", static_cast<double>(firstFrame));
+    auto finishSampler = [this, &attributes]() {
+        m_sampler->finish();
+        if (m_streamStartMs < 0) return;
+        attributes.insert("rollups", m_sampler->rollups());
+        attributes.insert("bad_episodes", m_sampler->badEpisodes());
+        attributes.insert("bad_seconds", m_sampler->badSeconds());
+        attributes.insert("sampling_gap_s", m_sampler->samplingGapS());
+    };
+    if (m_sampler->thread() == QThread::currentThread()) finishSampler();
+    else QMetaObject::invokeMethod(m_sampler, finishSampler, Qt::BlockingQueuedConnection);
+    if (m_streamStartMs >= 0) {
+        attributes.insert("stream_s", (m_playElapsed.elapsed() - m_streamStartMs) / 1000.0);
+        attributes.insert("reconnects", m_reconnectCount);
+        if (m_statsAggregator.hasSegments()) {
+            const auto quality = m_statsAggregator.aggregate();
+            struct Field { const char* name; OptionalMetric VideoStats::* member; };
+            const Field fields[] = {
+                {"fps_avg", &VideoStats::renderedFps}, {"net_drop_avg", &VideoStats::networkDroppedFramePct},
+                {"jitter_drop_avg", &VideoStats::jitterDroppedFramePct}, {"rtt_avg", &VideoStats::rttMs},
+                {"decode_avg", &VideoStats::decodeTimeMs}, {"queue_avg", &VideoStats::queueTimeMs},
+                {"render_avg", &VideoStats::renderTimeMs}, {"host_avg", &VideoStats::hostProcessingAvgMs}
+            };
+            for (const auto& field : fields) {
+                const auto value = quality.*field.member;
+                if (value.present) attributes.insert(QString::fromLatin1(field.name), value.value);
+            }
+        }
+    }
+    SeatHubTelemetry::emitDiagnostic(QStringLiteral("play.summary"),
+                                     outcome == QLatin1String("failed") ? LogLevel::Warning : LogLevel::Info,
+                                     attributes);
+    LogShipper::instance().drainBeforeSignOut();
+    SeatHubTelemetry::flush(2000);
 }
 
 void SeatHubClient::handleAccountState(const AccountStateInfo& account)
@@ -3075,6 +3217,8 @@ void SeatHubClient::handleHorizonReached()
 
     // The authorization this session was given has run out and the control plane has not
     // extended it. Stop locally rather than keep streaming on credit the server never approved.
+    finishPlay(QStringLiteral("horizon"), QStringLiteral("ok"),
+               m_streamStarted ? QStringLiteral("stream") : m_lastFailedStep);
     m_liveness->stop();
     m_sessionChannel->close();
     m_session->interrupt();
@@ -3140,6 +3284,8 @@ void SeatHubClient::handlePairingCompleted(const QString& clientUuid)
         m_lastFailedStep = QStringLiteral("engine_prepare");
         noteStepOutcome(m_lastFailedStep, QStringLiteral("failed"),
                         classForLaunchReason(launchReason), m_playElapsed.elapsed(), 1);
+        finishPlay(QStringLiteral("start_refused"), QStringLiteral("failed"),
+                   m_lastFailedStep, classForLaunchReason(launchReason));
         // Pairing itself succeeded, but nothing was attached to start with - connecting never
         // truly began, so the stage this stopped at is still `pairing` (D-11).
         m_liveness->reportFailure(QStringLiteral("pairing"));
@@ -3347,6 +3493,8 @@ void SeatHubClient::handlePairingFailed(const SeatHubFailure& failure)
                         classification.attempts);
     }
 
+    finishPlay(QStringLiteral("pair_failed"), QStringLiteral("failed"),
+               m_lastFailedStep, m_lastFailureClass);
     // D-11: a pairing timeout or a control-plane refusal of the pairing read, neither with an
     // engine code - reported before liveness stops, so the server sees "SeatHub failed at
     // pairing" rather than a session that simply went quiet.

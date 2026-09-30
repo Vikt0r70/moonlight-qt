@@ -1013,6 +1013,7 @@ private slots:
         QTest::addColumn<int>("exit");
         QTest::addColumn<QString>("token");
         QTest::addColumn<QString>("outcome");
+        QTest::addColumn<bool>("liveFrame");
         const char* tokens[] = {"refused", "pair_failed", "stage_failed", "launch_failed",
             "start_refused", "cancelled", "server_ended_pre", "ended", "terminated",
             "server_ended", "horizon", "reconnect_ended", "ended_held", "signed_out", "app_quit"};
@@ -1021,7 +1022,7 @@ private slots:
                 ? QStringLiteral("failed") : (i == 5 || i >= 12 ? QStringLiteral("cancelled")
                                                                        : QStringLiteral("ok"));
             QTest::newRow(qPrintable(QStringLiteral("E%1-%2").arg(i + 1).arg(tokens[i])))
-                << i + 1 << QString::fromLatin1(tokens[i]) << outcome;
+                << i + 1 << QString::fromLatin1(tokens[i]) << outcome << false;
         }
     }
 
@@ -1030,9 +1031,11 @@ private slots:
         QFETCH(int, exit);
         QFETCH(QString, token);
         QFETCH(QString, outcome);
+        QFETCH(bool, liveFrame);
         QTemporaryDir spool;
         QMutex mutex;
         QList<ShippedLine> records;
+        QString userAtSummary;
         auto engine = std::make_unique<FakeEngineSession>();
         auto client = std::make_unique<SeatHubClient>();
         if (exit == 1) reachHome(*client, 90);
@@ -1041,7 +1044,10 @@ private slots:
         client->teardown()->setVerifyIntervalMs(1);
         LogShipper::instance().setSpoolDirectoryForTests(spool.path());
         LogShipper::instance().start([&](const ShippedLine& line) {
-            QMutexLocker lock(&mutex); records.append(line); return true;
+            QMutexLocker lock(&mutex);
+            records.append(line);
+            if (line.body == QLatin1String("play.summary")) userAtSummary = SeatHubTelemetry::currentUserId();
+            return true;
         });
         LogShipper::instance().setCanShip(true);
         StopShipperOnScopeExit guard;
@@ -1049,6 +1055,15 @@ private slots:
             client->session()->attachSession(engine.get());
             client->session()->start(nullptr);
             emit engine->connectionStarted();
+            if (liveFrame) {
+                auto& compositor = client->hud()->compositor();
+                SDL_Surface* surface = OsdCompositor::rasterize(Overlay::OverlayDebug,
+                    "Rendering frame rate: 59.00 FPS\nAverage network latency: 23 ms (variance: 1 ms)",
+                    true, SDL_Color{255, 255, 255, 255}, &compositor);
+                if (surface) SDL_FreeSurface(surface);
+                QTest::qWait(5);
+                emitStatsBlock(59.0);
+            }
         }
         switch (exit) {
         case 1:
@@ -1109,16 +1124,70 @@ private slots:
         QCOMPARE(summary.attrs.value("outcome").toString(), outcome);
         QCOMPARE(summaries().size(), 1);
         if (exit == 1) {
+            QVERIFY(summary.attrs.contains("t_allocate_ms"));
             QVERIFY(summary.sessionId.isEmpty());
             QVERIFY(!summary.attrs.contains("stream_s"));
             QVERIFY(!summary.attrs.contains("rollups"));
+            QVERIFY(!summary.attrs.contains("cfg_res"));
         }
         if (exit >= 8) {
             QVERIFY(summary.attrs.contains("stream_s"));
             QVERIFY(summary.attrs.contains("rollups"));
+            QVERIFY(summary.attrs.contains("cfg_res"));
+            QVERIFY(summary.attrs.contains("cfg_fps"));
+            QVERIFY(summary.attrs.contains("cfg_bitrate_kbps"));
+            QVERIFY(summary.attrs.contains("bad_episodes"));
+            QVERIFY(summary.attrs.contains("bad_seconds"));
+            QVERIFY(summary.attrs.contains("sampling_gap_s"));
+            if (liveFrame) {
+                QVERIFY(summary.attrs.contains("t_first_frame_ms"));
+                QCOMPARE(summary.attrs.value("last_step").toString(), QStringLiteral("stream"));
+                QCOMPARE(summary.attrs.value("fps_avg").toDouble(), 59.0);
+            }
+            else {
+                QCOMPARE(summary.attrs.value("last_step").toString(), QStringLiteral("first_frame"));
+                QCOMPARE(summary.attrs.value("failure_class").toString(), QStringLiteral("no_first_frame"));
+                QVERIFY(!summary.attrs.contains("t_first_frame_ms"));
+            }
         }
+        if (exit == 3) QVERIFY(summary.attrs.contains("t_engine_connect_ms"));
+        if (exit == 14 || exit == 15) QVERIFY(!userAtSummary.isEmpty());
+        if (exit == 14) QVERIFY(SeatHubTelemetry::currentUserId().isEmpty());
         if (client) client->session()->attachSession(nullptr);
     }
+
+    void aPlayNeverSummarisesTwice_data()
+    {
+        QTest::addColumn<int>("exit");
+        QTest::addColumn<QString>("token");
+        QTest::addColumn<QString>("outcome");
+        QTest::addColumn<bool>("liveFrame");
+        QTest::newRow("server-end-then-engine-deletion") << 10 << QStringLiteral("server_ended")
+            << QStringLiteral("ok") << true;
+    }
+    void aPlayNeverSummarisesTwice() { onePlaySummaryPerExitPath(); }
+
+    void signOutSummarisesBeforeTheDrain_data()
+    {
+        QTest::addColumn<int>("exit");
+        QTest::addColumn<QString>("token");
+        QTest::addColumn<QString>("outcome");
+        QTest::addColumn<bool>("liveFrame");
+        QTest::newRow("signed-out") << 14 << QStringLiteral("signed_out") << QStringLiteral("cancelled") << true;
+        QTest::newRow("quit") << 15 << QStringLiteral("app_quit") << QStringLiteral("cancelled") << true;
+    }
+    void signOutSummarisesBeforeTheDrain() { onePlaySummaryPerExitPath(); }
+
+    void theSummaryCarriesThePerStepTimingsAndTheConfiguredValues_data()
+    {
+        QTest::addColumn<int>("exit");
+        QTest::addColumn<QString>("token");
+        QTest::addColumn<QString>("outcome");
+        QTest::addColumn<bool>("liveFrame");
+        QTest::newRow("live-frame-and-final-decoder-stats") << 8 << QStringLiteral("ended")
+            << QStringLiteral("ok") << true;
+    }
+    void theSummaryCarriesThePerStepTimingsAndTheConfiguredValues() { onePlaySummaryPerExitPath(); }
 
     void initTestCase()
     {
@@ -3599,18 +3668,25 @@ private slots:
         QMutexLocker lock(&captureMutex);
         int diagnostics = 0;
         int playSteps = 0;
+        int summaries = 0;
         const ShippedLine* record = nullptr;
         for (const ShippedLine& line : captured) {
             if (line.diagnostic) {
                 ++diagnostics;
-                record = &line;
             }
             if (line.body == QLatin1String("play.step")) {
                 ++playSteps;
+                record = &line;
+            }
+            if (line.body == QLatin1String("play.summary")) {
+                ++summaries;
+                QCOMPARE(line.attrs.value("exit_path").toString(), QStringLiteral("start_refused"));
+                QCOMPARE(line.attrs.value("failure_class").toString(), QStringLiteral("no_app"));
             }
         }
-        QCOMPARE(diagnostics, 1);
+        QCOMPARE(diagnostics, 2);
         QCOMPARE(playSteps, 1);
+        QCOMPARE(summaries, 1);
         QVERIFY(record != nullptr);
         QCOMPARE(record->level, LogLevel::Warning);
         QCOMPARE(record->attrs.value(QStringLiteral("step")).toString(),
