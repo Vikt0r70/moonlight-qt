@@ -213,6 +213,8 @@ public:
     /// alone (D-09). Static and pure - no lock, no I/O - so `before_send_log` can call it a second
     /// time in `telemetry.cpp` with no extra cost.
     static QString scrub(const QString& text);
+    static void setRedactions(const QStringList& literals);
+    static void clearRedactions();
 
     /// Publishes the identity every future line snapshots. `telemetry.cpp`'s `setSession()` /
     /// `clearSession()` / `setTrace()` / `clearTrace()` call this (Plan 21 deviation - the

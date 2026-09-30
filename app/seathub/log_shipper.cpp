@@ -871,6 +871,9 @@ void LogShipper::setPauseTimeoutForTests(int milliseconds)
     m_impl->setPauseTimeoutForTests(milliseconds);
 }
 
+void LogShipper::setRedactions(const QStringList&) {}
+void LogShipper::clearRedactions() {}
+
 QString LogShipper::scrub(const QString& text)
 {
     QString result = text;

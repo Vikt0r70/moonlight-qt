@@ -41,6 +41,7 @@
 #include <cstring>
 #include <mutex>
 #include <thread>
+#include <vector>
 
 // This file defines `main()` below. `<SDL.h>` otherwise `#define`s `main` to `SDL_main` - the
 // same fix `tst_log_tee.cpp` uses for the same reason (log_tee.cpp needs SDL2).
@@ -612,6 +613,46 @@ private slots:
         QVERIFY(!scrubbed.contains(QStringLiteral("MIIBabc")));
         QVERIFY2(scrubbed.contains(QStringLiteral("203.0.113.7")),
                  "the customer's public IP must survive scrubbing");
+    }
+
+    void theCurrentRigAddressIsScrubbedAtBothPasses()
+    {
+        const QString rig = QStringLiteral("203.0.113.77");
+        const QStringList fixtures = {
+            QStringLiteral("Executing request: https://203.0.113.77:47984/serverinfo"),
+            QStringLiteral("Host 203.0.113.77 not found (Error 3)"),
+            QStringLiteral("Connecting to 203.0.113.77:47989")
+        };
+        LogShipper::setRedactions({rig});
+        for (const auto& raw : fixtures) {
+            const QString first = LogShipper::scrub(raw);
+            QVERIFY(!first.contains(rig));
+            QVERIFY(first.contains(QStringLiteral("[rig]")));
+            QCOMPARE(LogShipper::scrub(first), first);
+        }
+        QCOMPARE(LogShipper::scrub(QStringLiteral("Customer 198.51.100.12")),
+                 QStringLiteral("Customer 198.51.100.12"));
+        LogShipper::clearRedactions();
+        for (const auto& raw : fixtures) QCOMPARE(LogShipper::scrub(raw), raw);
+    }
+
+    void concurrentReadersNeverSeeATornRedactionList()
+    {
+        std::atomic<bool> failed{false};
+        std::vector<std::thread> readers;
+        for (int i = 0; i < 4; ++i) readers.emplace_back([&]() {
+            for (int n = 0; n < 1000; ++n) {
+                const QString result = LogShipper::scrub(QStringLiteral("203.0.113.77 203.0.113.78"));
+                if (result != QLatin1String("[rig] [rig]")
+                    && result != QLatin1String("203.0.113.77 203.0.113.78")) failed.store(true);
+            }
+        });
+        for (int n = 0; n < 1000; ++n) {
+            LogShipper::setRedactions({QStringLiteral("203.0.113.77"), QStringLiteral("203.0.113.78")});
+            LogShipper::clearRedactions();
+        }
+        for (auto& reader : readers) reader.join();
+        QVERIFY(!failed.load());
     }
 
     // --- the per-run shipped-bytes cap ------------------------------------------------------------
