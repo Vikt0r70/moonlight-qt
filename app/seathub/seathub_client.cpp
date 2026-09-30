@@ -415,6 +415,16 @@ SeatHubClient::SeatHubClient(QObject* parent)
     // sink only parses and marshals onto that thread via queued invoke — it never touches
     // timer state directly (same discipline as the termination sink above).
     m_sampler = new StreamQualitySampler(nullptr);
+    m_statusSinkHandle = LogTee::addSink([sampler = m_sampler](LogLevel, int category, int priority,
+                                                            const QString& message) {
+        int status;
+        const QByteArray text = message.toUtf8();
+        if (parseConnectionStatusUpdate(category, priority, text.constData(), &status)) {
+            QMetaObject::invokeMethod(sampler, [sampler, status]() {
+                sampler->noteConnectionStatus(status);
+            }, Qt::QueuedConnection);
+        }
+    });
 
     // The sign-in field's data: read from the binary, never fetched (Phase 5 D-02).
     qRegisterMetaType<SessionInfo>("SessionInfo");
@@ -578,6 +588,8 @@ SeatHubClient::SeatHubClient(QObject* parent)
 SeatHubClient::~SeatHubClient()
 {
     m_hud.compositor().setStatsTap(nullptr);
+    if (m_statusSinkHandle != 0) LogTee::removeSink(m_statusSinkHandle);
+    m_statusSinkHandle = 0;
     // D-17/A-51: unregister both `LogTee` sinks FIRST, before anything either lambda captures -
     // `this` (the termination sink calls `m_liveness->noteTermination()`) and `m_statsWatcher`
     // (owned by the stats sink) - is destroyed. `LogTee`'s sink list is process-global and

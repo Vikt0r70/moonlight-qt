@@ -102,6 +102,7 @@ void StreamQualitySampler::feed(const VideoStats& stats)
     else m_dropped.fetch_add(1);
     m_mutex.unlock();
 }
+void StreamQualitySampler::noteConnectionStatus(int) {}
 QJsonObject StreamQualitySampler::takeWindow(bool partial)
 {
     QVector<VideoStats> samples;

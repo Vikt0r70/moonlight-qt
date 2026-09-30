@@ -23,6 +23,7 @@ public:
     void setWindowMs(int ms);
     void start(const QString& sessionId);
     void finish();
+    void noteConnectionStatus(int status);
     void feed(const VideoStats& stats);
     // Snapshot and detach under the mutex; aggregation happens outside it.
     QJsonObject takeWindow(bool partial);
