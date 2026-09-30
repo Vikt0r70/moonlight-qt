@@ -1247,6 +1247,118 @@ private slots:
         QCOMPARE(seam.lastResult().engineError, QStringLiteral("the rig rejected the pairing PIN"));
     }
 
+    void aRecoveredConflictSuccessCarriesTheFrozenRecordOutOfTheSeam()
+    {
+        // ADR-0072 item 2 / `docs/spec/client.md` "Play diagnostics - Rules": a pairing that
+        // succeeds only after the clear-and-retry reports ONE record - `step=pair_handshake`,
+        // `failure_class=in_progress`, `attempt=2` - and it reaches the facade on the result the
+        // seam reports. The first run below is exactly what production builds for the rig's HTTP
+        // 409 on getservercert (step `pair_server_info`, class `http_4xx`): the recovered record
+        // is FROZEN by the ADR, not inherited from that mapper.
+        ProductionPairingSeam seam;
+        int handshakes = 0;
+        int cancels = 0;
+        seam.setHandshake([&handshakes](const PairingTarget&) {
+            ++handshakes;
+            if (handshakes == 1) {
+                PairingHandshakeResult conflict;
+                conflict.attemptStep = QStringLiteral("pair_server_info");
+                conflict.stepClass = QStringLiteral("http_4xx");
+                conflict.pairingConflict = true;
+                conflict.engineError = QStringLiteral(
+                    "the rig did not answer the server-info request (HTTP 409)");
+                return conflict;
+            }
+            PairingHandshakeResult paired;
+            paired.ok = true;
+            paired.clientIdentity = QStringLiteral("recovered-identity");
+            return paired;
+        });
+        seam.setCancelRequest([&cancels](const QString&, int) {
+            ++cancels;
+            return true;
+        });
+
+        QSignalSpy classified(&seam, &ProductionPairingSeam::failureClassified);
+        QVERIFY(classified.isValid());
+
+        SeamReport report;
+        seam.pair(pairingTarget(), recordInto(&report));
+        QTRY_COMPARE(report.count(), 1);
+
+        // One clear, one retry, and the retry's own identity reported - the G-06.2-2 contract.
+        QCOMPARE(handshakes, 2);
+        QCOMPARE(cancels, 1);
+        QVERIFY(report.outcomes.first());
+        QCOMPARE(report.identities.first(), QStringLiteral("recovered-identity"));
+        QVERIFY(report.diagnostics.first().isEmpty());
+
+        // ...and exactly ONE classification carrying the frozen recovered record, which is what
+        // the facade's INFO emission is built from.
+        QTRY_COMPARE(classified.count(), 1);
+        const PairingHandshakeResult delivered =
+            classified.at(0).at(0).value<PairingHandshakeResult>();
+        QVERIFY2(delivered.ok, "the recovered result must be reported as a success");
+        QCOMPARE(delivered.attemptStep, QStringLiteral("pair_handshake"));
+        QCOMPARE(delivered.stepClass, QStringLiteral("in_progress"));
+        QCOMPARE(delivered.attempts, 2);
+
+        // No diagnostic text and no address rides the record (ADR-0072 item 2, T-06.7-35).
+        QVERIFY2(!delivered.stepClass.isEmpty() && delivered.stepClass != delivered.engineError,
+                 "the class must be a token, never the diagnostic");
+        QVERIFY2(!delivered.engineError.contains(QStringLiteral("HTTP 409")),
+                 "the local diagnostic stays local - it is not part of the record");
+    }
+
+    void aRetryThatFailsAgainReportsTheLastFailureClass()
+    {
+        // ADR-0072 item 2: "A retry that fails again is `outcome=failed`, `failure_class` of the
+        // LAST failure, `attempt` 2" - the second run's own classification, not the cleared one's.
+        ProductionPairingSeam seam;
+        int handshakes = 0;
+        int cancels = 0;
+        seam.setHandshake([&handshakes](const PairingTarget&) {
+            ++handshakes;
+            if (handshakes == 1) {
+                PairingHandshakeResult conflict;
+                conflict.attemptStep = QStringLiteral("pair_server_info");
+                conflict.stepClass = QStringLiteral("http_4xx");
+                conflict.pairingConflict = true;
+                conflict.engineError =
+                    QStringLiteral("the rig did not answer the server-info request (HTTP 409)");
+                return conflict;
+            }
+            PairingHandshakeResult rejected;
+            rejected.attemptStep = QStringLiteral("pair_handshake");
+            rejected.stepClass = QStringLiteral("pin_rejected");
+            rejected.engineError = QStringLiteral("the rig rejected the pairing PIN");
+            return rejected;
+        });
+        seam.setCancelRequest([&cancels](const QString&, int) {
+            ++cancels;
+            return true;
+        });
+
+        QSignalSpy classified(&seam, &ProductionPairingSeam::failureClassified);
+        QVERIFY(classified.isValid());
+
+        SeamReport report;
+        seam.pair(pairingTarget(), recordInto(&report));
+        QTRY_COMPARE(report.count(), 1);
+
+        QCOMPARE(handshakes, 2);
+        QCOMPARE(cancels, 1);
+        QVERIFY(!report.outcomes.first());
+
+        QTRY_COMPARE(classified.count(), 1);
+        const PairingHandshakeResult delivered =
+            classified.at(0).at(0).value<PairingHandshakeResult>();
+        QVERIFY(!delivered.ok);
+        QCOMPARE(delivered.attemptStep, QStringLiteral("pair_handshake"));
+        QCOMPARE(delivered.stepClass, QStringLiteral("pin_rejected"));
+        QCOMPARE(delivered.attempts, 2);
+    }
+
     void theEndBodyCarriesTheAttemptStepAndNoOtherNewField()
     {
         // ADR-0072 item 1 / plan 09: the classified step is the ONE thing this plan sends to the

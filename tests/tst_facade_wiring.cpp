@@ -49,6 +49,7 @@
 #include <QNetworkAccessManager>
 #include <QNetworkReply>
 #include <QNetworkRequest>
+#include <QScopeGuard>
 #include <QScopedPointer>
 #include <QSignalSpy>
 #include <QTemporaryDir>
@@ -119,8 +120,38 @@ void MoonlightEngineSession::setTextRasterizer(Overlay::OverlayManager::TextRast
 {
 }
 
+// Plan 09 correction: the facade's own recovered-pairing record is produced through the REAL
+// production route (the seam's clear-and-retry, the controller, then the facade), and the only
+// part of that route a test binary cannot run is upstream's handshake against a live Sunshine.
+// Armed by `aRecoveredPairingEmitsExactlyOneInfoPlayStepWithTheFrozenRecord` alone: every other
+// test in this suite keeps the original always-fail answer (and, because no other test grants a
+// pairing target, none of them ever reaches this function at all).
+bool g_recoveredHandshakeArmed = false;
+int g_handshakeCalls = 0;
+
 PairingHandshakeResult runUpstreamPairingHandshake(const PairingTarget&)
 {
+    if (g_recoveredHandshakeArmed) {
+        ++g_handshakeCalls;
+        if (g_handshakeCalls == 1) {
+            // Exactly what production builds for the rig's HTTP 409 on getservercert
+            // (`pairing_handshake.cpp`): the conflict tag is what makes the seam clear the rig's
+            // pending session and retry once. Its own step/class are the mapper's - the recovered
+            // record the ADR freezes is the seam's to produce.
+            PairingHandshakeResult conflict;
+            conflict.attemptStep = QStringLiteral("pair_server_info");
+            conflict.stepClass = QStringLiteral("http_4xx");
+            conflict.pairingConflict = true;
+            conflict.engineError = QStringLiteral(
+                "the rig did not answer the server-info request (HTTP 409)");
+            return conflict;
+        }
+        PairingHandshakeResult paired;
+        paired.ok = true;
+        paired.clientIdentity = QStringLiteral("recovered-identity");
+        return paired;
+    }
+
     PairingHandshakeResult result;
     result.ok = false;
     result.engineError = QStringLiteral("no Sunshine host exists in this test environment");
@@ -131,6 +162,15 @@ namespace {
 
 const char* kAccessToken = "opaque-access-token";
 const char* kPlaintextMarker = "sb_rt_PLAINTEXT-MARKER-4F7K";
+
+/// Plan 09 correction: stops the process-wide `LogShipper` on EVERY exit path of the test that
+/// starts it (a `QVERIFY` failure returns early), so its worker - and the lambda it captured
+/// from that test's locals - never outlives the test. Declared last in the test so it runs
+/// first, before the capture locals it must not outlive are destroyed.
+struct StopShipperOnScopeExit
+{
+    ~StopShipperOnScopeExit() { LogShipper::instance().stop(); }
+};
 
 class FakeReply : public QNetworkReply
 {
@@ -2973,6 +3013,111 @@ private slots:
         QCOMPARE(client.settings()->getValue(QStringLiteral("width")).toInt(), 2560);
         QCOMPARE(client.settings()->getValue(QStringLiteral("height")).toInt(), 1440);
         QCOMPARE(client.settings()->getValue(QStringLiteral("fps")).toInt(), 30);
+    }
+
+    // Plan 09 correction, ADR-0072 item 2 / `docs/spec/client.md` "Play diagnostics - Rules": a
+    // pairing that succeeds only after the rig's 409 was cleared emits ONE `play.step` at INFO
+    // with `step=pair_handshake outcome=ok failure_class=in_progress attempt=2` - produced here by
+    // the real production route (the seam's clear-and-retry, the controller's completion, the
+    // facade's own emission into the shipper), never constructed by the test.
+    void aRecoveredPairingEmitsExactlyOneInfoPlayStepWithTheFrozenRecord()
+    {
+        g_recoveredHandshakeArmed = true;
+        g_handshakeCalls = 0;
+        auto disarm = qScopeGuard([]() {
+            g_recoveredHandshakeArmed = false;
+            g_handshakeCalls = 0;
+        });
+
+        SeatHubClient client;
+        reachHome(client, 90);
+        QVERIFY(!QTest::currentTestFailed());
+
+        // This suite never installs the LogTee and never calls `SeatHubTelemetry::start()`, so a
+        // shipper started here sees exactly one kind of line: the diagnostics the facade itself
+        // emits. Started AFTER `reachHome()`, whose identity changes run `updateCanShip()` -
+        // `setCanShip(true)` afterwards is what stands for the rest of this test.
+        QTemporaryDir spoolDir;
+        QVERIFY(spoolDir.isValid());
+        QMutex captureMutex;
+        QList<ShippedLine> captured;
+        LogShipper::instance().setSpoolDirectoryForTests(spoolDir.path());
+        LogShipper::instance().start([&captureMutex, &captured](const ShippedLine& line) {
+            QMutexLocker lock(&captureMutex);
+            captured.append(line);
+            return true;
+        });
+        LogShipper::instance().setCanShip(true);
+        StopShipperOnScopeExit stopGuard;
+
+        const auto capturedBodyCount = [&](const QString& body) {
+            QMutexLocker lock(&captureMutex);
+            int count = 0;
+            for (const ShippedLine& line : captured) {
+                if (line.body == body) {
+                    ++count;
+                }
+            }
+            return count;
+        };
+
+        // A real authorization, so the controller reaches the production seam - whose first
+        // handshake run is the rig's 409 (see the armed stub above). 127.0.0.1 keeps the seam's
+        // rig-side clear on the loopback, where nothing answers and the call returns at once.
+        QJsonObject ports;
+        ports.insert(QStringLiteral("https"), 47984);
+        ports.insert(QStringLiteral("control"), 47989);
+        ports.insert(QStringLiteral("rtsp"), 48010);
+        QJsonObject authBody;
+        authBody.insert(QStringLiteral("session_id"), QStringLiteral("s-recovered"));
+        authBody.insert(QStringLiteral("pairing_pin"), QStringLiteral("4821"));
+        authBody.insert(QStringLiteral("host_address"), QStringLiteral("127.0.0.1"));
+        authBody.insert(QStringLiteral("ports"), ports);
+        authBody.insert(QStringLiteral("state"), QStringLiteral("READY"));
+        m_fake->answerPairing(200, QJsonDocument(authBody).toJson(QJsonDocument::Compact));
+        m_fake->answerPlay(201, QByteArrayLiteral("{\"id\":\"s-recovered\"}"));
+
+        client.beginSession(QStringLiteral("s-recovered"));
+
+        // The record arrives through the real route.
+        QTRY_VERIFY_WITH_TIMEOUT(capturedBodyCount(QStringLiteral("play.step")) == 1, 20000);
+
+        // Stop the worker before reading the capture: the final assertions must not race it.
+        LogShipper::instance().stop();
+
+        // ONE line, and it is the ADR's frozen record - not a WARN, not a second emission.
+        QMutexLocker lock(&captureMutex);
+        QCOMPARE(captured.size(), 1);
+        const ShippedLine& record = captured.first();
+        QCOMPARE(record.body, QStringLiteral("play.step"));
+        QCOMPARE(record.level, LogLevel::Info);
+        QCOMPARE(record.attrs.value(QStringLiteral("step")).toString(),
+                 QStringLiteral("pair_handshake"));
+        QCOMPARE(record.attrs.value(QStringLiteral("outcome")).toString(), QStringLiteral("ok"));
+        QCOMPARE(record.attrs.value(QStringLiteral("failure_class")).toString(),
+                 QStringLiteral("in_progress"));
+        QCOMPARE(record.attrs.value(QStringLiteral("attempt")).toInt(), 2);
+
+        // No PIN, no address and no diagnostic text anywhere in what was emitted
+        // (ADR-0072 item 2, T-06.7-35): the 409 sentence and the PIN stay where they were.
+        const QByteArray serialised = QJsonDocument(record.attrs).toJson(QJsonDocument::Compact);
+        QVERIFY2(!serialised.contains("4821"), qPrintable(QString::fromUtf8(serialised)));
+        QVERIFY2(!serialised.contains("409"),
+                 qPrintable(QStringLiteral("the local diagnostic leaked: %1")
+                                .arg(QString::fromUtf8(serialised))));
+        QVERIFY(!record.body.contains(QStringLiteral("4821")));
+        lock.unlock();
+
+        // Nothing extra went to the server for the recovery (ADR-0072 item 2: "nothing extra is
+        // sent ... on a recovered pairing"): the only `/end` this scenario produces is the
+        // ordinary pre-stream end this suite's engine-less setup always sends, and it carries no
+        // `attempt_step` - a step the Play did NOT fail at never travels.
+        QTRY_VERIFY_WITH_TIMEOUT(
+            m_fake->requestPaths().contains(QStringLiteral("/api/sessions/s-recovered/end")), 15000);
+        QCOMPARE(m_fake->requestPaths().count(QStringLiteral("/api/sessions/s-recovered/end")), 1);
+        QVERIFY2(!m_fake->bodyFor(QStringLiteral("/api/sessions/s-recovered/end"))
+                      .contains("attempt_step"),
+                 "a recovered pairing must add nothing to the /end body");
     }
 
     void anEngineFailureBeforeTheStreamStartsIsAStallAtTheSecondStage()

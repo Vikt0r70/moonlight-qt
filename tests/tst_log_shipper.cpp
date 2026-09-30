@@ -139,6 +139,29 @@ void appendRawSpoolLine(const QString& directory, const QString& body, double lo
     file.write("\n");
 }
 
+/// The same line written for ANOTHER pid - a leftover spool file from a process that is no longer
+/// running, which `LogSpool::adoptLeftovers()` reclaims at the next `start()`. The pid is chosen
+/// so it can never be this process's own (which `adoptLeftovers()` skips by construction) and
+/// cannot be a live one either; no `.lock` companion is written, so the adoption's `tryLock()`
+/// takes a fresh lock exactly as it does for a real leftover whose owner died.
+void appendLeftoverSpoolLine(const QString& directory, qint64 deadPid, const QString& body,
+                             double loggedAt)
+{
+    QDir().mkpath(directory);
+    QJsonObject obj;
+    obj.insert(QStringLiteral("level"), static_cast<int>(LogLevel::Info));
+    obj.insert(QStringLiteral("body"), body);
+    obj.insert(QStringLiteral("logged_at"), loggedAt);
+    obj.insert(QStringLiteral("session_id"), QString());
+    obj.insert(QStringLiteral("host_id"), QString());
+    obj.insert(QStringLiteral("trace_id"), QString());
+
+    QFile file(QDir(directory).filePath(QStringLiteral("spool-%1.jsonl").arg(deadPid)));
+    file.open(QIODevice::Append | QIODevice::Text);
+    file.write(QJsonDocument(obj).toJson(QJsonDocument::Compact));
+    file.write("\n");
+}
+
 // --- the leftover-child role -------------------------------------------------------------------
 
 int runLeftoverChild(const QString& directory)
@@ -721,6 +744,49 @@ private slots:
             QTest::qWait(300);
             QCOMPARE(stub.countMatching(QStringLiteral("play.step")), 1000);
         }
+    }
+
+    void agedLeftoverLinesAreDroppedAndCountedWhenStartAdoptsThem()
+    {
+        // The launch record's `dropped_spool_age` is read immediately after
+        // `LogShipper::start()` runs (telemetry's `noteLaunch()` comes later in the same
+        // `SeatHubTelemetry::start()` chain), so a leftover line that is ALREADY older than
+        // `LogSpool::kSpoolMaxAgeDays` has to be counted where it is adopted - otherwise the
+        // record reports 0 while startup is holding lines that will never ship, and
+        // `spool_lines_adopted` counts them as though they were alive. The rule itself is the
+        // existing one: the same 7-day cutoff `takeAll()` has always applied at drain
+        // (`log_shipper.h` kSpoolMaxAgeDays), applied here at the earliest moment the line is
+        // known dead - no new clock policy, no extra scan.
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        // Eight days old - past the 7-day cutoff - and a fresh one beside it, both in one dead
+        // process's spool file (4194305 can never be this process's own pid, and no `.lock`
+        // companion exists, so adoption takes a fresh lock exactly as for a real leftover).
+        appendLeftoverSpoolLine(dir.path(), 4194305, QStringLiteral("aged-leftover-line"),
+                                epochSecondsNow() - 8.0 * 24.0 * 3600.0);
+        appendLeftoverSpoolLine(dir.path(), 4194305, QStringLiteral("fresh-leftover-line"),
+                                epochSecondsNow());
+
+        StubHandOff stub;
+        StopShipperOnScopeExit stopGuard;
+        LogShipper::instance().setSpoolDirectoryForTests(dir.path());
+        LogShipper::instance().start([&stub](const ShippedLine& line) { return stub(line); });
+
+        // Both are adopted, and the aged one is already counted as dropped the moment start()
+        // returns - before any drain has run.
+        QCOMPARE(LogShipper::instance().adoptedSpoolLines(), 2);
+        QCOMPARE(LogShipper::instance().droppedSpoolAgeCount(), 1);
+
+        // The fresh leftover still ships; the aged one never does.
+        LogShipper::instance().setCanShip(true);
+        QTRY_VERIFY_WITH_TIMEOUT(stub.countMatching(QStringLiteral("fresh-leftover-line")) == 1,
+                                 10000);
+        QTest::qWait(300);
+        QCOMPARE(stub.countMatching(QStringLiteral("aged-leftover-line")), 0);
+
+        // And the counter never counts the same line twice (the aged one is not in the spool for
+        // a later drain to drop again).
+        QCOMPARE(LogShipper::instance().droppedSpoolAgeCount(), 1);
     }
 
 private:

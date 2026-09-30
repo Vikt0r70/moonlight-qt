@@ -768,6 +768,28 @@ bool hasMetric(const QList<QByteArray>& envelopes, const QString& name)
     return findMetric(scanEnvelopes(envelopes), name) != nullptr;
 }
 
+/// Writes one line into a DEAD process's spool file in `directory`, in the shape the release
+/// before this one wrote it (no `attrs`, no `diagnostic` key) - a leftover that `adoptLeftovers()`
+/// reclaims when the child's own `LogShipper::start()` runs, before `noteLaunch()` reads the
+/// launch record's counters.
+void writeLeftoverSpoolLine(const QString& directory, qint64 deadPid, const QString& body,
+                            double loggedAt)
+{
+    QDir().mkpath(directory);
+    QJsonObject object;
+    object.insert(QStringLiteral("level"), static_cast<int>(LogLevel::Info));
+    object.insert(QStringLiteral("body"), body);
+    object.insert(QStringLiteral("logged_at"), loggedAt);
+    object.insert(QStringLiteral("session_id"), QString());
+    object.insert(QStringLiteral("host_id"), QString());
+    object.insert(QStringLiteral("trace_id"), QString());
+
+    QFile file(QDir(directory).filePath(QStringLiteral("spool-%1.jsonl").arg(deadPid)));
+    file.open(QIODevice::Append | QIODevice::Text);
+    file.write(QJsonDocument(object).toJson(QJsonDocument::Compact));
+    file.write("\n");
+}
+
 /// One "event" envelope item (CR-01 regression: `captureTestMessageForTests()`'s plain message
 /// event, never a crash). Same envelope shape `parseFirstLogItem()` above already parses - only
 /// the item `type` and the payload's own top-level keys differ: a message event's body lives at
@@ -1668,6 +1690,15 @@ private slots:
         QTemporaryDir runStateDir;
         QVERIFY(runStateDir.isValid());
 
+        // A dead process's leftover spool: one line past the 7-day cutoff and one fresh. The
+        // child adopts both in its own `LogShipper::start()`, which runs BEFORE `noteLaunch()`
+        // builds the record - so the snapshot the record carries must already know the aged one
+        // is dead, and must count it exactly once.
+        const double now = static_cast<double>(QDateTime::currentMSecsSinceEpoch()) / 1000.0;
+        writeLeftoverSpoolLine(spoolDir.path(), 4194305, QStringLiteral("aged-leftover"),
+                               now - 8.0 * 24.0 * 3600.0);
+        writeLeftoverSpoolLine(spoolDir.path(), 4194305, QStringLiteral("fresh-leftover"), now);
+
         QTcpServer server;
         QList<QByteArray> envelopes;
         wireEnvelopeCollector(&server, &envelopes);
@@ -1728,10 +1759,12 @@ private slots:
         QVERIFY(value(QStringLiteral("logs_enabled")).toBool());
         QVERIFY(value(QStringLiteral("signed_in")).toBool());
         QVERIFY(!value(QStringLiteral("crashed_last_run")).toBool());
-        QVERIFY(value(QStringLiteral("spool_lines_adopted")).toInt() >= 0);
+        // Both leftovers adopted, the aged one already counted as dropped at this snapshot, and
+        // nothing else in the run has had a chance to drop anything yet.
+        QCOMPARE(value(QStringLiteral("spool_lines_adopted")).toInt(), 2);
+        QCOMPARE(value(QStringLiteral("dropped_spool_age")).toInt(), 1);
         QVERIFY(value(QStringLiteral("retry_files")).toInt() >= 0);
         QVERIFY(value(QStringLiteral("dropped_queue")).toInt() >= 0);
-        QVERIFY(value(QStringLiteral("dropped_spool_age")).toInt() >= 0);
         QVERIFY(value(QStringLiteral("cap_reached")).toInt() >= 0);
     }
 
