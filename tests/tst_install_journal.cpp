@@ -57,7 +57,7 @@ private slots:
         QCOMPARE(r.ms.value("stage").toInteger(), qint64(0));
         QCOMPARE(r.ms.value("swap").toInteger(), qint64(3600000));
         QVERIFY(!r.toJson().contains("private_token"));
-        QCOMPARE(r.toJson().size(), 16);
+        QCOMPARE(r.toJson().keys(), record().keys());
     }
     void hostileFilesAreRejectedOrClamped_data()
     {
@@ -92,10 +92,12 @@ private slots:
         QVERIFY(InstallJournal::adopt(dir.path(), now).isEmpty());
         put(dir.path(), name(), "[]");
         QVERIFY(InstallJournal::adopt(dir.path(), now).isEmpty());
-        put(dir.path(), "attempt-0123456789ABCDEF.end.json", raw);
-        put(dir.path(), "attempt-0123.end.json", raw);
-        put(dir.path(), "attempt-..x.end.json", raw);
-        QVERIFY(InstallJournal::adopt(dir.path(), now).isEmpty());
+        for (const auto& forged : {"attempt-0123456789ABCDEF.end.json",
+                                  "attempt-0123.end.json", "attempt-..x.end.json"}) {
+            QTemporaryDir isolated;
+            put(isolated.path(), forged, raw);
+            QVERIFY(InstallJournal::adopt(isolated.path(), now).isEmpty());
+        }
     }
     void onlyNewestEightAreRead()
     {
