@@ -312,6 +312,7 @@ class FakeShellClient : public QObject
     Q_PROPERTY(bool liveUpdatesPaused READ liveUpdatesPaused NOTIFY liveUpdatesPausedChanged)
     // D-07, ADR-0067.
     Q_PROPERTY(bool signedOutNotice READ signedOutNotice NOTIFY signedOutNoticeChanged)
+    Q_PROPERTY(bool diagnosticsNoticePending READ diagnosticsNoticePending NOTIFY diagnosticsNoticePendingChanged)
     Q_PROPERTY(bool liveSession READ liveSession NOTIFY liveSessionChanged)
     Q_PROPERTY(int connectStage READ connectStage NOTIFY connectStageChanged)
     Q_PROPERTY(bool connectFailed READ connectFailed NOTIFY connectFailedChanged)
@@ -485,6 +486,18 @@ public:
 
     // D-07, ADR-0067.
     bool signedOutNotice() const { return m_signedOutNotice; }
+    bool diagnosticsNoticePending() const { return m_diagnosticsNoticePending; }
+    void setDiagnosticsNoticePending(bool pending)
+    {
+        m_diagnosticsNoticePending = pending;
+        emit diagnosticsNoticePendingChanged();
+    }
+    Q_INVOKABLE void acknowledgeDiagnosticsNotice()
+    {
+        ++m_acknowledgements;
+        setDiagnosticsNoticePending(false);
+    }
+    int acknowledgements() const { return m_acknowledgements; }
     void setSignedOutNotice(bool showing)
     {
         m_signedOutNotice = showing;
@@ -608,6 +621,7 @@ signals:
     void animationEffectsChanged();
     void liveUpdatesPausedChanged();
     void signedOutNoticeChanged();
+    void diagnosticsNoticePendingChanged();
     void connectStageChanged();
     void connectFailedChanged();
     void reconnectingChanged();
@@ -632,6 +646,8 @@ private:
     bool m_animationEffects = false;
     bool m_liveUpdatesPaused = false;
     bool m_signedOutNotice = false;
+    bool m_diagnosticsNoticePending = false;
+    int m_acknowledgements = 0;
     QString m_homeStatus = QStringLiteral("ready");
     QString m_endReasonText;
     QString m_identity = QStringLiteral("+962 7 0001 0002");
@@ -817,6 +833,10 @@ private slots:
     void theBalancePillPulsesOnALiveChange();
     void theSignedOutNoticeShowsOverWhicheverScreenIsCurrent();
     void theMainWindowHostsTheSignedOutNotice();
+    void theNoticeShowsItsTextAndOneOK();
+    void theNoticeIsHiddenWhileStreamingConnectingOrAnUpdateOfferIsUp();
+    void okAcknowledgesAndEnterActivates();
+    void theMainWindowHostsTheNotice();
     void menuHasItsThreeItemsAndTopUpAsksTheFacadeForTheWebsite();
     void menuPopupIsWideEnoughToShowItsThreeItems();
     void theProfileIsRoutedAsAViewInsideHomeAndHomeNoLongerSignsOut();
@@ -865,7 +885,7 @@ private slots:
     void theHostSpeakerRowIsPresentAndEditableAtUpstreamsDefault();
     void theStreamingBannerAndNegotiatedFallbackStillRenderOnTheRebuiltPage();
     void noSettingsPageStringCarriesTheUpstreamBrand();
-    void theSettingsPageShowsTheLogsAndCrashReportsDisclosureSentence();
+    void theSettingsPageShowsTheLogsQualityAndCrashReportsDisclosureSentence();
     void customResolutionSelectionRevealsAndPersistsTheWidthHeightFields();
     void customFrameRateSelectionRevealsAndPersistsTheFpsField();
     void aStoredCustomResolutionOrFrameRateShowsItsFieldsOnLoad();
@@ -3526,7 +3546,7 @@ void TstUiScreens::noSettingsPageStringCarriesTheUpstreamBrand()
 
 // D-14, ADR-0063, screens.md § 27 permitted change 4: the one plain-text disclosure sentence
 // under the page title - no switch, no link, verbatim from copy.md § Settings.
-void TstUiScreens::theSettingsPageShowsTheLogsAndCrashReportsDisclosureSentence()
+void TstUiScreens::theSettingsPageShowsTheLogsQualityAndCrashReportsDisclosureSentence()
 {
     SettingsFixture fixture;
     QQuickStyle::setStyle(QStringLiteral("Basic"));
@@ -3537,16 +3557,112 @@ void TstUiScreens::theSettingsPageShowsTheLogsAndCrashReportsDisclosureSentence(
     QScopedPointer<QObject> root(instantiateSettingsPage(&engine, fixture.client, &error));
     QVERIFY2(root, qPrintable(error));
 
-    bool found = false;
+    int found = 0;
+    bool oldFound = false;
     for (QObject* item : textItems(root.data())) {
         if (item->property("text").toString()
             == QStringLiteral(
-                "SeatHub sends diagnostic logs and crash reports to SevenHills so we can fix problems.")) {
-            found = true;
-            break;
+                "SeatHub sends diagnostic logs, stream quality numbers and crash reports to SevenHills so we can fix problems.")) {
+            ++found;
         }
+        oldFound |= item->property("text").toString() == QStringLiteral(
+            "SeatHub sends diagnostic logs and crash reports to SevenHills so we can fix problems.");
     }
-    QVERIFY2(found, "the Settings page must show the logs/crash-reports disclosure sentence");
+    QCOMPARE(found, 1);
+    QVERIFY2(!oldFound, "the old disclosure must not survive beside the updated one");
+}
+
+void TstUiScreens::theNoticeShowsItsTextAndOneOK()
+{
+    QQmlEngine engine; registerTokenSingletons(&engine);
+    FakeShellClient client;
+    QString error;
+    // Source existence is the intentional RED assertion, not a QML import failure.
+    QVERIFY2(QFile::exists(guiDir() + "/DiagnosticsNotice.qml"), "the frozen diagnostics notice is not implemented");
+    QScopedPointer<QObject> notice(instantiate(&engine, "DiagnosticsNotice.qml", &error));
+    QVERIFY2(notice, qPrintable(error));
+    QVERIFY(notice->setProperty("client", QVariant::fromValue(static_cast<QObject*>(&client))));
+    client.setDiagnosticsNoticePending(true);
+    QVERIFY(findVisibleTextItem(notice.data(), "What SeatHub sends us"));
+    QVERIFY(findVisibleTextItem(notice.data(), "While you play, SeatHub sends SevenHills how the stream is running: frame rate, delay, lost frames and picture size. If an update fails, it also sends a short note about what went wrong. It never sends your PIN, password, email or phone number, or the address of the PC you rent."));
+    int buttons = 0;
+    for (QObject* child : notice->findChildren<QObject*>()) {
+        if (child->inherits("QQuickButton")) {
+            ++buttons; QCOMPARE(child->property("text").toString(), QStringLiteral("OK"));
+        }
+        QVERIFY(!child->inherits("QQuickSwitch"));
+    }
+    QCOMPARE(buttons, 1);
+    QVERIFY(!readSource(guiDir() + "/DiagnosticsNotice.qml").contains("openUrlExternally"));
+}
+
+void TstUiScreens::theNoticeIsHiddenWhileStreamingConnectingOrAnUpdateOfferIsUp()
+{
+    QQmlEngine engine; registerTokenSingletons(&engine);
+    FakeShellClient client;
+    QVERIFY2(QFile::exists(guiDir() + "/DiagnosticsNotice.qml"), "the diagnostics notice is not implemented");
+    QString error;
+    QScopedPointer<QObject> notice(instantiate(&engine, "DiagnosticsNotice.qml", &error));
+    QVERIFY2(notice, qPrintable(error));
+    notice->setProperty("client", QVariant::fromValue(static_cast<QObject*>(&client)));
+    QObject* panel = notice->findChild<QObject*>("diagnosticsPanel"); QVERIFY(panel);
+    // The facade owns eligibility (the real state transitions are tested in tst_facade_wiring).
+    for (const QString& state : QStringList{"signed_out", "connecting", "streaming", "required offer", "optional offer"}) {
+        client.setDiagnosticsNoticePending(false);
+        QVERIFY2(!effectivelyVisible(panel), qPrintable(state));
+        client.setDiagnosticsNoticePending(true);
+        QVERIFY(effectivelyVisible(panel));
+    }
+}
+
+void TstUiScreens::okAcknowledgesAndEnterActivates()
+{
+    QQmlEngine engine; registerTokenSingletons(&engine);
+    FakeShellClient client;
+    QVERIFY2(QFile::exists(guiDir() + "/DiagnosticsNotice.qml"), "the diagnostics notice is not implemented");
+    QString error;
+    QScopedPointer<QObject> notice(instantiate(&engine, "DiagnosticsNotice.qml", &error));
+    QVERIFY2(notice, qPrintable(error));
+    auto* item = qobject_cast<QQuickItem*>(notice.data()); QVERIFY(item);
+    QQuickWindow window; window.resize(960, 640); item->setParentItem(window.contentItem());
+    notice->setProperty("client", QVariant::fromValue(static_cast<QObject*>(&client)));
+    window.show(); QVERIFY(QTest::qWaitForWindowExposed(&window));
+    window.requestActivate(); QVERIFY(QTest::qWaitForWindowActive(&window));
+    auto* ok = notice->findChild<QQuickItem*>("diagnosticsOK"); QVERIFY(ok);
+    QObject* panel = notice->findChild<QObject*>("diagnosticsPanel"); QVERIFY(panel);
+    int acknowledgements = 0;
+    for (const auto key : {Qt::Key_Return, Qt::Key_Space}) {
+        client.setDiagnosticsNoticePending(true);
+        QTRY_VERIFY(ok->hasActiveFocus()); // no test-side focus repair
+        QTest::keyClick(&window, Qt::Key_Escape);
+        QVERIFY(effectivelyVisible(panel)); QCOMPARE(client.acknowledgements(), acknowledgements);
+        QTest::keyClick(&window, key);
+        QCOMPARE(client.acknowledgements(), ++acknowledgements);
+        QVERIFY(!effectivelyVisible(panel));
+    }
+    client.setDiagnosticsNoticePending(true);
+    QTRY_VERIFY(ok->hasActiveFocus());
+    QTest::mouseClick(&window, Qt::LeftButton, Qt::NoModifier,
+                     ok->mapToScene(QPointF(ok->width()/2, ok->height()/2)).toPoint());
+    QCOMPARE(client.acknowledgements(), ++acknowledgements);
+    QVERIFY(!effectivelyVisible(panel));
+}
+
+void TstUiScreens::theMainWindowHostsTheNotice()
+{
+    const QString main = readSource(guiDir() + "/main.qml");
+    const int start = main.indexOf("\n    DiagnosticsNotice {");
+    QVERIFY2(start >= 0, "notice must be a direct window child outside the Loader");
+    const int end = main.indexOf("\n    }", start);
+    QVERIFY(end > start);
+    QVERIFY(main.mid(start, end - start).contains("client: seatHub"));
+    QVERIFY(start > main.indexOf("\n    SignedOutNotice {"));
+    QVERIFY(start < main.indexOf("\n    ForcedUpdateModal {"));
+    QVERIFY(readSource(guiDir() + "/../qml.qrc").contains("<file>gui/DiagnosticsNotice.qml</file>"));
+    QQmlEngine engine; registerTokenSingletons(&engine);
+    QString error; QScopedPointer<QObject> notice(instantiate(&engine, "DiagnosticsNotice.qml", &error));
+    QVERIFY2(notice, qPrintable(error));
+    QVERIFY(notice->property("z").toReal() < 1000);
 }
 
 void TstUiScreens::customResolutionSelectionRevealsAndPersistsTheWidthHeightFields()

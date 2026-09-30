@@ -52,6 +52,7 @@
 #include <QScopeGuard>
 #include <QScopedPointer>
 #include <QSignalSpy>
+ #include <QSettings>
 #include <QTemporaryDir>
 #include <QThread>
 #include <QTimeZone>
@@ -1239,6 +1240,70 @@ private slots:
         QVERIFY(client.reference().isEmpty());
         QCOMPARE(client.session()->active(), false);
         QVERIFY(client.session()->upstreamSession() == nullptr);
+    }
+
+    void theNoticeVersionGatesTheProperty()
+    {
+        const QString organization = QCoreApplication::organizationName();
+        const QString application = QCoreApplication::applicationName();
+        const auto format = QSettings::defaultFormat();
+        auto restore = qScopeGuard([&]() {
+            QCoreApplication::setOrganizationName(organization);
+            QCoreApplication::setApplicationName(application);
+            QSettings::setDefaultFormat(format);
+        });
+        QCoreApplication::setOrganizationName("SeatHubTest");
+        QCoreApplication::setApplicationName("DiagnosticsNoticeTest");
+        QSettings::setDefaultFormat(QSettings::IniFormat);
+        QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, m_dir->path());
+        QSettings::setPath(QSettings::IniFormat, QSettings::SystemScope, m_dir->path());
+        QSettings settings;
+        const QString key = QStringLiteral("diagnosticsNoticeVersion");
+        QVERIFY(!settings.contains(key));
+        {
+            SeatHubClient client;
+            QVERIFY2(client.metaObject()->indexOfProperty("diagnosticsNoticePending") >= 0,
+                     "the facade lacks the version-gated diagnostics notice property");
+            QVERIFY(!client.property("diagnosticsNoticePending").toBool());
+            reachHome(client, 90); QVERIFY(!QTest::currentTestFailed());
+            QVERIFY(client.property("diagnosticsNoticePending").toBool());
+            client.openSettings(); QVERIFY(!client.property("diagnosticsNoticePending").toBool());
+            client.closeSettings(); QVERIFY(client.property("diagnosticsNoticePending").toBool());
+            client.openProfile(); QVERIFY(client.property("diagnosticsNoticePending").toBool());
+            client.closeProfile();
+            auto* engine = new FakeEngineSession;
+            client.session()->attachSession(engine);
+            m_fake->answerPairing(409, playRefusalBody("The rig is not ready yet.", "SH-2K2XQ1"));
+            client.beginSession("s-notice");
+            QVERIFY(!client.property("diagnosticsNoticePending").toBool());
+            emit engine->connectionStarted();
+            QCOMPARE(client.appState(), QStringLiteral("streaming"));
+            QVERIFY(!client.property("diagnosticsNoticePending").toBool());
+            m_fake->answerSession("s-notice", "CANCELLED", "CUSTOMER_ENDED");
+            client.interrupt(); emit engine->sessionFinished(0); emit engine->readyForDeletion();
+            QTRY_COMPARE_WITH_TIMEOUT(client.appState(), QStringLiteral("home"), 15000);
+            QVERIFY(client.property("diagnosticsNoticePending").toBool());
+            // An offer, even optional, takes precedence. Drive the real property notifier.
+            QVERIFY(client.updates()->setProperty("availableUpdate", QVariantMap{{"version", "9.9.9"}}) == false);
+            QVERIFY(QMetaObject::invokeMethod(&client, "acknowledgeDiagnosticsNotice"));
+            QVERIFY(!client.property("diagnosticsNoticePending").toBool());
+            QSettings disk; QCOMPARE(disk.value(key, 0).toInt(), 1);
+            QCOMPARE(disk.value(key).metaType(), QMetaType::fromType<int>());
+            QVERIFY(QFile::exists(disk.fileName()));
+            client.signOut(); QCOMPARE(QSettings().value(key, 0).toInt(), 1);
+        }
+        {
+            SeatHubClient updated;
+            reachHome(updated, 90); QVERIFY(!QTest::currentTestFailed());
+            QVERIFY(!updated.property("diagnosticsNoticePending").toBool());
+        }
+        settings.setValue(key, 0); settings.sync();
+        {
+            SeatHubClient newerWording;
+            reachHome(newerWording, 90); QVERIFY(!QTest::currentTestFailed());
+            QVERIFY(newerWording.property("diagnosticsNoticePending").toBool());
+            newerWording.signOut(); QCOMPARE(QSettings().value(key).toInt(), 0);
+        }
     }
 
     void theFacadeDrivesTheAttachedEngineAndInterruptReachesIt()
