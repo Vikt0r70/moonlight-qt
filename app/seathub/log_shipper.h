@@ -210,8 +210,8 @@ public:
     /// `app/backend/nvpairingmanager.cpp`'s own request bodies, which `nvhttp.cpp` logs verbatim
     /// with `qInfo() << "Executing request:" << url.toString();`), a 4-digit Sunshine PIN written
     /// next to the word "pin", and a PEM certificate block. The customer's public IP is left
-    /// alone (D-09). Static and pure - no lock, no I/O - so `before_send_log` can call it a second
-    /// time in `telemetry.cpp` with no extra cost.
+    /// alone (D-09). Takes an immutable rig-literal snapshot under a short lock; replacement and
+    /// the existing pure rules run outside the lock, including the SDK's second pass.
     static QString scrub(const QString& text);
     static void setRedactions(const QStringList& literals);
     static void clearRedactions();

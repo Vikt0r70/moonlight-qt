@@ -421,6 +421,13 @@ int runDiagChild(int argc, char* argv[])
         sampler.finish();
         if (sampler.rollups() != 1) return 3;
     }
+    else if (scenario == QLatin1String("rig-tee")) {
+        LogShipper::setRedactions({QStringLiteral("203.0.113.77")});
+        qInfo() << "Executing request: https://203.0.113.77:47984/serverinfo";
+        qWarning() << "Host 203.0.113.77 not found (Error 3)";
+        qInfo() << "Connecting to 203.0.113.77:47989";
+        LogShipper::clearRedactions();
+    }
     else if (scenario == QLatin1String("play-step")) {
         // ADR-0072 item 2: the local diagnostic a real failure would carry, PIN and all. It is
         // built HERE and handed to nothing - the emission below receives only vocabulary tokens
@@ -2031,6 +2038,32 @@ private slots:
             QCOMPARE(gauges, scenario == QLatin1String("rollup") ? 17 : 15);
             QCOMPARE(names.size(), gauges);
         }
+    }
+
+    void noRigAddressEverSurvivesTheRealTeeEnvelope()
+    {
+        QTemporaryDir db, spool, state;
+        QTcpServer server;
+        QList<QByteArray> envelopes;
+        wireEnvelopeCollector(&server, &envelopes);
+        QVERIFY(server.listen(QHostAddress::LocalHost, 0));
+        QProcess child;
+        child.setProgram(m_appPath);
+        child.setArguments({"--diag-child", "rig-tee",
+            QStringLiteral("http://publickey@127.0.0.1:%1/1").arg(server.serverPort()),
+            db.path(), m_handlerPath, spool.path(), state.path()});
+        child.start();
+        QVERIFY(child.waitForStarted(5000));
+        QTRY_VERIFY_WITH_TIMEOUT(child.state() != QProcess::Running, 20000);
+        QCOMPARE(child.exitCode(), 0);
+        const auto scan = scanEnvelopes(envelopes);
+        int rigLines = 0;
+        for (const auto& envelope : envelopes) {
+            QVERIFY(!envelope.contains("203.0.113.77"));
+            QVERIFY(!envelope.contains("203.0.113.77:47984"));
+        }
+        for (const auto& log : scan.logs) if (log.body.contains(QStringLiteral("[rig]"))) ++rigLines;
+        QCOMPARE(rigLines, 3);
     }
 
     void hostileFixtureEmissionsReachTheRealEnvelopeCollector()

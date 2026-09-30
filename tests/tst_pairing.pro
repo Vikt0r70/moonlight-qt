@@ -20,8 +20,15 @@ DESTDIR = $$OUT_PWD
 
 INCLUDEPATH += $$PWD/.. $$PWD/../app
 
+win32 {
+    INCLUDEPATH += $$PWD/../libs/windows/include $$PWD/../libs/windows/include/x64
+    LIBS += -L$$PWD/../libs/windows/lib/x64 -lSDL2
+}
+
 SOURCES += \
     tst_pairing.cpp \
+    ../app/seathub/log_tee.cpp \
+    ../app/seathub/log_shipper.cpp \
     ../app/seathub/pairing_controller.cpp \
     ../app/seathub/pairing_seam.cpp \
     ../app/seathub/pairing_recovery.cpp \

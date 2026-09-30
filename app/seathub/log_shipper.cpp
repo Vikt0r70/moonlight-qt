@@ -12,6 +12,9 @@
 #include <QSaveFile>
 #include <QStandardPaths>
 #include <QStringList>
+#include <QSharedPointer>
+#include <QMutex>
+#include <QMutexLocker>
 
 #include <atomic>
 #include <chrono>
@@ -45,6 +48,23 @@
 Q_LOGGING_CATEGORY(seathubLogShipper, "seathub.log_shipper")
 
 namespace {
+
+QMutex redactionsMutex;
+QSharedPointer<const QStringList> currentRedactions;
+
+QString scrubRig(const QString& text)
+{
+    QSharedPointer<const QStringList> snapshot;
+    {
+        QMutexLocker lock(&redactionsMutex);
+        snapshot = currentRedactions;
+    }
+    QString result = text;
+    if (snapshot) for (const auto& literal : *snapshot) {
+        if (!literal.isEmpty()) result.replace(literal, QStringLiteral("[rig]"));
+    }
+    return result;
+}
 
 double currentEpochSeconds()
 {
@@ -482,7 +502,8 @@ private:
 
         ShippedLine line;
         line.level = level;
-        line.body = text;
+        // Capture-time redaction survives a terminal clear before the worker drains this line.
+        line.body = scrubRig(text);
         line.loggedAt = currentEpochSeconds();
         const std::shared_ptr<const Ids> ids = std::atomic_load(&currentIds);
         if (ids) {
@@ -871,12 +892,21 @@ void LogShipper::setPauseTimeoutForTests(int milliseconds)
     m_impl->setPauseTimeoutForTests(milliseconds);
 }
 
-void LogShipper::setRedactions(const QStringList&) {}
-void LogShipper::clearRedactions() {}
+void LogShipper::setRedactions(const QStringList& literals)
+{
+    auto snapshot = QSharedPointer<const QStringList>(new const QStringList(literals));
+    QMutexLocker lock(&redactionsMutex);
+    currentRedactions.swap(snapshot);
+}
+void LogShipper::clearRedactions()
+{
+    QMutexLocker lock(&redactionsMutex);
+    currentRedactions.clear();
+}
 
 QString LogShipper::scrub(const QString& text)
 {
-    QString result = text;
+    QString result = scrubRig(text);
 
     // Upstream's own two redactions (`main.cpp`:71-72, 97-99) run only on the disk-log path -
     // reapplied here so the shipper never depends on that ordering.

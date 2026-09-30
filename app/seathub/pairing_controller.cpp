@@ -1,4 +1,5 @@
 #include "pairing_controller.h"
+#include "log_shipper.h"
 
 #include <QLoggingCategory>
 #include <QSet>
@@ -44,6 +45,7 @@ PairingController::PairingController(QObject* parent)
 {
     m_pollTimer->setSingleShot(true);
     connect(m_pollTimer, &QTimer::timeout, this, &PairingController::pollAuthorization);
+    connect(this, &QObject::destroyed, []() { LogShipper::clearRedactions(); });
 }
 
 void PairingController::setControlPlane(ControlPlaneClient* client)
@@ -82,6 +84,7 @@ bool PairingController::deadlineExceeded() const
 
 void PairingController::start(const QString& sessionId)
 {
+    LogShipper::clearRedactions();
     if (sessionId.isEmpty()) {
         fail(SeatHubFailure::local(QString::fromLatin1(kNoAuthorization)));
         return;
@@ -128,6 +131,7 @@ void PairingController::cancel()
         m_handshakeInFlight = false;
     }
     setState(QString::fromLatin1(kStateIdle));
+    LogShipper::clearRedactions();
 }
 
 void PairingController::pollNow()
@@ -297,6 +301,7 @@ void PairingController::handleAuthorization(const ControlPlaneResult& result)
     target.hostAddress = authorization.hostAddress;
     target.httpsPort = authorization.httpsPort;
     target.pairingPin = authorization.pairingPin;
+    LogShipper::setRedactions({target.hostAddress});
 
     // The engine seam gets the address and the PIN. Nothing else in this process does.
     m_lastTarget = target;
@@ -341,6 +346,7 @@ void PairingController::handleSeamResult(bool ok, const QString& clientUuid,
     setState(QString::fromLatin1(kStateReady));
     qCInfo(seathubPairing) << "silent pairing complete";
     emit pairingCompleted(clientUuid);
+    LogShipper::clearRedactions();
 }
 
 void PairingController::fail(const SeatHubFailure& failure, const QString& attemptFailureClass)
@@ -358,4 +364,5 @@ void PairingController::fail(const SeatHubFailure& failure, const QString& attem
                         m_clock.isValid() ? m_clock.elapsed() : -1);
     }
     emit pairingFailed(failure);
+    LogShipper::clearRedactions();
 }

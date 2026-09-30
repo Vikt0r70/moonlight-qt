@@ -1221,10 +1221,10 @@ void SeatHubClient::raiseConnectFailure(const SeatHubFailure& failure, const QSt
         return;
     }
 
-    // The engine's own text and the stage detail are logged for support and never shown (D-51).
+    // Raw diagnostic text stays in the local failure object, never in the shipping tee.
     if (!failure.diagnostic.isEmpty()) {
-        qWarning("SeatHub connect diagnostic (not shown to the customer, reference %s): %s",
-                 qPrintable(failure.reference), qPrintable(failure.diagnostic));
+        qCWarning(seathubClient) << "SeatHub connect failure" << coerceStep(m_lastFailedStep)
+            << (isClosedFailureClass(m_lastFailedStep, m_lastFailureClass) ? m_lastFailureClass : QString());
     }
 
     // What the customer reads under the stage: the deck's sentence for what the server decided when
@@ -1297,8 +1297,8 @@ void SeatHubClient::raiseFailure(const SeatHubFailure& failure)
     // The raw engine text stays out of the view layer entirely: it is logged here for
     // support and dropped (D-51, T-03-05).
     if (!failure.diagnostic.isEmpty()) {
-        qWarning("SeatHub engine diagnostic (not shown to the customer, reference %s): %s",
-                 qPrintable(failure.reference), qPrintable(failure.diagnostic));
+        qCWarning(seathubClient) << "SeatHub engine failure" << coerceStep(m_lastFailedStep)
+            << (isClosedFailureClass(m_lastFailedStep, m_lastFailureClass) ? m_lastFailureClass : QString());
     }
     emit failureChanged();
     setAppState(QString::fromLatin1(kStateError));
