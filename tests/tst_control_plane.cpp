@@ -31,6 +31,7 @@
 #include "seathub/control_plane_client.h"
 #include "seathub/countries.h"
 #include "seathub/region.h"
+#include "seathub/seathub_version.h"
 #include "seathub/web_origin.h"
 
 namespace {
@@ -660,6 +661,34 @@ private slots:
 
         QCOMPARE(fake->lastPath,
                  QStringLiteral("/api/sessions/aaaabbbb-cccc-dddd-eeee-ffff00001111/end"));
+    }
+
+    void createAndEndRequestsIdentifyTheSeatHubVersion()
+    {
+        ControlPlaneClient client;
+        auto* fake = new FakeNetworkAccessManager;
+        client.setNetworkAccessManager(fake);
+        fake->status = 200;
+        fake->body = okBody();
+
+        bool called = false;
+        client.requestSession([&](const ControlPlaneResult& result) {
+            QVERIFY(result.ok);
+            called = true;
+        });
+        QTRY_VERIFY(called);
+        const QByteArray expectedAgent = QByteArrayLiteral("SeatHub/") + SEATHUB_VERSION;
+        QCOMPARE(fake->lastRequest.rawHeader(QByteArrayLiteral("User-Agent")), expectedAgent);
+
+        called = false;
+        fake->status = 202;
+        client.endSession(QStringLiteral("aaaabbbb-cccc-dddd-eeee-ffff00001111"), false,
+                          [&](const ControlPlaneResult& result) {
+                              QVERIFY(result.ok);
+                              called = true;
+                          });
+        QTRY_VERIFY(called);
+        QCOMPARE(fake->lastRequest.rawHeader(QByteArrayLiteral("User-Agent")), expectedAgent);
     }
 
     // D-05/D-23, contract 3.3.0: `SessionEndRequest`'s optional `{"failed": true}`.
