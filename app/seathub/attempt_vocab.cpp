@@ -118,6 +118,48 @@ QString classForEngineStage(int stage)
     return QStringLiteral("launch_error");
 }
 
+QString classForEngineStageName(const QString& stageName)
+{
+    static const QStringList stageNames{
+        QStringLiteral("Platform initialization"),
+        QStringLiteral("Name resolution"),
+        QStringLiteral("Audio stream initialization"),
+        QStringLiteral("RTSP handshake"),
+        QStringLiteral("Control stream initialization"),
+        QStringLiteral("Video stream initialization"),
+        QStringLiteral("Input stream initialization"),
+        QStringLiteral("Control stream establishment"),
+        QStringLiteral("Video stream establishment"),
+        QStringLiteral("Audio stream establishment"),
+        QStringLiteral("Input stream establishment")};
+    for (qsizetype index = 0; index < stageNames.size(); ++index) {
+        if (stageNames.at(index).compare(stageName, Qt::CaseInsensitive) == 0) {
+            return classForEngineStage(static_cast<int>(index) + 1);
+        }
+    }
+    return QStringLiteral("launch_error");
+}
+
+QString classForStreamError(int code)
+{
+    switch (code) {
+    case 0:
+        return QStringLiteral("graceful");
+    case -100:
+        return QStringLiteral("no_video_traffic");
+    case -101:
+        return QStringLiteral("no_video_frame");
+    case -102:
+        return QStringLiteral("early_termination");
+    case -103:
+        return QStringLiteral("protected_content");
+    case -104:
+        return QStringLiteral("frame_conversion");
+    default:
+        return QStringLiteral("net_other");
+    }
+}
+
 QString classForLaunchReason(EngineLaunchReason reason)
 {
     switch (reason) {

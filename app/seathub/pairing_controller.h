@@ -149,6 +149,8 @@ signals:
     void pairingCompleted(const QString& clientUuid);
     /// Pairing failed closed. Always a SeatHub failure, never engine text in `error`.
     void pairingFailed(const SeatHubFailure& failure);
+    /// Closed attempt classification for authorization failures; never carries response text.
+    void stepFailed(const QString& step, const QString& failureClass, qint64 elapsedMs);
     /// The session exactly as `GET /api/sessions/{id}` reported it on one poll tick. It rides the
     /// tick this controller already runs - the same interval, no timer of its own - and is what the
     /// connecting stages are read from (CUST-12, `ADR-0055`). A read that failed, or that arrived
@@ -167,7 +169,7 @@ private slots:
 
 private:
     void setState(const QString& state);
-    void fail(const SeatHubFailure& failure);
+    void fail(const SeatHubFailure& failure, const QString& attemptFailureClass = QString());
     void scheduleNextPoll();
 
     ControlPlaneClient* m_client = nullptr;
@@ -185,6 +187,7 @@ private:
     int m_polls = 0;
     int m_conflictPolls = 0;
     bool m_finished = false;
+    bool m_transportFailureSeen = false;
 
     // G-06.2-2 state (Plan 06.2-12 Task 1).
     //

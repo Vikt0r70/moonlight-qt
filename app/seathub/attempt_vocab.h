@@ -81,6 +81,13 @@ QString classForPairState(int state);
 /// past the last stage - is `launch_error`, the set's only bucket for "no stage had started".
 QString classForEngineStage(int stage);
 
+/// The fixed `LiGetStageName()` string to its engine-connect slug. Unknown engine text maps to
+/// the closed launch-error token and is never returned as telemetry.
+QString classForEngineStageName(const QString& stageName);
+
+/// moonlight-common-c termination code to the frozen stream class.
+QString classForStreamError(int code);
+
 /// Closed `engine_prepare` class for the launch reason enum; `Started` has no failure class.
 QString classForLaunchReason(EngineLaunchReason reason);
 

@@ -92,6 +92,7 @@ void PairingController::start(const QString& sessionId)
     m_finished = false;
     m_polls = 0;
     m_conflictPolls = 0;
+    m_transportFailureSeen = false;
     m_lastTarget = PairingTarget();
     m_handshakeStarted = false;
     m_handshakeInFlight = false;
@@ -154,7 +155,9 @@ void PairingController::pollAuthorization()
         // D-08: nothing resolved inside 90 s. Fail closed. The host side cancels its own
         // pending request at the same horizon; this client's job is to stop waiting and say so
         // rather than leave a half-open handshake behind.
-        fail(SeatHubFailure::local(QString::fromLatin1(kTimedOut)));
+        fail(SeatHubFailure::local(QString::fromLatin1(kTimedOut)),
+             m_transportFailureSeen ? QStringLiteral("unreachable_deadline")
+                                    : QStringLiteral("deadline"));
         return;
     }
 
@@ -204,6 +207,7 @@ void PairingController::handleAuthorization(const ControlPlaneResult& result)
             // The control plane is unreachable. Keep trying until the deadline: a brief network
             // gap is not a reason to throw away the session (D-33's posture, applied here).
             qCInfo(seathubPairing) << "authorization poll failed in transport; retrying";
+            m_transportFailureSeen = true;
             scheduleNextPoll();
             return;
         }
@@ -218,18 +222,24 @@ void PairingController::handleAuthorization(const ControlPlaneResult& result)
             // clock restarts on every "not yet", so it counts from the last moment the rig could
             // not pair. A transport failure does not restart it, so an outage is still bounded.
             ++m_conflictPolls;
+            m_transportFailureSeen = false;
             m_clock.restart();
             scheduleNextPoll();
             return;
         }
 
-        fail(result.toFailure());
+        fail(result.toFailure(), result.statusCode >= 400 && result.statusCode < 500
+                                    ? QStringLiteral("refused")
+                                    : QStringLiteral("bad_response"));
         return;
     }
 
+    m_transportFailureSeen = false;
+
     SessionAuthorization authorization;
     if (!SessionAuthorization::parse(result.body, &authorization)) {
-        fail(SeatHubFailure::local(QString::fromLatin1(kNoAuthorization)));
+        fail(SeatHubFailure::local(QString::fromLatin1(kNoAuthorization)),
+             QStringLiteral("bad_response"));
         return;
     }
 
@@ -241,6 +251,7 @@ void PairingController::handleAuthorization(const ControlPlaneResult& result)
         // does for a 409, because preparation has its own server deadline and a session that
         // deadline fails arrives here as a terminal session read, not as this poll's answer.
         ++m_conflictPolls;
+        m_transportFailureSeen = false;
         m_clock.restart();
         scheduleNextPoll();
         return;
@@ -274,7 +285,8 @@ void PairingController::handleAuthorization(const ControlPlaneResult& result)
     if (m_seam == nullptr) {
         // No engine pairing seam was supplied. Failing closed is the only safe answer: silently
         // reporting success here would tell the caller a rig was paired when nothing paired.
-        fail(SeatHubFailure::local(QString::fromLatin1(kNoAuthorization)));
+        fail(SeatHubFailure::local(QString::fromLatin1(kNoAuthorization)),
+             QStringLiteral("no_seam"));
         return;
     }
 
@@ -331,7 +343,7 @@ void PairingController::handleSeamResult(bool ok, const QString& clientUuid,
     emit pairingCompleted(clientUuid);
 }
 
-void PairingController::fail(const SeatHubFailure& failure)
+void PairingController::fail(const SeatHubFailure& failure, const QString& attemptFailureClass)
 {
     m_pollTimer->stop();
     m_finished = true;
@@ -341,5 +353,9 @@ void PairingController::fail(const SeatHubFailure& failure)
     // the fact that pairing did not resolve, not the credentials that were in flight.
     qCWarning(seathubPairing) << "silent pairing failed; reference" << failure.reference;
 
+    if (!attemptFailureClass.isEmpty()) {
+        emit stepFailed(QStringLiteral("pair_authorize"), attemptFailureClass,
+                        m_clock.isValid() ? m_clock.elapsed() : -1);
+    }
     emit pairingFailed(failure);
 }

@@ -178,6 +178,25 @@ private slots:
         }
     }
 
+    void fixedEngineStageNamesAndStreamCodesMapToClosedSlugs()
+    {
+        QCOMPARE(classForEngineStageName(QStringLiteral("RTSP handshake")),
+                 QStringLiteral("rtsp_handshake"));
+        QCOMPARE(classForEngineStageName(QStringLiteral("untrusted engine wording")),
+                 QStringLiteral("launch_error"));
+        const QList<QPair<int, QString>> streamCases{
+            {0, QStringLiteral("graceful")},
+            {-100, QStringLiteral("no_video_traffic")},
+            {-101, QStringLiteral("no_video_frame")},
+            {-102, QStringLiteral("early_termination")},
+            {-103, QStringLiteral("protected_content")},
+            {-104, QStringLiteral("frame_conversion")},
+            {-999, QStringLiteral("net_other")}};
+        for (const auto& testCase : streamCases) {
+            QCOMPARE(classForStreamError(testCase.first), testCase.second);
+        }
+    }
+
     void everyLaunchReasonMapsToAClosedEnginePrepareClass()
     {
         QCOMPARE(classForLaunchReason(EngineLaunchReason::NoApp), QStringLiteral("no_app"));

@@ -668,7 +668,8 @@ private:
     /// immediate sign-out.
     void fetchAccountStateFallback();
     void noteStepOutcome(const QString& step, const QString& outcome,
-                         const QString& failureClass, qint64 elapsedMs, int attempt = 0);
+                         const QString& failureClass, qint64 elapsedMs, int attempt = 0,
+                         const QString& endReason = {});
     /// The D-07 signed-out sequence itself (the owner's design A-87), started by
     /// `handleSseRevoked()`, the fallback read's own 401, or a running stream's own end applying
     /// a deferred one (`m_pendingSignedOutNotice`, Phase 3 D-33). While the engine's stream is
