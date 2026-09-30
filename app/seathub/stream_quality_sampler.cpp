@@ -181,7 +181,10 @@ void StreamQualitySampler::updateQuality(const QString& reason)
     if (poor && m_badSinceMs.load() < 0) {
         const auto now = nowMs();
         m_badSinceMs.store(now); m_badEpisodes.fetch_add(1); m_badReason = reason;
-        if (m_badLines >= kBadCapPerPlay || now - m_lastBadLineMs < kBadSpacingMs) return;
+        if (m_badLines >= kBadCapPerPlay || now - m_lastBadLineMs < kBadSpacingMs) {
+            m_badReason.clear();
+            return;
+        }
         QVector<VideoStats> recent;
         { QMutexLocker lock(&m_mutex); recent = m_recent; }
         auto attrs = aggregate(recent, 0, true, kRecentSamples);
@@ -189,10 +192,15 @@ void StreamQualitySampler::updateQuality(const QString& reason)
         SeatHubTelemetry::emitDiagnostic(QStringLiteral("stream.quality_bad"), LogLevel::Warning, attrs);
         ++m_badLines; m_lastBadLineMs = now;
     } else if (!poor && m_badSinceMs.load() >= 0) {
+        // A silently suppressed episode has no shipped bad record to recover. Keep its
+        // counters, but do not flood the run budget with orphan recovery lines.
+        const bool shippedEpisode = !m_badReason.isEmpty();
         const double seconds = (nowMs() - m_badSinceMs.load()) / 1000.0;
         closeBadEpisode();
-        SeatHubTelemetry::emitDiagnostic(QStringLiteral("stream.quality_ok"), LogLevel::Info,
-                                        {{"reason", m_badReason}, {"bad_s", rounded(seconds, 2)}});
+        if (shippedEpisode) {
+            SeatHubTelemetry::emitDiagnostic(QStringLiteral("stream.quality_ok"), LogLevel::Info,
+                                            {{"reason", m_badReason}, {"bad_s", rounded(seconds, 2)}});
+        }
     }
 }
 QJsonObject StreamQualitySampler::takeWindow(bool partial)

@@ -2331,7 +2331,7 @@ private slots:
                                    QStringLiteral("stream.quality_ok"), QStringLiteral("play.summary")}) {
             QVERIFY2(findLog(scan, body).found, qPrintable(QStringLiteral("hostile-all omitted %1").arg(body)));
         }
-        QVERIFY(findMetric(scan, QStringLiteral("seathub.stream.fps_avg")) != nullptr);
+        QVERIFY(findMetric(scan, QStringLiteral("seathub.stream.fps.avg")) != nullptr);
 
         const QList<QByteArray> hostileValues = {
             QByteArray(HostileFixtures::RigAddress), QByteArray(HostileFixtures::RigAddressWithPort),
