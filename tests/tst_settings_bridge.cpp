@@ -28,6 +28,7 @@ class TstSettingsBridge : public QObject
 private slots:
     void initTestCase();
     void init();
+    void prepareForSessionKeepsTheStatsSlotEnabled();
 
     void catalogueMatchesUpstreamInventoryRowForRow();
     void bridgeReadsThroughToStreamingPreferences();
@@ -67,6 +68,26 @@ void TstSettingsBridge::init()
     // "on every load" assertion.
     delete m_bridge;
     m_bridge = new SettingsBridge(this);
+}
+
+void TstSettingsBridge::prepareForSessionKeepsTheStatsSlotEnabled()
+{
+    struct RestoreToggles {
+        SettingsBridge* bridge;
+        QMap<QString, bool> values;
+        ~RestoreToggles() {
+            for (auto it = values.begin(); it != values.end(); ++it) bridge->setStatsToggle(it.key(), it.value());
+        }
+    } restore{m_bridge, {}};
+    for (const auto& key : m_bridge->statsToggleKeys()) restore.values.insert(key, m_bridge->getStatsToggle(key));
+    for (const auto& key : m_bridge->statsToggleKeys()) QVERIFY(m_bridge->setStatsToggle(key, false));
+    QVERIFY(m_bridge->enabledStatsLabels().isEmpty());
+    QVERIFY(!StreamingPreferences::get()->showPerformanceOverlay);
+    m_bridge->prepareForSession();
+    QVERIFY(StreamingPreferences::get()->showPerformanceOverlay);
+    QVERIFY(m_bridge->enabledStatsLabels().isEmpty());
+    QSettings settings;
+    QVERIFY(!settings.value("showperfoverlay").toBool());
 }
 
 void TstSettingsBridge::catalogueMatchesUpstreamInventoryRowForRow()

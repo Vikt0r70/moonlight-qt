@@ -19,14 +19,22 @@ TARGET = tst_osd_render
 DESTDIR = $$OUT_PWD
 
 INCLUDEPATH += $$PWD/.. $$PWD/../app
+win32 {
+    INCLUDEPATH += $$PWD/../libs/windows/include $$PWD/../libs/windows/include/x64
+    LIBS += -L$$PWD/../libs/windows/lib/x64 -lSDL2
+}
 
 RESOURCES += ../app/seathub/fonts.qrc
 
 # `duration_text.cpp` is the one formatter every client surface uses (FLOW-09); Time left's
 # renderer calls it rather than making a second one, so this project has to link it.
 SOURCES += tst_osd_render.cpp \
+    ../app/seathub/osd_compositor.cpp \
+    ../app/seathub/stream_stats.cpp \
     ../app/seathub/osd_renderer.cpp \
     ../app/seathub/duration_text.cpp
 
 HEADERS += ../app/seathub/osd_renderer.h \
+    ../app/seathub/osd_compositor.h \
+    ../app/seathub/stream_stats.h \
     ../app/seathub/duration_text.h
