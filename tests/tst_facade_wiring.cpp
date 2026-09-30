@@ -1008,6 +1008,118 @@ private:
     }
 
 private slots:
+    void onePlaySummaryPerExitPath_data()
+    {
+        QTest::addColumn<int>("exit");
+        QTest::addColumn<QString>("token");
+        QTest::addColumn<QString>("outcome");
+        const char* tokens[] = {"refused", "pair_failed", "stage_failed", "launch_failed",
+            "start_refused", "cancelled", "server_ended_pre", "ended", "terminated",
+            "server_ended", "horizon", "reconnect_ended", "ended_held", "signed_out", "app_quit"};
+        for (int i = 0; i < 15; ++i) {
+            const QString outcome = i < 5 || i == 6 || i == 8 || i == 11
+                ? QStringLiteral("failed") : (i == 5 || i >= 12 ? QStringLiteral("cancelled")
+                                                                       : QStringLiteral("ok"));
+            QTest::newRow(qPrintable(QStringLiteral("E%1-%2").arg(i + 1).arg(tokens[i])))
+                << i + 1 << QString::fromLatin1(tokens[i]) << outcome;
+        }
+    }
+
+    void onePlaySummaryPerExitPath()
+    {
+        QFETCH(int, exit);
+        QFETCH(QString, token);
+        QFETCH(QString, outcome);
+        QTemporaryDir spool;
+        QMutex mutex;
+        QList<ShippedLine> records;
+        auto engine = std::make_unique<FakeEngineSession>();
+        auto client = std::make_unique<SeatHubClient>();
+        if (exit == 1) reachHome(*client, 90);
+        else beginStagedSession(*client);
+        QVERIFY(!QTest::currentTestFailed());
+        client->teardown()->setVerifyIntervalMs(1);
+        LogShipper::instance().setSpoolDirectoryForTests(spool.path());
+        LogShipper::instance().start([&](const ShippedLine& line) {
+            QMutexLocker lock(&mutex); records.append(line); return true;
+        });
+        LogShipper::instance().setCanShip(true);
+        StopShipperOnScopeExit guard;
+        if (exit >= 8) {
+            client->session()->attachSession(engine.get());
+            client->session()->start(nullptr);
+            emit engine->connectionStarted();
+        }
+        switch (exit) {
+        case 1:
+            m_fake->answerPlay(402, playRefusalBody(QStringLiteral("refused"), QStringLiteral("SH-TEST")));
+            client->start();
+            QTRY_COMPARE(client->homeStatus(), QStringLiteral("refused"));
+            break;
+        case 2: emit client->pairing()->pairingFailed(SeatHubFailure::generic()); break;
+        case 3:
+            client->session()->attachSession(engine.get());
+            client->session()->start(nullptr);
+            emit engine->stageFailed(QStringLiteral("RTSP handshake"), -1, QString()); break;
+        case 4:
+            client->session()->attachSession(engine.get());
+            client->session()->start(nullptr);
+            emit engine->displayLaunchError(QStringLiteral("local-only diagnostic")); break;
+        case 5: emit client->pairing()->pairingCompleted(QStringLiteral("fixture-client")); break;
+        case 6: client->interrupt(); break;
+        case 7: case 10: {
+            SessionInfo over = sessionIn(QStringLiteral("COMPLETED"), QStringLiteral("s-stages"));
+            over.endReason = QStringLiteral("CUSTOMER_ENDED");
+            report(*client, over); break;
+        }
+        case 8: emitConnectionTerminated(0); emit engine->readyForDeletion(); break;
+        case 9:
+            emitConnectionTerminated(-102);
+            emit engine->displayLaunchError(QStringLiteral("local-only diagnostic"));
+            emit engine->readyForDeletion(); break;
+        case 11: QVERIFY(QMetaObject::invokeMethod(client.get(), "handleHorizonReached", Qt::DirectConnection)); break;
+        case 12: case 13: {
+            emitConnectionTerminated(-100);
+            emit engine->displayLaunchError(QStringLiteral("local-only diagnostic"));
+            QVERIFY(client->reconnecting());
+            emit engine->readyForDeletion();
+            if (exit == 13) client->endHeldSession();
+            else {
+                SessionInfo over = sessionIn(QStringLiteral("COMPLETED"), QStringLiteral("s-stages"));
+                over.endReason = QStringLiteral("GRACE_EXPIRED");
+                report(*client, over);
+            }
+            break;
+        }
+        case 14: client->signOut(); break;
+        case 15: client.reset(); break;
+        }
+        // Duplicate teardown/exit notifications must not produce another summary.
+        if (client && exit >= 8) emit engine->readyForDeletion();
+        auto summaries = [&]() {
+            QMutexLocker lock(&mutex);
+            QList<ShippedLine> result;
+            for (const auto& line : records) if (line.body == QLatin1String("play.summary")) result.append(line);
+            return result;
+        };
+        QTRY_COMPARE_WITH_TIMEOUT(summaries().size(), 1, 10000);
+        LogShipper::instance().drainBeforeSignOut();
+        const auto summary = summaries().first();
+        QCOMPARE(summary.attrs.value("exit_path").toString(), token);
+        QCOMPARE(summary.attrs.value("outcome").toString(), outcome);
+        QCOMPARE(summaries().size(), 1);
+        if (exit == 1) {
+            QVERIFY(summary.sessionId.isEmpty());
+            QVERIFY(!summary.attrs.contains("stream_s"));
+            QVERIFY(!summary.attrs.contains("rollups"));
+        }
+        if (exit >= 8) {
+            QVERIFY(summary.attrs.contains("stream_s"));
+            QVERIFY(summary.attrs.contains("rollups"));
+        }
+        if (client) client->session()->attachSession(nullptr);
+    }
+
     void initTestCase()
     {
         qRegisterMetaType<SeatHubFailure>("SeatHubFailure");
