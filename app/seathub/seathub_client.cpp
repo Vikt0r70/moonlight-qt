@@ -499,11 +499,13 @@ SeatHubClient::SeatHubClient(QObject* parent)
     connect(m_pairingSeam, &ProductionPairingSeam::hostResolved,
             this, &SeatHubClient::handleHostResolved);
 
-    // The classified pairing failure (ADR-0072, Plan 09), emitted by the seam immediately before
-    // it reports the failure itself - hence always ahead of the controller's `pairingFailed` for
-    // the same run, on either connection type. `handlePairingFailed()` reads the step and the
-    // class from here; the seam's own `engineError` is deliberately not part of it.
-    connect(m_pairingSeam, &ProductionPairingSeam::failureClassified, this,
+    // The classification for the result the seam is about to report (ADR-0072, Plan 09), emitted
+    // by the seam immediately before it reports that result - hence always ahead of the
+    // controller's `pairingFailed` / `pairingCompleted` for the same run, on either connection
+    // type. Both handlers consume it: `handlePairingFailed()` reads the step and the class for a
+    // failure, `handlePairingCompleted()` for the frozen record of a pairing that recovered
+    // through the clear-and-retry. The seam's own `engineError` is deliberately not part of it.
+    connect(m_pairingSeam, &ProductionPairingSeam::handshakeClassified, this,
             [this](const PairingHandshakeResult& result) {
                 m_pairingClassification = result;
             });
@@ -2887,6 +2889,28 @@ void SeatHubClient::onLivenessWarning()
 
 void SeatHubClient::handlePairingCompleted(const QString& clientUuid)
 {
+    // Plan 09 (ADR-0072 item 2): the classification the seam reported for THIS handshake,
+    // consumed here - one handshake, one classification, so neither handler can hand the other a
+    // stale step. A pairing that succeeded after the rig's 409 was cleared carries the ADR's
+    // frozen record and gets its ONE `play.step` here; an ordinary success carries no step and
+    // emits nothing. INFO, never WARN: the step SUCCEEDED, after exactly one bounded retry - and
+    // this is the only emission the recovery makes (no second line, no WARN, and no `/end`
+    // change: "nothing extra is sent to the server on a recovered pairing"). The body is the
+    // fixed token and the attributes are allow-listed vocabulary - the 409 sentence, the PIN and
+    // the rig address were never part of the classification and never reach this call.
+    const PairingHandshakeResult classification = m_pairingClassification;
+    m_pairingClassification = PairingHandshakeResult();
+    if (!classification.attemptStep.isEmpty()) {
+        QJsonObject stepAttributes;
+        stepAttributes.insert(QStringLiteral("step"), classification.attemptStep);
+        stepAttributes.insert(QStringLiteral("outcome"), QStringLiteral("ok"));
+        if (!classification.stepClass.isEmpty()) {
+            stepAttributes.insert(QStringLiteral("failure_class"), classification.stepClass);
+        }
+        stepAttributes.insert(QStringLiteral("attempt"), classification.attempts);
+        SeatHubTelemetry::emitDiagnostic(QStringLiteral("play.step"), LogLevel::Info, stepAttributes);
+    }
+
     // The exact Sunshine client UUID. It is the only identifier that ever refers to this client
     // - never the readable label, the address or a list index (Pitfall 3, D-07) - and teardown
     // needs it to verify the removal.

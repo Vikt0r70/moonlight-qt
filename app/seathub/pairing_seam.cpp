@@ -66,22 +66,26 @@ public:
         // run could cancel the very session that superseded it. The atomic is read and written
         // without touching `this`, which the worker outlives.
         if (!result.ok && m_generation == m_currentGeneration->load()) {
-            // The classification the clear is about to remove, kept for the recovered record
-            // (ADR-0072 item 2): a pairing that succeeds only after the clear reports the class
-            // that was cleared, at attempt 2.
-            const QString clearedStep = result.attemptStep;
-            const QString clearedClass = result.stepClass;
             m_cancelRequest(m_target.hostAddress, kPairingControlPort);
             if (result.pairingConflict && m_generation == m_currentGeneration->load()) {
                 result = m_handshake(m_target);
-                // A second try of the same step in this Play is attempt 2, whether the retry
-                // succeeds (with the cleared class) or fails (with the class of its own last
-                // failure, which the second run computed for itself).
+                // A second try of the same step in this Play is attempt 2 (ADR-0072 item 2).
                 result.attempts = 2;
                 if (result.ok) {
-                    result.attemptStep = clearedStep;
-                    result.stepClass = clearedClass;
+                    // The recovered record is FROZEN by the ADR (item 2) and by
+                    // `docs/spec/client.md` "Play diagnostics - Rules": `step=pair_handshake`,
+                    // `failure_class=in_progress`, `attempt=2`. The conflict that was cleared was
+                    // a pairing-already-in-progress whichever surface named it - the rig's HTTP
+                    // 409 on getservercert, whose own mapper would say `pair_server_info` /
+                    // `http_4xx`, or `ALREADY_IN_PROGRESS` out of the handshake - so the record
+                    // names the step that was retried and the class that was cleared, never the
+                    // mapper's interim answer for the failure the retry just retired. The
+                    // diagnostic text the first run carried stays where it was: out of it.
+                    result.attemptStep = QStringLiteral("pair_handshake");
+                    result.stepClass = QStringLiteral("in_progress");
                 }
+                // A retry that fails again keeps ITS OWN class at attempt 2 (same item): the
+                // second run computed it from its own failure, and nothing here overwrites it.
             }
         }
 
@@ -251,7 +255,7 @@ void ProductionPairingSeam::finish(quint64 generation, const PairingHandshakeRes
         // (ADR-0072, Plan 09): `handlePairingFailed()` then has the step and the class while it
         // is still handling this failure.
         m_lastResult = result;
-        emit failureClassified(result);
+        emit handshakeClassified(result);
         done(false, QString(), result.engineError);
         return;
     }
@@ -262,12 +266,23 @@ void ProductionPairingSeam::finish(quint64 generation, const PairingHandshakeRes
         // reported is that verification (fail closed, Pitfall 3).
         qCWarning(seathubPairingSeam) << "upstream reported success with no client identity";
         m_lastResult = result;
-        emit failureClassified(result);
+        emit handshakeClassified(result);
         done(false, QString(), result.engineError);
         return;
     }
 
     qCInfo(seathubPairingSeam) << "upstream pairing handshake completed";
+
+    // The result's classification leaves on the same thread BEFORE the result itself, exactly as
+    // it does on the failure paths above - so a queued connection to the facade holds it by the
+    // time `hostResolved` and the controller's `pairingCompleted` arrive. An ordinary success
+    // carries no step and no class (attempts 1) and the facade emits nothing for it; a pairing
+    // that recovered through the clear-and-retry carries the frozen record (ADR-0072 item 2),
+    // which is the one this seam previously dropped on the floor here - the success branch
+    // reported only the host, and the classification the whole recovery produced never reached an
+    // emitter at all.
+    m_lastResult = result;
+    emit handshakeClassified(result);
 
     // The host travels first: the engine session is built from it, and a listener that acted on
     // `done` before this arrived would be building a session from nothing. Tagged with the session

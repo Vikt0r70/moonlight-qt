@@ -3085,27 +3085,46 @@ private slots:
         // Stop the worker before reading the capture: the final assertions must not race it.
         LogShipper::instance().stop();
 
-        // ONE line, and it is the ADR's frozen record - not a WARN, not a second emission.
+        // ONE line this run DIAGNOSED - `LogShipper::start()` installs the LogTee, so the
+        // capture also holds this suite's ordinary local log lines, and those are not emissions
+        // of the record under test.
         QMutexLocker lock(&captureMutex);
-        QCOMPARE(captured.size(), 1);
-        const ShippedLine& record = captured.first();
-        QCOMPARE(record.body, QStringLiteral("play.step"));
-        QCOMPARE(record.level, LogLevel::Info);
-        QCOMPARE(record.attrs.value(QStringLiteral("step")).toString(),
+        int diagnostics = 0;
+        const ShippedLine* record = nullptr;
+        int playSteps = 0;
+        for (const ShippedLine& line : captured) {
+            if (line.diagnostic) {
+                ++diagnostics;
+                record = &line;
+            }
+            if (line.body == QLatin1String("play.step")) {
+                ++playSteps;
+            }
+        }
+        QCOMPARE(diagnostics, 1);
+        QVERIFY(record != nullptr);
+        QVERIFY2(!record->body.isEmpty(), "the one diagnostic must be the play.step record");
+
+        // Exactly ONE `play.step`, and it is the ADR's frozen record - not a WARN, not a second
+        // emission of any kind (the recovery makes this one line and nothing else).
+        QCOMPARE(playSteps, 1);
+        QCOMPARE(record->body, QStringLiteral("play.step"));
+        QCOMPARE(record->level, LogLevel::Info);
+        QCOMPARE(record->attrs.value(QStringLiteral("step")).toString(),
                  QStringLiteral("pair_handshake"));
-        QCOMPARE(record.attrs.value(QStringLiteral("outcome")).toString(), QStringLiteral("ok"));
-        QCOMPARE(record.attrs.value(QStringLiteral("failure_class")).toString(),
+        QCOMPARE(record->attrs.value(QStringLiteral("outcome")).toString(), QStringLiteral("ok"));
+        QCOMPARE(record->attrs.value(QStringLiteral("failure_class")).toString(),
                  QStringLiteral("in_progress"));
-        QCOMPARE(record.attrs.value(QStringLiteral("attempt")).toInt(), 2);
+        QCOMPARE(record->attrs.value(QStringLiteral("attempt")).toInt(), 2);
 
         // No PIN, no address and no diagnostic text anywhere in what was emitted
         // (ADR-0072 item 2, T-06.7-35): the 409 sentence and the PIN stay where they were.
-        const QByteArray serialised = QJsonDocument(record.attrs).toJson(QJsonDocument::Compact);
+        const QByteArray serialised = QJsonDocument(record->attrs).toJson(QJsonDocument::Compact);
         QVERIFY2(!serialised.contains("4821"), qPrintable(QString::fromUtf8(serialised)));
         QVERIFY2(!serialised.contains("409"),
                  qPrintable(QStringLiteral("the local diagnostic leaked: %1")
                                 .arg(QString::fromUtf8(serialised))));
-        QVERIFY(!record.body.contains(QStringLiteral("4821")));
+        QVERIFY(!record->body.contains(QStringLiteral("4821")));
         lock.unlock();
 
         // Nothing extra went to the server for the recovery (ADR-0072 item 2: "nothing extra is

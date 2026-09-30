@@ -38,6 +38,7 @@
 #include <QList>
 #include <QString>
 
+#include <atomic>
 #include <functional>
 #include <memory>
 
@@ -104,10 +105,21 @@ public:
     /// that purpose).
     QList<ShippedLine> takeAll();
 
+    /// Appends an adopted batch (what `adoptLeftovers()` returned) with the age rule already
+    /// applied: a line older than `kSpoolMaxAgeDays` is dropped HERE and counted, never queued
+    /// for the first drain to drop again. Plan 09 (ADR-0072 item 8): `LogShipper::start()` runs
+    /// this BEFORE `SeatHubTelemetry::start()` reaches `noteLaunch()`, so the launch record's
+    /// `dropped_spool_age` already knows how many leftovers startup threw away while
+    /// `spool_lines_adopted` still reports what was adopted. Same 7-day cutoff `takeAll()` has
+    /// always applied - no new clock policy, and a line the filter already passed is unaffected.
+    void appendAdopted(const QList<ShippedLine>& lines);
+
     /// Plan 09 (D-13): how many lines `takeAll()` has dropped for being older than
-    /// `kSpoolMaxAgeDays`. Cumulative over this object's life; the launch record's
-    /// `dropped_spool_age` reads it through `LogShipper::droppedSpoolAgeCount()`.
-    int droppedAgeLines() const { return m_droppedAgeLines; }
+    /// `kSpoolMaxAgeDays`, plus what `appendAdopted()` dropped at startup. Atomic: the worker
+    /// increments it on the spool thread while the launch record reads it from the client thread
+    /// - a plain `int` there would be a data race. Cumulative over this object's life; the
+    /// launch record's `dropped_spool_age` reads it through `LogShipper::droppedSpoolAgeCount()`.
+    int droppedAgeLines() const { return m_droppedAgeLines.load(); }
 
     /// Scans `directory` for `spool-*.jsonl` files this process did not create, adopts (reads,
     /// then deletes) any whose owning process is no longer running - proven by a failed-to-lock
@@ -120,7 +132,7 @@ private:
     QString m_directory;
     QString m_path;
     std::unique_ptr<QLockFile> m_lock;
-    int m_droppedAgeLines = 0;
+    std::atomic<int> m_droppedAgeLines{ 0 };
 };
 
 /// The one process-lifetime sink `SeatHubTelemetry::start()` registers (D-14). A singleton -

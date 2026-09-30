@@ -1200,7 +1200,7 @@ private slots:
         });
         seam.setCancelRequest([](const QString&, int) { return true; });
 
-        QSignalSpy classified(&seam, &ProductionPairingSeam::failureClassified);
+        QSignalSpy classified(&seam, &ProductionPairingSeam::handshakeClassified);
         QVERIFY(classified.isValid());
 
         SeamReport report;
@@ -1279,7 +1279,7 @@ private slots:
             return true;
         });
 
-        QSignalSpy classified(&seam, &ProductionPairingSeam::failureClassified);
+        QSignalSpy classified(&seam, &ProductionPairingSeam::handshakeClassified);
         QVERIFY(classified.isValid());
 
         SeamReport report;
@@ -1339,7 +1339,7 @@ private slots:
             return true;
         });
 
-        QSignalSpy classified(&seam, &ProductionPairingSeam::failureClassified);
+        QSignalSpy classified(&seam, &ProductionPairingSeam::handshakeClassified);
         QVERIFY(classified.isValid());
 
         SeamReport report;

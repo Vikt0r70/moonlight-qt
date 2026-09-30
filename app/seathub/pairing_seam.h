@@ -145,19 +145,22 @@ public:
     void clearPendingPairing(const PairingTarget& target) override;
 
     /// The classification this seam last reported, or a default-constructed result before any
-    /// failure was reported. The failure path the facade reads: `handlePairingFailed()` is
+    /// result was reported. The failure path the facade reads: `handlePairingFailed()` is
     /// reached through `pairingFailed`, which carries no classification of its own (the
     /// controller's callback and signal signatures are not this plan's to change), so the step
-    /// and the class the facade needs are read from here and from `failureClassified`.
+    /// and the class the facade needs are read from here and from `handshakeClassified`.
     const PairingHandshakeResult& lastResult() const { return m_lastResult; }
 
 signals:
-    /// The classified failure this seam just reported, handed to the facade as one value whose
-    /// `attemptStep`, `stepClass` and `attempts` are separate members - never `engineError`
-    /// (ADR-0072 item 2, D-12). Emitted immediately before `done(false, ...)` on every failure
-    /// path the seam reports, so a queued connection to the facade always lands before the
-    /// controller's own `pairingFailed` for the same run.
-    void failureClassified(const PairingHandshakeResult& result);
+    /// The result this seam just reported, with whatever classification it carries, handed to the
+    /// facade as one value whose `attemptStep`, `stepClass` and `attempts` are separate members -
+    /// never `engineError` (ADR-0072 item 2, D-12). Emitted immediately BEFORE `done()` on every
+    /// path that reports a result - a failure, and also a pairing that succeeded after the
+    /// clear-and-retry, whose frozen record (`pair_handshake` / `in_progress` / attempt 2) the
+    /// facade turns into its ONE INFO `play.step` (ADR-0072 item 2). Because it always leads the
+    /// result, a queued connection to the facade always lands before the controller's own
+    /// `pairingFailed` / `pairingCompleted` for the same run, and before `hostResolved`.
+    void handshakeClassified(const PairingHandshakeResult& result);
 
     /// The host the handshake resolved, tagged with the session id of the `pair()` call it answers
     /// (06.6-18/T-06.6-52), emitted immediately before `done(true, ...)` on the one success path and
@@ -204,6 +207,6 @@ private:
     quint64 m_generation = 0;
     /// What the last reported failure carried (ADR-0072, Plan 09): written on the same thread
     /// that reports it, read by the facade after the queued `pairingFailed` for that run has
-    /// already delivered the `failureClassified` copy.
+    /// already delivered the `handshakeClassified` copy.
     PairingHandshakeResult m_lastResult;
 };

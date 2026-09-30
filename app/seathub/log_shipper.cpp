@@ -211,10 +211,30 @@ QList<ShippedLine> LogSpool::takeAll()
         else {
             // D-13: a line dropped for age is a line this run will never deliver. Counted, not
             // logged - the launch record's `dropped_spool_age` is where a reader finds it.
-            ++m_droppedAgeLines;
+            // Atomic: this runs on the worker thread while that record is read from the client
+            // thread (LogSpool's own comment on `droppedAgeLines()`).
+            m_droppedAgeLines.fetch_add(1);
         }
     }
     return fresh;
+}
+
+void LogSpool::appendAdopted(const QList<ShippedLine>& lines)
+{
+    // The same cutoff `takeAll()` applies at drain, computed the same way - applied here instead
+    // because a line that is ALREADY dead on arrival should be counted before anything reads the
+    // counter (Plan 09: `noteLaunch()` reads it right after `LogShipper::start()` returns), and
+    // because dropping it now keeps `takeAll()` from counting the same line a second time.
+    const double cutoff
+        = currentEpochSeconds() - static_cast<double>(kSpoolMaxAgeDays) * 24.0 * 3600.0;
+    for (const ShippedLine& line : lines) {
+        if (line.loggedAt >= cutoff) {
+            append(line);
+        }
+        else {
+            m_droppedAgeLines.fetch_add(1);
+        }
+    }
 }
 
 QList<ShippedLine> LogSpool::adoptLeftovers(const QString& directory)
@@ -337,9 +357,10 @@ public:
         adoptedSpoolLines.store(adopted.size());
 
         spool = std::make_unique<LogSpool>(directory);
-        for (const ShippedLine& line : adopted) {
-            spool->append(line);
-        }
+        // Plan 09 (ADR-0072 item 8): adopted lines go through the age rule HERE rather than at
+        // the first drain, so `dropped_spool_age` already counts the dead-on-arrival ones by the
+        // time `SeatHubTelemetry::start()` reaches `noteLaunch()` and builds the launch record.
+        spool->appendAdopted(adopted);
 
         if (sinkHandle == 0) {
             // D-16/log_tee.h's own contract: registered exactly once, ever, for the life of the
