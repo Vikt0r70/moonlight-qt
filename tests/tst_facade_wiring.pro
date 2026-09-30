@@ -70,6 +70,7 @@ SOURCES += \
     ../app/seathub/teardown_controller.cpp \
     ../app/seathub/liveness_timer.cpp \
     ../app/seathub/authorized_through_timer.cpp \
+    ../app/seathub/attempt_vocab.cpp \
     ../app/seathub/log_tee.cpp \
     ../app/seathub/log_shipper.cpp \
     ../app/seathub/telemetry.cpp \

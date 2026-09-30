@@ -679,6 +679,9 @@ private slots:
         QTRY_VERIFY(called);
         const QByteArray expectedAgent = QByteArrayLiteral("SeatHub/") + SEATHUB_VERSION;
         QCOMPARE(fake->lastRequest.rawHeader(QByteArrayLiteral("User-Agent")), expectedAgent);
+        QVERIFY(QRegularExpression(QStringLiteral("^SeatHub/[0-9]{1,4}(\\.[0-9]{1,4}){1,3}$"))
+                    .match(QString::fromLatin1(expectedAgent))
+                    .hasMatch());
 
         called = false;
         fake->status = 202;
@@ -689,6 +692,9 @@ private slots:
                           });
         QTRY_VERIFY(called);
         QCOMPARE(fake->lastRequest.rawHeader(QByteArrayLiteral("User-Agent")), expectedAgent);
+        QVERIFY(QRegularExpression(QStringLiteral("^SeatHub/[0-9]{1,4}(\\.[0-9]{1,4}){1,3}$"))
+                    .match(QString::fromLatin1(expectedAgent))
+                    .hasMatch());
     }
 
     // D-05/D-23, contract 3.3.0: `SessionEndRequest`'s optional `{"failed": true}`.

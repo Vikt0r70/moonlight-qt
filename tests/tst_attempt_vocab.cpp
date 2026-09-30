@@ -178,6 +178,21 @@ private slots:
         }
     }
 
+    void everyLaunchReasonMapsToAClosedEnginePrepareClass()
+    {
+        QCOMPARE(classForLaunchReason(EngineLaunchReason::NoApp), QStringLiteral("no_app"));
+        QCOMPARE(classForLaunchReason(EngineLaunchReason::AppCount), QStringLiteral("app_count"));
+        QCOMPARE(classForLaunchReason(EngineLaunchReason::CreateFailed), QStringLiteral("engine_create"));
+        QCOMPARE(classForLaunchReason(EngineLaunchReason::StartRefused), QStringLiteral("start_refused"));
+        QCOMPARE(classForLaunchReason(EngineLaunchReason::AppListFailed), QStringLiteral("app_list_failed"));
+        QVERIFY(classForLaunchReason(EngineLaunchReason::Started).isEmpty());
+        QCOMPARE(classForLaunchReason(static_cast<EngineLaunchReason>(99)),
+                 QStringLiteral("engine_create"));
+        QVERIFY(isClosedFailureClass(QStringLiteral("engine_prepare"), QStringLiteral("no_app")));
+        QVERIFY(isClosedFailureClass(QStringLiteral("rig_wait"), QStringLiteral("server_ended")));
+        QVERIFY(!isClosedFailureClass(QStringLiteral("engine_prepare"), QStringLiteral("no_app raw")));
+    }
+
     void everyAnswerIsATokenAndStaysInThePairingClasses()
     {
         // The redaction rule, asserted structurally: no mapper can return anything that is not

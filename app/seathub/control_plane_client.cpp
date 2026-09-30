@@ -1,4 +1,5 @@
 #include "control_plane_client.h"
+#include "seathub_version.h"
 
 #include <QJsonArray>
 #include <QJsonDocument>
@@ -28,6 +29,11 @@ const char* const kLivenessStates[] = { "streaming", "reconnecting", "ending" };
 // ADR-0008 / `Error.reference`, `ReferenceCode`, `liveness.error_code`. The alphabet
 // excludes I, L and O so a reference read off a screen is unambiguous.
 const char* kReferencePattern = "^SH-[0-9A-HJ-KM-NP-TV-Z]{6}$";
+
+QString seatHubUserAgent()
+{
+    return QStringLiteral("SeatHub/") + QString::fromLatin1(SEATHUB_VERSION);
+}
 
 // D-27: a W3C trace id - 32 lowercase hex characters, not all zeros
 // (https://www.w3.org/TR/trace-context/#trace-id).
@@ -889,7 +895,7 @@ void ControlPlaneClient::sendOnOwningThread(const QString& method, const QString
 {
     QUrl url(m_baseUrl + path);
     QNetworkRequest request(url);
-    request.setHeader(QNetworkRequest::UserAgentHeader, QStringLiteral("SeatHub"));
+    request.setHeader(QNetworkRequest::UserAgentHeader, seatHubUserAgent());
 
     if (authenticated && !accessToken.isEmpty()) {
         request.setRawHeader("Authorization", QByteArrayLiteral("Bearer ") + accessToken.toUtf8());
@@ -1061,7 +1067,7 @@ QNetworkReply* ControlPlaneClient::openAccountStream()
 
     QUrl url(m_baseUrl + QStringLiteral("/api/stream"));
     QNetworkRequest request(url);
-    request.setHeader(QNetworkRequest::UserAgentHeader, QStringLiteral("SeatHub"));
+    request.setHeader(QNetworkRequest::UserAgentHeader, seatHubUserAgent());
     request.setRawHeader("Accept", "text/event-stream");
     if (!accessToken.isEmpty()) {
         request.setRawHeader("Authorization", QByteArrayLiteral("Bearer ") + accessToken.toUtf8());

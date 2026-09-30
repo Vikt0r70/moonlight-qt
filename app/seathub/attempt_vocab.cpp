@@ -1,5 +1,7 @@
 #include "attempt_vocab.h"
 
+#include <QHash>
+
 // The vocabulary's own code, and nothing else: no Qt network, no `app/backend/`, no telemetry.
 // Every answer below is a token from a closed set (ADR-0072 item 1) computed from an enum
 // integer, an HTTP bucket or a stage index - never from `what()`, `toQString()`, `errorString()`,
@@ -114,4 +116,73 @@ QString classForEngineStage(int stage)
     // Stage `none`, an index past the last stage, a negative index: no stage had started, which
     // is what `launch_error` names (a `displayLaunchError` before the first stage).
     return QStringLiteral("launch_error");
+}
+
+QString classForLaunchReason(EngineLaunchReason reason)
+{
+    switch (reason) {
+    case EngineLaunchReason::Started:
+        return QString();
+    case EngineLaunchReason::NoApp:
+        return QStringLiteral("no_app");
+    case EngineLaunchReason::AppCount:
+        return QStringLiteral("app_count");
+    case EngineLaunchReason::CreateFailed:
+        return QStringLiteral("engine_create");
+    case EngineLaunchReason::StartRefused:
+        return QStringLiteral("start_refused");
+    case EngineLaunchReason::AppListFailed:
+        return QStringLiteral("app_list_failed");
+    }
+    return QStringLiteral("engine_create");
+}
+
+bool isClosedFailureClass(const QString& step, const QString& failureClass)
+{
+    if (failureClass.isEmpty()) {
+        return true;
+    }
+    static const QHash<QString, QStringList> classes = {
+        {QStringLiteral("allocate"), {QStringLiteral("no_host"), QStringLiteral("refused_balance"),
+                                       QStringLiteral("refused_state"), QStringLiteral("unreachable"),
+                                       QStringLiteral("server_error"), QStringLiteral("bad_response")}},
+        {QStringLiteral("rig_wait"), {QStringLiteral("ok"), QStringLiteral("server_ended")}},
+        {QStringLiteral("pair_authorize"), {QStringLiteral("deadline"), QStringLiteral("refused"),
+                                            QStringLiteral("bad_response"), QStringLiteral("no_seam"),
+                                            QStringLiteral("unreachable_deadline")}},
+        {QStringLiteral("pair_server_info"), {QStringLiteral("no_address"), QStringLiteral("net_refused"),
+                                              QStringLiteral("net_closed"), QStringLiteral("net_host_not_found"),
+                                              QStringLiteral("net_timeout"), QStringLiteral("net_tls"),
+                                              QStringLiteral("net_proxy"), QStringLiteral("net_other"),
+                                              QStringLiteral("http_4xx"), QStringLiteral("http_5xx")}},
+        {QStringLiteral("pair_handshake"), {QStringLiteral("pin_rejected"), QStringLiteral("in_progress"),
+                                            QStringLiteral("failed"), QStringLiteral("net_refused"),
+                                            QStringLiteral("net_closed"), QStringLiteral("net_host_not_found"),
+                                            QStringLiteral("net_timeout"), QStringLiteral("net_tls"),
+                                            QStringLiteral("net_proxy"), QStringLiteral("net_other"),
+                                            QStringLiteral("http_4xx"), QStringLiteral("http_5xx"),
+                                            QStringLiteral("crypto_init"), QStringLiteral("other")}},
+        {QStringLiteral("engine_prepare"), {QStringLiteral("no_app"), QStringLiteral("app_count"),
+                                            QStringLiteral("engine_create"), QStringLiteral("start_refused"),
+                                            QStringLiteral("app_list_failed")}},
+        {QStringLiteral("engine_connect"), {QStringLiteral("platform_init"), QStringLiteral("name_resolution"),
+                                             QStringLiteral("audio_init"), QStringLiteral("rtsp_handshake"),
+                                             QStringLiteral("control_init"), QStringLiteral("video_init"),
+                                             QStringLiteral("input_init"), QStringLiteral("control_start"),
+                                             QStringLiteral("video_start"), QStringLiteral("audio_start"),
+                                             QStringLiteral("input_start"), QStringLiteral("launch_error")}},
+        {QStringLiteral("first_frame"), {QStringLiteral("ok"), QStringLiteral("no_first_frame")}},
+        {QStringLiteral("stream"), {QStringLiteral("graceful"), QStringLiteral("no_video_traffic"),
+                                     QStringLiteral("no_video_frame"), QStringLiteral("early_termination"),
+                                     QStringLiteral("protected_content"), QStringLiteral("frame_conversion"),
+                                     QStringLiteral("net_other")}},
+        {QStringLiteral("reconnect"), {QStringLiteral("attempt_pair_failed"),
+                                        QStringLiteral("attempt_engine_failed"),
+                                        QStringLiteral("grace_expired"), QStringLiteral("reconnect_limit"),
+                                        QStringLiteral("ok")}},
+        {QStringLiteral("teardown"), {QStringLiteral("failed_net"), QStringLiteral("failed_api"),
+                                      QStringLiteral("failed_auth"), QStringLiteral("failed_local"),
+                                      QStringLiteral("ok")}},
+    };
+    return classes.value(step).contains(failureClass);
 }

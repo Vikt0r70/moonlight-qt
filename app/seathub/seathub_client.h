@@ -15,6 +15,8 @@
 // an explicitly injected fake (`stub_engine_session.h`), never as a fallback.
 
 #include <QJsonObject>
+#include <QElapsedTimer>
+#include <QHash>
 #include <QObject>
 #include <QString>
 #include <QTimer>
@@ -665,6 +667,8 @@ private:
     /// is paused. Its own 401 starts the D-07 signed-out sequence (`timing.md` L9), never an
     /// immediate sign-out.
     void fetchAccountStateFallback();
+    void noteStepOutcome(const QString& step, const QString& outcome,
+                         const QString& failureClass, qint64 elapsedMs, int attempt = 0);
     /// The D-07 signed-out sequence itself (the owner's design A-87), started by
     /// `handleSseRevoked()`, the fallback read's own 401, or a running stream's own end applying
     /// a deferred one (`m_pendingSignedOutNotice`, Phase 3 D-33). While the engine's stream is
@@ -961,6 +965,10 @@ private:
     /// the seam reports from. Consumed - not merely read - by whichever handler runs next, so no
     /// later failure can inherit it. Empty until a result arrives.
     PairingHandshakeResult m_pairingClassification;
+    EngineLaunchReason m_engineLaunchReason = EngineLaunchReason::Started;
+    QString m_lastFailedStep;
+    QElapsedTimer m_playElapsed;
+    QHash<QString, QVariantMap> m_stepTimings;
     TeardownController* m_teardown = nullptr;
 
     // D-31/D-34 and D-33. Both must outlive the stream and neither is a Q_PROPERTY: the UI has

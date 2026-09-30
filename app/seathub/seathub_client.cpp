@@ -695,6 +695,10 @@ void SeatHubClient::beginSession(const QString& sessionId)
 
     setAttachedSession(sessionId);
     setAttachedSessionEnded(false);
+    m_lastFailedStep.clear();
+    m_engineLaunchReason = EngineLaunchReason::Started;
+    m_stepTimings.clear();
+    m_playElapsed.start();
     m_clientUuid.clear();
     // A new session's teardown has not been asked for yet. Without this the second and later
     // sessions in one run never tear down (defect F-9; `teardown_guard.h`).
@@ -2648,7 +2652,13 @@ void SeatHubClient::handleSessionState(const SessionInfo& session)
         m_horizon->arm(session.authorizedThrough);
     }
 
+    if (session.state == QLatin1String("REQUESTED") || session.state == QLatin1String("ALLOCATED")
+        || session.state == QLatin1String("PREPARING")) {
+        m_lastFailedStep = QStringLiteral("rig_wait");
+    }
+
     if (session.isTerminal()) {
+        const bool wasAlreadyEnded = m_sessionEnded;
         // The server considers this session over - the wallet ran out, the owner's reservation
         // arrived, or an operator ended it. Home no longer offers to resume it, even while its
         // teardown is still running. Stop locally; teardown follows from `handleReadyForDeletion()`.
@@ -2681,6 +2691,16 @@ void SeatHubClient::handleSessionState(const SessionInfo& session)
             // stepper that looks alive for a session that is over. Connecting stops here, at the stage
             // it had reached, in the server's own words for why.
             onClientThread(m_pairing, [this]() { m_pairing->cancel(); });
+            if (!wasAlreadyEnded && inControlPlaneSession()) {
+                m_lastFailedStep = QStringLiteral("rig_wait");
+                noteStepOutcome(m_lastFailedStep, QStringLiteral("failed"),
+                                QStringLiteral("server_ended"), m_playElapsed.elapsed());
+                EndReport report;
+                report.stage = QStringLiteral("connecting");
+                report.attemptStep = m_lastFailedStep;
+                endPreStreamSessionWithReport(m_teardownGuard, m_teardown, m_sessionId,
+                                              m_clientUuid, report);
+            }
             raiseConnectFailure(SeatHubFailure::generic(), session.endReason, session.minutesBilled);
         }
     }
@@ -2691,6 +2711,56 @@ void SeatHubClient::handleSessionState(const SessionInfo& session)
         // `minutes_billed`, never arithmetic done here.
         setEndReasonText(endReasonSentence(session.endReason, session.minutesBilled));
     }
+}
+
+void SeatHubClient::noteStepOutcome(const QString& step, const QString& outcome,
+                                   const QString& failureClass, qint64 elapsedMs, int attempt)
+{
+    const QString closedStep = coerceStep(step);
+    if (closedStep == QLatin1String("other")
+        || (outcome != QLatin1String("ok") && outcome != QLatin1String("failed")
+            && outcome != QLatin1String("cancelled"))
+        || !isClosedFailureClass(closedStep, failureClass)) {
+        return;
+    }
+
+    QVariantMap timing;
+    timing.insert(QStringLiteral("step"), closedStep);
+    const qint64 nowMs = m_playElapsed.isValid() ? m_playElapsed.elapsed() : 0;
+    timing.insert(QStringLiteral("start_ms"),
+                  elapsedMs >= 0 ? qMax<qint64>(0, nowMs - elapsedMs) : nowMs);
+    if (elapsedMs >= 0) {
+        timing.insert(QStringLiteral("elapsed_ms"), elapsedMs);
+    }
+    m_stepTimings.insert(closedStep, timing);
+
+    const QString closedClass = failureClass;
+    SeatHubTelemetry::emitStepMetric(closedStep, outcome, closedClass,
+                                     elapsedMs >= 0 ? static_cast<double>(elapsedMs) : 0.0);
+
+    const bool emitLine = outcome == QLatin1String("failed")
+        || outcome == QLatin1String("cancelled")
+        || (outcome == QLatin1String("ok") && attempt == 2 && !closedClass.isEmpty());
+    if (!emitLine) {
+        return;
+    }
+
+    QJsonObject attributes;
+    attributes.insert(QStringLiteral("step"), closedStep);
+    attributes.insert(QStringLiteral("outcome"), outcome);
+    if (!closedClass.isEmpty()) {
+        attributes.insert(QStringLiteral("failure_class"), closedClass);
+    }
+    if (elapsedMs >= 0) {
+        attributes.insert(QStringLiteral("elapsed_ms"), static_cast<double>(elapsedMs));
+    }
+    if (attempt > 0) {
+        attributes.insert(QStringLiteral("attempt"), attempt);
+    }
+    SeatHubTelemetry::emitDiagnostic(QStringLiteral("play.step"),
+                                     outcome == QLatin1String("failed") ? LogLevel::Warning
+                                                                         : LogLevel::Info,
+                                     attributes);
 }
 
 void SeatHubClient::handleAccountState(const AccountStateInfo& account)
@@ -2901,14 +2971,8 @@ void SeatHubClient::handlePairingCompleted(const QString& clientUuid)
     const PairingHandshakeResult classification = m_pairingClassification;
     m_pairingClassification = PairingHandshakeResult();
     if (!classification.attemptStep.isEmpty()) {
-        QJsonObject stepAttributes;
-        stepAttributes.insert(QStringLiteral("step"), classification.attemptStep);
-        stepAttributes.insert(QStringLiteral("outcome"), QStringLiteral("ok"));
-        if (!classification.stepClass.isEmpty()) {
-            stepAttributes.insert(QStringLiteral("failure_class"), classification.stepClass);
-        }
-        stepAttributes.insert(QStringLiteral("attempt"), classification.attempts);
-        SeatHubTelemetry::emitDiagnostic(QStringLiteral("play.step"), LogLevel::Info, stepAttributes);
+        noteStepOutcome(classification.attemptStep, QStringLiteral("ok"), classification.stepClass,
+                        -1, classification.attempts);
     }
 
     // The exact Sunshine client UUID. It is the only identifier that ever refers to this client
@@ -2934,6 +2998,11 @@ void SeatHubClient::handlePairingCompleted(const QString& clientUuid)
             retryReconnectOrGiveUp();
             return;
         }
+        const EngineLaunchReason launchReason = m_engineLaunchReason == EngineLaunchReason::Started
+            ? EngineLaunchReason::StartRefused : m_engineLaunchReason;
+        m_lastFailedStep = QStringLiteral("engine_prepare");
+        noteStepOutcome(m_lastFailedStep, QStringLiteral("failed"),
+                        classForLaunchReason(launchReason), m_playElapsed.elapsed(), 1);
         // Pairing itself succeeded, but nothing was attached to start with - connecting never
         // truly began, so the stage this stopped at is still `pairing` (D-11).
         m_liveness->reportFailure(QStringLiteral("pairing"));
@@ -2953,6 +3022,7 @@ void SeatHubClient::handlePairingCompleted(const QString& clientUuid)
             setAttachedSessionEnded(true);
             EndReport report;
             report.stage = QStringLiteral("connecting");
+            report.attemptStep = m_lastFailedStep;
             endPreStreamSessionWithReport(m_teardownGuard, m_teardown, m_sessionId, m_clientUuid,
                                           report);
         }
@@ -3004,7 +3074,9 @@ void SeatHubClient::handleHostResolved(const QString& sessionId, const PairedHos
         return;
     }
 
-    MoonlightEngineSession* engine = MoonlightEngineSession::create(host);
+    m_engineLaunchReason = EngineLaunchReason::CreateFailed;
+    MoonlightEngineSession* engine = MoonlightEngineSession::create(host, nullptr,
+                                                                    &m_engineLaunchReason);
     if (engine == nullptr) {
         // Fail closed. `MoonlightEngineSession::create()` logs which of the two reasons it was.
         return;
@@ -3118,15 +3190,9 @@ void SeatHubClient::handlePairingFailed(const SeatHubFailure& failure)
     // through the shipper's diagnostic lane, so the three kill switches reach it like every other
     // line, and the body is the fixed token `play.step`, never customer or engine text.
     if (!classification.attemptStep.isEmpty()) {
-        QJsonObject stepAttributes;
-        stepAttributes.insert(QStringLiteral("step"), classification.attemptStep);
-        stepAttributes.insert(QStringLiteral("outcome"), QStringLiteral("failed"));
-        if (!classification.stepClass.isEmpty()) {
-            stepAttributes.insert(QStringLiteral("failure_class"), classification.stepClass);
-        }
-        stepAttributes.insert(QStringLiteral("attempt"), classification.attempts);
-        SeatHubTelemetry::emitDiagnostic(QStringLiteral("play.step"), LogLevel::Warning,
-                                         stepAttributes);
+        m_lastFailedStep = coerceStep(classification.attemptStep);
+        noteStepOutcome(m_lastFailedStep, QStringLiteral("failed"), classification.stepClass, -1,
+                        classification.attempts);
     }
 
     // D-11: a pairing timeout or a control-plane refusal of the pairing read, neither with an
@@ -3154,7 +3220,7 @@ void SeatHubClient::handlePairingFailed(const SeatHubFailure& failure)
         // the step. An unclassified pairing failure (the controller's own deadline, a
         // control-plane refusal) leaves this empty and the field absent from the body, because a
         // step the client never classified is a step it must not invent.
-        report.attemptStep = classification.attemptStep;
+        report.attemptStep = m_lastFailedStep;
         endPreStreamSessionWithReport(m_teardownGuard, m_teardown, m_sessionId, m_clientUuid,
                                       report);
     }

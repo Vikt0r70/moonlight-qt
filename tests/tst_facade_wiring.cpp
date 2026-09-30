@@ -89,11 +89,20 @@
 // tell "dropped before create()" from "reached create() and failed closed the ordinary way" - the
 // two things `handleHostResolved()`'s session-id check must tell apart.
 int g_engineCreateCalls = 0;
+EngineLaunchReason g_engineCreateReason = EngineLaunchReason::CreateFailed;
+std::function<void()> g_engineFactoryHook;
 
-MoonlightEngineSession* MoonlightEngineSession::create(const PairedHostPtr&, QObject* parent)
+MoonlightEngineSession* MoonlightEngineSession::create(const PairedHostPtr&, QObject* parent,
+                                                       EngineLaunchReason* reason)
 {
     Q_UNUSED(parent);
     ++g_engineCreateCalls;
+    if (reason != nullptr) {
+        *reason = g_engineCreateReason;
+    }
+    if (g_engineFactoryHook) {
+        g_engineFactoryHook();
+    }
     // The production factory returns null when the host is not a `MoonlightPairedHost` or its
     // application list does not name a single application, and the caller then fails closed
     // instead of substituting a stub. Returning null here is that same answer: no host is paired
@@ -127,10 +136,18 @@ void MoonlightEngineSession::setTextRasterizer(Overlay::OverlayManager::TextRast
 // test in this suite keeps the original always-fail answer (and, because no other test grants a
 // pairing target, none of them ever reaches this function at all).
 bool g_recoveredHandshakeArmed = false;
+bool g_noAppHandshakeArmed = false;
 int g_handshakeCalls = 0;
 
 PairingHandshakeResult runUpstreamPairingHandshake(const PairingTarget&)
 {
+    if (g_noAppHandshakeArmed) {
+        PairingHandshakeResult paired;
+        paired.ok = true;
+        paired.clientIdentity = QStringLiteral("no-app-identity");
+        paired.host = std::make_shared<PairedHost>();
+        return paired;
+    }
     if (g_recoveredHandshakeArmed) {
         ++g_handshakeCalls;
         if (g_handshakeCalls == 1) {
@@ -149,6 +166,7 @@ PairingHandshakeResult runUpstreamPairingHandshake(const PairingTarget&)
         PairingHandshakeResult paired;
         paired.ok = true;
         paired.clientIdentity = QStringLiteral("recovered-identity");
+        paired.host = std::make_shared<PairedHost>();
         return paired;
     }
 
@@ -3058,6 +3076,16 @@ private slots:
         reachHome(client, 90);
         QVERIFY(!QTest::currentTestFailed());
 
+        auto engine = std::make_unique<FakeEngineSession>();
+        g_engineCreateReason = EngineLaunchReason::Started;
+        g_engineFactoryHook = [&client, enginePtr = engine.get()]() {
+            client.session()->attachSession(enginePtr);
+        };
+        auto clearFactoryHook = qScopeGuard([]() {
+            g_engineFactoryHook = {};
+            g_engineCreateReason = EngineLaunchReason::CreateFailed;
+        });
+
         // This suite never installs the LogTee and never calls `SeatHubTelemetry::start()`, so a
         // shipper started here sees exactly one kind of line: the diagnostics the facade itself
         // emits. Started AFTER `reachHome()`, whose identity changes run `updateCanShip()` -
@@ -3152,16 +3180,101 @@ private slots:
         QVERIFY(!record->body.contains(QStringLiteral("4821")));
         lock.unlock();
 
+        // Let the successful fake engine complete so ordinary teardown runs. The recovered
+        // pairing itself must not fail the Play or add an attempt step to /end.
+        emit engine->readyForDeletion();
+
         // Nothing extra went to the server for the recovery (ADR-0072 item 2: "nothing extra is
-        // sent ... on a recovered pairing"): the only `/end` this scenario produces is the
-        // ordinary pre-stream end this suite's engine-less setup always sends, and it carries no
+        // sent ... on a recovered pairing"): the successful stream's ordinary `/end` carries no
         // `attempt_step` - a step the Play did NOT fail at never travels.
         QTRY_VERIFY_WITH_TIMEOUT(
             m_fake->requestPaths().contains(QStringLiteral("/api/sessions/s-recovered/end")), 15000);
         QCOMPARE(m_fake->requestPaths().count(QStringLiteral("/api/sessions/s-recovered/end")), 1);
         QVERIFY2(!m_fake->bodyFor(QStringLiteral("/api/sessions/s-recovered/end"))
                       .contains("attempt_step"),
-                 "a recovered pairing must add nothing to the /end body");
+                  "a recovered pairing must add nothing to the /end body");
+    }
+
+    void aNoLaunchableAppEmitsOneClassifiedStepAndEndsWithThatStep()
+    {
+        g_noAppHandshakeArmed = true;
+        g_engineCreateReason = EngineLaunchReason::NoApp;
+        auto disarm = qScopeGuard([]() {
+            g_noAppHandshakeArmed = false;
+            g_engineCreateReason = EngineLaunchReason::CreateFailed;
+        });
+
+        SeatHubClient client;
+        reachHome(client, 90);
+        QVERIFY(!QTest::currentTestFailed());
+
+        QTemporaryDir spoolDir;
+        QVERIFY(spoolDir.isValid());
+        QMutex captureMutex;
+        QList<ShippedLine> captured;
+        LogShipper::instance().setSpoolDirectoryForTests(spoolDir.path());
+        LogShipper::instance().start([&captureMutex, &captured](const ShippedLine& line) {
+            QMutexLocker lock(&captureMutex);
+            captured.append(line);
+            return true;
+        });
+        LogShipper::instance().setCanShip(true);
+        StopShipperOnScopeExit stopGuard;
+
+        QJsonObject ports;
+        ports.insert(QStringLiteral("https"), 47984);
+        ports.insert(QStringLiteral("control"), 47989);
+        ports.insert(QStringLiteral("rtsp"), 48010);
+        QJsonObject authBody;
+        authBody.insert(QStringLiteral("session_id"), QStringLiteral("s-no-app"));
+        authBody.insert(QStringLiteral("pairing_pin"), QStringLiteral("4821"));
+        authBody.insert(QStringLiteral("host_address"), QStringLiteral("127.0.0.1"));
+        authBody.insert(QStringLiteral("ports"), ports);
+        authBody.insert(QStringLiteral("state"), QStringLiteral("READY"));
+        m_fake->answerPairing(200, QJsonDocument(authBody).toJson(QJsonDocument::Compact));
+        m_fake->answerPlay(201, QByteArrayLiteral("{\"id\":\"s-no-app\"}"));
+
+        client.beginSession(QStringLiteral("s-no-app"));
+
+        QTRY_VERIFY_WITH_TIMEOUT(
+            m_fake->requestPaths().contains(QStringLiteral("/api/sessions/s-no-app/end")),
+            20000);
+        LogShipper::instance().stop();
+
+        QMutexLocker lock(&captureMutex);
+        int diagnostics = 0;
+        int playSteps = 0;
+        const ShippedLine* record = nullptr;
+        for (const ShippedLine& line : captured) {
+            if (line.diagnostic) {
+                ++diagnostics;
+                record = &line;
+            }
+            if (line.body == QLatin1String("play.step")) {
+                ++playSteps;
+            }
+        }
+        QCOMPARE(diagnostics, 1);
+        QCOMPARE(playSteps, 1);
+        QVERIFY(record != nullptr);
+        QCOMPARE(record->level, LogLevel::Warning);
+        QCOMPARE(record->attrs.value(QStringLiteral("step")).toString(),
+                 QStringLiteral("engine_prepare"));
+        QCOMPARE(record->attrs.value(QStringLiteral("outcome")).toString(),
+                 QStringLiteral("failed"));
+        QCOMPARE(record->attrs.value(QStringLiteral("failure_class")).toString(),
+                 QStringLiteral("no_app"));
+        lock.unlock();
+
+        QTRY_VERIFY_WITH_TIMEOUT(
+            m_fake->requestPaths().contains(QStringLiteral("/api/sessions/s-no-app/end")),
+            15000);
+        const QJsonObject endBody = QJsonDocument::fromJson(
+            m_fake->bodyFor(QStringLiteral("/api/sessions/s-no-app/end"))).object();
+        QCOMPARE(endBody.value(QStringLiteral("failed")).toBool(), true);
+        QCOMPARE(endBody.value(QStringLiteral("attempt_step")).toString(),
+                 QStringLiteral("engine_prepare"));
+        QCOMPARE(m_fake->requestPaths().count(QStringLiteral("/api/sessions/s-no-app/end")), 1);
     }
 
     void anEngineFailureBeforeTheStreamStartsIsAStallAtTheSecondStage()
@@ -5563,6 +5676,8 @@ private slots:
         // `buildEndRequest(false, ...)` posts no body at all - only a failed end has anything to
         // say about why.
         QVERIFY2(!sent.contains(QStringLiteral("failed")), "no failed flag for an ordinary end");
+        QVERIFY2(!sent.contains(QStringLiteral("attempt_step")),
+                 "a customer-ended attempt has no failed-step classification");
         QTRY_COMPARE_WITH_TIMEOUT(client.appState(), QStringLiteral("home"), 15000);
     }
 

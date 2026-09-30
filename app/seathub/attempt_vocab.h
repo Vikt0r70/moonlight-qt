@@ -24,6 +24,15 @@
 #include <QString>
 #include <QStringList>
 
+enum class EngineLaunchReason {
+    Started,
+    NoApp,
+    AppCount,
+    CreateFailed,
+    StartRefused,
+    AppListFailed,
+};
+
 /// The 11 `attempt_step` tokens in the frozen order (ADR-0072 item 1). One literal per line
 /// between the two markers, because the vocabulary script reads this block and nothing else.
 // attempt-steps-begin
@@ -71,3 +80,9 @@ QString classForPairState(int state);
 /// 11 `input_start`) to its slug; every other value - stage `none`, a negative index, an index
 /// past the last stage - is `launch_error`, the set's only bucket for "no stage had started".
 QString classForEngineStage(int stage);
+
+/// Closed `engine_prepare` class for the launch reason enum; `Started` has no failure class.
+QString classForLaunchReason(EngineLaunchReason reason);
+
+/// Whether a failure-class token belongs to the closed class set for this attempt step.
+bool isClosedFailureClass(const QString& step, const QString& failureClass);
