@@ -17,7 +17,10 @@ function Controller()
     if (!installer.isInstaller()) return;
     installer.installationStarted.connect(this, this.seathubStarted);
     installer.installationFinished.connect(this, this.seathubFinished);
-    installer.installationInterrupted.connect(this, this.seathubInterrupted);
+    // IFW 4.7.0 error-dialog Cancel calls core.interrupt() too. Only the GUI
+    // interrupted signal identifies a genuine progress-page cancellation.
+    gui.interrupted.connect(this, this.seathubInterrupted);
+    installer.statusChanged.connect(this, this.seathubStatus);
 }
 
 Controller.prototype.TargetDirectoryPageCallback = function()
@@ -26,6 +29,7 @@ Controller.prototype.TargetDirectoryPageCallback = function()
     var x = seathubChosenTargetDir();
     if (!x) return;
     seathubRecoverInterruptedSwap(x);
+    seathubPrepareJournal();
     // Nonempty directories without a tool are staged too: never accept an overwrite prompt.
     if (!installer.fileExists(x)) return;
     var entries = seathubPs("@(Get-ChildItem -LiteralPath " + seathubPsQuote(x) + " -Force).Count");
@@ -60,6 +64,7 @@ Controller.prototype.TargetDirectoryPageCallback = function()
         seathubFail("installer.access_denied", "preflight", SEATHUB_FAILURE);
         return;
     }
+    if (!seathubAttempt.journalStarted) seathubJournalStart();
     seathubHook("callback_done");
 };
 
@@ -83,6 +88,18 @@ Controller.prototype.seathubInterrupted = function()
     if (seathubAttempt) seathubAttempt.interrupted = true;
 };
 
+Controller.prototype.seathubStatus = function(status)
+{
+    if (status == QInstaller.Canceled && seathubAttempt && !seathubAttempt.ended
+            && (seathubAttempt.step === "preflight" || seathubAttempt.step === "stop_client")) {
+        // Ready-page quit has no installationFinished signal, and no IFW
+        // operations can have failed yet. Extraction cancellation waits for
+        // installationFinished, after IFW has rolled back.
+        seathubJournalEnd("cancelled", seathubAttempt.step, "installer.unknown");
+        seathubCloseWizardAfterEnd();
+    }
+};
+
 Controller.prototype.seathubFinished = function()
 {
     if (!seathubAttempt || seathubAttempt.ended) { seathubFlushLog(); return; }
@@ -90,7 +107,8 @@ Controller.prototype.seathubFinished = function()
     a.stageMs = Date.now() - a.clock;
     if (a.interrupted || installer.status != QInstaller.Success) {
         seathubAbandon();
-        seathubJournalEnd("cancelled", "extract", "installer.extract_error");
+        seathubJournalEnd(a.interrupted ? "cancelled" : "failed", a.step,
+            a.interrupted ? "installer.unknown" : "installer.extract_error");
         seathubFlushLog();
         return;
     }
@@ -146,6 +164,23 @@ function seathubFail(cls, step, text)
     gui.reject();
 }
 
+// The Ready-page Cancel closes the wizard (QDialog::done) BEFORE the Canceled status callback
+// runs, and the journal end's threaded AppendFile/Delete enter a nested QEventLoop that removes
+// the automatic Quit Qt posted at last-window closure (IFW 4.7.0 packagemanagercore_p.cpp 320-335;
+// Qt 6.6 qeventloop.cpp 176-179), so the process never terminates. With the attempt already ended,
+// re-showing the wizard and rejecting again posts a fresh Quit AFTER every nested journal loop.
+// Guarded exactly-once, and only when the end record is written; nothing runs after the final
+// close - no operation, execute, prune, flush or journal write.
+function seathubCloseWizardAfterEnd()
+{
+    if (!seathubAttempt || !seathubAttempt.ended || seathubAttempt.wizardClosed) return;
+    seathubAttempt.wizardClosed = true;
+    seathubLog("re-show wizard");
+    gui.setSilent(false);
+    seathubLog("close wizard");
+    gui.rejectWithoutPrompt();
+}
+
 function seathubRandomId()
 {
     var r = seathubPs("[guid]::NewGuid().ToString('N').Substring(0,16)");
@@ -159,13 +194,128 @@ function seathubProgramFiles()
 {
     return installer.toNativeSeparators(installer.environmentVariable("ProgramFiles"));
 }
-// Journal routines are intentionally supplied by the journal-writer task, after failure tests.
-function seathubJournalOwnerTrusted(dir) { return false; }
-function seathubJournalStart() {}
-function seathubJournalRecovered(state) {}
+var seathubJournalDir = "";
+function seathubJournalOwnerTrusted(dir)
+{
+    var r = seathubPs("$p=" + seathubPsQuote(dir) + ";$d=Get-Item -LiteralPath $p -Force;"
+        + "if($d.Attributes -band [IO.FileAttributes]::ReparsePoint){exit 1};$a=Get-Acl -LiteralPath $p;"
+        + "$owner=$a.GetOwner([Security.Principal.SecurityIdentifier]).Value;"
+        + "if($owner -notin ('S-1-5-18','S-1-5-32-544') -or !$a.AreAccessRulesProtected){exit 1};"
+        + "$rules=$a.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier]);if($rules.Count -ne 3){exit 1};"
+        + "foreach($sid in ('S-1-5-18','S-1-5-32-544','S-1-5-32-545')){"
+        + "$v=[Security.AccessControl.FileSystemAccessRule[]]($rules | Where-Object {$_.IdentityReference.Value -eq $sid});"
+        + "$rights=if($sid -eq 'S-1-5-32-545'){[int]([Security.AccessControl.FileSystemRights]::ReadAndExecute -bor [Security.AccessControl.FileSystemRights]::Synchronize)}else{[int][Security.AccessControl.FileSystemRights]::FullControl};"
+        + "if($v.Count -ne 1 -or $v[0].IsInherited -or $v[0].AccessControlType -ne 'Allow' -or [int]$v[0].FileSystemRights -ne $rights -or [int]$v[0].InheritanceFlags -ne 3 -or [int]$v[0].PropagationFlags -ne 0){exit 1}};'trusted'");
+    return r.length >= 2 && Number(r[1]) === 0 && String(r[0]).indexOf("trusted") >= 0;
+}
+
+function seathubSecureJournalDirectory(dir)
+{
+    var r = seathubPs("$p=" + seathubPsQuote(dir) + ";if(Test-Path -LiteralPath $p){"
+        + "if((Get-Item -LiteralPath $p -Force).Attributes -band [IO.FileAttributes]::ReparsePoint){'reparse'}else{'directory'}}else{'missing'}");
+    if (r.length < 2 || Number(r[1]) !== 0) return false;
+    if (String(r[0]).indexOf("reparse") >= 0) {
+        // Unlink without traversing; do not repair ACLs or delete anything in the destination.
+        var detached = installer.execute(seathubSystemTool("cmd.exe"), ["/c", "rmdir", dir], "");
+        if (detached.length < 2 || Number(detached[1]) !== 0) return false;
+    }
+    if (seathubJournalOwnerTrusted(dir)) return true;
+    if (installer.fileExists(dir) && !seathubRemoveTree(dir)) return false;
+    // The permitted test seam can create a protected scratch folder under a non-admin token.
+    if (seathubJournalOwnerTrusted(dir)) return true;
+    r = seathubPs("$a=New-Object Security.AccessControl.DirectorySecurity;"
+        + "$a.SetAccessRuleProtection($true,$false);"
+        + "$a.SetOwner((New-Object Security.Principal.SecurityIdentifier('S-1-5-32-544')));"
+        + "foreach($sid in ('S-1-5-18','S-1-5-32-544','S-1-5-32-545')){"
+        + "$s=New-Object Security.Principal.SecurityIdentifier($sid);"
+        + "$rights=if($sid -eq 'S-1-5-32-545'){'ReadAndExecute'}else{'FullControl'};"
+        + "$a.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($s,$rights,'ContainerInherit,ObjectInherit','None','Allow')))};"
+        + "[IO.Directory]::CreateDirectory(" + seathubPsQuote(dir) + ",$a) | Out-Null");
+    if (r.length < 2 || Number(r[1]) !== 0 || !seathubJournalOwnerTrusted(dir)) return false;
+    var acl = installer.execute(seathubSystemTool("icacls.exe"), [dir], "");
+    return acl.length >= 2 && Number(acl[1]) === 0;
+}
+
+function seathubPrepareJournal()
+{
+    if (seathubJournalDir) return seathubJournalDir;
+    try {
+        var root = seathubJoin(installer.environmentVariable("ProgramData"), "SeatHubSetup");
+        var dir = seathubJoin(root, "install-journal");
+        if (!seathubSecureJournalDirectory(root) || !seathubSecureJournalDirectory(dir)) return "";
+        seathubJournalDir = dir;
+        seathubPruneJournal(0);
+        return dir;
+    } catch (e) { seathubLog("journal prepare unavailable"); return ""; }
+}
+
+function seathubPruneJournal(reserve)
+{
+    // V35: reserve the next bounded file before writing, not after exceeding the file cap.
+    return seathubPs("$p=" + seathubPsQuote(seathubJournalDir) + ";$files=Get-ChildItem -LiteralPath $p -File -Force;"
+        + "foreach($f in $files){if($f.Name -notmatch '^attempt-[0-9a-f]{16}\\.(start|end)\\.json$' -or $f.Length -gt 4096 -or $f.LastWriteTimeUtc -lt [DateTime]::UtcNow.AddDays(-7)){Remove-Item -LiteralPath $f.FullName -Force}};"
+        + "$files=Get-ChildItem -LiteralPath $p -File -Force | Sort-Object LastWriteTimeUtc -Descending;"
+        + "$bytes=0;$count=0;foreach($f in $files){$bytes+=$f.Length;$count++;"
+        + "if($count -gt " + (8 - reserve) + " -or $bytes -gt " + (32768 - reserve * 4096) + "){Remove-Item -LiteralPath $f.FullName -Force}}");
+}
+
+function seathubJournalVersion(value)
+{
+    value = String(value);
+    return /^[0-9]{1,4}(\.[0-9]{1,4}){1,3}$/.test(value) ? value : "unknown";
+}
+
+function seathubJournalRecord(a, outcome, step, cls, end)
+{
+    function duration(n) { return Math.max(0, Math.min(3600000, Math.round(n))); }
+    return {v:1, attempt:a.id, from:seathubJournalVersion(installer.value("SeatHubFromVersion")),
+        to:seathubJournalVersion(installer.value("ProductVersion")), mode:"staged", started:a.started,
+        ended:end ? new Date().toISOString() : "", outcome:outcome, step:step, "class":cls,
+        code:Math.max(-2147483648, Math.min(2147483647, Math.round(a.code))),
+        rollback:a.rollback, state:a.state,
+        ms:{stage:duration(a.stageMs), swap:duration(a.swapMs), total:duration(Date.now() - a.clock)},
+        elevated:installer.hasAdminRights()};
+}
+
+function seathubJournalWrite(a, outcome, step, cls, end)
+{
+    // Reserve both new paths before start. Ready-page rejection must not enter
+    // execute()'s nested event loop after Qt has posted last-window quit.
+    var closingBeforeInstall = end && a.journalStarted
+        && (a.step === "preflight" || a.step === "stop_client");
+    var dir = closingBeforeInstall ? seathubJournalDir : seathubPrepareJournal();
+    if (!dir) return false;
+    var text = JSON.stringify(seathubJournalRecord(a, outcome, step, cls, end));
+    var file = seathubJoin(dir, "attempt-" + a.id + (end ? ".end.json" : ".start.json"));
+    if (!closingBeforeInstall) {
+        var prune = seathubPruneJournal(end ? 1 : 2);
+        if (prune.length < 2 || Number(prune[1]) !== 0) return false;
+    }
+    if (text.length > 4096 || installer.fileExists(file)) return false;
+    if (!installer.performOperation("AppendFile", [file, text])) return false;
+    if (end) installer.performOperation("Delete", [seathubJoin(dir, "attempt-" + a.id + ".start.json")]);
+    return true;
+}
+
+function seathubJournalStart()
+{
+    var a = seathubAttempt;
+    if (!a || a.ended || a.journalStarted) return;
+    a.journalStarted = seathubJournalWrite(a, "failed", "stage", "installer.unknown", false);
+}
+
+function seathubJournalRecovered(state)
+{
+    var a = {id:seathubRandomId(), started:new Date().toISOString(), clock:Date.now(),
+        stageMs:0, swapMs:0, code:0, rollback:"ok", state:state};
+    seathubJournalWrite(a, "recovered", "recover", "installer.interrupted", true);
+}
+
 function seathubJournalEnd(outcome, step, cls)
 {
-    if (seathubAttempt) seathubAttempt.ended = true;
+    if (!seathubAttempt || seathubAttempt.ended) return;
+    seathubAttempt.ended = true;
+    if (!seathubJournalWrite(seathubAttempt, outcome, step, cls, true)) seathubLog("journal end unavailable");
 }
 
 function seathubPsQuote(s) { return "'" + String(s).replace(/'/g, "''") + "'"; }
