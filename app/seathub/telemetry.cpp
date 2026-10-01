@@ -5,6 +5,7 @@
 #include "path.h"
 #include "seathub_version.h"
 #include "token_store.h"
+#include "update_retry_state.h"
 
 #include <QByteArray>
 #include <QDebug>
@@ -16,6 +17,8 @@
 #include <QJsonParseError>
 #include <QJsonValue>
 #include <QLoggingCategory>
+#include <QMutex>
+#include <QMutexLocker>
 #include <QSaveFile>
 #include <QStandardPaths>
 #include <QString>
@@ -56,6 +59,8 @@ QString s_lastCrashEventId;
 /// handler paths, release and callbacks never drift between the first init and the re-init
 /// (SEATHUB § C.2's code sketch: "the same options plus the DSN").
 SeatHubTelemetry::Options s_lastOptions;
+QMutex s_deliveryMutex;
+QString s_retryDirectory;
 /// True when this process's `startWith()` ran with an empty `dsn`. Only such a process ever
 /// re-inits (C.3 rule 2); a process that started with a cached DSN keeps it for the whole run.
 bool s_startedWithNoDsn = false;
@@ -68,6 +73,35 @@ int s_closeCount = 0;
 /// `false` with no DSN in use, or the last handout's `logs` was `false`. Plan 21's shipper worker
 /// reads this from its own thread while `applyHandout()` may run on the client thread.
 std::atomic<bool> s_logsEnabled{ false };
+
+// --- Plan 09 (ADR-0072 item 7): the diagnostics gate the metric hook reads ---------------------
+//
+// The SAME value `updateCanShip()` publishes to `LogShipper::setCanShip()`, kept as its own
+// atomic because `seatHubBeforeSendMetric()` runs on whatever thread emitted the metric and must
+// never read `s_signedIn` directly - that is a plain client-thread bool (its own comment in
+// `setUser()`), and reading it from another thread is a data race. One publish point, two
+// readers: the shipper's worker and the SDK's metric hook.
+std::atomic<bool> s_diagShipping{ false };
+/// True once `seathub.client.launch` has been emitted this process - the launch metric is
+/// one per process, emitted from `updateCanShip()` the first time shipping turns on, so it is
+/// never counted for a launch the gate would then discard.
+bool s_launchMetricEmitted = false;
+
+// --- Plan 09 (ADR-0072 item 5): the clean-exit marker `run-state` -----------------------------
+//
+// Written at launch, removed at a clean quit - its mere existence at the next launch is what
+// says the previous run did not finish. The directory defaults to the app-local data location
+// (`%LOCALAPPDATA%\Seven Hills\SeatHub`) and is overridden only by
+// `setRunStateDirectoryForTests()`.
+QString s_runStateDirectory;
+
+QString runStatePath()
+{
+    const QString directory = s_runStateDirectory.isEmpty()
+        ? QStandardPaths::writableLocation(QStandardPaths::AppLocalDataLocation)
+        : s_runStateDirectory;
+    return QDir(directory).filePath(QStringLiteral("run-state"));
+}
 
 // --- identity (D-09, D-13, G.4): read and written only from `SeatHubClient`'s own (client)
 // thread - see `setUser()`'s own comment - so plain statics need no synchronization here, unlike
@@ -90,7 +124,20 @@ bool s_testCrashChecked = false;
 /// `clearUser()` and `applyHandout()` - every site that changes either input.
 void updateCanShip()
 {
-    LogShipper::instance().setCanShip(s_signedIn && s_logsEnabled.load());
+    const bool shipping = s_signedIn && s_logsEnabled.load();
+    LogShipper::instance().setCanShip(shipping);
+    // Plan 09 (ADR-0072 item 7): the metric hook's own view of the same fact. Published here and
+    // only here, so the gate and the shipper can never disagree - `seatHubBeforeSendMetric()`
+    // reads this, never `s_signedIn`.
+    s_diagShipping.store(shipping);
+
+    // Plan 09 (ADR-0072 item 8): one `seathub.client.launch` per process, counted the first time
+    // this client can actually ship. Emitted any earlier the gate would discard it, and a launch
+    // metric that a gate throws away is a launch that never happened.
+    if (shipping && !s_launchMetricEmitted) {
+        s_launchMetricEmitted = true;
+        SeatHubTelemetry::emitLaunchMetric();
+    }
 }
 
 /// Runs inside crashpad's first-chance filter, in the crashing process, on the crashing thread
@@ -106,7 +153,8 @@ sentry_value_t seatHubOnCrash(const sentry_ucontext_t*, sentry_value_t event, se
 /// D-11: only unexpected errors reach Sentry - unhandled exceptions, 5xx, panics and crashes. A
 /// crash event's level is always `"fatal"`; anything else that reaches this callback (a captured
 /// message, a non-fatal event this SDK does not currently send at all) is dropped rather than
-/// uploaded. Per `on_crash`/`before_send` mutual exclusion (SPIKE Q5), a real crash never reaches
+/// uploaded, except the named installer_update exception (ADR-0070 item 7). Per
+/// `on_crash`/`before_send` mutual exclusion (SPIKE Q5), a real crash never reaches
 /// this function - `seatHubOnCrash` above already handled it - so this is defence in depth, not
 /// the crash path.
 sentry_value_t seatHubBeforeSend(sentry_value_t event, sentry_hint_t*, void*)
@@ -116,8 +164,69 @@ sentry_value_t seatHubBeforeSend(sentry_value_t event, sentry_hint_t*, void*)
     if (levelStr && QString::fromUtf8(levelStr) == QLatin1String("fatal")) {
         return event;
     }
+    const auto tags = sentry_value_get_by_key(event, "tags");
+    const auto kind = sentry_value_get_by_key(tags, "kind");
+    if (QString::fromUtf8(sentry_value_as_string(kind)) == QLatin1String("installer_update")) {
+        return event;
+    }
     sentry_value_decref(event);
     return sentry_value_new_null();
+}
+
+/// Plan 09 (ADR-0072 item 7): the `before_send_metric` hook - the atomic gate first, then the
+/// attribute allow-list (T-06.7-36, T-06.7-37). It runs synchronously on the thread that emitted
+/// the metric (`sentry_metrics.c`), so it takes no lock and reads only atomics and the SDK's own
+/// values.
+///
+/// Gate first: a metric emitted while this client is not shipping is discarded outright - the
+/// three kill switches (the DSN handout off, `logs: false`, sign-out) have to reach metrics too,
+/// or "telemetry off" would still leave a live fleet view behind.
+///
+/// Then the strip: `session_id`, `host_id` and `user.id` are per-session identities the scope
+/// attaches to every metric, and a per-session id as a metric dimension would both blow up
+/// cardinality and key a fleet number on one customer's session. Every key outside the
+/// allow-list - `step`, `outcome`, `failure_class` and the SDK's own `sentry.*` / `os.*` - goes
+/// the same way. The metric's own top-level `trace_id` field is deliberately untouched: it is a
+/// field, not a group-by attribute (P-3), and it is the one link from a fleet metric back to the
+/// Play's logs.
+sentry_value_t seatHubBeforeSendMetric(sentry_value_t metric, void*)
+{
+    if (!s_diagShipping.load()) {
+        sentry_value_decref(metric);
+        return sentry_value_new_null();
+    }
+
+    // Borrowed (`sentry.h`: `sentry_value_get_by_key` returns a borrowed value), so no decref -
+    // the object below is the metric's own `attributes`.
+    sentry_value_t attributes = sentry_value_get_by_key(metric, "attributes");
+    if (sentry_value_is_null(attributes)) {
+        return metric;
+    }
+
+    // Collected first, removed after: the SDK lets a callback modify the object, but a removal
+    // that races the walk would ship an attribute nobody meant to ship, and this hook is the last
+    // place that can stop one.
+    QStringList doomed;
+    sentry_value_foreach_key_value(
+        attributes,
+        [](const char* key, sentry_value_t, void* userdata) -> int {
+            const QString name = QString::fromUtf8(key != nullptr ? key : "");
+            if (name == QLatin1String("step") || name == QLatin1String("outcome")
+                || name == QLatin1String("failure_class")
+                || name.startsWith(QLatin1String("sentry."))
+                || name.startsWith(QLatin1String("os."))) {
+                return 0;
+            }
+            static_cast<QStringList*>(userdata)->append(name);
+            return 0;
+        },
+        &doomed);
+
+    for (const QString& key : doomed) {
+        const QByteArray keyUtf8 = key.toUtf8();
+        sentry_value_remove_by_key(attributes, keyUtf8.constData());
+    }
+    return metric;
 }
 
 /// Registered on every init, but the facts it deposits are only meaningful after the FIRST init of
@@ -234,6 +343,18 @@ bool initSentry(const SeatHubTelemetry::Options& options)
     sentry_options_set_on_crashed_last_run(sentryOptions, seatHubOnCrashedLastRun, nullptr);
     // Plan 21/D-14: restores the line's own original time and re-scrubs the body.
     sentry_options_set_before_send_log(sentryOptions, seatHubRestoreTimestampAndScrubLog, nullptr);
+    // Plan 09 (ADR-0072 item 7): the gate + allow-list strip on every metric.
+    sentry_options_set_before_send_metric(sentryOptions, seatHubBeforeSendMetric, nullptr);
+    // Plan 09 (ADR-0072 item 9, V32): the offline retry cache's bounds. The count and the age
+    // are design values, the size the byte bound that actually limits the footprint - 8 MiB, the
+    // same figure the shipper's own per-run body cap uses, and 7 days the same age as the spool
+    // (`LogSpool::kSpoolMaxAgeDays`), so an envelope older than the evidence it carries outlives
+    // nothing. `http_retry` stays 1, `cache_keep` stays unset, `send_client_reports` stays on
+    // (its default) and `max_breadcrumbs` stays 0 - all three are set above or left at their
+    // defaults on purpose (item 9).
+    sentry_options_set_cache_max_items(sentryOptions, 500);
+    sentry_options_set_cache_max_size(sentryOptions, static_cast<size_t>(8u * 1024u * 1024u));
+    sentry_options_set_cache_max_age(sentryOptions, static_cast<time_t>(7 * 24 * 60 * 60));
 
     const int rv = sentry_init(sentryOptions);
     ++s_initCount;
@@ -357,6 +478,39 @@ HandOff logShipperHandOff()
                     sentry_value_new_string(traceUtf8.constData()), nullptr));
         }
 
+        // Plan 09 (ADR-0072 item 7): the diagnostic lane's own attributes - `step`,
+        // `failure_class`, `attempt`, the launch record's ten and nothing else. Scalars only,
+        // because that is all `sentry_value_new_attribute()` accepts (a bool, int, double or
+        // string); a non-scalar is dropped rather than flattened, since an attribute the caller
+        // built as an object or a list was never on the ADR-0072 allow-list to begin with. The
+        // caller chose every key here - nothing from `engineError`, `diagnostic` or any other raw
+        // text ever reaches this loop (item 2).
+        for (auto it = line.attrs.constBegin(); it != line.attrs.constEnd(); ++it) {
+            const QJsonValue value = it.value();
+            if (value.isBool()) {
+                const QByteArray key = it.key().toUtf8();
+                sentry_value_set_by_key(attrs, key.constData(),
+                    sentry_value_new_attribute(sentry_value_new_bool(value.toBool()), nullptr));
+            }
+            else if (value.isDouble()) {
+                const double number = value.toDouble();
+                const QByteArray key = it.key().toUtf8();
+                const bool whole = number == static_cast<double>(static_cast<qint64>(number));
+                sentry_value_set_by_key(
+                    attrs, key.constData(),
+                    sentry_value_new_attribute(
+                        whole ? sentry_value_new_int64(static_cast<qint64>(number))
+                              : sentry_value_new_double(number),
+                        nullptr));
+            }
+            else if (value.isString()) {
+                const QByteArray key = it.key().toUtf8();
+                const QByteArray text = value.toString().toUtf8();
+                sentry_value_set_by_key(attrs, key.constData(),
+                    sentry_value_new_attribute(sentry_value_new_string(text.constData()), nullptr));
+            }
+        }
+
         // Never a `sentry_log_*` printf-style variant (Pitfall 6) - `line.body` is
         // customer/engine-produced text that may contain a literal `%`.
         const QByteArray bodyUtf8 = line.body.toUtf8();
@@ -380,6 +534,7 @@ void removeLegacyDumps(const QString& dir)
 
 bool startWith(const Options& options)
 {
+    { QMutexLocker lock(&s_deliveryMutex); s_retryDirectory = options.databaseDir; }
     s_lastOptions = options;
     s_startedWithNoDsn = options.dsn.isEmpty();
     s_adoptedFirstDsn = false;
@@ -420,7 +575,14 @@ bool start()
     updateCanShip();
     removeLegacyDumps(Path::getLogDir());
 
-    return startWith(options);
+    const bool startedOk = startWith(options);
+    // Plan 09 (ADR-0072 item 8): one `client.telemetry` record per launch, queued HERE - after
+    // the cache read (so `dsn_source` is decided), after `LogShipper::start()` (so
+    // `spool_lines_adopted` is already this run's count) and after `startWith()` (so
+    // `crashed_last_run` is the value the first init read). The line waits in the spool until
+    // this client may ship, exactly like any other line.
+    noteLaunch();
+    return startedOk;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -582,12 +744,255 @@ int closeCallCount()
     return s_closeCount;
 }
 
+// ---------------------------------------------------------------------------------------------
+// Plan 09 (ADR-0072): the diagnostic lane, the metric emitters, the flush and the launch record.
+
+void emitDiagnostic(const QString& body, LogLevel level, const QJsonObject& attributes)
+{
+    // Straight into the shipper's diagnostic lane: the line inherits `canShip`, the pause, the
+    // scrub and the spool exactly as a tee line does, which is what makes the three kill switches
+    // reach it with no extra code here (ADR-0072 item 7). `attributes` is the caller's - only
+    // allow-listed keys (item 2), never a diagnostic string.
+    LogShipper::instance().enqueueDiagnostic(body, level, attributes);
+}
+
+void emitStepMetric(const QString& step, const QString& outcome, const QString& failureClass,
+                    double elapsedMs)
+{
+    // ADR-0072 item 6: two metrics per attempt step, with exactly the dimensions the ADR freezes.
+    // Ownership of each attributes object transfers to the metric call (`sentry.h`).
+    const QByteArray stepUtf8 = step.toUtf8();
+    const QByteArray outcomeUtf8 = outcome.toUtf8();
+    const QByteArray classUtf8 = failureClass.toUtf8();
+
+    sentry_value_t resultAttributes = sentry_value_new_object();
+    sentry_value_set_by_key(resultAttributes, "step",
+        sentry_value_new_attribute(sentry_value_new_string(stepUtf8.constData()), nullptr));
+    sentry_value_set_by_key(resultAttributes, "outcome",
+        sentry_value_new_attribute(sentry_value_new_string(outcomeUtf8.constData()), nullptr));
+    sentry_value_set_by_key(resultAttributes, "failure_class",
+        sentry_value_new_attribute(sentry_value_new_string(classUtf8.constData()), nullptr));
+    sentry_metrics_count("seathub.play.step_result", 1, resultAttributes);
+
+    sentry_value_t durationAttributes = sentry_value_new_object();
+    sentry_value_set_by_key(durationAttributes, "step",
+        sentry_value_new_attribute(sentry_value_new_string(stepUtf8.constData()), nullptr));
+    sentry_value_set_by_key(durationAttributes, "outcome",
+        sentry_value_new_attribute(sentry_value_new_string(outcomeUtf8.constData()), nullptr));
+    sentry_metrics_distribution("seathub.play.step_duration", elapsedMs,
+        SENTRY_UNIT_MILLISECOND, durationAttributes);
+}
+
+void emitRollupMetrics(const QJsonObject& attrs)
+{
+    // ADR-0072, D-11, Plan 13 Task 1: emit the 17 frozen stream gauge names.
+    // Each gauge uses sentry_value_new_null() attributes (no per-session dimensions).
+    // Units: SENTRY_UNIT_MILLISECOND for all timing and RTT fields; no unit for fps
+    // and the two drop percentages (they are already %-of-frames, not ms). Absent
+    // fields in attrs are simply not emitted.
+
+    struct GaugeDef {
+        const char* key;        // key in the roll-up attrs QJsonObject
+        const char* name;       // seathub.stream.* gauge name
+        const char* unit;       // SENTRY_UNIT_MILLISECOND or nullptr
+    };
+
+    static const GaugeDef kGauges[] = {
+        { "fps_avg",         "seathub.stream.fps.avg",         nullptr                  },
+        { "fps_min",         "seathub.stream.fps.min",         nullptr                  },
+        { "net_drop_avg",    "seathub.stream.net_drop.avg",    nullptr                  },
+        { "net_drop_p95",    "seathub.stream.net_drop.p95",    nullptr                  },
+        { "jitter_drop_avg", "seathub.stream.jitter_drop.avg", nullptr                  },
+        { "jitter_drop_p95", "seathub.stream.jitter_drop.p95", nullptr                  },
+        { "rtt_avg",         "seathub.stream.rtt.avg",         SENTRY_UNIT_MILLISECOND  },
+        { "rtt_p95",         "seathub.stream.rtt.p95",         SENTRY_UNIT_MILLISECOND  },
+        { "decode_avg",      "seathub.stream.decode.avg",      SENTRY_UNIT_MILLISECOND  },
+        { "decode_p95",      "seathub.stream.decode.p95",      SENTRY_UNIT_MILLISECOND  },
+        { "queue_avg",       "seathub.stream.queue.avg",       SENTRY_UNIT_MILLISECOND  },
+        { "queue_p95",       "seathub.stream.queue.p95",       SENTRY_UNIT_MILLISECOND  },
+        { "render_avg",      "seathub.stream.render.avg",      SENTRY_UNIT_MILLISECOND  },
+        { "render_p95",      "seathub.stream.render.p95",      SENTRY_UNIT_MILLISECOND  },
+        { "host_avg",        "seathub.stream.host.avg",        SENTRY_UNIT_MILLISECOND  },
+        { "host_p95",        "seathub.stream.host.p95",        SENTRY_UNIT_MILLISECOND  },
+        { "n",               "seathub.stream.samples",         nullptr                  },
+    };
+
+    for (const GaugeDef& g : kGauges) {
+        const QString key = QString::fromLatin1(g.key);
+        if (!attrs.contains(key)) {
+            continue;
+        }
+        const double value = attrs.value(key).toDouble();
+        sentry_value_t gaugeAttrs = sentry_value_new_null();
+        sentry_metrics_gauge(g.name, value, g.unit, gaugeAttrs);
+    }
+}
+
+QJsonObject rollupDeliveryHealth()
+{
+    QString directory;
+    { QMutexLocker lock(&s_deliveryMutex); directory = s_retryDirectory; }
+    const int retries = directory.isEmpty() ? 0
+        : QDir(directory + QStringLiteral("/cache"))
+              .entryList({QStringLiteral("*.envelope")}, QDir::Files).size();
+    return {{"backlog_spool_lines", LogShipper::instance().backlogSpoolLines()},
+            {"backlog_retry_files", retries}};
+}
+
+bool emitInstallerEvent(const InstallJournalRecord& record)
+{
+    const auto cached = readCache();
+    if (!started() || s_lastOptions.dsn.isEmpty() || !cached || cached->dsn.isEmpty()
+        || !acceptDsn(cached->dsn)
+        || (record.outcome != QLatin1String("failed") && record.outcome != QLatin1String("recovered")))
+        return false;
+    auto event = sentry_value_new_message_event(record.outcome == QLatin1String("failed")
+        ? SENTRY_LEVEL_ERROR : SENTRY_LEVEL_WARNING, nullptr, "installer_update");
+    auto tags = sentry_value_new_object();
+    const QJsonObject tagValues{{"kind", "installer_update"}, {"step", record.step},
+        {"class", record.failureClass}, {"from", record.from}, {"to", record.to}, {"mode", record.mode}};
+    for (auto it = tagValues.constBegin(); it != tagValues.constEnd(); ++it) {
+        const auto key = it.key().toUtf8(); const auto value = it.value().toString().toUtf8();
+        sentry_value_set_by_key(tags, key.constData(), sentry_value_new_string(value.constData()));
+    }
+    sentry_value_set_by_key(event, "tags", tags);
+    auto fingerprint = sentry_value_new_list();
+    for (const auto& item : QStringList{"installer-update", record.step, record.failureClass}) {
+        const auto bytes = item.toUtf8();
+        sentry_value_append(fingerprint, sentry_value_new_string(bytes.constData()));
+    }
+    sentry_value_set_by_key(event, "fingerprint", fingerprint);
+    auto details = sentry_value_new_object();
+    const auto json = record.toJson();
+    for (auto it = json.constBegin(); it != json.constEnd(); ++it) {
+        const auto key = it.key().toUtf8();
+        sentry_value_t value;
+        if (it.value().isString()) value = sentry_value_new_string(it.value().toString().toUtf8().constData());
+        else if (it.value().isBool()) value = sentry_value_new_bool(it.value().toBool());
+        else if (it.value().isDouble()) value = sentry_value_new_double(it.value().toDouble());
+        else {
+            value = sentry_value_new_object();
+            const auto ms = it.value().toObject();
+            for (auto duration = ms.constBegin(); duration != ms.constEnd(); ++duration)
+                sentry_value_set_by_key(value, duration.key().toUtf8().constData(),
+                                       sentry_value_new_double(duration.value().toDouble()));
+        }
+        sentry_value_set_by_key(details, key.constData(), value);
+    }
+    auto extra = sentry_value_new_object();
+    sentry_value_set_by_key(extra, "installer", details);
+    sentry_value_set_by_key(event, "extra", extra);
+    const auto id = sentry_capture_event(event); // event ownership moves into the SDK.
+    return !sentry_uuid_is_nil(&id);
+}
+void adoptInstallerJournal(const QString& folder, const QString& retryStatePath, const QDateTime& now)
+{
+    const auto cached = readCache();
+    if (!started() || !cached || cached->dsn.isEmpty() || !acceptDsn(cached->dsn)) return;
+    auto state = UpdateRetryState::load(retryStatePath);
+    for (const auto& record : InstallJournal::adopt(folder, now)) {
+        if (state.reportedIds.contains(record.attempt)) continue;
+        if (emitInstallerEvent(record)) {
+            state.rememberReport(record.attempt); // only AFTER SDK handoff.
+            state.save(retryStatePath);
+        }
+    }
+}
+QString installerJournalDirectory()
+{
+    return QDir(qEnvironmentVariable("ProgramData")).filePath("SeatHubSetup/install-journal");
+}
+
+void emitLaunchMetric()
+{
+    // One count per process, no dimensions (ADR-0072 item 6 lists only the name). Called from
+    // `updateCanShip()` the first time shipping turns on - see the comment there.
+    sentry_value_t attributes = sentry_value_new_object();
+    sentry_metrics_count("seathub.client.launch", 1, attributes);
+}
+
+bool flush(uint64_t timeoutMs)
+{
+    // ADR-0072 item 9 (V31): `sentry_flush()` only, never `sentry_close()` - closing the SDK
+    // would cost the in-process fatal event, its hooks and the crash marker for any crash in the
+    // window after it (SPIKE T11), and there is nothing to gain: the flush already force-drains
+    // the logs and metrics batchers and then the transport's queue.
+    return sentry_flush(timeoutMs) == 0;
+}
+
+void noteLaunch()
+{
+    // The marker the PREVIOUS run left behind decides this run's `prev_exit` - read before this
+    // run writes its own. Absent means the previous run removed it, and only a clean quit ever
+    // does (`markCleanExit()`), so it is `clean` whatever `crashed_last_run` then says: a crash
+    // leaves the marker exactly where it was.
+    const bool markerLeftBehind = QFile::exists(runStatePath());
+    const QString prevExit = !markerLeftBehind
+        ? QStringLiteral("clean")
+        : (s_lastRunCrashed ? QStringLiteral("crash") : QStringLiteral("unknown"));
+
+    // This run's own marker: written here, removed only by a clean quit - what the NEXT launch
+    // will read in turn (ADR-0072 item 5).
+    QDir().mkpath(QFileInfo(runStatePath()).absolutePath());
+    QFile marker(runStatePath());
+    if (marker.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+        marker.write("1");
+        marker.close();
+    }
+
+    // Where this run's DSN came from, as of now (ADR-0072 item 8): a cached handout this launch
+    // started with, one adopted in-process since (only possible when `noteLaunch()` runs after
+    // `applyHandout()`, which the production order in `start()` does not do), or none yet.
+    const char* dsnSource = "none";
+    if (s_started && !s_startedWithNoDsn) {
+        dsnSource = "cache";
+    }
+    else if (s_started && s_adoptedFirstDsn) {
+        dsnSource = "handout";
+    }
+
+    // The SDK's own offline backlog: `*.envelope` files the retry cache holds for this crash
+    // database (ADR-0072 item 8, research section 5).
+    int retryFiles = 0;
+    if (!s_lastOptions.databaseDir.isEmpty()) {
+        retryFiles = QDir(s_lastOptions.databaseDir + QStringLiteral("/cache"))
+                         .entryList(QStringList(QStringLiteral("*.envelope")), QDir::Files)
+                         .size();
+    }
+
+    const LogShipper& shipper = LogShipper::instance();
+    QJsonObject attributes;
+    attributes.insert(QStringLiteral("dsn_source"), QString::fromLatin1(dsnSource));
+    attributes.insert(QStringLiteral("logs_enabled"), s_logsEnabled.load());
+    attributes.insert(QStringLiteral("signed_in"), s_signedIn);
+    attributes.insert(QStringLiteral("crashed_last_run"), s_lastRunCrashed);
+    attributes.insert(QStringLiteral("prev_exit"), prevExit);
+    attributes.insert(QStringLiteral("spool_lines_adopted"), shipper.adoptedSpoolLines());
+    attributes.insert(QStringLiteral("retry_files"), retryFiles);
+    attributes.insert(QStringLiteral("dropped_queue"), shipper.droppedQueueCount());
+    attributes.insert(QStringLiteral("dropped_spool_age"), shipper.droppedSpoolAgeCount());
+    attributes.insert(QStringLiteral("cap_reached"), shipper.capReachedCount());
+
+    emitDiagnostic(QStringLiteral("client.telemetry"), LogLevel::Info, attributes);
+}
+
+void markCleanExit()
+{
+    QFile::remove(runStatePath());
+}
+
+void setRunStateDirectoryForTests(const QString& directory)
+{
+    s_runStateDirectory = directory;
+}
+
 #ifdef SEATHUB_TEST_ALLOW_LOOPBACK_DSN
-void captureTestMessageForTests(const QString& message)
+void captureTestMessageForTests(const QString& message, bool fatal)
 {
     const QByteArray messageUtf8 = message.toUtf8();
     sentry_value_t event
-        = sentry_value_new_message_event(SENTRY_LEVEL_FATAL, nullptr, messageUtf8.constData());
+        = sentry_value_new_message_event(fatal ? SENTRY_LEVEL_FATAL : SENTRY_LEVEL_ERROR,
+                                         nullptr, messageUtf8.constData());
     sentry_capture_event(event);
 }
 #endif

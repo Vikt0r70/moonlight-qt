@@ -14,6 +14,7 @@
 
 #include <QtTest>
 #include <QBuffer>
+#include <QDir>
 #include <QElapsedTimer>
 #include <QFile>
 #include <QJsonDocument>
@@ -21,6 +22,7 @@
 #include <QNetworkAccessManager>
 #include <QNetworkReply>
 #include <QNetworkRequest>
+#include <QRegularExpression>
 #include <QScopeGuard>
 #include <QSemaphore>
 #include <QSignalSpy>
@@ -28,6 +30,9 @@
 #include <QTcpSocket>
 #include <QTimer>
 
+#include <type_traits>
+
+#include "seathub/attempt_vocab.h"
 #include "seathub/pairing_controller.h"
 #include "seathub/pairing_recovery.h"
 #include "seathub/pairing_seam.h"
@@ -1179,6 +1184,225 @@ private slots:
         QCOMPARE(report.diagnostics.first(), QStringLiteral("plain-failure"));
     }
 
+    void aWrongPinFailureCarriesStepAndClassButNeverTheDiagnostic()
+    {
+        // ADR-0072 items 1-2: a failed handshake reports WHICH step failed and WHY as closed
+        // vocabulary tokens, while `engineError` keeps its local diagnostic for support only.
+        // The fake handshake builds exactly what `pairing_handshake.cpp` builds for
+        // `NvPairingManager::PIN_WRONG` (the mapper itself is asserted in
+        // `tst_attempt_vocab::pairStateMapsToClosedClasses`, which this suite does not link);
+        // what is under test here is that the classification survives the seam and reaches the
+        // facade as separate members, and that it is never the diagnostic text.
+        ProductionPairingSeam seam;
+        seam.setHandshake([](const PairingTarget&) {
+            PairingHandshakeResult rejected;
+            rejected.engineError = QStringLiteral("the rig rejected the pairing PIN");
+            rejected.attemptStep = QStringLiteral("pair_handshake");
+            rejected.stepClass = QStringLiteral("pin_rejected");
+            rejected.attempts = 1;
+            return rejected;
+        });
+        seam.setCancelRequest([](const QString&, int) { return true; });
+
+        QSignalSpy classified(&seam, &ProductionPairingSeam::handshakeClassified);
+        QVERIFY(classified.isValid());
+
+        SeamReport report;
+        seam.pair(pairingTarget(), recordInto(&report));
+        QTRY_COMPARE(report.count(), 1);
+
+        // The failure itself: not ok, no identity, and the local diagnostic unchanged - it is
+        // still there for support, and it is still the only text in the result.
+        QCOMPARE(report.outcomes.first(), false);
+        QVERIFY(report.identities.first().isEmpty());
+        QCOMPARE(report.diagnostics.first(), QStringLiteral("the rig rejected the pairing PIN"));
+
+        // The classification handed to the facade, as separate members.
+        QTRY_COMPARE(classified.count(), 1);
+        const PairingHandshakeResult delivered =
+            classified.at(0).at(0).value<PairingHandshakeResult>();
+        QCOMPARE(delivered.attemptStep, QStringLiteral("pair_handshake"));
+        QCOMPARE(delivered.stepClass, QStringLiteral("pin_rejected"));
+        QCOMPARE(delivered.attempts, 1);
+
+        // The step is one of the 11 frozen tokens, read from the header block the vocabulary
+        // script checks - a step outside it could never reach `/end` or a Sentry query.
+        bool stepIsFrozen = false;
+        for (int i = 0; i < kAttemptStepCount; ++i) {
+            if (delivered.attemptStep == QLatin1String(kAttemptStepTokens[i])) {
+                stepIsFrozen = true;
+            }
+        }
+        QVERIFY2(stepIsFrozen, "the step must be one of the 11 frozen attempt-step tokens");
+
+        // Never the diagnostic: the class is a token in its own right, and the local text stays
+        // out of it (the redaction rule, ADR-0072 item 2).
+        QVERIFY(!delivered.engineError.isEmpty());
+        QVERIFY2(delivered.stepClass != delivered.engineError,
+                 qPrintable(QStringLiteral("the class must not be the diagnostic: %1")
+                                .arg(delivered.stepClass)));
+        QVERIFY2(!delivered.stepClass.contains(delivered.engineError),
+                 "the diagnostic must not leak into the class");
+
+        // The same classification on the accessor the facade reads once `pairingFailed` lands.
+        QCOMPARE(seam.lastResult().attemptStep, QStringLiteral("pair_handshake"));
+        QCOMPARE(seam.lastResult().stepClass, QStringLiteral("pin_rejected"));
+        QCOMPARE(seam.lastResult().attempts, 1);
+        QCOMPARE(seam.lastResult().engineError, QStringLiteral("the rig rejected the pairing PIN"));
+    }
+
+    void aRecoveredConflictSuccessCarriesTheFrozenRecordOutOfTheSeam()
+    {
+        // ADR-0072 item 2 / `docs/spec/client.md` "Play diagnostics - Rules": a pairing that
+        // succeeds only after the clear-and-retry reports ONE record - `step=pair_handshake`,
+        // `failure_class=in_progress`, `attempt=2` - and it reaches the facade on the result the
+        // seam reports. The first run below is exactly what production builds for the rig's HTTP
+        // 409 on getservercert (step `pair_server_info`, class `http_4xx`): the recovered record
+        // is FROZEN by the ADR, not inherited from that mapper.
+        ProductionPairingSeam seam;
+        int handshakes = 0;
+        int cancels = 0;
+        seam.setHandshake([&handshakes](const PairingTarget&) {
+            ++handshakes;
+            if (handshakes == 1) {
+                PairingHandshakeResult conflict;
+                conflict.attemptStep = QStringLiteral("pair_server_info");
+                conflict.stepClass = QStringLiteral("http_4xx");
+                conflict.pairingConflict = true;
+                conflict.engineError = QStringLiteral(
+                    "the rig did not answer the server-info request (HTTP 409)");
+                return conflict;
+            }
+            PairingHandshakeResult paired;
+            paired.ok = true;
+            paired.clientIdentity = QStringLiteral("recovered-identity");
+            return paired;
+        });
+        seam.setCancelRequest([&cancels](const QString&, int) {
+            ++cancels;
+            return true;
+        });
+
+        QSignalSpy classified(&seam, &ProductionPairingSeam::handshakeClassified);
+        QVERIFY(classified.isValid());
+
+        SeamReport report;
+        seam.pair(pairingTarget(), recordInto(&report));
+        QTRY_COMPARE(report.count(), 1);
+
+        // One clear, one retry, and the retry's own identity reported - the G-06.2-2 contract.
+        QCOMPARE(handshakes, 2);
+        QCOMPARE(cancels, 1);
+        QVERIFY(report.outcomes.first());
+        QCOMPARE(report.identities.first(), QStringLiteral("recovered-identity"));
+        QVERIFY(report.diagnostics.first().isEmpty());
+
+        // ...and exactly ONE classification carrying the frozen recovered record, which is what
+        // the facade's INFO emission is built from.
+        QTRY_COMPARE(classified.count(), 1);
+        const PairingHandshakeResult delivered =
+            classified.at(0).at(0).value<PairingHandshakeResult>();
+        QVERIFY2(delivered.ok, "the recovered result must be reported as a success");
+        QCOMPARE(delivered.attemptStep, QStringLiteral("pair_handshake"));
+        QCOMPARE(delivered.stepClass, QStringLiteral("in_progress"));
+        QCOMPARE(delivered.attempts, 2);
+
+        // No diagnostic text and no address rides the record (ADR-0072 item 2, T-06.7-35).
+        QVERIFY2(!delivered.stepClass.isEmpty() && delivered.stepClass != delivered.engineError,
+                 "the class must be a token, never the diagnostic");
+        QVERIFY2(!delivered.engineError.contains(QStringLiteral("HTTP 409")),
+                 "the local diagnostic stays local - it is not part of the record");
+    }
+
+    void aRetryThatFailsAgainReportsTheLastFailureClass()
+    {
+        // ADR-0072 item 2: "A retry that fails again is `outcome=failed`, `failure_class` of the
+        // LAST failure, `attempt` 2" - the second run's own classification, not the cleared one's.
+        ProductionPairingSeam seam;
+        int handshakes = 0;
+        int cancels = 0;
+        seam.setHandshake([&handshakes](const PairingTarget&) {
+            ++handshakes;
+            if (handshakes == 1) {
+                PairingHandshakeResult conflict;
+                conflict.attemptStep = QStringLiteral("pair_server_info");
+                conflict.stepClass = QStringLiteral("http_4xx");
+                conflict.pairingConflict = true;
+                conflict.engineError =
+                    QStringLiteral("the rig did not answer the server-info request (HTTP 409)");
+                return conflict;
+            }
+            PairingHandshakeResult rejected;
+            rejected.attemptStep = QStringLiteral("pair_handshake");
+            rejected.stepClass = QStringLiteral("pin_rejected");
+            rejected.engineError = QStringLiteral("the rig rejected the pairing PIN");
+            return rejected;
+        });
+        seam.setCancelRequest([&cancels](const QString&, int) {
+            ++cancels;
+            return true;
+        });
+
+        QSignalSpy classified(&seam, &ProductionPairingSeam::handshakeClassified);
+        QVERIFY(classified.isValid());
+
+        SeamReport report;
+        seam.pair(pairingTarget(), recordInto(&report));
+        QTRY_COMPARE(report.count(), 1);
+
+        QCOMPARE(handshakes, 2);
+        QCOMPARE(cancels, 1);
+        QVERIFY(!report.outcomes.first());
+
+        QTRY_COMPARE(classified.count(), 1);
+        const PairingHandshakeResult delivered =
+            classified.at(0).at(0).value<PairingHandshakeResult>();
+        QVERIFY(!delivered.ok);
+        QCOMPARE(delivered.attemptStep, QStringLiteral("pair_handshake"));
+        QCOMPARE(delivered.stepClass, QStringLiteral("pin_rejected"));
+        QCOMPARE(delivered.attempts, 2);
+    }
+
+    void theEndBodyCarriesTheAttemptStepAndNoOtherNewField()
+    {
+        // ADR-0072 item 1 / plan 09: the classified step is the ONE thing this plan sends to the
+        // server - `attempt_step` on `POST /api/sessions/{id}/end` (contract 3.8.0) - and only
+        // when the client classified one. `buildEndRequest` is the exact builder `endSession()`
+        // posts, so what it produces here is what the wire carries.
+        EndReport report;
+        report.stage = QStringLiteral("pairing");
+        report.attemptStep = QStringLiteral("pair_handshake");
+
+        const QJsonObject object =
+            QJsonDocument::fromJson(ControlPlaneClient::buildEndRequest(true, report)).object();
+        QCOMPARE(object.value(QStringLiteral("attempt_step")).toString(),
+                 QStringLiteral("pair_handshake"));
+        QCOMPARE(object.value(QStringLiteral("failed")).toBool(), true);
+        QCOMPARE(object.value(QStringLiteral("stage")).toString(), QStringLiteral("pairing"));
+
+        // No OTHER field joined the body: the key set is exactly the report's own known fields
+        // plus `attempt_step`. The failure class never travels (D-12) - it stays in Sentry.
+        QStringList keys = object.keys();
+        keys.sort();
+        QStringList expected{ QStringLiteral("attempt_step"), QStringLiteral("failed"),
+                              QStringLiteral("stage") };
+        expected.sort();
+        QCOMPARE(keys, expected);
+
+        // An unclassified failure - the controller's own deadline, or a control-plane refusal -
+        // leaves the field out entirely: an absent field is not the same as an empty or a guessed
+        // one on this leniently-parsed body.
+        EndReport unclassified;
+        unclassified.stage = QStringLiteral("pairing");
+        const QJsonObject without = QJsonDocument::fromJson(
+            ControlPlaneClient::buildEndRequest(true, unclassified)).object();
+        QVERIFY2(!without.contains(QStringLiteral("attempt_step")),
+                 "a step the client never classified must not be invented on the wire");
+
+        // And a customer-initiated end still posts no body at all (contract 3.3.0).
+        QVERIFY(ControlPlaneClient::buildEndRequest(false, report).isEmpty());
+    }
+
     void seamSupersededRun_noClearNoRetry_droppedResult()
     {
         ProductionPairingSeam seam;
@@ -1375,6 +1599,69 @@ private slots:
         QVERIFY(clientCertificateFingerprint(
                     QByteArray("-----BEGIN CERTIFICATE-----\nnope\n-----END CERTIFICATE-----\n"))
                     .isEmpty());
+    }
+
+    void noTelemetryEmitterAcceptsFreeText()
+    {
+        using StepFailureSignal =
+            void (PairingController::*)(const QString&, const QString&, qint64);
+        static_assert(std::is_same_v<decltype(&PairingController::stepFailed), StepFailureSignal>,
+                      "pairing diagnostics may carry only closed tokens and elapsed time");
+
+        const QString clientPath = QDir(QCoreApplication::applicationDirPath())
+                                       .filePath(QStringLiteral("../app/seathub/seathub_client.cpp"));
+        const QString headerPath = QDir(QCoreApplication::applicationDirPath())
+                                       .filePath(QStringLiteral("../app/seathub/seathub_client.h"));
+        QFile headerFile(headerPath);
+        QVERIFY2(headerFile.open(QIODevice::ReadOnly), qPrintable(headerPath));
+        const QString headerSource = QString::fromUtf8(headerFile.readAll());
+        const QRegularExpression helperSignature(
+            QStringLiteral("void\\s+noteStepOutcome\\s*\\(([^)]*)\\)\\s*;"));
+        const QRegularExpressionMatch helperMatch = helperSignature.match(headerSource);
+        QVERIFY2(helperMatch.hasMatch(), "noteStepOutcome declaration was not found");
+        QString parameterTypes = helperMatch.captured(1);
+        parameterTypes.remove(QRegularExpression(QStringLiteral("\\s+")));
+        QCOMPARE(parameterTypes,
+                 QStringLiteral("constQString&step,constQString&outcome,constQString&failureClass,"
+                                "qint64elapsedMs,intattempt=0,constQString&endReason={}"));
+
+        QFile clientFile(clientPath);
+        QVERIFY2(clientFile.open(QIODevice::ReadOnly), qPrintable(clientPath));
+        const QString clientSource = QString::fromUtf8(clientFile.readAll());
+        QVERIFY(QRegularExpression(
+                    QStringLiteral("isClosedFailureClass\\s*\\(\\s*closedStep\\s*,\\s*failureClass\\s*\\)"))
+                    .match(clientSource).hasMatch());
+
+        const QRegularExpression callStart(QStringLiteral("\\bnoteStepOutcome\\s*\\("));
+        auto match = callStart.globalMatch(clientSource);
+        int checkedCalls = 0;
+        const QRegularExpression forbidden(QStringLiteral("\\b(engineError|diagnostic|errorString)\\b"));
+        while (match.hasNext()) {
+            const QRegularExpressionMatch current = match.next();
+            int open = clientSource.indexOf(QLatin1Char('('), current.capturedStart());
+            int depth = 1;
+            int close = open + 1;
+            for (; close < clientSource.size() && depth > 0; ++close) {
+                if (clientSource.at(close) == QLatin1Char('(')) {
+                    ++depth;
+                } else if (clientSource.at(close) == QLatin1Char(')')) {
+                    --depth;
+                }
+            }
+            QVERIFY(depth == 0);
+            int after = close;
+            while (after < clientSource.size() && clientSource.at(after).isSpace()) {
+                ++after;
+            }
+            if (after < clientSource.size() && clientSource.at(after) == QLatin1Char('{')) {
+                continue; // the helper definition, not an emitter call
+            }
+            const QString arguments = clientSource.mid(open + 1, close - open - 2);
+            QVERIFY2(!forbidden.match(arguments).hasMatch(),
+                     "a play-step emitter call must never receive raw engine or failure text");
+            ++checkedCalls;
+        }
+        QVERIFY(checkedCalls > 0);
     }
 };
 

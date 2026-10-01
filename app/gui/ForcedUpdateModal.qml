@@ -4,11 +4,8 @@ import SeatHub.Tokens 1.0
 
 // The forced-update modal (D-38, D-41, D-42, D-43).
 //
-// Blocking on purpose. Once the release feed offers a build and no session is running, this is
-// the only thing the customer can act on: it swallows every pointer and key event aimed at the
-// page behind it, offers no way to make it go away, and stays up until the verified installer
-// has actually been launched. D-41 is explicit that no path exists out of it except updating,
-// so this file deliberately has no dismissal affordance at all - adding one would be the defect.
+// ADR-0070 / screens.md §49: required updates remain blocking. A newer release above its floor
+// is optional and can be dismissed for this launch; a failed optional update renders nothing.
 //
 // It is never shown while a stream is running (Pitfall 8): `SeatHubClient` refuses to check,
 // refuse to download, and refuse to install during a session, and this file renders nothing
@@ -32,7 +29,10 @@ Item {
     }
     readonly property bool hasOffer: offeredVersion.length > 0
     // D-41 + Pitfall 8: nothing while a stream is running.
-    readonly property bool shown: hasOffer && updates.blockedBySession !== true
+    readonly property bool requiredUpdate: hasOffer && updates.mandatory === true
+    readonly property bool exhausted: requiredUpdate && updates.exhausted === true
+    readonly property bool shown: hasOffer && (requiredUpdate || updates.optionalOffer === true)
+                                 && updates.blockedBySession !== true
     // `ready` is a verified download on its way to `installing`: the client starts the installer
     // by itself, because the one press that began the download is the only one there is (D-41).
     readonly property bool busy: updates !== null && updates !== undefined
@@ -108,7 +108,7 @@ Item {
 
             Text {
                 width: parent.width
-                text: qsTr("Update SeatHub")
+                text: modal.requiredUpdate ? qsTr("Update SeatHub") : qsTr("SeatHub update")
                 wrapMode: Text.Wrap
                 color: Tokens.foregroundDefault
                 font.family: Tokens.fontDisplayDefault
@@ -122,6 +122,13 @@ Item {
                 width: parent.width
                 wrapMode: Text.Wrap
                 text: {
+                    // Exact frozen copy: copy.md §Update window, ADR-0070 items 8/9.
+                    if (!modal.requiredUpdate)
+                        return qsTr("Version %1 is ready. Update now, or later.").arg(modal.offeredVersion)
+                    if (modal.exhausted)
+                        return qsTr("SeatHub could not update itself. Download the new version and install it to keep playing.")
+                    if (updates && updates.state === "failed")
+                        return qsTr("SeatHub could not finish updating, so playing is paused until it does. It will try again %1.").arg(updates.nextAttemptText)
                     if (modal.hasOffer && modal.offer.rollback === true)
                         return qsTr("SevenHills has set version %1 for this app on your PC.").arg(modal.offeredVersion)
                     return qsTr("Version %1 is available. SeatHub has to restart to finish updating.").arg(modal.offeredVersion)
@@ -209,11 +216,14 @@ Item {
                 }
             }
 
-            // The one action. There is no second one, by design (D-41).
-            SeatHubButton {
-                id: updateAction
-
+            Row {
                 width: parent.width
+                spacing: Metrics.s3
+                SeatHubButton {
+                id: updateAction
+                objectName: "updateAction"
+
+                width: secondaryAction.active ? (parent.width - parent.spacing) / 2 : parent.width
                 enabled: updates !== null && updates !== undefined && modal.busy === false
                 text: updates && updates.state === "failed" ? qsTr("Try again") : qsTr("Update")
 
@@ -221,27 +231,58 @@ Item {
                 // button through Qt's own handling; only the tab keys are answered here.
                 Keys.onPressed: function(event) {
                     if (event.key === Qt.Key_Tab || event.key === Qt.Key_Backtab) {
-                        modal.forceActiveFocus()
+                        if (secondaryAction.item && secondaryAction.item.enabled)
+                            secondaryAction.item.forceActiveFocus()
+                        else
+                            modal.forceActiveFocus()
                         event.accepted = true
                     }
+                    if (event.key === Qt.Key_Escape)
+                        event.accepted = true
                 }
 
                 onClicked: {
                     if (updates === null || updates === undefined)
                         return
-                    if (updates.state === "failed" && updates.readyToInstall === true) {
-                        // The launch failed (usually a declined UAC prompt) but the verified
-                        // package is still on disk: Try again re-runs the launch, which re-checks
-                        // the digest first, instead of downloading the whole installer again.
-                        updates.installDownloaded()
+                    if (updates.state === "failed" || modal.exhausted) {
+                        updates.tryAgain()
                     }
-                    else if (updates.state === "available" || updates.state === "failed") {
+                    else if (updates.state === "available") {
                         // The digest the offer carries is the one baked in from the release pin
                         // at release prep. When it is empty the client refuses to install and
                         // says so, rather than running an unverified binary (D-43). A verified
                         // download goes on to launch the installer by itself.
                         updates.downloadUpdate(String(updates.availableUpdate.url),
                                                String(updates.availableUpdate.sha256))
+                    }
+                }
+                }
+                Loader {
+                    id: secondaryAction
+                    width: (parent.width - parent.spacing) / 2
+                    active: modal.hasOffer && (modal.exhausted || updates.optionalOffer === true)
+                    sourceComponent: Component {
+                        SeatHubButton {
+                            width: secondaryAction.width
+                            variant: "ghost"
+                            objectName: modal.exhausted ? "downloadAction" : "notNowAction"
+                            enabled: !modal.busy
+                            text: modal.exhausted ? qsTr("Download") : qsTr("Not now")
+                            Keys.onPressed: function(event) {
+                                if (event.key === Qt.Key_Tab || event.key === Qt.Key_Backtab) {
+                                    updateAction.forceActiveFocus()
+                                    event.accepted = true
+                                }
+                                if (event.key === Qt.Key_Escape)
+                                    event.accepted = true
+                            }
+                            onClicked: {
+                                if (modal.exhausted)
+                                    updates.openManualDownload()
+                                else
+                                    updates.dismissOptional()
+                            }
+                        }
                     }
                 }
             }

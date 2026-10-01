@@ -49,8 +49,10 @@
 #include <QNetworkAccessManager>
 #include <QNetworkReply>
 #include <QNetworkRequest>
+#include <QScopeGuard>
 #include <QScopedPointer>
 #include <QSignalSpy>
+#include <QSettings>
 #include <QTemporaryDir>
 #include <QThread>
 #include <QTimeZone>
@@ -88,11 +90,20 @@
 // tell "dropped before create()" from "reached create() and failed closed the ordinary way" - the
 // two things `handleHostResolved()`'s session-id check must tell apart.
 int g_engineCreateCalls = 0;
+EngineLaunchReason g_engineCreateReason = EngineLaunchReason::CreateFailed;
+std::function<void()> g_engineFactoryHook;
 
-MoonlightEngineSession* MoonlightEngineSession::create(const PairedHostPtr&, QObject* parent)
+MoonlightEngineSession* MoonlightEngineSession::create(const PairedHostPtr&, QObject* parent,
+                                                       EngineLaunchReason* reason)
 {
     Q_UNUSED(parent);
     ++g_engineCreateCalls;
+    if (reason != nullptr) {
+        *reason = g_engineCreateReason;
+    }
+    if (g_engineFactoryHook) {
+        g_engineFactoryHook();
+    }
     // The production factory returns null when the host is not a `MoonlightPairedHost` or its
     // application list does not name a single application, and the caller then fails closed
     // instead of substituting a stub. Returning null here is that same answer: no host is paired
@@ -119,8 +130,64 @@ void MoonlightEngineSession::setTextRasterizer(Overlay::OverlayManager::TextRast
 {
 }
 
+// Plan 09 correction: the facade's own recovered-pairing record is produced through the REAL
+// production route (the seam's clear-and-retry, the controller, then the facade), and the only
+// part of that route a test binary cannot run is upstream's handshake against a live Sunshine.
+// Armed by `aRecoveredPairingEmitsExactlyOneInfoPlayStepWithTheFrozenRecord` alone: every other
+// test in this suite keeps the original always-fail answer (and, because no other test grants a
+// pairing target, none of them ever reaches this function at all).
+bool g_recoveredHandshakeArmed = false;
+bool g_noAppHandshakeArmed = false;
+bool g_failedRetryHandshakeArmed = false;
+int g_handshakeCalls = 0;
+
 PairingHandshakeResult runUpstreamPairingHandshake(const PairingTarget&)
 {
+    if (g_noAppHandshakeArmed) {
+        PairingHandshakeResult paired;
+        paired.ok = true;
+        paired.clientIdentity = QStringLiteral("no-app-identity");
+        paired.host = std::make_shared<PairedHost>();
+        return paired;
+    }
+    if (g_failedRetryHandshakeArmed) {
+        ++g_handshakeCalls;
+        if (g_handshakeCalls == 1) {
+            PairingHandshakeResult conflict;
+            conflict.attemptStep = QStringLiteral("pair_server_info");
+            conflict.stepClass = QStringLiteral("http_4xx");
+            conflict.pairingConflict = true;
+            conflict.engineError = QStringLiteral("fixture conflict before retry");
+            return conflict;
+        }
+        PairingHandshakeResult rejected;
+        rejected.attemptStep = QStringLiteral("pair_handshake");
+        rejected.stepClass = QStringLiteral("pin_rejected");
+        rejected.engineError = QStringLiteral("fixture retry rejection text");
+        return rejected;
+    }
+    if (g_recoveredHandshakeArmed) {
+        ++g_handshakeCalls;
+        if (g_handshakeCalls == 1) {
+            // Exactly what production builds for the rig's HTTP 409 on getservercert
+            // (`pairing_handshake.cpp`): the conflict tag is what makes the seam clear the rig's
+            // pending session and retry once. Its own step/class are the mapper's - the recovered
+            // record the ADR freezes is the seam's to produce.
+            PairingHandshakeResult conflict;
+            conflict.attemptStep = QStringLiteral("pair_server_info");
+            conflict.stepClass = QStringLiteral("http_4xx");
+            conflict.pairingConflict = true;
+            conflict.engineError = QStringLiteral(
+                "the rig did not answer the server-info request (HTTP 409)");
+            return conflict;
+        }
+        PairingHandshakeResult paired;
+        paired.ok = true;
+        paired.clientIdentity = QStringLiteral("recovered-identity");
+        paired.host = std::make_shared<PairedHost>();
+        return paired;
+    }
+
     PairingHandshakeResult result;
     result.ok = false;
     result.engineError = QStringLiteral("no Sunshine host exists in this test environment");
@@ -131,6 +198,15 @@ namespace {
 
 const char* kAccessToken = "opaque-access-token";
 const char* kPlaintextMarker = "sb_rt_PLAINTEXT-MARKER-4F7K";
+
+/// Plan 09 correction: stops the process-wide `LogShipper` on EVERY exit path of the test that
+/// starts it (a `QVERIFY` failure returns early), so its worker - and the lambda it captured
+/// from that test's locals - never outlives the test. Declared last in the test so it runs
+/// first, before the capture locals it must not outlive are destroyed.
+struct StopShipperOnScopeExit
+{
+    ~StopShipperOnScopeExit() { LogShipper::instance().stop(); }
+};
 
 class FakeReply : public QNetworkReply
 {
@@ -933,6 +1009,187 @@ private:
     }
 
 private slots:
+    void onePlaySummaryPerExitPath_data()
+    {
+        QTest::addColumn<int>("exit");
+        QTest::addColumn<QString>("token");
+        QTest::addColumn<QString>("outcome");
+        QTest::addColumn<bool>("liveFrame");
+        const char* tokens[] = {"refused", "pair_failed", "stage_failed", "launch_failed",
+            "start_refused", "cancelled", "server_ended_pre", "ended", "terminated",
+            "server_ended", "horizon", "reconnect_ended", "ended_held", "signed_out", "app_quit"};
+        for (int i = 0; i < 15; ++i) {
+            const QString outcome = i < 5 || i == 6 || i == 8 || i == 11
+                ? QStringLiteral("failed") : (i == 5 || i >= 12 ? QStringLiteral("cancelled")
+                                                                       : QStringLiteral("ok"));
+            QTest::newRow(qPrintable(QStringLiteral("E%1-%2").arg(i + 1).arg(tokens[i])))
+                << i + 1 << QString::fromLatin1(tokens[i]) << outcome << false;
+        }
+    }
+
+    void onePlaySummaryPerExitPath()
+    {
+        QFETCH(int, exit);
+        QFETCH(QString, token);
+        QFETCH(QString, outcome);
+        QFETCH(bool, liveFrame);
+        QTemporaryDir spool;
+        QMutex mutex;
+        QList<ShippedLine> records;
+        QString userAtSummary;
+        auto engine = std::make_unique<FakeEngineSession>();
+        auto client = std::make_unique<SeatHubClient>();
+        if (exit == 1) reachHome(*client, 90);
+        else beginStagedSession(*client);
+        QVERIFY(!QTest::currentTestFailed());
+        client->teardown()->setVerifyIntervalMs(1);
+        LogShipper::instance().setSpoolDirectoryForTests(spool.path());
+        LogShipper::instance().start([&](const ShippedLine& line) {
+            QMutexLocker lock(&mutex);
+            records.append(line);
+            if (line.body == QLatin1String("play.summary")) userAtSummary = SeatHubTelemetry::currentUserId();
+            return true;
+        });
+        LogShipper::instance().setCanShip(true);
+        StopShipperOnScopeExit guard;
+        if (exit >= 8) {
+            client->session()->attachSession(engine.get());
+            client->session()->start(nullptr);
+            emit engine->connectionStarted();
+            if (liveFrame) {
+                auto& compositor = client->hud()->compositor();
+                SDL_Surface* surface = OsdCompositor::rasterize(Overlay::OverlayDebug,
+                    "Rendering frame rate: 59.00 FPS\nAverage network latency: 23 ms (variance: 1 ms)",
+                    true, SDL_Color{255, 255, 255, 255}, &compositor);
+                if (surface) SDL_FreeSurface(surface);
+                QTest::qWait(5);
+                emitStatsBlock(59.0);
+            }
+        }
+        switch (exit) {
+        case 1:
+            m_fake->answerPlay(402, playRefusalBody(QStringLiteral("refused"), QStringLiteral("SH-TEST")));
+            client->start();
+            QTRY_COMPARE(client->homeStatus(), QStringLiteral("refused"));
+            break;
+        case 2: emit client->pairing()->pairingFailed(SeatHubFailure::generic()); break;
+        case 3:
+            client->session()->attachSession(engine.get());
+            client->session()->start(nullptr);
+            emit engine->stageFailed(QStringLiteral("RTSP handshake"), -1, QString()); break;
+        case 4:
+            client->session()->attachSession(engine.get());
+            client->session()->start(nullptr);
+            emit engine->displayLaunchError(QStringLiteral("local-only diagnostic")); break;
+        case 5: emit client->pairing()->pairingCompleted(QStringLiteral("fixture-client")); break;
+        case 6: client->interrupt(); break;
+        case 7: case 10: {
+            SessionInfo over = sessionIn(QStringLiteral("COMPLETED"), QStringLiteral("s-stages"));
+            over.endReason = QStringLiteral("CUSTOMER_ENDED");
+            report(*client, over); break;
+        }
+        case 8: emitConnectionTerminated(0); emit engine->readyForDeletion(); break;
+        case 9:
+            emitConnectionTerminated(-102);
+            emit engine->displayLaunchError(QStringLiteral("local-only diagnostic"));
+            emit engine->readyForDeletion(); break;
+        case 11: QVERIFY(QMetaObject::invokeMethod(client.get(), "handleHorizonReached", Qt::DirectConnection)); break;
+        case 12: case 13: {
+            emitConnectionTerminated(-100);
+            emit engine->displayLaunchError(QStringLiteral("local-only diagnostic"));
+            QVERIFY(client->reconnecting());
+            emit engine->readyForDeletion();
+            if (exit == 13) client->endHeldSession();
+            else {
+                SessionInfo over = sessionIn(QStringLiteral("COMPLETED"), QStringLiteral("s-stages"));
+                over.endReason = QStringLiteral("GRACE_EXPIRED");
+                report(*client, over);
+            }
+            break;
+        }
+        case 14: client->signOut(); break;
+        case 15: client.reset(); break;
+        }
+        // Duplicate teardown/exit notifications must not produce another summary.
+        if (client && exit >= 8) emit engine->readyForDeletion();
+        auto summaries = [&]() {
+            QMutexLocker lock(&mutex);
+            QList<ShippedLine> result;
+            for (const auto& line : records) if (line.body == QLatin1String("play.summary")) result.append(line);
+            return result;
+        };
+        QTRY_COMPARE_WITH_TIMEOUT(summaries().size(), 1, 10000);
+        LogShipper::instance().drainBeforeSignOut();
+        const auto summary = summaries().first();
+        QCOMPARE(summary.attrs.value("exit_path").toString(), token);
+        QCOMPARE(summary.attrs.value("outcome").toString(), outcome);
+        QCOMPARE(summaries().size(), 1);
+        if (exit == 1) {
+            QVERIFY(summary.attrs.contains("t_allocate_ms"));
+            QVERIFY(summary.sessionId.isEmpty());
+            QVERIFY(!summary.attrs.contains("stream_s"));
+            QVERIFY(!summary.attrs.contains("rollups"));
+            QVERIFY(!summary.attrs.contains("cfg_res"));
+        }
+        if (exit >= 8) {
+            QVERIFY(summary.attrs.contains("stream_s"));
+            QVERIFY(summary.attrs.contains("rollups"));
+            QVERIFY(summary.attrs.contains("cfg_res"));
+            QVERIFY(summary.attrs.contains("cfg_fps"));
+            QVERIFY(summary.attrs.contains("cfg_bitrate_kbps"));
+            QVERIFY(summary.attrs.contains("bad_episodes"));
+            QVERIFY(summary.attrs.contains("bad_seconds"));
+            QVERIFY(summary.attrs.contains("sampling_gap_s"));
+            if (liveFrame) {
+                QVERIFY(summary.attrs.contains("t_first_frame_ms"));
+                QCOMPARE(summary.attrs.value("last_step").toString(), QStringLiteral("stream"));
+                QCOMPARE(summary.attrs.value("fps_avg").toDouble(), 59.0);
+            }
+            else {
+                QCOMPARE(summary.attrs.value("last_step").toString(), QStringLiteral("first_frame"));
+                QCOMPARE(summary.attrs.value("failure_class").toString(), QStringLiteral("no_first_frame"));
+                QVERIFY(!summary.attrs.contains("t_first_frame_ms"));
+            }
+        }
+        if (exit == 3) QVERIFY(summary.attrs.contains("t_engine_connect_ms"));
+        if (exit == 14 || exit == 15) QVERIFY(!userAtSummary.isEmpty());
+        if (exit == 14) QVERIFY(SeatHubTelemetry::currentUserId().isEmpty());
+        if (client) client->session()->attachSession(nullptr);
+    }
+
+    void aPlayNeverSummarisesTwice_data()
+    {
+        QTest::addColumn<int>("exit");
+        QTest::addColumn<QString>("token");
+        QTest::addColumn<QString>("outcome");
+        QTest::addColumn<bool>("liveFrame");
+        QTest::newRow("server-end-then-engine-deletion") << 10 << QStringLiteral("server_ended")
+            << QStringLiteral("ok") << true;
+    }
+    void aPlayNeverSummarisesTwice() { onePlaySummaryPerExitPath(); }
+
+    void signOutSummarisesBeforeTheDrain_data()
+    {
+        QTest::addColumn<int>("exit");
+        QTest::addColumn<QString>("token");
+        QTest::addColumn<QString>("outcome");
+        QTest::addColumn<bool>("liveFrame");
+        QTest::newRow("signed-out") << 14 << QStringLiteral("signed_out") << QStringLiteral("cancelled") << true;
+        QTest::newRow("quit") << 15 << QStringLiteral("app_quit") << QStringLiteral("cancelled") << true;
+    }
+    void signOutSummarisesBeforeTheDrain() { onePlaySummaryPerExitPath(); }
+
+    void theSummaryCarriesThePerStepTimingsAndTheConfiguredValues_data()
+    {
+        QTest::addColumn<int>("exit");
+        QTest::addColumn<QString>("token");
+        QTest::addColumn<QString>("outcome");
+        QTest::addColumn<bool>("liveFrame");
+        QTest::newRow("live-frame-and-final-decoder-stats") << 8 << QStringLiteral("ended")
+            << QStringLiteral("ok") << true;
+    }
+    void theSummaryCarriesThePerStepTimingsAndTheConfiguredValues() { onePlaySummaryPerExitPath(); }
+
     void initTestCase()
     {
         qRegisterMetaType<SeatHubFailure>("SeatHubFailure");
@@ -983,6 +1240,108 @@ private slots:
         QVERIFY(client.reference().isEmpty());
         QCOMPARE(client.session()->active(), false);
         QVERIFY(client.session()->upstreamSession() == nullptr);
+    }
+
+    void theNoticeVersionGatesTheProperty()
+    {
+        const QString organization = QCoreApplication::organizationName();
+        const QString application = QCoreApplication::applicationName();
+        const auto format = QSettings::defaultFormat();
+        auto restore = qScopeGuard([&]() {
+            QCoreApplication::setOrganizationName(organization);
+            QCoreApplication::setApplicationName(application);
+            QSettings::setDefaultFormat(format);
+        });
+        QCoreApplication::setOrganizationName("SeatHubTest");
+        QCoreApplication::setApplicationName("DiagnosticsNoticeTest");
+        QSettings::setDefaultFormat(QSettings::IniFormat);
+        QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, m_dir->path());
+        QSettings::setPath(QSettings::IniFormat, QSettings::SystemScope, m_dir->path());
+        QSettings settings;
+        const QString key = QStringLiteral("diagnosticsNoticeVersion");
+        QVERIFY(!settings.contains(key));
+        {
+            SeatHubClient client;
+            QVERIFY2(client.metaObject()->indexOfProperty("diagnosticsNoticePending") >= 0,
+                     "the facade lacks the version-gated diagnostics notice property");
+            QVERIFY(!client.property("diagnosticsNoticePending").toBool());
+            reachHome(client, 90); QVERIFY(!QTest::currentTestFailed());
+            QVERIFY(client.property("diagnosticsNoticePending").toBool());
+            const QString feedPath = m_dir->path() + "/feed/api/releases";
+            QVERIFY(QDir().mkpath(feedPath));
+            client.updates()->setBaseUrl(QUrl::fromLocalFile(m_dir->path() + "/feed").toString());
+            client.updates()->setInstalledVersion("2.0.0");
+            client.updates()->setRetryStatePath(m_dir->path() + "/retry.json");
+            client.updates()->setJournalFolder(m_dir->path() + "/journal");
+            client.openSettings(); QVERIFY(!client.property("diagnosticsNoticePending").toBool());
+            client.closeSettings(); QVERIFY(client.property("diagnosticsNoticePending").toBool());
+            client.openProfile(); QVERIFY(client.property("diagnosticsNoticePending").toBool());
+            client.closeProfile();
+            QTemporaryDir spool;
+            QMutex shippedMutex;
+            QStringList shipped;
+            LogShipper::instance().setSpoolDirectoryForTests(spool.path());
+            LogShipper::instance().start([&](const ShippedLine& line) {
+                QMutexLocker lock(&shippedMutex); shipped.append(line.body); return true;
+            });
+            LogShipper::instance().setCanShip(true);
+            StopShipperOnScopeExit stopShipper;
+            auto* engine = new FakeEngineSession;
+            client.session()->attachSession(engine);
+            m_fake->answerPairing(409, playRefusalBody("The rig is not ready yet.", "SH-2K2XQ1"));
+            client.beginSession("s-notice");
+            QVERIFY(!client.property("diagnosticsNoticePending").toBool());
+            emit engine->connectionStarted();
+            QCOMPARE(client.appState(), QStringLiteral("streaming"));
+            QVERIFY(!client.property("diagnosticsNoticePending").toBool());
+            m_fake->answerSession("s-notice", "CANCELLED", "CUSTOMER_ENDED");
+            client.interrupt(); emit engine->sessionFinished(0); emit engine->readyForDeletion();
+            QTRY_COMPARE_WITH_TIMEOUT(client.appState(), QStringLiteral("home"), 15000);
+            QVERIFY(client.property("diagnosticsNoticePending").toBool());
+            LogShipper::instance().drainBeforeSignOut();
+            {
+                QMutexLocker lock(&shippedMutex);
+                QVERIFY2(shipped.contains("play.summary"), "actual diagnostic hand-off must not wait for OK");
+            }
+            QVERIFY(!QSettings().contains(key));
+            // Drive actual feed replies, including optional/required precedence and clearing.
+            for (const bool required : {true, false}) {
+                QFile feed(feedPath + "/client"); QVERIFY(feed.open(QIODevice::WriteOnly));
+                feed.write(required
+                    ? QByteArrayLiteral("{\"version\":\"3.0.0\",\"url\":\"https://example.invalid/setup.exe\"}")
+                    : QByteArrayLiteral("{\"version\":\"3.0.0\",\"min_version\":\"1.0.0\",\"url\":\"https://example.invalid/setup.exe\"}"));
+                feed.close();
+                QSignalSpy checked(client.updates(), &UpdateFeedClient::checkFinished);
+                QTRY_VERIFY(client.updates()->state() != QStringLiteral("checking"));
+                checked.clear(); // exclude the stream-end check that was already in flight
+                QVERIFY(client.updates()->checkForUpdates());
+                QTRY_VERIFY(!checked.isEmpty());
+                QCOMPARE(client.updates()->mandatory(), required);
+                QVERIFY(!client.property("diagnosticsNoticePending").toBool());
+                QVERIFY(feed.open(QIODevice::WriteOnly)); feed.write("{\"version\":\"2.0.0\"}"); feed.close();
+                checked.clear(); QVERIFY(client.updates()->checkForUpdates());
+                QTRY_VERIFY(!checked.isEmpty());
+                QVERIFY(client.property("diagnosticsNoticePending").toBool());
+            }
+            QVERIFY(QMetaObject::invokeMethod(&client, "acknowledgeDiagnosticsNotice"));
+            QVERIFY(!client.property("diagnosticsNoticePending").toBool());
+            QSettings disk; QCOMPARE(disk.value(key, 0).toInt(), 1);
+            QCOMPARE(disk.value(key).metaType(), QMetaType::fromType<int>());
+            QVERIFY(QFile::exists(disk.fileName()));
+            client.signOut(); QCOMPARE(QSettings().value(key, 0).toInt(), 1);
+        }
+        {
+            SeatHubClient updated;
+            reachHome(updated, 90); QVERIFY(!QTest::currentTestFailed());
+            QVERIFY(!updated.property("diagnosticsNoticePending").toBool());
+        }
+        settings.setValue(key, 0); settings.sync();
+        {
+            SeatHubClient newerWording;
+            reachHome(newerWording, 90); QVERIFY(!QTest::currentTestFailed());
+            QVERIFY(newerWording.property("diagnosticsNoticePending").toBool());
+            newerWording.signOut(); QCOMPARE(QSettings().value(key).toInt(), 0);
+        }
     }
 
     void theFacadeDrivesTheAttachedEngineAndInterruptReachesIt()
@@ -1977,6 +2336,47 @@ private slots:
                  "each Play mints its own trace id, refused or not");
     }
 
+    void aBalanceRefusalEmitsExactlyOneAllocateStep()
+    {
+        SeatHubClient client;
+        reachHome(client, 0);
+        QVERIFY(!QTest::currentTestFailed());
+
+        QTemporaryDir spoolDir;
+        QVERIFY(spoolDir.isValid());
+        QMutex captureMutex;
+        QList<ShippedLine> captured;
+        LogShipper::instance().setSpoolDirectoryForTests(spoolDir.path());
+        LogShipper::instance().start([&captureMutex, &captured](const ShippedLine& line) {
+            QMutexLocker lock(&captureMutex);
+            captured.append(line);
+            return true;
+        });
+        LogShipper::instance().setCanShip(true);
+        StopShipperOnScopeExit stopGuard;
+        const auto playStepCount = [&captureMutex, &captured]() {
+            QMutexLocker lock(&captureMutex);
+            return static_cast<int>(std::count_if(captured.cbegin(), captured.cend(),
+                [](const ShippedLine& line) { return line.body == QLatin1String("play.step"); }));
+        };
+
+        m_fake->answerPlay(402, playRefusalBody(QStringLiteral("Not enough credit."),
+                                                QStringLiteral("SH-3K2XQ1")));
+        client.start();
+        QTRY_COMPARE_WITH_TIMEOUT(client.homeStatus(), QStringLiteral("refused"), 15000);
+        QTRY_COMPARE_WITH_TIMEOUT(playStepCount(), 1, 15000);
+
+        LogShipper::instance().stop();
+        QMutexLocker lock(&captureMutex);
+        const auto record = std::find_if(captured.cbegin(), captured.cend(),
+            [](const ShippedLine& line) { return line.body == QLatin1String("play.step"); });
+        QVERIFY(record != captured.cend());
+        QCOMPARE(record->attrs.value(QStringLiteral("step")).toString(), QStringLiteral("allocate"));
+        QCOMPARE(record->attrs.value(QStringLiteral("outcome")).toString(), QStringLiteral("failed"));
+        QCOMPARE(record->attrs.value(QStringLiteral("failure_class")).toString(),
+                 QStringLiteral("refused_balance"));
+    }
+
     // --- WR-01: every Play-end path clears the trace id (06.3-REVIEW-fork.md) ---------------------
 
     void aRefusedPlayLeavesNoTraceIdOnALaterNonPlayRequest()
@@ -2065,6 +2465,19 @@ private slots:
         QVERIFY(!QTest::currentTestFailed());
         client.teardown()->setVerifyIntervalMs(1);
 
+        QTemporaryDir spoolDir;
+        QVERIFY(spoolDir.isValid());
+        QMutex captureMutex;
+        QList<ShippedLine> captured;
+        LogShipper::instance().setSpoolDirectoryForTests(spoolDir.path());
+        LogShipper::instance().start([&captureMutex, &captured](const ShippedLine& line) {
+            QMutexLocker lock(&captureMutex);
+            captured.append(line);
+            return true;
+        });
+        LogShipper::instance().setCanShip(true);
+        StopShipperOnScopeExit stopGuard;
+
         // `beginSession()` skips `beginPlayRequest()` (the teardown tests' own established
         // pattern), so it mints no trace id of its own - set one directly, standing in for the
         // Play that would have minted it in production.
@@ -2075,10 +2488,38 @@ private slots:
         emit engine->connectionStarted();
         QVERIFY2(client.liveSession(), "a session that streamed is live (C5)");
 
-        m_fake->answerEnd(500);
+        m_fake->answerEnd(401);
         QSignalSpy failed(client.teardown(), &TeardownController::teardownFailed);
         emit engine->readyForDeletion();
         QTRY_COMPARE_WITH_TIMEOUT(failed.count(), 1, 15000);
+        const auto teardownDiagnosticCount = [&captureMutex, &captured]() {
+            QMutexLocker lock(&captureMutex);
+            return std::count_if(captured.cbegin(), captured.cend(),
+                [](const ShippedLine& line) {
+                    return line.body == QLatin1String("play.step")
+                        && line.attrs.value(QStringLiteral("step")).toString()
+                            == QLatin1String("teardown");
+                });
+        };
+        QTRY_COMPARE_WITH_TIMEOUT(teardownDiagnosticCount(), 1, 15000);
+        LogShipper::instance().stop();
+        QMutexLocker captureLock(&captureMutex);
+        const auto teardownRecord = std::find_if(captured.cbegin(), captured.cend(),
+            [](const ShippedLine& line) {
+                return line.body == QLatin1String("play.step")
+                    && line.attrs.value(QStringLiteral("step")).toString()
+                        == QLatin1String("teardown");
+            });
+        QVERIFY(teardownRecord != captured.cend());
+        QCOMPARE(teardownRecord->attrs.value(QStringLiteral("failure_class")).toString(),
+                 QStringLiteral("failed_auth"));
+        QCOMPARE(std::count_if(captured.cbegin(), captured.cend(),
+            [](const ShippedLine& line) {
+                return line.body == QLatin1String("play.step")
+                    && line.attrs.value(QStringLiteral("step")).toString()
+                        == QLatin1String("teardown");
+            }), 1);
+        captureLock.unlock();
 
         const int beforeReload = m_fake->requestPaths().size();
         m_fake->answerMe(200, accountBody());
@@ -2584,6 +3025,70 @@ private slots:
         QCOMPARE(stages.count(), 3);
     }
 
+    void aServerEndedFailureStillPostsOneEndWithTheStep()
+    {
+        SeatHubClient client;
+        beginStagedSession(client);
+        QVERIFY(!QTest::currentTestFailed());
+
+        QTemporaryDir spoolDir;
+        QVERIFY(spoolDir.isValid());
+        QMutex captureMutex;
+        QList<ShippedLine> captured;
+        LogShipper::instance().setSpoolDirectoryForTests(spoolDir.path());
+        LogShipper::instance().start([&captureMutex, &captured](const ShippedLine& line) {
+            QMutexLocker lock(&captureMutex);
+            captured.append(line);
+            return true;
+        });
+        LogShipper::instance().setCanShip(true);
+        StopShipperOnScopeExit stopGuard;
+
+        report(client, sessionIn(QStringLiteral("PREPARING")));
+        client.teardown()->setVerifyIntervalMs(1);
+
+        SessionInfo over = sessionIn(QStringLiteral("FAILED"));
+        over.endReason = QStringLiteral("READINESS_TIMEOUT");
+        report(client, over);
+
+        QTRY_VERIFY_WITH_TIMEOUT(
+            std::any_of(captured.cbegin(), captured.cend(), [](const ShippedLine& line) {
+                return line.body == QLatin1String("play.step");
+            }), 15000);
+
+        QTRY_VERIFY_WITH_TIMEOUT(
+            m_fake->requestPaths().contains(QStringLiteral("/api/sessions/s-stages/end")), 15000);
+        QCOMPARE(m_fake->requestPaths().count(QStringLiteral("/api/sessions/s-stages/end")), 1);
+        const QJsonObject body = QJsonDocument::fromJson(
+            m_fake->bodyFor(QStringLiteral("/api/sessions/s-stages/end"))).object();
+        QCOMPARE(body.value(QStringLiteral("failed")).toBool(), true);
+        QCOMPARE(body.value(QStringLiteral("attempt_step")).toString(), QStringLiteral("rig_wait"));
+
+        LogShipper::instance().stop();
+        QMutexLocker lock(&captureMutex);
+        int playSteps = 0;
+        const ShippedLine* record = nullptr;
+        for (const ShippedLine& line : captured) {
+            if (line.body == QLatin1String("play.step")) {
+                ++playSteps;
+                record = &line;
+            }
+        }
+        QCOMPARE(playSteps, 1);
+        QVERIFY(record != nullptr);
+        QCOMPARE(record->attrs.value(QStringLiteral("step")).toString(),
+                 QStringLiteral("rig_wait"));
+        QCOMPARE(record->attrs.value(QStringLiteral("failure_class")).toString(),
+                 QStringLiteral("server_ended"));
+        QCOMPARE(record->attrs.value(QStringLiteral("end_reason")).toString(),
+                 QStringLiteral("READINESS_TIMEOUT"));
+        lock.unlock();
+
+        report(client, over);
+        QTest::qWait(25);
+        QCOMPARE(m_fake->requestPaths().count(QStringLiteral("/api/sessions/s-stages/end")), 1);
+    }
+
     void aLateReplyCarryingAnEarlierStateChangesNothing()
     {
         SeatHubClient client;
@@ -2893,6 +3398,25 @@ private slots:
         SeatHubClient client;
         reachHome(client, 90);
         QVERIFY(!QTest::currentTestFailed());
+
+        QTemporaryDir spoolDir;
+        QVERIFY(spoolDir.isValid());
+        QMutex captureMutex;
+        QList<ShippedLine> captured;
+        LogShipper::instance().setSpoolDirectoryForTests(spoolDir.path());
+        LogShipper::instance().start([&captureMutex, &captured](const ShippedLine& line) {
+            QMutexLocker lock(&captureMutex);
+            captured.append(line);
+            return true;
+        });
+        LogShipper::instance().setCanShip(true);
+        StopShipperOnScopeExit stopGuard;
+        const auto playStepCount = [&captureMutex, &captured]() {
+            QMutexLocker lock(&captureMutex);
+            return static_cast<int>(std::count_if(captured.cbegin(), captured.cend(),
+                [](const ShippedLine& line) { return line.body == QLatin1String("play.step"); }));
+        };
+
         // A run of 409s no longer stalls this deadline (fork `15962514`: "a 409 while the rig is
         // prepared does not spend the pairing deadline" - it restarts D-08's clock on every "not
         // yet" answer). A transport failure still does, so the authorization poll never resolving
@@ -2907,6 +3431,7 @@ private slots:
         client.beginSession(QStringLiteral("s-stages"));
 
         QTRY_VERIFY_WITH_TIMEOUT(client.connectFailed(), 15000);
+        QTRY_COMPARE_WITH_TIMEOUT(playStepCount(), 1, 15000);
         QCOMPARE(client.appState(), QStringLiteral("connecting"));
         // Nothing was read about the session, so it stopped at the stage every session begins at.
         QCOMPARE(client.stalledStepText(), QStringLiteral("Stopped at: Preparing the rig"));
@@ -2918,6 +3443,18 @@ private slots:
         QVERIFY2(!client.liveSession(), "a pre-stream failure ends the session (C2)");
         QTRY_VERIFY_WITH_TIMEOUT(
             m_fake->requestPaths().contains(QStringLiteral("/api/sessions/s-stages/end")), 15000);
+        QVERIFY(m_fake->bodyFor(QStringLiteral("/api/sessions/s-stages/end"))
+                    .contains(QByteArrayLiteral("\"attempt_step\":\"pair_authorize\"")));
+        LogShipper::instance().stop();
+        QMutexLocker lock(&captureMutex);
+        const auto record = std::find_if(captured.cbegin(), captured.cend(),
+            [](const ShippedLine& line) { return line.body == QLatin1String("play.step"); });
+        QVERIFY(record != captured.cend());
+        QCOMPARE(record->attrs.value(QStringLiteral("step")).toString(),
+                 QStringLiteral("pair_authorize"));
+        QCOMPARE(record->attrs.value(QStringLiteral("outcome")).toString(), QStringLiteral("failed"));
+        QCOMPARE(record->attrs.value(QStringLiteral("failure_class")).toString(),
+                 QStringLiteral("unreachable_deadline"));
         verifyNoInternalNameIsShown(client);
     }
 
@@ -2973,6 +3510,305 @@ private slots:
         QCOMPARE(client.settings()->getValue(QStringLiteral("width")).toInt(), 2560);
         QCOMPARE(client.settings()->getValue(QStringLiteral("height")).toInt(), 1440);
         QCOMPARE(client.settings()->getValue(QStringLiteral("fps")).toInt(), 30);
+    }
+
+    // Plan 09 correction, ADR-0072 item 2 / `docs/spec/client.md` "Play diagnostics - Rules": a
+    // pairing that succeeds only after the rig's 409 was cleared emits ONE `play.step` at INFO
+    // with `step=pair_handshake outcome=ok failure_class=in_progress attempt=2` - produced here by
+    // the real production route (the seam's clear-and-retry, the controller's completion, the
+    // facade's own emission into the shipper), never constructed by the test.
+    void aRecoveredPairingEmitsExactlyOneInfoPlayStepWithTheFrozenRecord()
+    {
+        g_recoveredHandshakeArmed = true;
+        g_handshakeCalls = 0;
+        auto disarm = qScopeGuard([]() {
+            g_recoveredHandshakeArmed = false;
+            g_handshakeCalls = 0;
+        });
+
+        SeatHubClient client;
+        reachHome(client, 90);
+        QVERIFY(!QTest::currentTestFailed());
+
+        auto engine = std::make_unique<FakeEngineSession>();
+        g_engineCreateReason = EngineLaunchReason::Started;
+        g_engineFactoryHook = [&client, enginePtr = engine.get()]() {
+            client.session()->attachSession(enginePtr);
+        };
+        auto clearFactoryHook = qScopeGuard([]() {
+            g_engineFactoryHook = {};
+            g_engineCreateReason = EngineLaunchReason::CreateFailed;
+        });
+
+        // This suite never installs the LogTee and never calls `SeatHubTelemetry::start()`, so a
+        // shipper started here sees exactly one kind of line: the diagnostics the facade itself
+        // emits. Started AFTER `reachHome()`, whose identity changes run `updateCanShip()` -
+        // `setCanShip(true)` afterwards is what stands for the rest of this test.
+        QTemporaryDir spoolDir;
+        QVERIFY(spoolDir.isValid());
+        QMutex captureMutex;
+        QList<ShippedLine> captured;
+        LogShipper::instance().setSpoolDirectoryForTests(spoolDir.path());
+        LogShipper::instance().start([&captureMutex, &captured](const ShippedLine& line) {
+            QMutexLocker lock(&captureMutex);
+            captured.append(line);
+            return true;
+        });
+        LogShipper::instance().setCanShip(true);
+        StopShipperOnScopeExit stopGuard;
+
+        const auto capturedBodyCount = [&](const QString& body) {
+            QMutexLocker lock(&captureMutex);
+            int count = 0;
+            for (const ShippedLine& line : captured) {
+                if (line.body == body) {
+                    ++count;
+                }
+            }
+            return count;
+        };
+
+        // A real authorization, so the controller reaches the production seam - whose first
+        // handshake run is the rig's 409 (see the armed stub above). 127.0.0.1 keeps the seam's
+        // rig-side clear on the loopback, where nothing answers and the call returns at once.
+        QJsonObject ports;
+        ports.insert(QStringLiteral("https"), 47984);
+        ports.insert(QStringLiteral("control"), 47989);
+        ports.insert(QStringLiteral("rtsp"), 48010);
+        QJsonObject authBody;
+        authBody.insert(QStringLiteral("session_id"), QStringLiteral("s-recovered"));
+        authBody.insert(QStringLiteral("pairing_pin"), QStringLiteral("4821"));
+        authBody.insert(QStringLiteral("host_address"), QStringLiteral("127.0.0.1"));
+        authBody.insert(QStringLiteral("ports"), ports);
+        authBody.insert(QStringLiteral("state"), QStringLiteral("READY"));
+        m_fake->answerPairing(200, QJsonDocument(authBody).toJson(QJsonDocument::Compact));
+        m_fake->answerPlay(201, QByteArrayLiteral("{\"id\":\"s-recovered\"}"));
+
+        client.beginSession(QStringLiteral("s-recovered"));
+
+        // The record arrives through the real route.
+        QTRY_VERIFY_WITH_TIMEOUT(capturedBodyCount(QStringLiteral("play.step")) == 1, 20000);
+
+        // Stop the worker before reading the capture: the final assertions must not race it.
+        LogShipper::instance().stop();
+
+        // ONE line this run DIAGNOSED - `LogShipper::start()` installs the LogTee, so the
+        // capture also holds this suite's ordinary local log lines, and those are not emissions
+        // of the record under test.
+        QMutexLocker lock(&captureMutex);
+        int diagnostics = 0;
+        const ShippedLine* record = nullptr;
+        int playSteps = 0;
+        for (const ShippedLine& line : captured) {
+            if (line.diagnostic) {
+                ++diagnostics;
+                record = &line;
+            }
+            if (line.body == QLatin1String("play.step")) {
+                ++playSteps;
+            }
+        }
+        QCOMPARE(diagnostics, 1);
+        QVERIFY(record != nullptr);
+        QVERIFY2(!record->body.isEmpty(), "the one diagnostic must be the play.step record");
+
+        // Exactly ONE `play.step`, and it is the ADR's frozen record - not a WARN, not a second
+        // emission of any kind (the recovery makes this one line and nothing else).
+        QCOMPARE(playSteps, 1);
+        QCOMPARE(record->body, QStringLiteral("play.step"));
+        QCOMPARE(record->level, LogLevel::Info);
+        QCOMPARE(record->attrs.value(QStringLiteral("step")).toString(),
+                 QStringLiteral("pair_handshake"));
+        QCOMPARE(record->attrs.value(QStringLiteral("outcome")).toString(), QStringLiteral("ok"));
+        QCOMPARE(record->attrs.value(QStringLiteral("failure_class")).toString(),
+                 QStringLiteral("in_progress"));
+        QCOMPARE(record->attrs.value(QStringLiteral("attempt")).toInt(), 2);
+
+        // No PIN, no address and no diagnostic text anywhere in what was emitted
+        // (ADR-0072 item 2, T-06.7-35): the 409 sentence and the PIN stay where they were.
+        const QByteArray serialised = QJsonDocument(record->attrs).toJson(QJsonDocument::Compact);
+        QVERIFY2(!serialised.contains("4821"), qPrintable(QString::fromUtf8(serialised)));
+        QVERIFY2(!serialised.contains("409"),
+                 qPrintable(QStringLiteral("the local diagnostic leaked: %1")
+                                .arg(QString::fromUtf8(serialised))));
+        QVERIFY(!record->body.contains(QStringLiteral("4821")));
+        lock.unlock();
+
+        // Let the successful fake engine complete so ordinary teardown runs. The recovered
+        // pairing itself must not fail the Play or add an attempt step to /end.
+        emit engine->readyForDeletion();
+
+        // Nothing extra went to the server for the recovery (ADR-0072 item 2: "nothing extra is
+        // sent ... on a recovered pairing"): the successful stream's ordinary `/end` carries no
+        // `attempt_step` - a step the Play did NOT fail at never travels.
+        QTRY_VERIFY_WITH_TIMEOUT(
+            m_fake->requestPaths().contains(QStringLiteral("/api/sessions/s-recovered/end")), 15000);
+        QCOMPARE(m_fake->requestPaths().count(QStringLiteral("/api/sessions/s-recovered/end")), 1);
+        QVERIFY2(!m_fake->bodyFor(QStringLiteral("/api/sessions/s-recovered/end"))
+                      .contains("attempt_step"),
+                  "a recovered pairing must add nothing to the /end body");
+    }
+
+    void aFailedPairingRetryEmitsOneWarnWithTheLastClassAndEndsAtPairing()
+    {
+        g_failedRetryHandshakeArmed = true;
+        g_handshakeCalls = 0;
+        auto disarm = qScopeGuard([]() {
+            g_failedRetryHandshakeArmed = false;
+            g_handshakeCalls = 0;
+        });
+
+        SeatHubClient client;
+        reachHome(client, 90);
+        QVERIFY(!QTest::currentTestFailed());
+
+        QTemporaryDir spoolDir;
+        QVERIFY(spoolDir.isValid());
+        QMutex captureMutex;
+        QList<ShippedLine> captured;
+        LogShipper::instance().setSpoolDirectoryForTests(spoolDir.path());
+        LogShipper::instance().start([&captureMutex, &captured](const ShippedLine& line) {
+            QMutexLocker lock(&captureMutex);
+            captured.append(line);
+            return true;
+        });
+        LogShipper::instance().setCanShip(true);
+        StopShipperOnScopeExit stopGuard;
+
+        QJsonObject ports;
+        ports.insert(QStringLiteral("https"), 47984);
+        ports.insert(QStringLiteral("control"), 47989);
+        ports.insert(QStringLiteral("rtsp"), 48010);
+        QJsonObject authBody;
+        authBody.insert(QStringLiteral("session_id"), QStringLiteral("s-retry-failed"));
+        authBody.insert(QStringLiteral("pairing_pin"), QStringLiteral("4821"));
+        authBody.insert(QStringLiteral("host_address"), QStringLiteral("127.0.0.1"));
+        authBody.insert(QStringLiteral("ports"), ports);
+        authBody.insert(QStringLiteral("state"), QStringLiteral("READY"));
+        m_fake->answerPairing(200, QJsonDocument(authBody).toJson(QJsonDocument::Compact));
+        m_fake->answerPlay(201, QByteArrayLiteral("{\"id\":\"s-retry-failed\"}"));
+
+        client.beginSession(QStringLiteral("s-retry-failed"));
+        QTRY_VERIFY_WITH_TIMEOUT(
+            m_fake->requestPaths().contains(QStringLiteral("/api/sessions/s-retry-failed/end")),
+            20000);
+        const auto diagnosticCount = [&captureMutex, &captured]() {
+            QMutexLocker lock(&captureMutex);
+            return std::count_if(captured.cbegin(), captured.cend(),
+                [](const ShippedLine& line) { return line.body == QLatin1String("play.step"); });
+        };
+        QTRY_COMPARE_WITH_TIMEOUT(diagnosticCount(), 1, 15000);
+        LogShipper::instance().stop();
+
+        QMutexLocker lock(&captureMutex);
+        const auto record = std::find_if(captured.cbegin(), captured.cend(),
+            [](const ShippedLine& line) { return line.body == QLatin1String("play.step"); });
+        QVERIFY(record != captured.cend());
+        QCOMPARE(record->level, LogLevel::Warning);
+        QCOMPARE(record->attrs.value(QStringLiteral("step")).toString(),
+                 QStringLiteral("pair_handshake"));
+        QCOMPARE(record->attrs.value(QStringLiteral("outcome")).toString(),
+                 QStringLiteral("failed"));
+        QCOMPARE(record->attrs.value(QStringLiteral("failure_class")).toString(),
+                 QStringLiteral("pin_rejected"));
+        QCOMPARE(record->attrs.value(QStringLiteral("attempt")).toInt(), 2);
+        const QByteArray attrs = QJsonDocument(record->attrs).toJson(QJsonDocument::Compact);
+        QVERIFY(!attrs.contains("4821"));
+        QVERIFY(!attrs.contains("fixture retry rejection text"));
+        const QJsonObject endBody = QJsonDocument::fromJson(
+            m_fake->bodyFor(QStringLiteral("/api/sessions/s-retry-failed/end"))).object();
+        QCOMPARE(endBody.value(QStringLiteral("failed")).toBool(), true);
+        QCOMPARE(endBody.value(QStringLiteral("attempt_step")).toString(),
+                 QStringLiteral("pair_handshake"));
+    }
+
+    void aNoLaunchableAppEmitsOneClassifiedStepAndEndsWithThatStep()
+    {
+        g_noAppHandshakeArmed = true;
+        g_engineCreateReason = EngineLaunchReason::NoApp;
+        auto disarm = qScopeGuard([]() {
+            g_noAppHandshakeArmed = false;
+            g_engineCreateReason = EngineLaunchReason::CreateFailed;
+        });
+
+        SeatHubClient client;
+        reachHome(client, 90);
+        QVERIFY(!QTest::currentTestFailed());
+
+        QTemporaryDir spoolDir;
+        QVERIFY(spoolDir.isValid());
+        QMutex captureMutex;
+        QList<ShippedLine> captured;
+        LogShipper::instance().setSpoolDirectoryForTests(spoolDir.path());
+        LogShipper::instance().start([&captureMutex, &captured](const ShippedLine& line) {
+            QMutexLocker lock(&captureMutex);
+            captured.append(line);
+            return true;
+        });
+        LogShipper::instance().setCanShip(true);
+        StopShipperOnScopeExit stopGuard;
+
+        QJsonObject ports;
+        ports.insert(QStringLiteral("https"), 47984);
+        ports.insert(QStringLiteral("control"), 47989);
+        ports.insert(QStringLiteral("rtsp"), 48010);
+        QJsonObject authBody;
+        authBody.insert(QStringLiteral("session_id"), QStringLiteral("s-no-app"));
+        authBody.insert(QStringLiteral("pairing_pin"), QStringLiteral("4821"));
+        authBody.insert(QStringLiteral("host_address"), QStringLiteral("127.0.0.1"));
+        authBody.insert(QStringLiteral("ports"), ports);
+        authBody.insert(QStringLiteral("state"), QStringLiteral("READY"));
+        m_fake->answerPairing(200, QJsonDocument(authBody).toJson(QJsonDocument::Compact));
+        m_fake->answerPlay(201, QByteArrayLiteral("{\"id\":\"s-no-app\"}"));
+
+        client.beginSession(QStringLiteral("s-no-app"));
+
+        QTRY_VERIFY_WITH_TIMEOUT(
+            m_fake->requestPaths().contains(QStringLiteral("/api/sessions/s-no-app/end")),
+            20000);
+        LogShipper::instance().stop();
+
+        QMutexLocker lock(&captureMutex);
+        int diagnostics = 0;
+        int playSteps = 0;
+        int summaries = 0;
+        const ShippedLine* record = nullptr;
+        for (const ShippedLine& line : captured) {
+            if (line.diagnostic) {
+                ++diagnostics;
+            }
+            if (line.body == QLatin1String("play.step")) {
+                ++playSteps;
+                record = &line;
+            }
+            if (line.body == QLatin1String("play.summary")) {
+                ++summaries;
+                QCOMPARE(line.attrs.value("exit_path").toString(), QStringLiteral("start_refused"));
+                QCOMPARE(line.attrs.value("failure_class").toString(), QStringLiteral("no_app"));
+            }
+        }
+        QCOMPARE(diagnostics, 2);
+        QCOMPARE(playSteps, 1);
+        QCOMPARE(summaries, 1);
+        QVERIFY(record != nullptr);
+        QCOMPARE(record->level, LogLevel::Warning);
+        QCOMPARE(record->attrs.value(QStringLiteral("step")).toString(),
+                 QStringLiteral("engine_prepare"));
+        QCOMPARE(record->attrs.value(QStringLiteral("outcome")).toString(),
+                 QStringLiteral("failed"));
+        QCOMPARE(record->attrs.value(QStringLiteral("failure_class")).toString(),
+                 QStringLiteral("no_app"));
+        lock.unlock();
+
+        QTRY_VERIFY_WITH_TIMEOUT(
+            m_fake->requestPaths().contains(QStringLiteral("/api/sessions/s-no-app/end")),
+            15000);
+        const QJsonObject endBody = QJsonDocument::fromJson(
+            m_fake->bodyFor(QStringLiteral("/api/sessions/s-no-app/end"))).object();
+        QCOMPARE(endBody.value(QStringLiteral("failed")).toBool(), true);
+        QCOMPARE(endBody.value(QStringLiteral("attempt_step")).toString(),
+                 QStringLiteral("engine_prepare"));
+        QCOMPARE(m_fake->requestPaths().count(QStringLiteral("/api/sessions/s-no-app/end")), 1);
     }
 
     void anEngineFailureBeforeTheStreamStartsIsAStallAtTheSecondStage()
@@ -3111,6 +3947,19 @@ private slots:
             client.teardown()->setVerifyIntervalMs(1);
             m_fake->answerSession(QStringLiteral("s-stages"), QStringLiteral("CANCELLED"));
 
+            QTemporaryDir spoolDir;
+            QVERIFY(spoolDir.isValid());
+            QMutex captureMutex;
+            QList<ShippedLine> captured;
+            LogShipper::instance().setSpoolDirectoryForTests(spoolDir.path());
+            LogShipper::instance().start([&captureMutex, &captured](const ShippedLine& line) {
+                QMutexLocker lock(&captureMutex);
+                captured.append(line);
+                return true;
+            });
+            LogShipper::instance().setCanShip(true);
+            StopShipperOnScopeExit stopGuard;
+
             emit engine->stageStarting(QStringLiteral("RTSP handshake"));
             emit engine->stageFailed(QStringLiteral("RTSP handshake"), -102,
                                      QStringLiteral("UDP 47998"));
@@ -3129,11 +3978,80 @@ private slots:
             QCOMPARE(sent.value(QStringLiteral("engine_error")).toInt(), -102);
             QCOMPARE(sent.value(QStringLiteral("failing_ports")).toString(),
                      QStringLiteral("UDP 47998"));
+            const auto playStepCount = [&captureMutex, &captured]() {
+                QMutexLocker lock(&captureMutex);
+                return std::count_if(captured.cbegin(), captured.cend(),
+                    [](const ShippedLine& line) {
+                        return line.body == QLatin1String("play.step");
+                    });
+            };
+            QTRY_COMPARE_WITH_TIMEOUT(playStepCount(), 1, 15000);
+            LogShipper::instance().stop();
+            QMutexLocker lock(&captureMutex);
+            const auto record = std::find_if(captured.cbegin(), captured.cend(),
+                [](const ShippedLine& line) { return line.body == QLatin1String("play.step"); });
+            QVERIFY(record != captured.cend());
+            QCOMPARE(std::count_if(captured.cbegin(), captured.cend(),
+                [](const ShippedLine& line) { return line.body == QLatin1String("play.step"); }), 1);
+            QCOMPARE(record->attrs.value(QStringLiteral("step")).toString(),
+                     QStringLiteral("engine_connect"));
+            QCOMPARE(record->attrs.value(QStringLiteral("failure_class")).toString(),
+                     QStringLiteral("rtsp_handshake"));
+            QCOMPARE(sent.value(QStringLiteral("attempt_step")).toString(),
+                     QStringLiteral("engine_connect"));
             // The engine's own stage name never becomes customer-facing copy (D-51) - it only
             // rides the diagnostic end body the server sees.
             verifyNoInternalNameIsShown(client);
 
             client.session()->attachSession(nullptr);
+        }
+        delete engine;
+    }
+
+    void aNoVideoFrameFailureEmitsTheStreamStepClass()
+    {
+        auto* engine = new FakeEngineSession;
+        {
+            SeatHubClient client;
+            client.session()->attachSession(engine);
+            beginStagedSession(client);
+            QVERIFY(!QTest::currentTestFailed());
+            emit engine->connectionStarted();
+            QVERIFY(client.liveSession());
+
+            QTemporaryDir spoolDir;
+            QVERIFY(spoolDir.isValid());
+            QMutex captureMutex;
+            QList<ShippedLine> captured;
+            LogShipper::instance().setSpoolDirectoryForTests(spoolDir.path());
+            LogShipper::instance().start([&captureMutex, &captured](const ShippedLine& line) {
+                QMutexLocker lock(&captureMutex);
+                captured.append(line);
+                return true;
+            });
+            LogShipper::instance().setCanShip(true);
+            StopShipperOnScopeExit stopGuard;
+
+            emitConnectionTerminated(-101);
+            emit engine->displayLaunchError(QStringLiteral("fixture-only engine error text"));
+
+            const auto playStepCount = [&captureMutex, &captured]() {
+                QMutexLocker lock(&captureMutex);
+                return std::count_if(captured.cbegin(), captured.cend(),
+                    [](const ShippedLine& line) {
+                        return line.body == QLatin1String("play.step");
+                    });
+            };
+            QTRY_COMPARE_WITH_TIMEOUT(playStepCount(), 1, 15000);
+
+            QMutexLocker lock(&captureMutex);
+            const auto record = std::find_if(captured.cbegin(), captured.cend(),
+                [](const ShippedLine& line) { return line.body == QLatin1String("play.step"); });
+            QVERIFY(record != captured.cend());
+            QCOMPARE(record->attrs.value(QStringLiteral("step")).toString(),
+                     QStringLiteral("stream"));
+            QCOMPARE(record->attrs.value(QStringLiteral("failure_class")).toString(),
+                     QStringLiteral("no_video_frame"));
         }
         delete engine;
     }
@@ -5186,6 +6104,19 @@ private slots:
         // request (the same thing WR-14 already proved for `applyPlayFailure()`).
         client.controlPlane()->setTraceId(QStringLiteral("11112222333344445555666677778888"));
 
+        QTemporaryDir spoolDir;
+        QVERIFY(spoolDir.isValid());
+        QMutex captureMutex;
+        QList<ShippedLine> captured;
+        LogShipper::instance().setSpoolDirectoryForTests(spoolDir.path());
+        LogShipper::instance().start([&captureMutex, &captured](const ShippedLine& line) {
+            QMutexLocker lock(&captureMutex);
+            captured.append(line);
+            return true;
+        });
+        LogShipper::instance().setCanShip(true);
+        StopShipperOnScopeExit stopGuard;
+
         emitConnectionTerminated(-1);
         emit engine->displayLaunchError(QStringLiteral("Connection terminated"));
         emit engine->readyForDeletion();
@@ -5214,6 +6145,38 @@ private slots:
         // leaking it onto whatever the customer does next (Back to home -> refreshBalance()).
         QTRY_VERIFY_WITH_TIMEOUT(
             m_fake->requestPaths().contains(QStringLiteral("/api/sessions/s-live/end")), 15000);
+        const auto playStepCount = [&captureMutex, &captured]() {
+            QMutexLocker lock(&captureMutex);
+            return std::count_if(captured.cbegin(), captured.cend(),
+                [](const ShippedLine& line) { return line.body == QLatin1String("play.step"); });
+        };
+        QTRY_COMPARE_WITH_TIMEOUT(playStepCount(), 2, 15000);
+        LogShipper::instance().stop();
+        QMutexLocker captureLock(&captureMutex);
+        int streamSteps = 0;
+        int reconnectSteps = 0;
+        for (const ShippedLine& line : captured) {
+            if (line.body != QLatin1String("play.step")) {
+                continue;
+            }
+            const QString step = line.attrs.value(QStringLiteral("step")).toString();
+            if (step == QLatin1String("stream")) {
+                ++streamSteps;
+                QCOMPARE(line.attrs.value(QStringLiteral("failure_class")).toString(),
+                         QStringLiteral("net_other"));
+            } else if (step == QLatin1String("reconnect")) {
+                ++reconnectSteps;
+                QCOMPARE(line.attrs.value(QStringLiteral("failure_class")).toString(),
+                         QStringLiteral("grace_expired"));
+            }
+        }
+        QCOMPARE(streamSteps, 1);
+        QCOMPARE(reconnectSteps, 1);
+        captureLock.unlock();
+        const QJsonObject endBody = QJsonDocument::fromJson(
+            m_fake->bodyFor(QStringLiteral("/api/sessions/s-live/end"))).object();
+        QCOMPARE(endBody.value(QStringLiteral("attempt_step")).toString(),
+                 QStringLiteral("reconnect"));
         QTRY_VERIFY_WITH_TIMEOUT(client.controlPlane()->traceId().isEmpty(), 15000);
     }
 
@@ -5374,6 +6337,8 @@ private slots:
         // `buildEndRequest(false, ...)` posts no body at all - only a failed end has anything to
         // say about why.
         QVERIFY2(!sent.contains(QStringLiteral("failed")), "no failed flag for an ordinary end");
+        QVERIFY2(!sent.contains(QStringLiteral("attempt_step")),
+                 "a customer-ended attempt has no failed-step classification");
         QTRY_COMPARE_WITH_TIMEOUT(client.appState(), QStringLiteral("home"), 15000);
     }
 

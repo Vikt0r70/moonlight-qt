@@ -4,6 +4,7 @@
 #include "seathub_version.h"
 
 #include <QCryptographicHash>
+#include <QDesktopServices>
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
@@ -103,11 +104,25 @@ QString normalizedVersion(const QString& version)
 UpdateFeedClient::UpdateFeedClient(QObject* parent)
     : QObject(parent),
       m_network(new QNetworkAccessManager(this)),
-      m_launcher(&UpdateFeedClient::launchInstaller),
+      m_launcher([this](const QString& path) {
+          return launchInstaller(path, installerArguments(m_installedVersion,
+              qMin(UpdateRetryState::kMaxAttempts, m_retry.attemptsFailed + 1)));
+      }),
       m_baseUrl(defaultBaseUrl()),
       m_installedVersion(QString::fromLatin1(SEATHUB_VERSION)),
       m_state(QString::fromLatin1(kStateIdle))
 {
+    m_retry = UpdateRetryState::load(m_retryStatePath);
+    m_journalFolder = QDir(qEnvironmentVariable("ProgramData")).filePath("SeatHubSetup/install-journal");
+    m_urlOpener = &QDesktopServices::openUrl;
+    if (!m_retry.lastOffer.isEmpty()) {
+        m_available = parseRelease(QJsonDocument(QJsonObject::fromVariantMap(m_retry.lastOffer)).toJson(),
+                                   m_installedVersion, m_pinnedSha256);
+        if (!m_available.isEmpty()) {
+            m_silentRetry = !mandatory() && !m_retry.lastClass.isEmpty();
+            m_state = QString::fromLatin1(m_retry.lastClass.isEmpty() ? kStateAvailable : kStateFailed);
+        }
+    }
 }
 
 QString UpdateFeedClient::defaultBaseUrl()
@@ -194,6 +209,13 @@ QVariantMap UpdateFeedClient::parseRelease(const QByteArray& json, const QString
     offer.insert(QStringLiteral("sha256"), sha256);
     offer.insert(QStringLiteral("notes"), release.value(QStringLiteral("notes")).toString());
     offer.insert(QStringLiteral("rollback"), isRollback(version, installedVersion));
+    const auto floorValue = release.value(QStringLiteral("min_version"));
+    const QString floor = floorValue.isString() ? floorValue.toString() : version;
+    QList<quint64> parts;
+    if (!numericParts(version, parts) || !numericParts(installedVersion, parts)
+        || !numericParts(floor, parts)) return {};
+    offer.insert(QStringLiteral("min_version"), floor);
+    offer.insert(QStringLiteral("mandatory"), isNewerVersion(floor, installedVersion));
     return offer;
 }
 
@@ -230,6 +252,150 @@ bool UpdateFeedClient::verifyFileChecksum(const QString& path, const QString& ex
 }
 
 // ------------------------------------------------------------------------------------- checks
+bool UpdateFeedClient::mandatory() const
+{
+    return !m_available.isEmpty()
+        && isNewerVersion(m_available.value("min_version").toString(), m_installedVersion);
+}
+bool UpdateFeedClient::optionalOffer() const
+{
+    return !mandatory() && !m_optionalDismissed && !m_silentRetry && !m_available.isEmpty()
+        && m_state != QLatin1String(kStateFailed)
+        && isNewerVersion(m_available.value("version").toString(), m_installedVersion);
+}
+QString UpdateFeedClient::nextAttemptText() const
+{
+    const auto seconds = m_retry.now().secsTo(m_retry.nextAllowedAt);
+    if (m_retry.attemptsFailed <= 1 || seconds <= 0) return tr("the next time you open SeatHub");
+    if (seconds < 7200) return tr("in about %1 minutes").arg(qRound(double(seconds) / 60));
+    return tr("in about %1 hours").arg(qRound(double(seconds) / 3600));
+}
+QString UpdateFeedClient::manualDownloadUrl() const
+{
+    const QUrl url(m_available.value("url").toString(), QUrl::StrictMode);
+    // client.md §Website links / ADR-0070: only the current installer's https control-plane host.
+    return url.isValid() && url.scheme() == QLatin1String("https")
+        && url.host() == QUrl(defaultBaseUrl()).host() ? url.toString() : QString();
+}
+QString UpdateFeedClient::installerArguments(const QString& installed, int attempt)
+{
+    QList<quint64> parts;
+    if (!numericParts(installed, parts)) return {};
+    QStringList dotted;
+    for (const auto part : parts) dotted.append(QString::number(part));
+    return QStringLiteral("SeatHubFromVersion=%1 SeatHubAttempt=%2").arg(dotted.join('.')).arg(attempt);
+}
+void UpdateFeedClient::dismissOptional()
+{
+    if (mandatory()) return;
+    m_optionalDismissed = true; emit availableUpdateChanged();
+}
+bool UpdateFeedClient::openManualDownload()
+{
+    const auto url = manualDownloadUrl();
+    return !url.isEmpty() && m_urlOpener && m_urlOpener(QUrl(url));
+}
+bool UpdateFeedClient::tryAgain()
+{
+    m_manualAttempt = true;
+    return readyToInstall() ? installDownloaded() : downloadUpdate();
+}
+void UpdateFeedClient::setRetryStatePath(const QString& path)
+{
+    m_retryStatePath = path; m_retry = UpdateRetryState::load(path); m_outcomeChecked = false;
+    m_available = parseRelease(QJsonDocument(QJsonObject::fromVariantMap(m_retry.lastOffer)).toJson(),
+                               m_installedVersion, m_pinnedSha256);
+    m_silentRetry = !mandatory() && !m_retry.lastClass.isEmpty();
+    emit availableUpdateChanged(); emit retryChanged();
+    setState(m_available.isEmpty() ? kStateIdle : m_retry.lastClass.isEmpty() ? kStateAvailable : kStateFailed);
+}
+void UpdateFeedClient::persistRetry()
+{
+    if (m_retry.target.isEmpty()) return;
+    // The SDK adopter may have handed off journal records since this feed instance loaded.
+    for (const auto& id : UpdateRetryState::load(m_retryStatePath).reportedIds) m_retry.rememberReport(id);
+    if (!m_retry.save(m_retryStatePath)) qCWarning(seathubUpdates) << "could not persist update retry state";
+    emit retryChanged();
+}
+void UpdateFeedClient::adoptOffer(const QVariantMap& offer)
+{
+    const bool changed = m_retry.target != offer.value("version").toString();
+    m_available = offer;
+    if (changed) m_downloadedPath.clear();
+    m_expectedSha256 = offer.value("sha256").toString();
+    m_retry.reset(offer.value("version").toString(), m_installedVersion);
+    if (changed) { m_outcomeChecked = true; m_optionalDismissed = false; }
+    m_retry.lastOffer = offer; persistRetry();
+    inspectPendingLaunch();
+    m_silentRetry = !mandatory() && !m_retry.lastClass.isEmpty();
+    emit availableUpdateChanged();
+    setState(!m_retry.lastClass.isEmpty() || m_retry.exhausted() ? kStateFailed : kStateAvailable);
+    reportExhaustion();
+}
+void UpdateFeedClient::inspectPendingLaunch()
+{
+    if (m_outcomeChecked) return;
+    m_outcomeChecked = true;
+    if (!m_retry.launched) return;
+    const bool manual = m_retry.launchedManual;
+    const auto records = InstallJournal::adopt(m_journalFolder, m_retry.now());
+    for (const auto& record : records) {
+        if (record.to != m_retry.target || record.from != m_installedVersion
+            || (m_retry.lastFailedAt.isValid() && record.ended.isValid() && record.ended <= m_retry.lastFailedAt))
+            continue;
+        m_retry.launched = m_retry.launchedManual = false;
+        if (record.outcome == QLatin1String("failed") || record.outcome == QLatin1String("recovered"))
+            m_retry.noteFailure(record.failureClass, false, manual, true);
+        persistRetry();
+        return; // a verified journal outcome is never also inferred as no_result.
+    }
+    m_retry.noteFailure("installer.no_result", false, manual, true);
+    reportInference("installer.no_result"); persistRetry();
+}
+void UpdateFeedClient::reportInference(const QString& failureClass)
+{
+    if (!m_reporter) return;
+    InstallJournalRecord record;
+    record.v = 1;
+    record.attempt = QString::number(QRandomGenerator::global()->generate64(), 16).rightJustified(16, '0');
+    record.from = m_installedVersion; record.to = m_retry.target; record.mode = "staged";
+    record.started = record.ended = m_retry.now(); record.outcome = "failed";
+    record.step = "preflight"; record.failureClass = failureClass;
+    record.rollback = "not_needed"; record.state = "old_intact";
+    record.ms = {{"stage", 0}, {"swap", 0}, {"total", 0}};
+    if (m_reporter(record)) {
+        m_retry.rememberReport(record.attempt);
+        if (failureClass == QLatin1String("installer.retries_exhausted")) m_retry.exhaustedReported = true;
+        persistRetry();
+    }
+}
+void UpdateFeedClient::reportExhaustion()
+{
+    if (m_retry.exhausted() && !m_retry.exhaustedReported) reportInference("installer.retries_exhausted");
+}
+void UpdateFeedClient::recordFailure(const QString& failureClass, bool permanent)
+{
+    m_retry.noteFailure(failureClass, permanent, m_manualAttempt); m_manualAttempt = false;
+    persistRetry(); reportExhaustion();
+}
+void UpdateFeedClient::maybeAutomaticAttempt()
+{
+    if (m_optionalDismissed || m_available.isEmpty()
+        || !m_retry.automaticAttemptAllowed(m_retry.now(), m_streaming)) return;
+    // Only retries run without a click. A fresh optional/required offer still presents Update.
+    if (m_retry.lastClass.isEmpty()) return;
+    m_manualAttempt = false;
+    m_silentRetry = !mandatory();
+    const QUrl url(m_available.value("url").toString());
+    const QString path = QStandardPaths::writableLocation(QStandardPaths::TempLocation)
+        + QStringLiteral("/SeatHub/") + QFileInfo(url.path()).fileName();
+    m_expectedSha256 = m_available.value("sha256").toString();
+    if (verifyFileChecksum(path, m_expectedSha256)) {
+        m_downloadedPath = path; emit readyToInstallChanged(); installDownloaded();
+    } else {
+        downloadUpdate();
+    }
+}
 
 bool UpdateFeedClient::checkForUpdates()
 {
@@ -240,7 +406,7 @@ bool UpdateFeedClient::checkForUpdates()
         qCInfo(seathubUpdates) << "update check deferred: a stream is running";
         return false;
     }
-    if (m_reply != nullptr || m_downloadFile != nullptr) {
+    if (m_reply != nullptr || m_downloadFile != nullptr || m_state == QLatin1String(kStateInstalling)) {
         return false;
     }
 
@@ -279,6 +445,11 @@ bool UpdateFeedClient::checkForUpdates()
 
         if (reply->error() != QNetworkReply::NoError && status != 200) {
             finishWithError(reply->errorString(), QString());
+            if (!m_retry.lastOffer.isEmpty()) {
+                const auto cached = parseRelease(QJsonDocument(QJsonObject::fromVariantMap(m_retry.lastOffer)).toJson(),
+                                                  m_installedVersion, m_pinnedSha256);
+                if (!cached.isEmpty()) { adoptOffer(cached); maybeAutomaticAttempt(); }
+            }
             emit checkFinished();
             return;
         }
@@ -289,11 +460,10 @@ bool UpdateFeedClient::checkForUpdates()
             setState(QString::fromLatin1(kStateIdle));
         }
         else {
-            m_available = offer;
-            emit availableUpdateChanged();
-            setState(QString::fromLatin1(kStateAvailable));
+            adoptOffer(offer);
             qCInfo(seathubUpdates) << "release feed offers version"
                                    << offer.value(QStringLiteral("version")).toString();
+            maybeAutomaticAttempt();
         }
         emit checkFinished();
     });
@@ -325,12 +495,14 @@ bool UpdateFeedClient::downloadUpdate(const QString& url, const QString& expecte
         qCWarning(seathubUpdates) << "refused a download with no expected checksum";
         setFailure(SeatHubFailure::local(QString::fromLatin1(kNoChecksum)).toVariantMap());
         setState(QString::fromLatin1(kStateFailed));
+        recordFailure("installer.verify_failed", true);
         return false;
     }
 
     QUrl feed(url);
     if (!feed.isValid()) {
         finishWithError(QStringLiteral("The release download address is unusable."), QString());
+        recordFailure("installer.unknown");
         return false;
     }
 
@@ -352,6 +524,7 @@ bool UpdateFeedClient::downloadUpdate(const QString& url, const QString& expecte
         delete m_downloadFile;
         m_downloadFile = nullptr;
         finishWithError(QStringLiteral("The update couldn't be saved on this PC."), QString());
+        recordFailure("installer.disk_space");
         return false;
     }
 
@@ -399,6 +572,7 @@ bool UpdateFeedClient::downloadUpdate(const QString& url, const QString& expecte
                 QFile::remove(path);
             }
             finishWithError(reply->errorString(), QString());
+            recordFailure("installer.unknown");
             return;
         }
 
@@ -411,6 +585,7 @@ bool UpdateFeedClient::downloadUpdate(const QString& url, const QString& expecte
             emit progressChanged();
             setFailure(SeatHubFailure::local(QString::fromLatin1(kChecksumMismatch)).toVariantMap());
             setState(QString::fromLatin1(kStateFailed));
+            recordFailure("installer.verify_failed", true);
             qCWarning(seathubUpdates) << "downloaded package failed checksum verification and was "
                                          "deleted";
             return;
@@ -452,6 +627,7 @@ bool UpdateFeedClient::installDownloaded()
         emit readyToInstallChanged();
         setFailure(SeatHubFailure::local(QString::fromLatin1(kChecksumMismatch)).toVariantMap());
         setState(QString::fromLatin1(kStateFailed));
+        recordFailure("installer.verify_failed", true);
         return false;
     }
 
@@ -461,6 +637,14 @@ bool UpdateFeedClient::installDownloaded()
     setState(QString::fromLatin1(kStateInstalling));
     qCInfo(seathubUpdates) << "starting the installer" << QDir::toNativeSeparators(m_downloadedPath);
 
+    m_retry.launched = true;
+    m_retry.launchedManual = m_manualAttempt;
+    // Durable BEFORE the elevated call. Refuse the launch if its pending marker cannot be saved.
+    if (!m_retry.target.isEmpty() && !m_retry.save(m_retryStatePath)) {
+        m_retry.launched = false;
+        setFailure(SeatHubFailure::local(QStringLiteral("The installer couldn't be started.")).toVariantMap());
+        setState(QString::fromLatin1(kStateFailed)); return false;
+    }
     const bool started = m_launcher(m_downloadedPath);
     if (!started) {
         // A declined UAC prompt or a failed start. The modal shows why it stopped, and the
@@ -470,6 +654,8 @@ bool UpdateFeedClient::installDownloaded()
         setFailure(SeatHubFailure::local(QStringLiteral("The installer couldn't be started."))
                        .toVariantMap());
         setState(QString::fromLatin1(kStateFailed));
+        m_retry.noteDecline(); m_manualAttempt = false;
+        reportInference("installer.elevation_declined"); persistRetry();
         return false;
     }
 
@@ -478,20 +664,19 @@ bool UpdateFeedClient::installDownloaded()
     return true;
 }
 
-bool UpdateFeedClient::launchInstaller(const QString& path)
+bool UpdateFeedClient::launchInstaller(const QString& path, const QString& arguments)
 {
     // The installer is unsigned (D-43), so Windows shows its own SmartScreen warning, and the
-    // per-machine install raises a UAC prompt (D-42). Both are expected, not defects. No
-    // arguments are invented for it - the installer's own flow runs as published.
+    // per-machine install raises a UAC prompt (D-42). Both are expected, not defects.
+    // ADR-0070 adds only the from-version and attempt number; none of its flow is replaced.
 #ifdef Q_OS_WIN
-    // The installer's manifest requires administrator (per-machine, D-42). CreateProcess - which
-    // QProcess::startDetached uses - cannot launch an elevation-required binary; it fails with
-    // ERROR_ELEVATION_REQUIRED and the update hangs at "Starting the installer". Only
-    // ShellExecute's "runas" verb raises the UAC prompt that lets the install proceed.
+    // The measured installer manifest is asInvoker (ADR-0070/research). Elevation is supplied
+    // by ShellExecuteW's runas verb for the per-machine installation, not by that manifest.
     const QString nativePath = QDir::toNativeSeparators(path);
     const std::wstring exePath = nativePath.toStdWString();
+    const std::wstring params = arguments.toStdWString();
     const HINSTANCE rc =
-        ShellExecuteW(nullptr, L"runas", exePath.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        ShellExecuteW(nullptr, L"runas", exePath.c_str(), params.c_str(), nullptr, SW_SHOWNORMAL);
     const DWORD lastError = GetLastError();
     // ShellExecute returns a value <= 32 on failure (including the user declining the UAC prompt).
     const bool started = (reinterpret_cast<INT_PTR>(rc) > 32);
@@ -501,7 +686,7 @@ bool UpdateFeedClient::launchInstaller(const QString& path)
                                   << reinterpret_cast<INT_PTR>(rc) << "last error" << lastError;
     }
 #else
-    const bool started = QProcess::startDetached(path, QStringList());
+    const bool started = QProcess::startDetached(path, arguments.split(' '));
 #endif
     return started;
 }
@@ -514,7 +699,11 @@ void UpdateFeedClient::setInstalledVersion(const QString& version)
         return;
     }
     m_installedVersion = version;
+    if (!m_retry.target.isEmpty() && !isNewerVersion(m_retry.target, version)) {
+        m_retry.noteSuccess(); persistRetry(); clearOffer();
+    }
     emit installedVersionChanged();
+    emit availableUpdateChanged();
 }
 
 void UpdateFeedClient::setStreamingActive(bool active)
@@ -532,11 +721,8 @@ void UpdateFeedClient::setStreamingActive(bool active)
 
 void UpdateFeedClient::sessionFinished()
 {
-    if (m_heldDuringSession) {
-        m_heldDuringSession = false;
-        qCInfo(seathubUpdates) << "session ended - checking the release feed";
-        checkForUpdates();
-    }
+    m_heldDuringSession = false;
+    if (!m_streaming) checkForUpdates();
 }
 
 void UpdateFeedClient::setState(const QString& state)
@@ -546,6 +732,7 @@ void UpdateFeedClient::setState(const QString& state)
     }
     m_state = state;
     emit stateChanged();
+    emit availableUpdateChanged(); // optionalOffer changes when a failed optional update is hidden.
 }
 
 void UpdateFeedClient::setFailure(const QVariantMap& failure)

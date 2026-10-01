@@ -66,6 +66,18 @@ struct PairingHandshakeResult
     /// loop (G-06.2-2, Plan 06.2-12 Task 1) - never rendered, never logged, never leaves this
     /// process on a signal (D-51).
     bool pairingConflict = false;
+    /// The frozen attempt step this failure belongs to (ADR-0072 item 1, `attempt_vocab.h`):
+    /// `pair_server_info` for anything before `pair()`, `pair_handshake` for the five-phase
+    /// handshake and its recovery. Empty until the handshake classifies it; never derived from
+    /// `engineError`.
+    QString attemptStep;
+    /// The closed failure class for this step (ADR-0072 item 2): one vocabulary token computed
+    /// from an enum integer or an HTTP bucket only. Empty until classified. This is a token for
+    /// Sentry - `engineError` stays the local diagnostic and never enters a telemetry field.
+    QString stepClass;
+    /// How many tries of that step this Play made (ADR-0072 item 2): 1 normally, 2 after the
+    /// G-06.2-2 clear-and-retry.
+    int attempts = 1;
 };
 
 // Declared for the same reason as `SeatHubFailure` and `TeardownStage`: the handshake result
@@ -132,7 +144,24 @@ public:
     /// sequenced before the retry.
     void clearPendingPairing(const PairingTarget& target) override;
 
+    /// The classification this seam last reported, or a default-constructed result before any
+    /// result was reported. The failure path the facade reads: `handlePairingFailed()` is
+    /// reached through `pairingFailed`, which carries no classification of its own (the
+    /// controller's callback and signal signatures are not this plan's to change), so the step
+    /// and the class the facade needs are read from here and from `handshakeClassified`.
+    const PairingHandshakeResult& lastResult() const { return m_lastResult; }
+
 signals:
+    /// The result this seam just reported, with whatever classification it carries, handed to the
+    /// facade as one value whose `attemptStep`, `stepClass` and `attempts` are separate members -
+    /// never `engineError` (ADR-0072 item 2, D-12). Emitted immediately BEFORE `done()` on every
+    /// path that reports a result - a failure, and also a pairing that succeeded after the
+    /// clear-and-retry, whose frozen record (`pair_handshake` / `in_progress` / attempt 2) the
+    /// facade turns into its ONE INFO `play.step` (ADR-0072 item 2). Because it always leads the
+    /// result, a queued connection to the facade always lands before the controller's own
+    /// `pairingFailed` / `pairingCompleted` for the same run, and before `hostResolved`.
+    void handshakeClassified(const PairingHandshakeResult& result);
+
     /// The host the handshake resolved, tagged with the session id of the `pair()` call it answers
     /// (06.6-18/T-06.6-52), emitted immediately before `done(true, ...)` on the one success path and
     /// never on a failure.
@@ -176,4 +205,8 @@ private:
     /// its pool thread. The deadline timer needs no generation of its own: `pair()` restarts the
     /// same `QTimer`, so it is always counting down for whichever handshake is current.
     quint64 m_generation = 0;
+    /// What the last reported failure carried (ADR-0072, Plan 09): written on the same thread
+    /// that reports it, read by the facade after the queued `pairingFailed` for that run has
+    /// already delivered the `handshakeClassified` copy.
+    PairingHandshakeResult m_lastResult;
 };

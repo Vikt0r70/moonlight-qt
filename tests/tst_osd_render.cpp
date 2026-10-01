@@ -10,6 +10,7 @@
 //
 // Or, from anywhere: tests\run-all-suites.cmd tst_osd_render
 
+#define SDL_MAIN_HANDLED
 #include <QtTest>
 
 #include <QDir>
@@ -29,6 +30,7 @@
 #include <cmath>
 
 #include "seathub/osd_renderer.h"
+#include "seathub/osd_compositor.h"
 
 namespace {
 
@@ -136,6 +138,23 @@ class TestOsdRender : public QObject
     Q_OBJECT
 
 private slots:
+    void nothingIsDrawnWithNoRowsTickedEvenThoughSlotIsOn()
+    {
+        OsdCompositor compositor;
+        compositor.setEnabledStatsLabels({});
+        int samples = 0;
+        compositor.setStatsTap([&](const VideoStats& stats) {
+            ++samples;
+            QCOMPARE(stats.renderedFps.value, 59.96);
+        });
+        auto* surface = OsdCompositor::rasterize(Overlay::OverlayDebug,
+            "Rendering frame rate: 59.96 FPS\n", true, SDL_Color{255,255,255,255}, &compositor);
+        QVERIFY(surface == nullptr);
+        QCOMPARE(samples, 1);
+        OsdCompositor::rasterize(Overlay::OverlayDebug, "Rendering frame rate: 59.96 FPS\n",
+                                false, SDL_Color{255,255,255,255}, &compositor);
+        QCOMPARE(samples, 1);
+    }
     // Deliberately does not assert `registerOsdFonts()` here: a failed fixture aborts every test
     // function that follows it (QtTest runs only `cleanupTestCase()` after a failed
     // `initTestCase()`), which would hide the individually-named RED failures below behind one

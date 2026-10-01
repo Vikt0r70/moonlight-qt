@@ -1119,6 +1119,8 @@ void SettingsBridge::prepareForSession()
     // that reads `StreamingPreferences` (T-05-45).
     applyForcedValues();
     recomputeShowPerfOverlay();
+    // Keep the producer alive without changing or persisting the customer's visible rows.
+    m_preferences->showPerformanceOverlay = true;
 }
 
 void SettingsBridge::noteConnectionStarted()

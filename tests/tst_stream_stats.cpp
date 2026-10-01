@@ -47,6 +47,24 @@
 #include "seathub/log_tee.h"
 #include "seathub/quality_outbox.h"
 #include "seathub/stream_stats.h"
+#include "seathub/stream_quality_sampler.h"
+#include "seathub/telemetry.h"
+
+// Unit capture; the real SDK envelope proof lives in tst_telemetry.
+static QList<QJsonObject> rollupLogs;
+static QList<QJsonObject> rollupMetrics;
+struct QualityLog { QString body; LogLevel level; QJsonObject attrs; };
+static QList<QualityLog> qualityLogs;
+namespace SeatHubTelemetry {
+void emitDiagnostic(const QString& body, LogLevel level, const QJsonObject& attrs)
+{
+    if (body == QLatin1String("stream.rollup")) rollupLogs.append(attrs);
+    if (body.startsWith(QLatin1String("stream.quality_"))) qualityLogs.append({body, level, attrs});
+}
+void emitRollupMetrics(const QJsonObject& attrs) { rollupMetrics.append(attrs); }
+QJsonObject rollupDeliveryHealth()
+{ return {{"backlog_spool_lines", 0}, {"backlog_retry_files", 0}}; }
+}
 
 namespace {
 
@@ -143,6 +161,296 @@ class TstStreamStats : public QObject
     Q_OBJECT
 
 private slots:
+    void aSimulatedHourStaysInsideTheDiagnosticBudget()
+    {
+        rollupLogs.clear(); rollupMetrics.clear(); qualityLogs.clear();
+        qint64 now = 0;
+        StreamQualitySampler sampler(nullptr, [&]() { return now; });
+        sampler.start(QStringLiteral("hour"));
+        VideoStats stats;
+        stats.renderedFps = OptionalMetric::of(60);
+        stats.rttMs = OptionalMetric::of(23);
+        QTimer* timer = sampler.findChild<QTimer*>();
+        QVERIFY(timer);
+        for (int second = 1; second <= 3600; ++second) {
+            now = second * 1000;
+            sampler.feed(stats);
+            // Frequent engine transitions stress suppression independently of rollup cadence.
+            sampler.noteConnectionStatus(second % 2);
+            if (second % 60 == 0) QVERIFY(QMetaObject::invokeMethod(timer, "timeout", Qt::DirectConnection));
+        }
+        sampler.finish();
+        QCOMPARE(rollupLogs.size(), 60);
+        QCOMPARE(rollupMetrics.size(), 60);
+        int bad = 0;
+        for (const auto& log : qualityLogs) if (log.body == QLatin1String("stream.quality_bad")) ++bad;
+        QCOMPARE(bad, 20);
+        QVERIFY(rollupLogs.size() + qualityLogs.size() + 1 < 1000);
+        QCOMPARE(sampler.rollups(), 60);
+    }
+
+    void poorStateEmitsQualityBadAtOnceAndOkOnRecovery()
+    {
+        qualityLogs.clear();
+        qint64 now = 0;
+        StreamQualitySampler sampler(nullptr, [&]() { return now; });
+        sampler.start("quality");
+        for (int i = 1; i <= 15; ++i) {
+            VideoStats stats; stats.renderedFps = OptionalMetric::of(i);
+            sampler.feed(stats);
+        }
+        sampler.takeWindow(false); // a minute boundary must not discard the last ten samples
+        sampler.noteConnectionStatus(1); // Limelight.h: CONN_STATUS_POOR
+        QCOMPARE(qualityLogs.size(), 1);
+        QCOMPARE(qualityLogs.first().body, QStringLiteral("stream.quality_bad"));
+        QCOMPARE(qualityLogs.first().level, LogLevel::Warning);
+        QCOMPARE(qualityLogs.first().attrs.value("reason").toString(), QStringLiteral("engine_poor"));
+        QCOMPARE(qualityLogs.first().attrs.value("n").toInt(), 10);
+        QCOMPARE(qualityLogs.first().attrs.value("fps_avg").toDouble(), 10.5);
+        sampler.noteConnectionStatus(1);
+        QCOMPARE(qualityLogs.size(), 1);
+        now = 12500;
+        sampler.noteConnectionStatus(0);
+        QCOMPARE(qualityLogs.size(), 2);
+        QCOMPARE(qualityLogs.last().body, QStringLiteral("stream.quality_ok"));
+        QCOMPARE(qualityLogs.last().level, LogLevel::Info);
+        QCOMPARE(qualityLogs.last().attrs.value("bad_s").toDouble(), 12.5);
+        QCOMPARE(sampler.badEpisodes(), 1);
+        QCOMPARE(sampler.badSeconds(), 12.5);
+        sampler.finish();
+    }
+
+    void theRttTriggerNeedsFiveInAndTenOut()
+    {
+        qualityLogs.clear();
+        StreamQualitySampler sampler;
+        sampler.start("rtt");
+        VideoStats stats; stats.rttMs = OptionalMetric::of(80);
+        const auto feed = [&]() { sampler.feed(stats); QCoreApplication::processEvents(); };
+        for (int i = 0; i < 4; ++i) feed();
+        QVERIFY(qualityLogs.isEmpty());
+        feed();
+        QCOMPARE(qualityLogs.size(), 1);
+        QCOMPARE(qualityLogs.first().attrs.value("reason").toString(), QStringLiteral("rtt_high"));
+        sampler.noteConnectionStatus(0); // engine OKAY cannot clear an independent RTT collapse
+        QCOMPARE(qualityLogs.size(), 1);
+        stats.rttMs = OptionalMetric::of(79.99);
+        for (int i = 0; i < 9; ++i) feed();
+        QCOMPARE(qualityLogs.size(), 1);
+        feed();
+        QCOMPARE(qualityLogs.size(), 2);
+        QCOMPARE(qualityLogs.last().body, QStringLiteral("stream.quality_ok"));
+        sampler.finish();
+    }
+
+    void badLinesAreCappedAt20PerPlayAndOnePer30Seconds()
+    {
+        qualityLogs.clear();
+        qint64 now = 0;
+        StreamQualitySampler sampler(nullptr, [&]() { return now; });
+        sampler.start("caps");
+        const auto cycle = [&]() { sampler.noteConnectionStatus(1); ++now; sampler.noteConnectionStatus(0); };
+        const auto badCount = [&]() {
+            int count = 0;
+            for (const auto& log : qualityLogs) if (log.body == "stream.quality_bad") ++count;
+            return count;
+        };
+        cycle();
+        now = 29999; cycle();
+        QCOMPARE(badCount(), 1);
+        QCOMPARE(sampler.badEpisodes(), 2);
+        for (int i = 1; i <= 20; ++i) { now = i * 30000; cycle(); }
+        QCOMPARE(badCount(), 20);
+        QCOMPARE(sampler.badEpisodes(), 22);
+        QCOMPARE(sampler.badSeconds(), 0.022);
+        sampler.finish();
+        now += 30000;
+        sampler.start("caps"); // a reconnect is still the same Play
+        cycle();
+        QCOMPARE(badCount(), 20);
+        QCOMPARE(sampler.badEpisodes(), 23);
+        sampler.finish();
+        sampler.start("next-play");
+        cycle();
+        QCOMPARE(badCount(), 21);
+        QCOMPARE(sampler.badEpisodes(), 1);
+        sampler.finish();
+    }
+
+    void summaryAccumulatorsRetainMissingSamplingSecondsAndOpenBadTime()
+    {
+        qint64 now = 0;
+        StreamQualitySampler sampler(nullptr, [&]() { return now; });
+        sampler.start("gaps");
+        VideoStats stats; stats.renderedFps = OptionalMetric::of(60);
+        for (int i = 0; i < 45; ++i) { now = i * 1000; sampler.feed(stats); }
+        now = 50000; sampler.noteConnectionStatus(1);
+        now = 60000; sampler.finish();
+        QCOMPARE(sampler.rollups(), 1);
+        QCOMPARE(sampler.badEpisodes(), 1);
+        QCOMPARE(sampler.badSeconds(), 10.0);
+        QCOMPARE(sampler.samplingGapS(), 15.0);
+        now = 90000;
+        QCOMPARE(sampler.badSeconds(), 10.0);
+        QCOMPARE(sampler.samplingGapS(), 15.0);
+    }
+
+    void absentRttBreaksTheStreakAndBothSourcesMustRecover()
+    {
+        qualityLogs.clear();
+        StreamQualitySampler sampler;
+        sampler.start("sources");
+        VideoStats stats; stats.rttMs = OptionalMetric::of(80);
+        const auto feed = [&]() { sampler.feed(stats); QCoreApplication::processEvents(); };
+        for (int i = 0; i < 4; ++i) feed();
+        stats.rttMs = OptionalMetric::none(); feed();
+        stats.rttMs = OptionalMetric::of(80);
+        for (int i = 0; i < 4; ++i) feed();
+        QVERIFY(qualityLogs.isEmpty());
+        feed();
+        QCOMPARE(qualityLogs.size(), 1);
+        sampler.noteConnectionStatus(1);
+        stats.rttMs = OptionalMetric::of(79);
+        for (int i = 0; i < 10; ++i) feed();
+        QCOMPARE(qualityLogs.size(), 1);
+        sampler.noteConnectionStatus(0);
+        QCOMPARE(qualityLogs.size(), 2);
+        sampler.finish();
+    }
+
+    void rollupNearestRankP95()
+    {
+        StreamQualitySampler sampler;
+        sampler.start(QStringLiteral("math"));
+        for (int count : {100, 7, 1}) {
+            for (int i = count; i >= 1; --i) {
+                VideoStats stats;
+                stats.renderedFps = OptionalMetric::of(i);
+                stats.rttMs = OptionalMetric::of(i);
+                sampler.feed(stats);
+            }
+            const auto attrs = sampler.takeWindow(false);
+            QCOMPARE(attrs.value("rtt_p95").toDouble(), count == 100 ? 95.0 : double(count));
+            QCOMPARE(attrs.value("fps_avg").toDouble(), (count + 1) / 2.0);
+            QCOMPARE(attrs.value("fps_min").toDouble(), 1.0);
+        }
+        sampler.finish();
+    }
+
+    void rollupKeepsAbsentFieldsAbsent()
+    {
+        StreamQualitySampler sampler;
+        sampler.start(QStringLiteral("absent"));
+        VideoStats stats;
+        QVERIFY(parseVideoStatsBlock(productionStatsBlock(), &stats));
+        sampler.feed(stats);
+        QVERIFY(sampler.takeWindow(false).contains("rtt_avg"));
+        QVERIFY(parseVideoStatsBlock(productionStatsBlockWithNoRtt(), &stats));
+        sampler.feed(stats);
+        const auto attrs = sampler.takeWindow(false);
+        QVERIFY(!attrs.contains("rtt_avg"));
+        QVERIFY(!attrs.contains("rtt_p95"));
+        QVERIFY(sampler.takeWindow(false).isEmpty());
+        rollupLogs.clear();
+        sampler.finish();
+        QVERIFY(rollupLogs.isEmpty());
+    }
+
+    void rollupCoverageCapAndUnits()
+    {
+        StreamQualitySampler sampler;
+        sampler.start(QStringLiteral("coverage"));
+        VideoStats stats;
+        QVERIFY(parseVideoStatsBlock(QStringLiteral("Video stream: 1920x1080 60.00 FPS (Codec: H264)\n")
+                                    + productionStatsBlock(), &stats));
+        for (int i = 0; i < 45; ++i) sampler.feed(stats);
+        auto attrs = sampler.takeWindow(false);
+        QCOMPARE(attrs.value("n").toInt(), 45);
+        QCOMPARE(attrs.value("coverage_pct").toDouble(), 75.0);
+        QCOMPARE(attrs.value("res").toString(), QStringLiteral("1920x1080"));
+        QCOMPARE(attrs.value("host_avg").toDouble(), 1.6);
+        QCOMPARE(attrs.value("decode_avg").toDouble(), 3.21);
+        QCOMPARE(attrs.value("fps_avg").toDouble(), 59.96);
+        QCOMPARE(attrs.value("net_drop_avg").toDouble(), 0.42);
+        QCOMPARE(attrs.value("partial").toBool(), false);
+        for (int i = 0; i < 135; ++i) sampler.feed(stats);
+        attrs = sampler.takeWindow(true);
+        QCOMPARE(attrs.value("n").toInt(), 120);
+        QCOMPARE(attrs.value("dropped_samples").toInt(), 15);
+        QVERIFY(attrs.value("partial").toBool());
+        sampler.finish();
+    }
+
+    void theWindowIsAThreadSafeNonBlockingFeed()
+    {
+        StreamQualitySampler sampler;
+        sampler.start(QStringLiteral("concurrent"));
+        std::atomic<int> done{0};
+        QList<QThread*> writers;
+        for (int t = 0; t < 4; ++t) {
+            auto writer = QThread::create([&]() {
+                VideoStats stats; stats.renderedFps = OptionalMetric::of(60);
+                for (int i = 0; i < 10000; ++i) sampler.feed(stats);
+                ++done;
+            });
+            writers.append(writer); writer->start();
+        }
+        int accounted = 0;
+        const auto drain = [&]() {
+            const auto attrs = sampler.takeWindow(false);
+            accounted += attrs.value("n").toInt() + attrs.value("dropped_samples").toInt();
+        };
+        while (done.load() < 4) { drain(); QThread::yieldCurrentThread(); }
+        for (auto writer : writers) { writer->wait(); delete writer; }
+        drain();
+        QCOMPARE(accounted, 40000);
+        sampler.finish();
+    }
+
+    void rollupTimerStopsAndEmitsOnlyNonemptyWindows()
+    {
+        rollupLogs.clear(); rollupMetrics.clear();
+        StreamQualitySampler sampler;
+        sampler.setWindowMs(40);
+        sampler.start(QString()); // local streams have no control-plane session id
+        VideoStats stats; stats.renderedFps = OptionalMetric::of(60);
+        sampler.feed(stats);
+        QTRY_COMPARE(sampler.rollups(), 1);
+        QCOMPARE(rollupLogs.size(), 1);
+        QCOMPARE(rollupMetrics.size(), 1);
+        QTest::qWait(100);
+        QCOMPARE(sampler.rollups(), 1);
+        sampler.feed(stats); sampler.finish();
+        QCOMPARE(sampler.rollups(), 2);
+        QVERIFY(rollupLogs.last().value("partial").toBool());
+        sampler.finish();
+        QCOMPARE(sampler.rollups(), 2);
+    }
+
+    void rollupTimerRunsOnTheSamplerWorker()
+    {
+        QThread worker;
+        auto sampler = new StreamQualitySampler;
+        sampler->moveToThread(&worker);
+        connect(&worker, &QThread::finished, sampler, &QObject::deleteLater);
+        QSemaphore emitted;
+        QThread* emissionThread = nullptr;
+        connect(sampler, &StreamQualitySampler::rollupEmitted, sampler, [&]() {
+            emissionThread = QThread::currentThread(); emitted.release();
+        });
+        worker.start();
+        QMetaObject::invokeMethod(sampler, [sampler]() {
+            sampler->setWindowMs(20); sampler->start("worker");
+        }, Qt::BlockingQueuedConnection);
+        VideoStats stats; stats.renderedFps = OptionalMetric::of(60);
+        sampler->feed(stats);
+        const bool received = emitted.tryAcquire(1, 5000);
+        QMetaObject::invokeMethod(sampler, [sampler]() { sampler->finish(); }, Qt::BlockingQueuedConnection);
+        worker.quit(); worker.wait();
+        QVERIFY(received);
+        QCOMPARE(emissionThread, &worker);
+    }
+
     // --- LogTee. This must run first: `LogTee::install()` only ever captures "the previous
     // handler" on its FIRST call for the whole process (this test binary); every later test in
     // this file that logs anything already runs through the tee installed here. -----------------

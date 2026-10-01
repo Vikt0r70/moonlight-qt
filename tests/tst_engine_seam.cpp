@@ -12,6 +12,7 @@
  * attached the client fails closed instead of quietly substituting one.
  *****************************************************************************/
 
+#define SDL_MAIN_HANDLED
 #include <QtTest>
 #include <QCoreApplication>
 #include <QPointer>
@@ -22,6 +23,8 @@
 #include <memory>
 
 #include "seathub/engine_session.h"
+#include "seathub/engine_status.h"
+#include <SDL.h>
 #include "seathub/pairing_seam.h"
 #include "seathub/session_lifecycle.h"
 #include "seathub/stream_window_name.h"
@@ -172,6 +175,33 @@ class TstEngineSeam : public QObject
     Q_OBJECT
 
 private slots:
+    void connectionStatusLineIsParsedExactly()
+    {
+        int status = 99;
+        QVERIFY(parseConnectionStatusUpdate(SDL_LOG_CATEGORY_APPLICATION, SDL_LOG_PRIORITY_INFO,
+                                             "Connection status update: 0", &status));
+        QCOMPARE(status, 0);
+        QVERIFY(parseConnectionStatusUpdate(SDL_LOG_CATEGORY_APPLICATION, SDL_LOG_PRIORITY_INFO,
+                                             "Connection status update: 1", &status));
+        QCOMPARE(status, 1);
+        for (const char* line : {"Connection status update: ", "Connection status update: 2",
+             "Connection status update: -1", "Connection status update: +1",
+             "Connection status update: 01", "Connection status update:  1",
+             "Connection status update: 1\n", "Connection status update: abc", "status update: 1"}) {
+            status = 99;
+            QVERIFY(!parseConnectionStatusUpdate(SDL_LOG_CATEGORY_APPLICATION, SDL_LOG_PRIORITY_INFO, line, &status));
+            QCOMPARE(status, 99);
+        }
+        for (auto mismatch : {qMakePair(SDL_LOG_CATEGORY_APPLICATION, SDL_LOG_PRIORITY_ERROR),
+                              qMakePair(SDL_LOG_CATEGORY_CUSTOM, SDL_LOG_PRIORITY_INFO)}) {
+            status = 99;
+            QVERIFY(!parseConnectionStatusUpdate(mismatch.first, mismatch.second,
+                                                 "Connection status update: 1", &status));
+            QCOMPARE(status, 99);
+        }
+        QVERIFY(!parseConnectionStatusUpdate(SDL_LOG_CATEGORY_APPLICATION, SDL_LOG_PRIORITY_INFO, nullptr, &status));
+        QVERIFY(!parseConnectionStatusUpdate(SDL_LOG_CATEGORY_APPLICATION, SDL_LOG_PRIORITY_INFO, "Connection status update: 1", nullptr));
+    }
     void theNeutralNameReachesTheComputerWhateverTheHostReports_data()
     {
         QTest::addColumn<QString>("reported");

@@ -312,6 +312,7 @@ class FakeShellClient : public QObject
     Q_PROPERTY(bool liveUpdatesPaused READ liveUpdatesPaused NOTIFY liveUpdatesPausedChanged)
     // D-07, ADR-0067.
     Q_PROPERTY(bool signedOutNotice READ signedOutNotice NOTIFY signedOutNoticeChanged)
+    Q_PROPERTY(bool diagnosticsNoticePending READ diagnosticsNoticePending NOTIFY diagnosticsNoticePendingChanged)
     Q_PROPERTY(bool liveSession READ liveSession NOTIFY liveSessionChanged)
     Q_PROPERTY(int connectStage READ connectStage NOTIFY connectStageChanged)
     Q_PROPERTY(bool connectFailed READ connectFailed NOTIFY connectFailedChanged)
@@ -485,6 +486,18 @@ public:
 
     // D-07, ADR-0067.
     bool signedOutNotice() const { return m_signedOutNotice; }
+    bool diagnosticsNoticePending() const { return m_diagnosticsNoticePending; }
+    void setDiagnosticsNoticePending(bool pending)
+    {
+        m_diagnosticsNoticePending = pending;
+        emit diagnosticsNoticePendingChanged();
+    }
+    Q_INVOKABLE void acknowledgeDiagnosticsNotice()
+    {
+        ++m_acknowledgements;
+        setDiagnosticsNoticePending(false);
+    }
+    int acknowledgements() const { return m_acknowledgements; }
     void setSignedOutNotice(bool showing)
     {
         m_signedOutNotice = showing;
@@ -608,6 +621,7 @@ signals:
     void animationEffectsChanged();
     void liveUpdatesPausedChanged();
     void signedOutNoticeChanged();
+    void diagnosticsNoticePendingChanged();
     void connectStageChanged();
     void connectFailedChanged();
     void reconnectingChanged();
@@ -632,6 +646,8 @@ private:
     bool m_animationEffects = false;
     bool m_liveUpdatesPaused = false;
     bool m_signedOutNotice = false;
+    bool m_diagnosticsNoticePending = false;
+    int m_acknowledgements = 0;
     QString m_homeStatus = QStringLiteral("ready");
     QString m_endReasonText;
     QString m_identity = QStringLiteral("+962 7 0001 0002");
@@ -681,6 +697,10 @@ class FakeUpdates : public QObject
     Q_PROPERTY(QVariantMap failure READ failure NOTIFY changed)
     Q_PROPERTY(bool blockedBySession READ blockedBySession NOTIFY changed)
     Q_PROPERTY(bool readyToInstall READ readyToInstall NOTIFY changed)
+    Q_PROPERTY(bool mandatory READ mandatory NOTIFY changed)
+    Q_PROPERTY(bool optionalOffer READ optionalOffer NOTIFY changed)
+    Q_PROPERTY(bool exhausted READ exhausted NOTIFY changed)
+    Q_PROPERTY(QString nextAttemptText READ nextAttemptText NOTIFY changed)
 
 public:
     QString state() const { return m_state; }
@@ -689,6 +709,20 @@ public:
     QVariantMap failure() const { return m_failure; }
     bool blockedBySession() const { return m_blockedBySession; }
     bool readyToInstall() const { return false; }
+    bool mandatory() const { return m_mandatory; }
+    bool optionalOffer() const { return !m_mandatory && !m_dismissed && m_state != "failed"; }
+    bool exhausted() const { return m_exhausted; }
+    QString nextAttemptText() const { return m_when; }
+    void variant(bool required, bool exhausted, const QString& state, const QString& when = {})
+    {
+        m_mandatory = required; m_exhausted = exhausted; m_state = state; m_when = when;
+        m_failure = state == "failed" ? QVariantMap{{"error", "The installer couldn't be started."},
+                                                    {"reference", "SUPPORT-REF"}} : QVariantMap{};
+        emit changed();
+    }
+    Q_INVOKABLE void dismissOptional() { m_dismissed = true; emit changed(); }
+    Q_INVOKABLE bool openManualDownload() { ++m_opens; return true; }
+    Q_INVOKABLE bool tryAgain() { ++m_installs; return true; }
 
     void offerUpdate()
     {
@@ -715,6 +749,9 @@ private:
     bool m_blockedBySession = false;
     int m_downloads = 0;
     int m_installs = 0;
+    bool m_mandatory = true, m_exhausted = false, m_dismissed = false;
+    QString m_when;
+    int m_opens = 0;
 };
 
 // The `bridge` a settings row talks to (SettingsBridge in production).
@@ -796,6 +833,10 @@ private slots:
     void theBalancePillPulsesOnALiveChange();
     void theSignedOutNoticeShowsOverWhicheverScreenIsCurrent();
     void theMainWindowHostsTheSignedOutNotice();
+    void theNoticeShowsItsTextAndOneOK();
+    void theNoticeIsHiddenWhileStreamingConnectingOrAnUpdateOfferIsUp();
+    void okAcknowledgesAndEnterActivates();
+    void theMainWindowHostsTheNotice();
     void menuHasItsThreeItemsAndTopUpAsksTheFacadeForTheWebsite();
     void menuPopupIsWideEnoughToShowItsThreeItems();
     void theProfileIsRoutedAsAViewInsideHomeAndHomeNoLongerSignsOut();
@@ -834,6 +875,7 @@ private slots:
     void signInOpensTheWebsiteForSignupAndResetAndHasNoScreenOfItsOwn();
     void noSeatHubScreenBuildsAWebsiteAddressItself();
     void forcedUpdateModalKeepsUpdateTabbableAndUndismissable();
+    void updateWindowShowsTheFrozenVariantsInARealWindow();
     void settingsDropdownElidesLongOptionNames();
     void settingsDropdownPopupIsTallEnoughToShowItsOptions();
     void noComboBoxPopupHeightBindsToTheControlsOwnContentItem();
@@ -843,7 +885,7 @@ private slots:
     void theHostSpeakerRowIsPresentAndEditableAtUpstreamsDefault();
     void theStreamingBannerAndNegotiatedFallbackStillRenderOnTheRebuiltPage();
     void noSettingsPageStringCarriesTheUpstreamBrand();
-    void theSettingsPageShowsTheLogsAndCrashReportsDisclosureSentence();
+    void theSettingsPageShowsTheLogsQualityAndCrashReportsDisclosureSentence();
     void customResolutionSelectionRevealsAndPersistsTheWidthHeightFields();
     void customFrameRateSelectionRevealsAndPersistsTheFpsField();
     void aStoredCustomResolutionOrFrameRateShowsItsFieldsOnLoad();
@@ -2847,6 +2889,48 @@ void TstUiScreens::forcedUpdateModalKeepsUpdateTabbableAndUndismissable()
     QVERIFY2(modal->property("focus").toBool(), "the modal owns focus while it is shown");
 }
 
+void TstUiScreens::updateWindowShowsTheFrozenVariantsInARealWindow()
+{
+    // Exact authority: docs/spec/copy.md, "Update window"; screens.md §49.
+    QQmlEngine engine; registerTokenSingletons(&engine);
+    FakeUpdates updates; updates.offerUpdate();
+    QString error;
+    QScopedPointer<QObject> modal(instantiate(&engine, "ForcedUpdateModal.qml", &error));
+    QVERIFY2(modal, qPrintable(error));
+    auto* item = qobject_cast<QQuickItem*>(modal.data()); QVERIFY(item);
+    QQuickWindow window; window.resize(960, 640); item->setParentItem(window.contentItem());
+    QVERIFY(modal->setProperty("updates", QVariant::fromValue(static_cast<QObject*>(&updates))));
+    window.show(); QVERIFY(QTest::qWaitForWindowExposed(&window));
+    window.requestActivate(); QVERIFY(QTest::qWaitForWindowActive(&window));
+    QVERIFY(findVisibleTextItem(modal.data(), "Version 9.9.9 is available. SeatHub has to restart to finish updating."));
+    for (const auto& when : QStringList{"the next time you open SeatHub", "in about 90 minutes", "in about 3 hours"}) {
+        updates.variant(true, false, "failed", when);
+        QVERIFY(findVisibleTextItem(modal.data(), QString("SeatHub could not finish updating, so playing is paused until it does. It will try again %1.").arg(when)));
+        QVERIFY(findVisibleTextItem(modal.data(), "SUPPORT-REF"));
+        QTest::keyClick(&window, Qt::Key_Escape); QVERIFY(item->isVisible());
+    }
+    updates.variant(true, true, "failed");
+    QVERIFY(findVisibleTextItem(modal.data(), "SeatHub could not update itself. Download the new version and install it to keep playing."));
+    QTRY_VERIFY(modal->findChild<QObject*>("downloadAction"));
+    QVERIFY(modal->findChild<QObject*>("updateAction"));
+    updates.variant(false, false, "available");
+    QVERIFY(findVisibleTextItem(modal.data(), "SeatHub update"));
+    QVERIFY(findVisibleTextItem(modal.data(), "Version 9.9.9 is ready. Update now, or later."));
+    QTRY_VERIFY(modal->findChild<QQuickItem*>("notNowAction"));
+    auto* later = modal->findChild<QQuickItem*>("notNowAction");
+    auto* primary = modal->findChild<QQuickItem*>("updateAction");
+    // A variant's bindings update before Row's next polish. Click only after its real layout
+    // has placed the two controls side by side, and assert they do not overlap.
+    QTRY_VERIFY(later->mapToScene(QPointF()).x()
+                >= primary->mapToScene(QPointF()).x() + primary->width());
+    QTest::mouseClick(&window, Qt::LeftButton, Qt::NoModifier,
+                     later->mapToScene(QPointF(later->width()/2, later->height()/2)).toPoint());
+    QTRY_VERIFY(!item->isVisible());
+    updates.variant(false, false, "failed"); QVERIFY(!item->isVisible());
+    updates.variant(true, false, "downloading"); QVERIFY(item->isVisible());
+    QVERIFY(findVisibleTextItem(modal.data(), "Downloading: 0%"));
+}
+
 void TstUiScreens::settingsDropdownElidesLongOptionNames()
 {
     QQuickStyle::setStyle(QStringLiteral("Basic"));
@@ -3462,7 +3546,7 @@ void TstUiScreens::noSettingsPageStringCarriesTheUpstreamBrand()
 
 // D-14, ADR-0063, screens.md § 27 permitted change 4: the one plain-text disclosure sentence
 // under the page title - no switch, no link, verbatim from copy.md § Settings.
-void TstUiScreens::theSettingsPageShowsTheLogsAndCrashReportsDisclosureSentence()
+void TstUiScreens::theSettingsPageShowsTheLogsQualityAndCrashReportsDisclosureSentence()
 {
     SettingsFixture fixture;
     QQuickStyle::setStyle(QStringLiteral("Basic"));
@@ -3473,16 +3557,112 @@ void TstUiScreens::theSettingsPageShowsTheLogsAndCrashReportsDisclosureSentence(
     QScopedPointer<QObject> root(instantiateSettingsPage(&engine, fixture.client, &error));
     QVERIFY2(root, qPrintable(error));
 
-    bool found = false;
+    int found = 0;
+    bool oldFound = false;
     for (QObject* item : textItems(root.data())) {
         if (item->property("text").toString()
             == QStringLiteral(
-                "SeatHub sends diagnostic logs and crash reports to SevenHills so we can fix problems.")) {
-            found = true;
-            break;
+                "SeatHub sends diagnostic logs, stream quality numbers and crash reports to SevenHills so we can fix problems.")) {
+            ++found;
         }
+        oldFound |= item->property("text").toString() == QStringLiteral(
+            "SeatHub sends diagnostic logs and crash reports to SevenHills so we can fix problems.");
     }
-    QVERIFY2(found, "the Settings page must show the logs/crash-reports disclosure sentence");
+    QCOMPARE(found, 1);
+    QVERIFY2(!oldFound, "the old disclosure must not survive beside the updated one");
+}
+
+void TstUiScreens::theNoticeShowsItsTextAndOneOK()
+{
+    QQmlEngine engine; registerTokenSingletons(&engine);
+    FakeShellClient client;
+    QString error;
+    // Source existence is the intentional RED assertion, not a QML import failure.
+    QVERIFY2(QFile::exists(guiDir() + "/DiagnosticsNotice.qml"), "the frozen diagnostics notice is not implemented");
+    QScopedPointer<QObject> notice(instantiate(&engine, "DiagnosticsNotice.qml", &error));
+    QVERIFY2(notice, qPrintable(error));
+    QVERIFY(notice->setProperty("client", QVariant::fromValue(static_cast<QObject*>(&client))));
+    client.setDiagnosticsNoticePending(true);
+    QVERIFY(findVisibleTextItem(notice.data(), "What SeatHub sends us"));
+    QVERIFY(findVisibleTextItem(notice.data(), "While you play, SeatHub sends SevenHills how the stream is running: frame rate, delay, lost frames and picture size. If an update fails, it also sends a short note about what went wrong. It never sends your PIN, password, email or phone number, or the address of the PC you rent."));
+    int buttons = 0;
+    for (QObject* child : notice->findChildren<QObject*>()) {
+        if (child->inherits("QQuickButton")) {
+            ++buttons; QCOMPARE(child->property("text").toString(), QStringLiteral("OK"));
+        }
+        QVERIFY(!child->inherits("QQuickSwitch"));
+    }
+    QCOMPARE(buttons, 1);
+    QVERIFY(!readSource(guiDir() + "/DiagnosticsNotice.qml").contains("openUrlExternally"));
+}
+
+void TstUiScreens::theNoticeIsHiddenWhileStreamingConnectingOrAnUpdateOfferIsUp()
+{
+    QQmlEngine engine; registerTokenSingletons(&engine);
+    FakeShellClient client;
+    QVERIFY2(QFile::exists(guiDir() + "/DiagnosticsNotice.qml"), "the diagnostics notice is not implemented");
+    QString error;
+    QScopedPointer<QObject> notice(instantiate(&engine, "DiagnosticsNotice.qml", &error));
+    QVERIFY2(notice, qPrintable(error));
+    notice->setProperty("client", QVariant::fromValue(static_cast<QObject*>(&client)));
+    QObject* panel = notice->findChild<QObject*>("diagnosticsPanel"); QVERIFY(panel);
+    // The facade owns eligibility (the real state transitions are tested in tst_facade_wiring).
+    for (const QString& state : QStringList{"signed_out", "connecting", "streaming", "required offer", "optional offer"}) {
+        client.setDiagnosticsNoticePending(false);
+        QVERIFY2(!effectivelyVisible(panel), qPrintable(state));
+        client.setDiagnosticsNoticePending(true);
+        QVERIFY(effectivelyVisible(panel));
+    }
+}
+
+void TstUiScreens::okAcknowledgesAndEnterActivates()
+{
+    QQmlEngine engine; registerTokenSingletons(&engine);
+    FakeShellClient client;
+    QVERIFY2(QFile::exists(guiDir() + "/DiagnosticsNotice.qml"), "the diagnostics notice is not implemented");
+    QString error;
+    QScopedPointer<QObject> notice(instantiate(&engine, "DiagnosticsNotice.qml", &error));
+    QVERIFY2(notice, qPrintable(error));
+    auto* item = qobject_cast<QQuickItem*>(notice.data()); QVERIFY(item);
+    QQuickWindow window; window.resize(960, 640); item->setParentItem(window.contentItem());
+    notice->setProperty("client", QVariant::fromValue(static_cast<QObject*>(&client)));
+    window.show(); QVERIFY(QTest::qWaitForWindowExposed(&window));
+    window.requestActivate(); QVERIFY(QTest::qWaitForWindowActive(&window));
+    auto* ok = notice->findChild<QQuickItem*>("diagnosticsOK"); QVERIFY(ok);
+    QObject* panel = notice->findChild<QObject*>("diagnosticsPanel"); QVERIFY(panel);
+    int acknowledgements = 0;
+    for (const auto key : {Qt::Key_Return, Qt::Key_Space}) {
+        client.setDiagnosticsNoticePending(true);
+        QTRY_VERIFY(ok->hasActiveFocus()); // no test-side focus repair
+        QTest::keyClick(&window, Qt::Key_Escape);
+        QVERIFY(effectivelyVisible(panel)); QCOMPARE(client.acknowledgements(), acknowledgements);
+        QTest::keyClick(&window, key);
+        QCOMPARE(client.acknowledgements(), ++acknowledgements);
+        QVERIFY(!effectivelyVisible(panel));
+    }
+    client.setDiagnosticsNoticePending(true);
+    QTRY_VERIFY(ok->hasActiveFocus());
+    QTest::mouseClick(&window, Qt::LeftButton, Qt::NoModifier,
+                     ok->mapToScene(QPointF(ok->width()/2, ok->height()/2)).toPoint());
+    QCOMPARE(client.acknowledgements(), ++acknowledgements);
+    QVERIFY(!effectivelyVisible(panel));
+}
+
+void TstUiScreens::theMainWindowHostsTheNotice()
+{
+    const QString main = readSource(guiDir() + "/main.qml");
+    const int start = main.indexOf("\n    DiagnosticsNotice {");
+    QVERIFY2(start >= 0, "notice must be a direct window child outside the Loader");
+    const int end = main.indexOf("\n    }", start);
+    QVERIFY(end > start);
+    QVERIFY(main.mid(start, end - start).contains("client: seatHub"));
+    QVERIFY(start > main.indexOf("\n    SignedOutNotice {"));
+    QVERIFY(start < main.indexOf("\n    ForcedUpdateModal {"));
+    QVERIFY(readSource(guiDir() + "/../qml.qrc").contains("<file>gui/DiagnosticsNotice.qml</file>"));
+    QQmlEngine engine; registerTokenSingletons(&engine);
+    QString error; QScopedPointer<QObject> notice(instantiate(&engine, "DiagnosticsNotice.qml", &error));
+    QVERIFY2(notice, qPrintable(error));
+    QVERIFY(notice->property("z").toReal() < 1000);
 }
 
 void TstUiScreens::customResolutionSelectionRevealsAndPersistsTheWidthHeightFields()

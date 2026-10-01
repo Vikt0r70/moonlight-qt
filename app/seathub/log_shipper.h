@@ -34,9 +34,11 @@
 #include "log_tee.h"
 
 #include <QLockFile>
+#include <QJsonObject>
 #include <QList>
 #include <QString>
 
+#include <atomic>
 #include <functional>
 #include <memory>
 
@@ -52,6 +54,17 @@ struct ShippedLine
     QString sessionId;
     QString hostId;
     QString traceId;
+    /// ADR-0072 item 7 / plan 09: scalar attributes for the diagnostic lane (`play.step`,
+    /// `client.telemetry`, ...). Empty for every ordinary line the `LogTee` sink captures, so an
+    /// empty object and "not a diagnostic line" mean the same thing to a reader - `diagnostic`
+    /// below is the authoritative flag, persisted beside it. Scalars only: string, number or
+    /// bool, never a nested object or list (`logShipperHandOff()` turns each one into a
+    /// `sentry_value_new_attribute`).
+    QJsonObject attrs;
+    /// True for a line this process built itself as a structured diagnostic (ADR-0072), never one
+    /// the tee captured. Persisted, so a diagnostic line that waits in the spool keeps both its
+    /// attributes and its exemption from the 8 MiB body cap across a crash and a restart.
+    bool diagnostic = false;
 };
 
 /// `true` when the SDK took the line (an envelope now owns it, one way or another); `false` for
@@ -92,6 +105,23 @@ public:
     /// that purpose).
     QList<ShippedLine> takeAll();
 
+    /// Appends an adopted batch (what `adoptLeftovers()` returned) with the age rule already
+    /// applied: a line older than `kSpoolMaxAgeDays` is dropped HERE and counted, never queued
+    /// for the first drain to drop again. Plan 09 (ADR-0072 item 8): `LogShipper::start()` runs
+    /// this BEFORE `SeatHubTelemetry::start()` reaches `noteLaunch()`, so the launch record's
+    /// `dropped_spool_age` already knows how many leftovers startup threw away while
+    /// `spool_lines_adopted` still reports what was adopted. Same 7-day cutoff `takeAll()` has
+    /// always applied - no new clock policy, and a line the filter already passed is unaffected.
+    void appendAdopted(const QList<ShippedLine>& lines);
+
+    /// Plan 09 (D-13): how many lines `takeAll()` has dropped for being older than
+    /// `kSpoolMaxAgeDays`, plus what `appendAdopted()` dropped at startup. Atomic: the worker
+    /// increments it on the spool thread while the launch record reads it from the client thread
+    /// - a plain `int` there would be a data race. Cumulative over this object's life; the
+    /// launch record's `dropped_spool_age` reads it through `LogShipper::droppedSpoolAgeCount()`.
+    int droppedAgeLines() const { return m_droppedAgeLines.load(); }
+    int pendingLines() const { return m_pendingLines.load(); }
+
     /// Scans `directory` for `spool-*.jsonl` files this process did not create, adopts (reads,
     /// then deletes) any whose owning process is no longer running - proven by a failed-to-lock
     /// check against Qt's own PID-liveness detection, not a time heuristic - and leaves any file
@@ -103,6 +133,8 @@ private:
     QString m_directory;
     QString m_path;
     std::unique_ptr<QLockFile> m_lock;
+    std::atomic<int> m_droppedAgeLines{ 0 };
+    std::atomic<int> m_pendingLines{ 0 };
 };
 
 /// The one process-lifetime sink `SeatHubTelemetry::start()` registers (D-14). A singleton -
@@ -120,6 +152,12 @@ public:
     /// `"log cap reached"` line ships and nothing else does, for the rest of the run. The disk log
     /// (`main.cpp`'s own 10 MB cap) is a separate limit and is unaffected.
     static constexpr qint64 kShippedBytesPerRun = 8 * 1024 * 1024;
+    /// ADR-0072 V30 / plan 09: the diagnostic lane's own per-run bound. Ordinary lines are bounded
+    /// by `kShippedBytesPerRun` (bytes of body); diagnostics are bounded by COUNT instead - they
+    /// are the handful of structured lines per Play that carry the whole record of what failed,
+    /// and a byte cap would silence exactly the summary line that matters most. Past this count
+    /// the lane stops silently, and `capReachedCount()` records that it did.
+    static constexpr int kDiagnosticLinesPerRun = 1000;
 
     static LogShipper& instance();
 
@@ -172,9 +210,11 @@ public:
     /// `app/backend/nvpairingmanager.cpp`'s own request bodies, which `nvhttp.cpp` logs verbatim
     /// with `qInfo() << "Executing request:" << url.toString();`), a 4-digit Sunshine PIN written
     /// next to the word "pin", and a PEM certificate block. The customer's public IP is left
-    /// alone (D-09). Static and pure - no lock, no I/O - so `before_send_log` can call it a second
-    /// time in `telemetry.cpp` with no extra cost.
+    /// alone (D-09). Takes an immutable rig-literal snapshot under a short lock; replacement and
+    /// the existing pure rules run outside the lock, including the SDK's second pass.
     static QString scrub(const QString& text);
+    static void setRedactions(const QStringList& literals);
+    static void clearRedactions();
 
     /// Publishes the identity every future line snapshots. `telemetry.cpp`'s `setSession()` /
     /// `clearSession()` / `setTrace()` / `clearTrace()` call this (Plan 21 deviation - the
@@ -183,6 +223,26 @@ public:
     /// arbitrary, thread). Safe to call before `start()` - a snapshot published early is simply
     /// what the first captured line already carries.
     void publishIds(const QString& sessionId, const QString& hostId, const QString& traceId);
+
+    /// ADR-0072 item 7 / plan 09: the diagnostic lane's entry point - one structured line with
+    /// scalar attributes, enqueued exactly like an ordinary line (same queue, same scrub, same
+    /// `canShip`/pause/spool rules) but exempt from the 8 MiB body cap and counted against
+    /// `kDiagnosticLinesPerRun` instead. A Debug level is ignored, as `sink()` ignores it. Safe
+    /// before `start()` - nothing is captured then, as for any other line.
+    void enqueueDiagnostic(const QString& body, LogLevel level, const QJsonObject& attrs);
+
+    /// D-13 / plan 09: the three cumulative counters the launch record reports - a line dropped by
+    /// the queue's own drop-oldest cap, a line dropped for being older than
+    /// `kSpoolMaxAgeDays`, and how many times a per-run cap (the 8 MiB byte cap, or the
+    /// diagnostic lane's count cap) was reached in this run. Each is a count, not a flag: a run
+    /// that hits a cap once and a run that hits it a thousand times are told apart by it.
+    qint64 droppedQueueCount() const;
+    int backlogSpoolLines() const;
+    qint64 droppedSpoolAgeCount() const;
+    qint64 capReachedCount() const;
+    /// D-13 / plan 09: how many lines `start()` adopted from spool files left by processes that
+    /// are no longer running - the launch record's `spool_lines_adopted`.
+    int adoptedSpoolLines() const;
 
     /// Test-only: every later `start()` uses `directory` instead of the real
     /// `%LOCALAPPDATA%\Seven Hills\SeatHub\log-spool\`. Call before `start()`.

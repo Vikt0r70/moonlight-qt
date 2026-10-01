@@ -126,6 +126,11 @@ ApplicationWindow {
         client: seatHub
     }
 
+    DiagnosticsNotice {
+        id: diagnosticsNotice
+        client: seatHub
+    }
+
     // The forced-update modal lives outside the Loader so a view change can never take it away
     // mid-update (D-41). It renders nothing while a stream is running (Pitfall 8) and swallows
     // every event aimed at the page behind it while it is up.

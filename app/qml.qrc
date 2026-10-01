@@ -13,6 +13,7 @@
         <file>gui/SeatHubListView.qml</file>
         <file>gui/BalancePill.qml</file>
         <file>gui/SignedOutNotice.qml</file>
+        <file>gui/DiagnosticsNotice.qml</file>
         <file>gui/RestoreSplash.qml</file>
         <file>gui/ConnectingScreen.qml</file>
         <file>gui/ErrorScreen.qml</file>

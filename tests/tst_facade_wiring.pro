@@ -70,11 +70,16 @@ SOURCES += \
     ../app/seathub/teardown_controller.cpp \
     ../app/seathub/liveness_timer.cpp \
     ../app/seathub/authorized_through_timer.cpp \
+    ../app/seathub/attempt_vocab.cpp \
     ../app/seathub/log_tee.cpp \
     ../app/seathub/log_shipper.cpp \
     ../app/seathub/telemetry.cpp \
+    ../app/seathub/install_journal.cpp \
+    ../app/seathub/update_retry_state.cpp \
     ../app/seathub/stream_stats.cpp \
+    ../app/seathub/stream_quality_sampler.cpp \
     ../app/seathub/engine_termination.cpp \
+    ../app/seathub/engine_status.cpp \
     ../app/seathub/quality_outbox.cpp \
     ../app/seathub/hud_overlay.cpp \
     ../app/seathub/osd_compositor.cpp \
@@ -112,8 +117,12 @@ HEADERS += \
     ../app/seathub/log_tee.h \
     ../app/seathub/log_shipper.h \
     ../app/seathub/telemetry.h \
+    ../app/seathub/install_journal.h \
+    ../app/seathub/update_retry_state.h \
     ../app/seathub/stream_stats.h \
+    ../app/seathub/stream_quality_sampler.h \
     ../app/seathub/engine_termination.h \
+    ../app/seathub/engine_status.h \
     ../app/seathub/quality_outbox.h \
     ../app/seathub/hud_overlay.h \
     ../app/seathub/osd_compositor.h \

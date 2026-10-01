@@ -63,6 +63,10 @@ win32: LIBS += -lcrypt32
 SOURCES += \
     tst_telemetry.cpp \
     ../app/seathub/telemetry.cpp \
+    ../app/seathub/install_journal.cpp \
+    ../app/seathub/update_retry_state.cpp \
+    ../app/seathub/stream_stats.cpp \
+    ../app/seathub/stream_quality_sampler.cpp \
     ../app/seathub/log_tee.cpp \
     ../app/seathub/log_shipper.cpp \
     ../app/seathub/token_store.cpp \
@@ -71,8 +75,13 @@ SOURCES += \
 
 HEADERS += \
     ../app/seathub/telemetry.h \
+    ../app/seathub/install_journal.h \
+    ../app/seathub/update_retry_state.h \
+    ../app/seathub/stream_stats.h \
+    ../app/seathub/stream_quality_sampler.h \
     ../app/seathub/log_tee.h \
     ../app/seathub/log_shipper.h \
     ../app/seathub/token_store.h \
     ../app/seathub/error_map.h \
-    ../app/path.h
+    ../app/path.h \
+    hostile_fixtures.h

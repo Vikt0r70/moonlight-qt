@@ -18,6 +18,7 @@
 #include <QVector>
 
 #include "engine_session.h"
+#include "attempt_vocab.h"
 
 // D-09/D-13 (ADR-0045 amended 2026-09-26, Plan 14): `setTextRasterizer()` below needs
 // `Overlay::OverlayManager::TextRasterizer` in its own signature (the caller passes
@@ -78,7 +79,7 @@ public:
     /// several is a rig this client cannot choose for - and choosing one, or taking the first,
     /// would be inventing the value the contract omits. `ADR-0048` records the gap and what closes
     /// it. Selecting nothing is the honest answer.
-    bool launchApp(NvApp* out) const;
+    EngineLaunchReason launchApp(NvApp* out) const;
 
     NvComputer* computer() const { return m_computer; }
 
@@ -98,7 +99,8 @@ public:
     /// nothing to stream from: a host that is not a `MoonlightPairedHost` (the only producer is
     /// `runUpstreamPairingHandshake`), or one whose application list does not name a single
     /// application. The caller fails closed on null; it must not substitute a stub.
-    static MoonlightEngineSession* create(const PairedHostPtr& host, QObject* parent = nullptr);
+    static MoonlightEngineSession* create(const PairedHostPtr& host, QObject* parent = nullptr,
+                                          EngineLaunchReason* reason = nullptr);
 
     /// `host` is held for the session's whole life: upstream's `Session` keeps a raw
     /// `NvComputer*` and reads it - address, ports, pinned certificate - throughout. `app` is

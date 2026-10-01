@@ -239,8 +239,13 @@ SOURCES += \
     seathub/log_shipper.cpp \
     seathub/stream_stats.cpp \
     seathub/engine_termination.cpp \
+    seathub/engine_status.cpp \
+    seathub/attempt_vocab.cpp \
     seathub/quality_outbox.cpp \
+    seathub/stream_quality_sampler.cpp \
     seathub/telemetry.cpp \
+    seathub/install_journal.cpp \
+    seathub/update_retry_state.cpp \
     seathub/osd_renderer.cpp \
     seathub/osd_compositor.cpp \
     streaming/streamutils.cpp \
@@ -312,8 +317,13 @@ HEADERS += \
     seathub/log_shipper.h \
     seathub/stream_stats.h \
     seathub/engine_termination.h \
+    seathub/engine_status.h \
+    seathub/attempt_vocab.h \
     seathub/quality_outbox.h \
+    seathub/stream_quality_sampler.h \
     seathub/telemetry.h \
+    seathub/install_journal.h \
+    seathub/update_retry_state.h \
     seathub/osd_renderer.h \
     seathub/osd_compositor.h \
     seathub/stats_catalogue.h \

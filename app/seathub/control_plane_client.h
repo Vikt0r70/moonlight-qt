@@ -108,6 +108,11 @@ struct EndReport
     /// A reference an earlier error surface already gave the client (06.1's ADR, J-22). The
     /// client never mints one; this only carries one it was already given.
     QString errorCode;
+    /// ADR-0072 item 1 (plan 09): which attempt step failed - one of the 11 frozen
+    /// `attempt_step` tokens (`attempt_vocab.h`), never a class (the class stays in Sentry, D-12).
+    /// Empty when unknown, and then the field is absent from the body like every other optional
+    /// field here. `POST /api/sessions/{id}/end` carries it for every failed Play (contract 3.8.0).
+    QString attemptStep;
 };
 
 /// `GET /api/sessions/{session_id}/pairing` (`SessionAuthorization`). Short-lived and scoped

@@ -40,6 +40,7 @@ void MoonlightPairedHost::fetchAppList()
     try {
         NvHTTP http(m_computer);
         QVector<NvApp> apps = http.getAppList();
+        m_appListRead = true;
         if (apps.isEmpty()) {
             return;
         }
@@ -50,7 +51,6 @@ void MoonlightPairedHost::fetchAppList()
         // host's own order: upstream's `sortAppList()` is private to `NvComputer`, and nothing here
         // depends on the order - `launchApp()` matches on `currentGameId` or counts, either way.
         m_computer->appList = apps;
-        m_appListRead = true;
     }
     catch (const QtNetworkReplyException& e) {
         qCWarning(seathubEngine) << "error reading the host's application list:" << e.what();
@@ -64,10 +64,16 @@ void MoonlightPairedHost::fetchAppList()
     }
 }
 
-bool MoonlightPairedHost::launchApp(NvApp* out) const
+EngineLaunchReason MoonlightPairedHost::launchApp(NvApp* out) const
 {
-    if (out == nullptr || !m_paired) {
-        return false;
+    if (out == nullptr) {
+        return EngineLaunchReason::CreateFailed;
+    }
+    if (!m_paired) {
+        return EngineLaunchReason::CreateFailed;
+    }
+    if (!m_appListRead) {
+        return EngineLaunchReason::AppListFailed;
     }
 
     // The host says it is already running something. That is the application to attach to, and
@@ -77,7 +83,7 @@ bool MoonlightPairedHost::launchApp(NvApp* out) const
         for (const NvApp& app : m_computer->appList) {
             if (app.id == m_computer->currentGameId) {
                 *out = app;
-                return true;
+                return EngineLaunchReason::Started;
             }
         }
     }
@@ -94,20 +100,26 @@ bool MoonlightPairedHost::launchApp(NvApp* out) const
         }
     }
 
-    if (candidates.size() != 1) {
-        // Includes the zero case: the host never answered, or answered with nothing. Both are
-        // "this client cannot name an application", and both fail closed above.
+    if (candidates.isEmpty()) {
+        qCWarning(seathubEngine) << "the rig's application list names no launchable application";
+        return EngineLaunchReason::NoApp;
+    }
+    if (candidates.size() > 1) {
         qCWarning(seathubEngine) << "the rig's application list names" << candidates.size()
                                  << "applications to launch; the contract names none";
-        return false;
+        return EngineLaunchReason::AppCount;
     }
 
     *out = candidates.first();
-    return true;
+    return EngineLaunchReason::Started;
 }
 
-MoonlightEngineSession* MoonlightEngineSession::create(const PairedHostPtr& host, QObject* parent)
+MoonlightEngineSession* MoonlightEngineSession::create(const PairedHostPtr& host, QObject* parent,
+                                                        EngineLaunchReason* reason)
 {
+    if (reason != nullptr) {
+        *reason = EngineLaunchReason::CreateFailed;
+    }
     auto* paired = dynamic_cast<MoonlightPairedHost*>(host.get());
     if (paired == nullptr || !paired->isPaired()) {
         qCWarning(seathubEngine) << "no paired host to stream from";
@@ -115,7 +127,11 @@ MoonlightEngineSession* MoonlightEngineSession::create(const PairedHostPtr& host
     }
 
     NvApp app;
-    if (!paired->launchApp(&app)) {
+    const EngineLaunchReason launchReason = paired->launchApp(&app);
+    if (reason != nullptr) {
+        *reason = launchReason;
+    }
+    if (launchReason != EngineLaunchReason::Started) {
         return nullptr;
     }
 

@@ -33,6 +33,7 @@
  *****************************************************************************/
 
 #include <QtTest>
+#include "seathub/update_retry_state.h"
 
 #include <QByteArray>
 #include <QCoreApplication>
@@ -40,6 +41,7 @@
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
+#include <QHash>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -47,6 +49,7 @@
 #include <QProcessEnvironment>
 #include <QStandardPaths>
 #include <QStringList>
+#include <QSet>
 #include <QTcpServer>
 #include <QTcpSocket>
 #include <QTemporaryDir>
@@ -54,6 +57,7 @@
 #include <cstdio>
 #include <cstring>
 #include <memory>
+#include <stdexcept>
 
 #include "seathub/token_store.h"
 
@@ -70,6 +74,12 @@
 #define SDL_MAIN_HANDLED
 
 #include "seathub/telemetry.h"
+#include "seathub/stream_quality_sampler.h"
+#include <QEventLoop>
+#include <QTimer>
+#include "seathub/pairing_controller.h"
+#include "seathub/error_map.h"
+#include "hostile_fixtures.h"
 
 #ifndef SEATHUB_SENTRY_BIN_DIR
 #error "SEATHUB_SENTRY_BIN_DIR must be defined by the .pro file (the sentry-native install's bin folder)"
@@ -302,6 +312,269 @@ int runLogsChild(int argc, char* argv[])
     return 0;
 }
 
+// --- Plan 09 (ADR-0072): the diagnostic lane's own child role -----------------------------
+
+/// `tst_telemetry --diag-child <scenario> <dsn> <db> <handler> <spool-dir> <run-state-dir>`:
+/// one fresh process per scenario, so each assertion below is about a new SDK, a new shipper and
+/// a new gate - the state the three kill switches and the launch record are actually about.
+///
+/// Scenarios: `play-step` (one structured `play.step`, with the PIN sentinel present ONLY in a
+/// local `engineError`-shaped string the emission never receives), `step-metric` (one
+/// `seathub.play.step_result` + `seathub.play.step_duration` while signed in with a session, a
+/// host and a trace), `flush` (one line, then a timed `flush(2000)` reported on stdout),
+/// `launch` (the `client.telemetry` launch record), and the three `kill-*` scenarios, which emit
+/// a line AND a metric that must produce no envelope at all.
+int runDiagChild(int argc, char* argv[])
+{
+    QCoreApplication application(argc, argv);
+    const QString scenario = argc > 2 ? QString::fromLocal8Bit(argv[2]) : QString();
+    const QString dsn = argc > 3 ? QString::fromLocal8Bit(argv[3]) : QString();
+    const QString dbDir = argc > 4 ? QString::fromLocal8Bit(argv[4]) : QString();
+    const QString handler = argc > 5 ? QString::fromLocal8Bit(argv[5]) : QString();
+    const QString spoolDir = argc > 6 ? QString::fromLocal8Bit(argv[6]) : QString();
+    const QString runStateDir = argc > 7 ? QString::fromLocal8Bit(argv[7]) : QString();
+
+    SeatHubTelemetry::Options options;
+    options.databaseDir = dbDir;
+    options.handlerPath = handler;
+    options.environment = QStringLiteral("test");
+    options.release = QStringLiteral("seathub@0.0.0-diag");
+    // The `kill-no-dsn` scenario is the control plane's handout turning telemetry OFF: an empty
+    // DSN from the start, which is what an off handout looks like to `startWith()`.
+    options.dsn = scenario == QLatin1String("kill-no-dsn") ? QString() : dsn;
+
+    LogTee::install();
+    LogShipper::instance().setSpoolDirectoryForTests(spoolDir);
+    LogShipper::instance().start(SeatHubTelemetry::logShipperHandOff());
+    SeatHubTelemetry::setRunStateDirectoryForTests(runStateDir);
+    SeatHubTelemetry::startWith(options);
+    SeatHubTelemetry::setSession(QStringLiteral("session-diag-child"),
+                                 QStringLiteral("host-diag-child"));
+
+    SeatHubTelemetry::Handout handout;
+    handout.dsn = options.dsn;
+    handout.environment = QStringLiteral("test");
+    handout.logs = scenario != QLatin1String("kill-logs-false");
+    SeatHubTelemetry::applyHandout(handout);
+
+    if (scenario != QLatin1String("kill-signed-out")
+        && scenario != QLatin1String("offline-queue")) {
+        SeatHubTelemetry::setUser(QStringLiteral("acct-diag-child"));
+    }
+
+    QJsonObject stepAttributes;
+    stepAttributes.insert(QStringLiteral("step"), QStringLiteral("pair_handshake"));
+    stepAttributes.insert(QStringLiteral("outcome"), QStringLiteral("failed"));
+    stepAttributes.insert(QStringLiteral("failure_class"), QStringLiteral("pin_rejected"));
+    stepAttributes.insert(QStringLiteral("attempt"), 1);
+
+    const auto emitStep = [](const QString& step, const QString& outcome,
+                             const QString& failureClass, int attempt = 1,
+                             const QString& endReason = QString(), int numericDetail = 0) {
+        QJsonObject attributes;
+        attributes.insert(QStringLiteral("step"), step);
+        attributes.insert(QStringLiteral("outcome"), outcome);
+        attributes.insert(QStringLiteral("failure_class"), failureClass);
+        attributes.insert(QStringLiteral("elapsed_ms"), 23);
+        if (attempt > 0) {
+            attributes.insert(QStringLiteral("attempt"), attempt);
+        }
+        if (!endReason.isEmpty()) {
+            attributes.insert(QStringLiteral("end_reason"), endReason);
+        }
+        if (step == QLatin1String("allocate")) {
+            attributes.insert(QStringLiteral("http_status"), numericDetail);
+        } else if (step == QLatin1String("stream")) {
+            attributes.insert(QStringLiteral("engine_error"), numericDetail);
+        }
+        SeatHubTelemetry::emitDiagnostic(QStringLiteral("play.step"),
+                                         outcome == QLatin1String("ok") ? LogLevel::Info
+                                                                          : LogLevel::Warning,
+                                         attributes);
+        SeatHubTelemetry::emitStepMetric(step, outcome, failureClass, 23.0);
+    };
+
+    const auto emitStreamDiagnostics = []() {
+        qint64 now = 0;
+        StreamQualitySampler sampler(nullptr, [&]() { return now; });
+        sampler.start(QStringLiteral("diagnostic-play"));
+        VideoStats stats;
+        stats.renderedFps = OptionalMetric::of(59.0);
+        stats.networkDroppedFramePct = OptionalMetric::of(0.42);
+        stats.jitterDroppedFramePct = OptionalMetric::of(0.10);
+        stats.rttMs = OptionalMetric::of(23.0);
+        stats.decodeTimeMs = OptionalMetric::of(3.21);
+        stats.queueTimeMs = OptionalMetric::of(1.05);
+        stats.renderTimeMs = OptionalMetric::of(2.77);
+        stats.hostProcessingAvgMs = OptionalMetric::of(1.6);
+        stats.videoWidth = OptionalMetric::of(1920); stats.videoHeight = OptionalMetric::of(1080);
+        for (int i = 0; i < 60; ++i) { now = i * 1000; sampler.feed(stats); }
+        sampler.noteConnectionStatus(1);
+        now = 60000;
+        sampler.noteConnectionStatus(0);
+        sampler.finish();
+        SeatHubTelemetry::emitDiagnostic(QStringLiteral("play.summary"), LogLevel::Info,
+            {{"exit_path", "ended"}, {"outcome", "ok"}, {"last_step", "stream"},
+             {"failure_class", "graceful"}, {"t_first_frame_ms", 23}, {"stream_s", 60},
+             {"rollups", sampler.rollups()}, {"bad_episodes", sampler.badEpisodes()},
+             {"bad_seconds", sampler.badSeconds()}, {"sampling_gap_s", sampler.samplingGapS()},
+             {"reconnects", 0}, {"cfg_res", "1920x1080"}, {"cfg_fps", 60}, {"cfg_bitrate_kbps", 20000}});
+    };
+
+    if (scenario == QLatin1String("rollup") || scenario == QLatin1String("rollup-no-rtt")) {
+        StreamQualitySampler sampler;
+        sampler.setWindowMs(40);
+        sampler.start(QStringLiteral("session-diag-child"));
+        VideoStats stats;
+        const QString block = QStringLiteral(
+            "Video stream: 1920x1080 60.00 FPS (Codec: H264)\n"
+            "Incoming frame rate from network: 60.00 FPS\n"
+            "Decoding frame rate: 59.98 FPS\n"
+            "Rendering frame rate: 59.96 FPS\n"
+            "Host processing latency min/max/average: 1.0/2.0/1.6 ms\n"
+            "Frames dropped by your network connection: 0.42%\n"
+            "Frames dropped due to network jitter: 0.10%\n"
+            "Average network latency: %1\n"
+            "Average decoding time: 3.21 ms\n"
+            "Average frame queue delay: 1.05 ms\n"
+            "Average rendering time (including monitor V-sync latency): 2.77 ms\n")
+            .arg(scenario == QLatin1String("rollup") ? QStringLiteral("23 ms (variance: 4 ms)")
+                                                       : QStringLiteral("N/A"));
+        if (!parseVideoStatsBlock(block, &stats)) return 2;
+        sampler.feed(stats);
+        QEventLoop loop;
+        QObject::connect(&sampler, &StreamQualitySampler::rollupEmitted, &loop, &QEventLoop::quit);
+        QTimer::singleShot(5000, &loop, &QEventLoop::quit);
+        loop.exec();
+        sampler.finish();
+        if (sampler.rollups() != 1) return 3;
+    }
+    else if (scenario == QLatin1String("rig-tee")) {
+        LogShipper::setRedactions({QStringLiteral("203.0.113.77")});
+        qInfo() << "Executing request: https://203.0.113.77:47984/serverinfo";
+        qWarning() << "Host 203.0.113.77 not found (Error 3)";
+        qInfo() << "Connecting to 203.0.113.77:47989";
+        LogShipper::clearRedactions();
+    }
+    else if (scenario == QLatin1String("play-step")) {
+        // ADR-0072 item 2: the local diagnostic a real failure would carry, PIN and all. It is
+        // built HERE and handed to nothing - the emission below receives only vocabulary tokens
+        // and numbers, which is exactly what the assertion on the other side proves.
+        const QString engineError = QStringLiteral("the rig rejected the pairing PIN 4821");
+        QJsonObject attributes = stepAttributes;
+        attributes.insert(QStringLiteral("elapsed_ms"), 812);
+        SeatHubTelemetry::emitDiagnostic(QStringLiteral("play.step"), LogLevel::Warning,
+                                         attributes);
+        if (engineError.isEmpty()) { // never true: keeps the sentinel in scope, not in the emission
+            return 1;
+        }
+    }
+    else if (scenario == QLatin1String("step-metric")) {
+        SeatHubTelemetry::setTrace(QStringLiteral("trace-diag-child"));
+        SeatHubTelemetry::emitStepMetric(QStringLiteral("pair_handshake"),
+                                         QStringLiteral("failed"),
+                                         QStringLiteral("pin_rejected"), 812.0);
+    }
+    else if (scenario == QLatin1String("flush")) {
+        SeatHubTelemetry::emitDiagnostic(QStringLiteral("play.step"), LogLevel::Warning,
+                                         stepAttributes);
+    }
+    else if (scenario == QLatin1String("launch")) {
+        SeatHubTelemetry::noteLaunch();
+    }
+    else if (scenario == QLatin1String("hostile-all")) {
+        PairingTarget target;
+        target.sessionId = QStringLiteral("session-hostile");
+        target.hostAddress = QString::fromLatin1(HostileFixtures::RigAddress);
+        target.httpsPort = 48010;
+        target.pairingPin = QString::fromLatin1(HostileFixtures::Pin);
+        SeatHubFailure failure;
+        failure.error = QStringLiteral("Host %1 not found").arg(target.hostAddress);
+        failure.diagnostic = QStringLiteral("PIN %1, %2, %3")
+                                 .arg(target.pairingPin, QString::fromLatin1(HostileFixtures::Email),
+                                      QString::fromLatin1(HostileFixtures::Phone));
+        const QString rawNetworkText = QStringLiteral("Host %1 not found").arg(target.hostAddress);
+        const QString pem = QString::fromLatin1(HostileFixtures::PemHeader);
+        const QString pairingSecret = QString::fromLatin1(HostileFixtures::PairingSecret);
+        const QString responseFragment = QString::fromLatin1(HostileFixtures::ResponseFragment);
+        const std::runtime_error exception(
+            QStringLiteral("Bearer %1").arg(QString::fromLatin1(HostileFixtures::Bearer))
+                .toUtf8().constData());
+        if (target.hostAddress != QString::fromLatin1(HostileFixtures::RigAddress)
+            || target.httpsPort != 48010 || failure.diagnostic.isEmpty()
+            || !rawNetworkText.contains(target.hostAddress) || pem.isEmpty()
+            || pairingSecret.isEmpty() || responseFragment.isEmpty()
+            || !QString::fromUtf8(exception.what()).contains(QString::fromLatin1(HostileFixtures::Bearer))) {
+            return 2;
+        }
+
+        SeatHubTelemetry::setTrace(QStringLiteral("trace-hostile"));
+        const QList<QPair<QString, QString>> outcomes = {
+            {QStringLiteral("allocate"), QStringLiteral("refused_balance")},
+            {QStringLiteral("rig_wait"), QStringLiteral("server_ended")},
+            {QStringLiteral("pair_authorize"), QStringLiteral("unreachable_deadline")},
+            {QStringLiteral("pair_server_info"), QStringLiteral("net_timeout")},
+            {QStringLiteral("pair_handshake"), QStringLiteral("pin_rejected")},
+            {QStringLiteral("engine_prepare"), QStringLiteral("no_app")},
+            {QStringLiteral("engine_connect"), QStringLiteral("rtsp_handshake")},
+            {QStringLiteral("stream"), QStringLiteral("no_video_frame")},
+            {QStringLiteral("reconnect"), QStringLiteral("grace_expired")},
+            {QStringLiteral("teardown"), QStringLiteral("failed_auth")},
+        };
+        for (const auto& item : outcomes) {
+            emitStep(item.first, QStringLiteral("failed"), item.second, 1,
+                     item.first == QLatin1String("rig_wait")
+                         ? QStringLiteral("READINESS_TIMEOUT") : QString(),
+                     item.first == QLatin1String("allocate") ? 402
+                         : item.first == QLatin1String("stream") ? -101 : 0);
+        }
+        emitStep(QStringLiteral("pair_handshake"), QStringLiteral("ok"),
+                 QStringLiteral("in_progress"), 2);
+        emitStreamDiagnostics();
+        SeatHubTelemetry::noteLaunch();
+    }
+    else if (scenario == QLatin1String("offline-queue")) {
+        QElapsedTimer emission;
+        emission.start();
+        emitStep(QStringLiteral("pair_handshake"), QStringLiteral("failed"),
+                 QStringLiteral("pin_rejected"));
+        emitStreamDiagnostics();
+        fprintf(stdout, "EMISSION_MS=%lld\n", static_cast<long long>(emission.elapsed()));
+    }
+    else if (scenario == QLatin1String("offline-drain")) {
+        // Startup adopts the previous process's spool before this scenario reaches the exit drain.
+        SeatHubTelemetry::noteLaunch();
+    }
+    else if (scenario.startsWith(QLatin1String("kill-"))) {
+        // Both lanes at once: the kill switch has to reach the diagnostic line (the shipper's
+        // own gate) and the metric (`before_send_metric`'s atomic gate) or one of them would
+        // still report while telemetry is off.
+        SeatHubTelemetry::emitDiagnostic(QStringLiteral("play.step"), LogLevel::Warning,
+                                         stepAttributes);
+        SeatHubTelemetry::emitStepMetric(QStringLiteral("pair_handshake"),
+                                         QStringLiteral("failed"),
+                                         QStringLiteral("pin_rejected"), 812.0);
+        emitStreamDiagnostics();
+    }
+
+    LogShipper::instance().drainBeforeSignOut();
+    const qint64 flushStartedAt = QDateTime::currentMSecsSinceEpoch();
+    const bool flushed = SeatHubTelemetry::flush(2000);
+    const qint64 flushElapsed = QDateTime::currentMSecsSinceEpoch() - flushStartedAt;
+    if (scenario == QLatin1String("flush")) {
+        // The parent reads this: the call must return inside its 2000 ms budget.
+        fprintf(stdout, "FLUSH_MS=%lld FLUSH_OK=%d\n", static_cast<long long>(flushElapsed),
+                flushed ? 1 : 0);
+        fflush(stdout);
+    }
+    LogShipper::instance().stop();
+    // A marker after the one call that can block on another thread, so a parent that reports a
+    // child "still running" can tell where it stopped rather than guessing.
+    fprintf(stdout, "STOPPED=1\n");
+    fflush(stdout);
+    return 0;
+}
+
 // --- the fake Sentry endpoint --------------------------------------------------------------
 
 /// Wires `server` to answer every request with `200 {}` and record the request line's path in
@@ -403,6 +676,7 @@ struct ParsedLogItem
 {
     bool found = false;
     QString body;
+    QString level;
     QJsonObject attributes;
 };
 
@@ -442,12 +716,254 @@ ParsedLogItem parseFirstLogItem(const QByteArray& envelopeBody)
                 const QJsonObject firstLog = items.first().toObject();
                 result.found = true;
                 result.body = firstLog.value(QStringLiteral("body")).toString();
+                result.level = firstLog.value(QStringLiteral("level")).toString();
                 result.attributes = firstLog.value(QStringLiteral("attributes")).toObject();
                 return result;
             }
         }
     }
     return result;
+}
+
+/// Like `wireLogEnvelopeListener()` but keeps EVERY envelope instead of the last one written:
+/// plan 09's runs send more than one (the launch record, the `play.step` and the metrics can
+/// each arrive as their own request), and a test that has to prove "zero envelopes" or find one
+/// item among several cannot do it through a single overwritten buffer. Same body-complete rule,
+/// same `Connection: close` answer - one request per connection, so nothing is ever concatenated.
+void wireEnvelopeCollector(QTcpServer* server, QList<QByteArray>* envelopes,
+                           QList<QByteArray>* requestHeaders = nullptr)
+{
+    QObject::connect(server, &QTcpServer::newConnection, server,
+                     [server, envelopes, requestHeaders]() {
+        while (QTcpSocket* socket = server->nextPendingConnection()) {
+            auto buffer = std::make_shared<QByteArray>();
+            auto responded = std::make_shared<bool>(false);
+            QObject::connect(socket, &QTcpSocket::readyRead, socket,
+                              [socket, buffer, responded, envelopes, requestHeaders]() {
+                                 *buffer += socket->readAll();
+                                 if (*responded) {
+                                     return;
+                                 }
+                                 const int headerEnd = buffer->indexOf("\r\n\r\n");
+                                 if (headerEnd < 0) {
+                                     return;
+                                 }
+                                 qint64 contentLength = 0;
+                                 for (const QByteArray& line : buffer->left(headerEnd).split('\n')) {
+                                     const QByteArray trimmed = line.trimmed();
+                                     if (trimmed.toLower().startsWith("content-length:")) {
+                                         contentLength = trimmed.mid(trimmed.indexOf(':') + 1)
+                                                             .trimmed()
+                                                             .toLongLong();
+                                         break;
+                                     }
+                                 }
+                                 const int bodyStart = headerEnd + 4;
+                                 if (buffer->size() - bodyStart < contentLength) {
+                                     return;
+                                 }
+                                  envelopes->append(
+                                      buffer->mid(bodyStart, static_cast<int>(contentLength)));
+                                  if (requestHeaders) {
+                                      requestHeaders->append(buffer->left(headerEnd));
+                                  }
+                                 *responded = true;
+                                 static const QByteArray body = QByteArrayLiteral("{}");
+                                 QByteArray response
+                                     = QByteArrayLiteral("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                                                        "Content-Length: ")
+                                     + QByteArray::number(body.size())
+                                     + QByteArrayLiteral("\r\nConnection: close\r\n\r\n") + body;
+                                 socket->write(response);
+                                 socket->flush();
+                                 socket->disconnectFromHost();
+                             });
+            QObject::connect(socket, &QTcpSocket::disconnected, socket, &QTcpSocket::deleteLater);
+        }
+    });
+}
+
+/// Every `log` item in one envelope - the same walk `parseFirstLogItem()` does, kept going past
+/// the first item so a run whose envelope batches several lines can still be searched by body.
+QList<ParsedLogItem> parseLogItems(const QByteArray& envelopeBody)
+{
+    QList<ParsedLogItem> items;
+    int pos = envelopeBody.indexOf('\n');
+    if (pos < 0) {
+        return items;
+    }
+    pos += 1;
+    while (pos < envelopeBody.size()) {
+        const int headerLineEnd = envelopeBody.indexOf('\n', pos);
+        if (headerLineEnd < 0) {
+            break;
+        }
+        QJsonParseError error;
+        const QJsonObject itemHeader =
+            QJsonDocument::fromJson(envelopeBody.mid(pos, headerLineEnd - pos), &error).object();
+        if (error.error != QJsonParseError::NoError) {
+            break;
+        }
+        const qint64 length = itemHeader.value(QStringLiteral("length")).toVariant().toLongLong();
+        const QString type = itemHeader.value(QStringLiteral("type")).toString();
+        pos = headerLineEnd + 1;
+        const QByteArray payload = envelopeBody.mid(pos, static_cast<int>(length));
+        pos += static_cast<int>(length);
+        if (pos < envelopeBody.size() && envelopeBody.at(pos) == '\n') {
+            ++pos;
+        }
+        if (type != QLatin1String("log")) {
+            continue;
+        }
+        const QJsonArray entries =
+            QJsonDocument::fromJson(payload).object().value(QStringLiteral("items")).toArray();
+        for (const QJsonValue& entry : entries) {
+            const QJsonObject log = entry.toObject();
+            ParsedLogItem parsed;
+            parsed.found = true;
+            parsed.body = log.value(QStringLiteral("body")).toString();
+            parsed.level = log.value(QStringLiteral("level")).toString();
+            parsed.attributes = log.value(QStringLiteral("attributes")).toObject();
+            items.append(parsed);
+        }
+    }
+    return items;
+}
+
+/// One `trace_metric` entry (ADR-0072 item 6): the item type is `trace_metric`, its payload is
+/// the same `{items: [...]}` shape the log item uses (`sentry__envelope_add_metrics` ->
+/// `add_telemetry()` in the pinned `sentry_envelope.c`), and each entry carries `name`, `type`,
+/// `value`, its `attributes` object and - when the Play's trace is live - a top-level `trace_id`
+/// (P-3: a field of the metric, never one of its attributes).
+struct ParsedMetric
+{
+    QString name;
+    QString type;
+    QString unit;
+    double value = 0;
+    QJsonObject attributes;
+    QString traceId;
+};
+
+QList<ParsedMetric> parseMetricItems(const QByteArray& envelopeBody)
+{
+    QList<ParsedMetric> metrics;
+    int pos = envelopeBody.indexOf('\n');
+    if (pos < 0) {
+        return metrics;
+    }
+    pos += 1;
+    while (pos < envelopeBody.size()) {
+        const int headerLineEnd = envelopeBody.indexOf('\n', pos);
+        if (headerLineEnd < 0) {
+            break;
+        }
+        QJsonParseError error;
+        const QJsonObject itemHeader =
+            QJsonDocument::fromJson(envelopeBody.mid(pos, headerLineEnd - pos), &error).object();
+        if (error.error != QJsonParseError::NoError) {
+            break;
+        }
+        const qint64 length = itemHeader.value(QStringLiteral("length")).toVariant().toLongLong();
+        const QString type = itemHeader.value(QStringLiteral("type")).toString();
+        pos = headerLineEnd + 1;
+        const QByteArray payload = envelopeBody.mid(pos, static_cast<int>(length));
+        pos += static_cast<int>(length);
+        if (pos < envelopeBody.size() && envelopeBody.at(pos) == '\n') {
+            ++pos;
+        }
+        if (type != QLatin1String("trace_metric")) {
+            continue;
+        }
+        const QJsonArray entries =
+            QJsonDocument::fromJson(payload).object().value(QStringLiteral("items")).toArray();
+        for (const QJsonValue& entry : entries) {
+            const QJsonObject metric = entry.toObject();
+            ParsedMetric parsed;
+            parsed.name = metric.value(QStringLiteral("name")).toString();
+            parsed.type = metric.value(QStringLiteral("type")).toString();
+            parsed.unit = metric.value(QStringLiteral("unit")).toString();
+            parsed.value = metric.value(QStringLiteral("value")).toDouble();
+            parsed.attributes = metric.value(QStringLiteral("attributes")).toObject();
+            parsed.traceId = metric.value(QStringLiteral("trace_id")).toString();
+            metrics.append(parsed);
+        }
+    }
+    return metrics;
+}
+
+/// Everything a run sent, flattened across every captured envelope.
+struct EnvelopeScan
+{
+    QList<ParsedLogItem> logs;
+    QList<ParsedMetric> metrics;
+};
+
+EnvelopeScan scanEnvelopes(const QList<QByteArray>& envelopes)
+{
+    EnvelopeScan scan;
+    for (const QByteArray& envelope : envelopes) {
+        scan.logs.append(parseLogItems(envelope));
+        scan.metrics.append(parseMetricItems(envelope));
+    }
+    return scan;
+}
+
+/// The first log whose body is exactly `body`, or a default-constructed (not found) item.
+ParsedLogItem findLog(const EnvelopeScan& scan, const QString& body)
+{
+    for (const ParsedLogItem& item : scan.logs) {
+        if (item.body == body) {
+            return item;
+        }
+    }
+    return ParsedLogItem();
+}
+
+/// The first metric with this name, or `nullptr`.
+const ParsedMetric* findMetric(const EnvelopeScan& scan, const QString& name)
+{
+    for (const ParsedMetric& metric : scan.metrics) {
+        if (metric.name == name) {
+            return &metric;
+        }
+    }
+    return nullptr;
+}
+
+/// Convenience predicates over the whole capture - a `QTRY_` on these also gives the event loop
+/// the time it needs to read an envelope that the child sent just before it exited (the listener
+/// only ever reads on the event loop, and `QProcess::waitForFinished()` blocks it).
+bool hasLog(const QList<QByteArray>& envelopes, const QString& body)
+{
+    return findLog(scanEnvelopes(envelopes), body).found;
+}
+
+bool hasMetric(const QList<QByteArray>& envelopes, const QString& name)
+{
+    return findMetric(scanEnvelopes(envelopes), name) != nullptr;
+}
+
+/// Writes one line into a DEAD process's spool file in `directory`, in the shape the release
+/// before this one wrote it (no `attrs`, no `diagnostic` key) - a leftover that `adoptLeftovers()`
+/// reclaims when the child's own `LogShipper::start()` runs, before `noteLaunch()` reads the
+/// launch record's counters.
+void writeLeftoverSpoolLine(const QString& directory, qint64 deadPid, const QString& body,
+                            double loggedAt)
+{
+    QDir().mkpath(directory);
+    QJsonObject object;
+    object.insert(QStringLiteral("level"), static_cast<int>(LogLevel::Info));
+    object.insert(QStringLiteral("body"), body);
+    object.insert(QStringLiteral("logged_at"), loggedAt);
+    object.insert(QStringLiteral("session_id"), QString());
+    object.insert(QStringLiteral("host_id"), QString());
+    object.insert(QStringLiteral("trace_id"), QString());
+
+    QFile file(QDir(directory).filePath(QStringLiteral("spool-%1.jsonl").arg(deadPid)));
+    file.open(QIODevice::Append | QIODevice::Text);
+    file.write(QJsonDocument(object).toJson(QJsonDocument::Compact));
+    file.write("\n");
 }
 
 /// One "event" envelope item (CR-01 regression: `captureTestMessageForTests()`'s plain message
@@ -460,6 +976,7 @@ ParsedLogItem parseFirstLogItem(const QByteArray& envelopeBody)
 struct ParsedEventItem
 {
     bool found = false;
+    QJsonObject json;
     QString body;
     QJsonObject tags;
     QJsonObject user;
@@ -498,6 +1015,7 @@ ParsedEventItem parseFirstEventItem(const QByteArray& envelopeBody)
         if (type == QStringLiteral("event")) {
             const QJsonObject event = QJsonDocument::fromJson(payload).object();
             result.found = true;
+            result.json = event;
             result.tags = event.value(QStringLiteral("tags")).toObject();
             result.user = event.value(QStringLiteral("user")).toObject();
             result.body = event.value(QStringLiteral("message")).toObject()
@@ -534,6 +1052,97 @@ class TstTelemetry : public QObject
     Q_OBJECT
 
 private slots:
+    void anInstallerFailureBecomesOneMessageEventAndIsDeduplicated_data()
+    {
+        QTest::addColumn<QString>("outcome"); QTest::addColumn<QString>("level");
+        QTest::newRow("failed") << QString("failed") << QString("error");
+        QTest::newRow("recovered") << QString("recovered") << QString("warning");
+    }
+    void anInstallerFailureBecomesOneMessageEventAndIsDeduplicated()
+    {
+        QFETCH(QString, outcome); QFETCH(QString, level);
+        QTemporaryDir journal, db, state;
+        QVERIFY(journal.isValid() && db.isValid() && state.isValid());
+        const QString id = "0123456789abcdef";
+        const auto now = QDateTime::currentDateTimeUtc();
+        QJsonObject row{{"v", 1}, {"attempt", id}, {"from", "0.1.24"}, {"to", "0.1.25"},
+            {"mode", "staged"}, {"started", now.addSecs(-100).toString(Qt::ISODate)},
+            {"ended", now.addSecs(-10).toString(Qt::ISODate)}, {"outcome", outcome},
+            {"step", "swap_aside"}, {"class", "installer.locked_file"}, {"code", 5},
+            {"rollback", "not_needed"}, {"state", "old_intact"},
+            {"ms", QJsonObject{{"stage", 2}, {"swap", 3}, {"total", 5}}}, {"elevated", true},
+            {"private_path", "C:/Users/DO_NOT_SHIP"}};
+        QFile file(journal.filePath("attempt-" + id + ".end.json"));
+        QVERIFY(file.open(QIODevice::WriteOnly)); file.write(QJsonDocument(row).toJson()); file.close();
+        const auto mtime = QFileInfo(file).lastModified(); const auto bytes = QFileInfo(file).size();
+        QTcpServer server; QList<QByteArray> envelopes;
+        wireEnvelopeCollector(&server, &envelopes);
+        QVERIFY(server.listen(QHostAddress::LocalHost, 0));
+        const QString dsn = QString("http://publickey@127.0.0.1:%1/1").arg(server.serverPort());
+        const QString retry = state.filePath("retry-state.json");
+        for (int run = 0; run < 2; ++run) {
+            QProcess child; child.setProgram(m_appPath);
+            child.setArguments({"--installer-child", dsn, db.path(), m_handlerPath,
+                                journal.path(), retry});
+            child.start(); QVERIFY(child.waitForStarted(5000));
+            QTRY_VERIFY_WITH_TIMEOUT(child.state() != QProcess::Running, 15000);
+            QCOMPARE(child.exitCode(), 0);
+        }
+        QList<ParsedEventItem> events;
+        for (const auto& envelope : envelopes) {
+            const auto item = parseFirstEventItem(envelope);
+            if (item.found) events.append(item);
+            QVERIFY(!envelope.contains("DO_NOT_SHIP"));
+        }
+        QCOMPARE(events.size(), 1);
+        const auto event = events.first();
+        QCOMPARE(event.json.value("level").toString(), level);
+        QCOMPARE(event.tags.value("kind").toString(), QString("installer_update"));
+        QCOMPARE(event.tags.value("step").toString(), QString("swap_aside"));
+        QCOMPARE(event.tags.value("class").toString(), QString("installer.locked_file"));
+        QCOMPARE(event.tags.value("mode").toString(), QString("staged"));
+        QCOMPARE(event.tags.value("from").toString(), QString("0.1.24"));
+        QCOMPARE(event.tags.value("to").toString(), QString("0.1.25"));
+        QCOMPARE(event.json.value("fingerprint").toArray(),
+                 QJsonArray({"installer-update", "swap_aside", "installer.locked_file"}));
+        QCOMPARE(UpdateRetryState::load(retry).reportedIds, QStringList{id});
+        QCOMPARE(QFileInfo(file).lastModified(), mtime); QCOMPARE(QFileInfo(file).size(), bytes);
+    }
+    void noDsnKeepsTheFilesAndSendsNothing()
+    {
+        QTemporaryDir journal, db, state;
+        QFile sentinel(journal.filePath("attempt-0123456789abcdef.end.json"));
+        QVERIFY(sentinel.open(QIODevice::WriteOnly)); sentinel.write("unread sentinel"); sentinel.close();
+        const auto mtime = QFileInfo(sentinel).lastModified();
+        const QString retry = state.filePath("retry-state.json");
+        QProcess child; child.setProgram(m_appPath);
+        child.setArguments({"--installer-child", "", db.path(), m_handlerPath, journal.path(), retry});
+        child.start(); QVERIFY(child.waitForStarted(5000));
+        QTRY_VERIFY_WITH_TIMEOUT(child.state() != QProcess::Running, 15000);
+        QCOMPARE(child.exitCode(), 0);
+        QVERIFY(!QFileInfo::exists(retry));
+        QCOMPARE(QFileInfo(sentinel).lastModified(), mtime);
+        QCOMPARE(QFileInfo(sentinel).size(), qint64(15));
+    }
+    void retryStateRoundTripsAndCapsTheLastSixteenIds()
+    {
+        QTemporaryDir dir; const QString path = dir.filePath("retry-state.json");
+        UpdateRetryState state; state.target = "0.1.25"; state.attemptsFailed = 3; state.declines = 2;
+        state.firstFailedAt = QDateTime::currentDateTimeUtc().addSecs(-30);
+        state.lastFailedAt = state.firstFailedAt.addSecs(10); state.nextAllowedAt = state.lastFailedAt.addSecs(3600);
+        state.lastClass = "installer.locked_file"; state.exhaustedReported = true; state.launched = true;
+        for (int i = 0; i < 20; ++i) state.rememberReport(QString::number(i, 16).rightJustified(16, '0'));
+        QVERIFY(state.save(path));
+        const auto loaded = UpdateRetryState::load(path);
+        QCOMPARE(loaded.target, state.target); QCOMPARE(loaded.attemptsFailed, 3); QCOMPARE(loaded.declines, 2);
+        QCOMPARE(loaded.firstFailedAt.toSecsSinceEpoch(), state.firstFailedAt.toSecsSinceEpoch());
+        QCOMPARE(loaded.lastFailedAt.toSecsSinceEpoch(), state.lastFailedAt.toSecsSinceEpoch());
+        QCOMPARE(loaded.nextAllowedAt.toSecsSinceEpoch(), state.nextAllowedAt.toSecsSinceEpoch());
+        QCOMPARE(loaded.lastClass, state.lastClass); QVERIFY(loaded.exhaustedReported && loaded.launched);
+        QCOMPARE(loaded.reportedIds.size(), 16); QCOMPARE(loaded.reportedIds.first(), QString("0000000000000004"));
+        QFile file(path); QVERIFY(file.open(QIODevice::WriteOnly)); file.write("corrupt"); file.close();
+        QVERIFY(UpdateRetryState::load(path).reportedIds.isEmpty());
+    }
     void initTestCase()
     {
         // Behaviour 4: the handler folder these tests use is a temp copy holding
@@ -692,8 +1301,8 @@ private slots:
         QVERIFY(spoolDir.isValid());
 
         QTcpServer server;
-        QByteArray envelopeBody;
-        wireLogEnvelopeListener(&server, &envelopeBody);
+        QList<QByteArray> envelopes;
+        wireEnvelopeCollector(&server, &envelopes);
         QVERIFY2(server.listen(QHostAddress::LocalHost, 0),
                  "the fake Sentry listener must bind 127.0.0.1:0");
         const QString dsn = QStringLiteral("http://publickey@127.0.0.1:%1/1").arg(server.serverPort());
@@ -708,12 +1317,18 @@ private slots:
         child.start();
         QVERIFY2(child.waitForStarted(5000), "the logs-child process must start");
 
-        QTRY_VERIFY_WITH_TIMEOUT(!envelopeBody.isEmpty(), 15000);
+        // Plan 09: this run also emits `seathub.client.launch`, whose `trace_metric` envelope can
+        // arrive before (and in any case separately from) the log envelope - so wait for the
+        // envelope that actually carries the marker line, across every envelope captured.
+        QTRY_VERIFY_WITH_TIMEOUT(
+            findLog(scanEnvelopes(envelopes), QStringLiteral("logs-child-line-marker")).found,
+            15000);
 
         QVERIFY(child.waitForFinished(10000));
         QCOMPARE(child.exitCode(), 0);
 
-        const ParsedLogItem item = parseFirstLogItem(envelopeBody);
+        const ParsedLogItem item =
+            findLog(scanEnvelopes(envelopes), QStringLiteral("logs-child-line-marker"));
         QVERIFY2(item.found, "no log item found in the captured envelope");
         QVERIFY2(item.body.contains(QStringLiteral("logs-child-line-marker")),
                  qPrintable(QStringLiteral("unexpected log body: %1").arg(item.body)));
@@ -1162,6 +1777,742 @@ private slots:
         qunsetenv("SEATHUB_TEST_CRASH");
     }
 
+    // --- Plan 09 (ADR-0072): the diagnostic lane end to end ---------------------------------
+
+    void metricsCarryNoSessionHostOrUserIdAndKeepTheTraceId()
+    {
+        QTemporaryDir dbDir;
+        QVERIFY(dbDir.isValid());
+        QTemporaryDir spoolDir;
+        QVERIFY(spoolDir.isValid());
+        QTemporaryDir runStateDir;
+        QVERIFY(runStateDir.isValid());
+
+        QTcpServer server;
+        QList<QByteArray> envelopes;
+        wireEnvelopeCollector(&server, &envelopes);
+        QVERIFY2(server.listen(QHostAddress::LocalHost, 0),
+                 "the fake Sentry listener must bind 127.0.0.1:0");
+        const QString dsn =
+            QStringLiteral("http://publickey@127.0.0.1:%1/1").arg(server.serverPort());
+
+        QProcess child;
+        child.setProgram(m_appPath);
+        child.setArguments({ QStringLiteral("--diag-child"), QStringLiteral("step-metric"), dsn,
+                             dbDir.path(), m_handlerPath, spoolDir.path(), runStateDir.path() });
+        child.start();
+        QVERIFY2(child.waitForStarted(5000), "the diag-child process must start");
+        QTRY_VERIFY_WITH_TIMEOUT(!envelopes.isEmpty(), 20000);
+        // QTRY, never `waitForFinished()`: the latter blocks this process's event loop, and the
+        // fake Sentry listener only ever reads ON that loop. A child waiting for its envelope to
+        // be acknowledged would then be waiting for a parent that is waiting for it - the two
+        // deadlocking until the timeout below. `state()` flips from the process's own notifier,
+        // which the same event loop delivers, so this wait also lets every envelope in.
+        QTRY_VERIFY_WITH_TIMEOUT(child.state() != QProcess::Running, 20000);
+        QCOMPARE(child.exitCode(), 0);
+
+        // The listener only reads on the event loop, which `waitForFinished()` just blocked -
+        // give an envelope the child sent on its way out its turn to be read.
+        QTRY_VERIFY_WITH_TIMEOUT(
+            hasMetric(envelopes, QStringLiteral("seathub.play.step_result")), 10000);
+
+        const EnvelopeScan scan = scanEnvelopes(envelopes);
+        const ParsedMetric* result =
+            findMetric(scan, QStringLiteral("seathub.play.step_result"));
+        QVERIFY2(result != nullptr, "no seathub.play.step_result metric reached the listener");
+
+        // Exactly `step`, `outcome`, `failure_class` plus the SDK's own `sentry.*` / `os.*`
+        // (ADR-0072 item 6) - and above all none of the per-session identities the scope attaches
+        // to every metric (item 7, T-06.7-36).
+        const QStringList attributeKeys = result->attributes.keys();
+        QVERIFY2(!attributeKeys.isEmpty(), "the metric carries no attributes at all");
+        for (const QString& key : attributeKeys) {
+            const bool named = key == QLatin1String("step") || key == QLatin1String("outcome")
+                || key == QLatin1String("failure_class");
+            const bool sdk = key.startsWith(QLatin1String("sentry."))
+                || key.startsWith(QLatin1String("os."));
+            QVERIFY2(named || sdk, qPrintable(QStringLiteral("metric attribute outside the allow-list: %1").arg(key)));
+        }
+        QVERIFY(result->attributes.contains(QStringLiteral("step")));
+        QVERIFY(result->attributes.contains(QStringLiteral("outcome")));
+        QVERIFY(result->attributes.contains(QStringLiteral("failure_class")));
+        QVERIFY2(!result->attributes.contains(QStringLiteral("session_id")),
+                 "session_id must never be a metric dimension");
+        QVERIFY2(!result->attributes.contains(QStringLiteral("host_id")),
+                 "host_id must never be a metric dimension");
+        QVERIFY2(!result->attributes.contains(QStringLiteral("user.id")),
+                 "user.id must never be a metric dimension");
+        QVERIFY2(!result->traceId.isEmpty(),
+                 "the top-level trace_id field is what links a fleet metric to its Play (P-3)");
+
+        const ParsedMetric* duration =
+            findMetric(scan, QStringLiteral("seathub.play.step_duration"));
+        QVERIFY2(duration != nullptr, "no seathub.play.step_duration metric reached the listener");
+        QCOMPARE(duration->type, QStringLiteral("distribution"));
+        QVERIFY(duration->attributes.contains(QStringLiteral("step")));
+        QVERIFY(duration->attributes.contains(QStringLiteral("outcome")));
+        QVERIFY2(!duration->attributes.contains(QStringLiteral("failure_class")),
+                 "the duration distribution is dimensioned by step and outcome only");
+    }
+
+    void theKillSwitchesAlsoStopMetricsAndDiagnosticLines()
+    {
+        const QStringList scenarios = { QStringLiteral("kill-no-dsn"),
+                                         QStringLiteral("kill-logs-false"),
+                                         QStringLiteral("kill-signed-out") };
+        for (const QString& scenario : scenarios) {
+            QTemporaryDir dbDir;
+            QVERIFY(dbDir.isValid());
+            QTemporaryDir spoolDir;
+            QVERIFY(spoolDir.isValid());
+            QTemporaryDir runStateDir;
+            QVERIFY(runStateDir.isValid());
+
+            QTcpServer server;
+            QList<QByteArray> envelopes;
+            wireEnvelopeCollector(&server, &envelopes);
+            QVERIFY2(server.listen(QHostAddress::LocalHost, 0),
+                     "the fake Sentry listener must bind 127.0.0.1:0");
+            const QString dsn =
+                QStringLiteral("http://publickey@127.0.0.1:%1/1").arg(server.serverPort());
+
+            QProcess child;
+            child.setProgram(m_appPath);
+            child.setArguments({ QStringLiteral("--diag-child"), scenario, dsn, dbDir.path(),
+                                 m_handlerPath, spoolDir.path(), runStateDir.path() });
+            child.start();
+            QVERIFY2(child.waitForStarted(5000), qPrintable(scenario + " must start"));
+            // Event-loop wait for the same reason as everywhere else in this file: the listener
+            // only reads on the loop (and these children send nothing to read, but a blocked loop
+            // would still be the wrong way to wait for one).
+            QTRY_VERIFY_WITH_TIMEOUT(child.state() != QProcess::Running, 30000);
+            QCOMPARE(child.exitCode(), 0);
+
+            // Anything the SDK was still going to send would be on the wire by the time the
+            // child exits (its own `flush(2000)` runs before it does); a moment longer only
+            // makes the negative claim harder to satisfy, never easier.
+            QTest::qWait(1500);
+            QVERIFY2(envelopes.isEmpty(),
+                     qPrintable(QStringLiteral("%1 still shipped %2 envelope(s)")
+                                    .arg(scenario)
+                                    .arg(envelopes.size())));
+        }
+    }
+
+    void flushDeliversTheLastLineWithinBudget()
+    {
+        QTemporaryDir dbDir;
+        QVERIFY(dbDir.isValid());
+        QTemporaryDir spoolDir;
+        QVERIFY(spoolDir.isValid());
+        QTemporaryDir runStateDir;
+        QVERIFY(runStateDir.isValid());
+
+        QTcpServer server;
+        QList<QByteArray> envelopes;
+        wireEnvelopeCollector(&server, &envelopes);
+        QVERIFY2(server.listen(QHostAddress::LocalHost, 0),
+                 "the fake Sentry listener must bind 127.0.0.1:0");
+        const QString dsn =
+            QStringLiteral("http://publickey@127.0.0.1:%1/1").arg(server.serverPort());
+
+        QProcess child;
+        child.setProgram(m_appPath);
+        child.setArguments({ QStringLiteral("--diag-child"), QStringLiteral("flush"), dsn,
+                             dbDir.path(), m_handlerPath, spoolDir.path(), runStateDir.path() });
+        child.start();
+        QVERIFY2(child.waitForStarted(5000), "the diag-child process must start");
+
+        // The child exits immediately after its own `flush(2000)`, so an envelope can only be
+        // here if the flush put it on the wire - the SDK's own 5 s batcher interval would fire
+        // long after the process is gone (ADR-0072 item 9, V31).
+        QTRY_VERIFY_WITH_TIMEOUT(!envelopes.isEmpty(), 20000);
+        // QTRY, never `waitForFinished()`: the latter blocks this process's event loop, and the
+        // fake Sentry listener only ever reads ON that loop. A child waiting for its envelope to
+        // be acknowledged would then be waiting for a parent that is waiting for it - the two
+        // deadlocking until the timeout below. `state()` flips from the process's own notifier,
+        // which the same event loop delivers, so this wait also lets every envelope in.
+        QTRY_VERIFY_WITH_TIMEOUT(child.state() != QProcess::Running, 20000);
+        QCOMPARE(child.exitCode(), 0);
+
+        const QString report = QString::fromUtf8(child.readAllStandardOutput());
+        const QRegularExpressionMatch match =
+            QRegularExpression(QStringLiteral("FLUSH_MS=(\\d+)")).match(report);
+        QVERIFY2(match.hasMatch(), qPrintable(QStringLiteral("no flush timing in: %1").arg(report)));
+        const qint64 flushMs = match.captured(1).toLongLong();
+        QVERIFY2(flushMs <= 2500,
+                 qPrintable(QStringLiteral("flush(2000) took %1 ms - outside its budget").arg(flushMs)));
+
+        QTRY_VERIFY_WITH_TIMEOUT(hasLog(envelopes, QStringLiteral("play.step")), 10000);
+
+        const EnvelopeScan scan = scanEnvelopes(envelopes);
+        const ParsedLogItem item = findLog(scan, QStringLiteral("play.step"));
+        QVERIFY2(item.found, "the line emitted before the flush never reached the listener");
+    }
+
+    void theLaunchRecordCarriesTheDeliveryHealthAttributes()
+    {
+        QTemporaryDir dbDir;
+        QVERIFY(dbDir.isValid());
+        QTemporaryDir spoolDir;
+        QVERIFY(spoolDir.isValid());
+        QTemporaryDir runStateDir;
+        QVERIFY(runStateDir.isValid());
+
+        // A dead process's leftover spool: one line past the 7-day cutoff and one fresh. The
+        // child adopts both in its own `LogShipper::start()`, which runs BEFORE `noteLaunch()`
+        // builds the record - so the snapshot the record carries must already know the aged one
+        // is dead, and must count it exactly once.
+        const double now = static_cast<double>(QDateTime::currentMSecsSinceEpoch()) / 1000.0;
+        writeLeftoverSpoolLine(spoolDir.path(), 4194305, QStringLiteral("aged-leftover"),
+                               now - 8.0 * 24.0 * 3600.0);
+        writeLeftoverSpoolLine(spoolDir.path(), 4194305, QStringLiteral("fresh-leftover"), now);
+
+        QTcpServer server;
+        QList<QByteArray> envelopes;
+        wireEnvelopeCollector(&server, &envelopes);
+        QVERIFY2(server.listen(QHostAddress::LocalHost, 0),
+                 "the fake Sentry listener must bind 127.0.0.1:0");
+        const QString dsn =
+            QStringLiteral("http://publickey@127.0.0.1:%1/1").arg(server.serverPort());
+
+        QProcess child;
+        child.setProgram(m_appPath);
+        child.setArguments({ QStringLiteral("--diag-child"), QStringLiteral("launch"), dsn,
+                             dbDir.path(), m_handlerPath, spoolDir.path(), runStateDir.path() });
+        child.start();
+        QVERIFY2(child.waitForStarted(5000), "the diag-child process must start");
+        QTRY_VERIFY_WITH_TIMEOUT(!envelopes.isEmpty(), 20000);
+        // QTRY, never `waitForFinished()`: the latter blocks this process's event loop, and the
+        // fake Sentry listener only ever reads ON that loop. A child waiting for its envelope to
+        // be acknowledged would then be waiting for a parent that is waiting for it - the two
+        // deadlocking until the timeout below. `state()` flips from the process's own notifier,
+        // which the same event loop delivers, so this wait also lets every envelope in.
+        QTRY_VERIFY_WITH_TIMEOUT(child.state() != QProcess::Running, 20000);
+        QCOMPARE(child.exitCode(), 0);
+
+        QTRY_VERIFY_WITH_TIMEOUT(hasLog(envelopes, QStringLiteral("client.telemetry")), 10000);
+
+        const EnvelopeScan scan = scanEnvelopes(envelopes);
+        const ParsedLogItem item = findLog(scan, QStringLiteral("client.telemetry"));
+        QVERIFY2(item.found, "the launch record never reached the listener");
+
+        int records = 0;
+        for (const ParsedLogItem& log : scan.logs) {
+            if (log.body == QLatin1String("client.telemetry")) {
+                ++records;
+            }
+        }
+        QVERIFY2(records == 1, qPrintable(QStringLiteral("expected one launch record, found %1").arg(records)));
+
+        const QStringList expected = {
+            QStringLiteral("dsn_source"),           QStringLiteral("logs_enabled"),
+            QStringLiteral("signed_in"),            QStringLiteral("crashed_last_run"),
+            QStringLiteral("prev_exit"),            QStringLiteral("spool_lines_adopted"),
+            QStringLiteral("retry_files"),          QStringLiteral("dropped_queue"),
+            QStringLiteral("dropped_spool_age"),    QStringLiteral("cap_reached"),
+        };
+        for (const QString& key : expected) {
+            QVERIFY2(item.attributes.contains(key),
+                     qPrintable(QStringLiteral("the launch record is missing %1").arg(key)));
+        }
+
+        const auto value = [&item](const QString& key) {
+            return item.attributes.value(key).toObject().value(QStringLiteral("value"));
+        };
+        const QString dsnSource = value(QStringLiteral("dsn_source")).toString();
+        QVERIFY2(dsnSource == QLatin1String("cache") || dsnSource == QLatin1String("handout")
+                     || dsnSource == QLatin1String("none"),
+                 qPrintable(QStringLiteral("dsn_source is not one of the three: %1").arg(dsnSource)));
+        QCOMPARE(value(QStringLiteral("prev_exit")).toString(), QStringLiteral("clean"));
+        QVERIFY(value(QStringLiteral("logs_enabled")).toBool());
+        QVERIFY(value(QStringLiteral("signed_in")).toBool());
+        QVERIFY(!value(QStringLiteral("crashed_last_run")).toBool());
+        // Both leftovers adopted, the aged one already counted as dropped at this snapshot, and
+        // nothing else in the run has had a chance to drop anything yet.
+        QCOMPARE(value(QStringLiteral("spool_lines_adopted")).toInt(), 2);
+        QCOMPARE(value(QStringLiteral("dropped_spool_age")).toInt(), 1);
+        QVERIFY(value(QStringLiteral("retry_files")).toInt() >= 0);
+        QVERIFY(value(QStringLiteral("dropped_queue")).toInt() >= 0);
+        QVERIFY(value(QStringLiteral("cap_reached")).toInt() >= 0);
+    }
+
+    void thePlayStepCarriesOnlyAllowListedAttributesAndNeverThePin()
+    {
+        QTemporaryDir dbDir;
+        QVERIFY(dbDir.isValid());
+        QTemporaryDir spoolDir;
+        QVERIFY(spoolDir.isValid());
+        QTemporaryDir runStateDir;
+        QVERIFY(runStateDir.isValid());
+
+        QTcpServer server;
+        QList<QByteArray> envelopes;
+        wireEnvelopeCollector(&server, &envelopes);
+        QVERIFY2(server.listen(QHostAddress::LocalHost, 0),
+                 "the fake Sentry listener must bind 127.0.0.1:0");
+        const QString dsn =
+            QStringLiteral("http://publickey@127.0.0.1:%1/1").arg(server.serverPort());
+
+        QProcess child;
+        child.setProgram(m_appPath);
+        child.setArguments({ QStringLiteral("--diag-child"), QStringLiteral("play-step"), dsn,
+                             dbDir.path(), m_handlerPath, spoolDir.path(), runStateDir.path() });
+        child.start();
+        QVERIFY2(child.waitForStarted(5000), "the diag-child process must start");
+        QTRY_VERIFY_WITH_TIMEOUT(!envelopes.isEmpty(), 20000);
+        // QTRY, never `waitForFinished()`: the latter blocks this process's event loop, and the
+        // fake Sentry listener only ever reads ON that loop. A child waiting for its envelope to
+        // be acknowledged would then be waiting for a parent that is waiting for it - the two
+        // deadlocking until the timeout below. `state()` flips from the process's own notifier,
+        // which the same event loop delivers, so this wait also lets every envelope in.
+        QTRY_VERIFY_WITH_TIMEOUT(child.state() != QProcess::Running, 20000);
+        QCOMPARE(child.exitCode(), 0);
+
+        QTRY_VERIFY_WITH_TIMEOUT(hasLog(envelopes, QStringLiteral("play.step")), 10000);
+
+        const EnvelopeScan scan = scanEnvelopes(envelopes);
+        const ParsedLogItem item = findLog(scan, QStringLiteral("play.step"));
+        QVERIFY2(item.found, "the one failed pair_handshake step never reached the listener");
+
+        int steps = 0;
+        for (const ParsedLogItem& log : scan.logs) {
+            if (log.body == QLatin1String("play.step")) {
+                ++steps;
+            }
+        }
+        QVERIFY2(steps == 1, qPrintable(QStringLiteral("expected one play.step, found %1").arg(steps)));
+
+        // Every key within the ADR-0072 allow-list (item 1/7): SeatHub's own, the keys the
+        // shipper and the SDK attach, and nothing else.
+        const QSet<QString> allowed = {
+            QStringLiteral("step"),           QStringLiteral("outcome"),
+            QStringLiteral("failure_class"),  QStringLiteral("http_status"),
+            QStringLiteral("net_error"),      QStringLiteral("engine_error"),
+            QStringLiteral("engine_stage"),   QStringLiteral("failing_ports"),
+            QStringLiteral("elapsed_ms"),     QStringLiteral("attempt"),
+            QStringLiteral("end_reason"),     QStringLiteral("exit_path"),
+            QStringLiteral("last_step"),      QStringLiteral("reason"),
+            QStringLiteral("session_id"),     QStringLiteral("host_id"),
+            QStringLiteral("seathub.trace_id"), QStringLiteral("seathub.logged_at"),
+            QStringLiteral("user.id"),
+        };
+        for (const QString& key : item.attributes.keys()) {
+            QVERIFY2(allowed.contains(key) || key.startsWith(QLatin1String("sentry."))
+                         || key.startsWith(QLatin1String("os.")),
+                     qPrintable(QStringLiteral("play.step attribute outside the allow-list: %1").arg(key)));
+        }
+        QCOMPARE(item.attributes.value(QStringLiteral("step")).toObject()
+                     .value(QStringLiteral("value")).toString(),
+                 QStringLiteral("pair_handshake"));
+        QCOMPARE(item.attributes.value(QStringLiteral("failure_class")).toObject()
+                     .value(QStringLiteral("value")).toString(),
+                 QStringLiteral("pin_rejected"));
+
+        // The child built an `engineError` holding the PIN sentinel `4821`; the emission never
+        // receives it, so not one byte of it may appear anywhere in what was sent
+        // (ADR-0072 item 2, T-06.7-35). The wider hostile fixture over every emitter is plan 22.
+        for (const QByteArray& envelope : envelopes) {
+            QVERIFY2(!envelope.contains("4821"),
+                     "the PIN sentinel reached the envelope bytes");
+        }
+    }
+
+    void aRollupReachesTheEnvelopeWithItsGauges()
+    {
+        for (const QString& scenario : {QStringLiteral("rollup"), QStringLiteral("rollup-no-rtt")}) {
+            QTemporaryDir db, spool, runState;
+            QTcpServer server;
+            QList<QByteArray> envelopes, headers;
+            wireEnvelopeCollector(&server, &envelopes, &headers);
+            QVERIFY(server.listen(QHostAddress::LocalHost, 0));
+            QProcess child;
+            child.setProgram(m_appPath);
+            child.setArguments({"--diag-child", scenario,
+                QStringLiteral("http://publickey@127.0.0.1:%1/1").arg(server.serverPort()),
+                db.path(), m_handlerPath, spool.path(), runState.path()});
+            child.start();
+            QVERIFY(child.waitForStarted(5000));
+            QTRY_VERIFY_WITH_TIMEOUT(child.state() != QProcess::Running, 20000);
+            QCOMPARE(child.exitCode(), 0);
+            const auto scan = scanEnvelopes(envelopes);
+            int logs = 0, gauges = 0;
+            for (const auto& log : scan.logs) {
+                if (log.body != QLatin1String("stream.rollup")) continue;
+                ++logs;
+                QVERIFY(log.attributes.contains("backlog_spool_lines"));
+                QVERIFY(log.attributes.contains("backlog_retry_files"));
+                if (scenario == QLatin1String("rollup-no-rtt")) {
+                    QVERIFY(!log.attributes.contains("rtt_avg"));
+                    QVERIFY(!log.attributes.contains("rtt_p95"));
+                }
+            }
+            QSet<QString> names;
+            for (const auto& metric : scan.metrics) {
+                if (!metric.name.startsWith(QLatin1String("seathub.stream."))) continue;
+                ++gauges; names.insert(metric.name);
+                QCOMPARE(metric.type, QStringLiteral("gauge"));
+                QVERIFY(!metric.attributes.contains("session_id"));
+                QVERIFY(!metric.attributes.contains("host_id"));
+                QVERIFY(!metric.attributes.contains("user.id"));
+                const bool time = metric.name.contains(".rtt.") || metric.name.contains(".decode.")
+                    || metric.name.contains(".queue.") || metric.name.contains(".render.")
+                    || metric.name.contains(".host.");
+                QCOMPARE(metric.unit, time ? QStringLiteral("millisecond") : QString());
+                if (metric.name == QLatin1String("seathub.stream.samples")) QCOMPARE(metric.value, 1.0);
+            }
+            QCOMPARE(logs, 1);
+            QCOMPARE(gauges, scenario == QLatin1String("rollup") ? 17 : 15);
+            QCOMPARE(names.size(), gauges);
+        }
+    }
+
+    void noRigAddressEverSurvivesTheRealTeeEnvelope()
+    {
+        QTemporaryDir db, spool, state;
+        QTcpServer server;
+        QList<QByteArray> envelopes;
+        wireEnvelopeCollector(&server, &envelopes);
+        QVERIFY(server.listen(QHostAddress::LocalHost, 0));
+        QProcess child;
+        child.setProgram(m_appPath);
+        child.setArguments({"--diag-child", "rig-tee",
+            QStringLiteral("http://publickey@127.0.0.1:%1/1").arg(server.serverPort()),
+            db.path(), m_handlerPath, spool.path(), state.path()});
+        child.start();
+        QVERIFY(child.waitForStarted(5000));
+        QTRY_VERIFY_WITH_TIMEOUT(child.state() != QProcess::Running, 20000);
+        QCOMPARE(child.exitCode(), 0);
+        const auto scan = scanEnvelopes(envelopes);
+        int rigLines = 0;
+        for (const auto& envelope : envelopes) {
+            QVERIFY(!envelope.contains("203.0.113.77"));
+            QVERIFY(!envelope.contains("203.0.113.77:47984"));
+        }
+        for (const auto& log : scan.logs) if (log.body.contains(QStringLiteral("[rig]"))) ++rigLines;
+        QCOMPARE(rigLines, 3);
+    }
+
+    void hostileFixtureEmissionsReachTheRealEnvelopeCollector()
+    {
+        QTemporaryDir dbDir;
+        QVERIFY(dbDir.isValid());
+        QTemporaryDir spoolDir;
+        QVERIFY(spoolDir.isValid());
+        QTemporaryDir runStateDir;
+        QVERIFY(runStateDir.isValid());
+
+        QTcpServer server;
+        QList<QByteArray> envelopes;
+        QList<QByteArray> requestHeaders;
+        wireEnvelopeCollector(&server, &envelopes, &requestHeaders);
+        QVERIFY(server.listen(QHostAddress::LocalHost, 0));
+        const QString dsn =
+            QStringLiteral("http://publickey@127.0.0.1:%1/1").arg(server.serverPort());
+
+        QProcess child;
+        child.setProgram(m_appPath);
+        child.setArguments({ QStringLiteral("--diag-child"), QStringLiteral("hostile-all"), dsn,
+                             dbDir.path(), m_handlerPath, spoolDir.path(), runStateDir.path() });
+        child.start();
+        QVERIFY2(child.waitForStarted(5000), "the hostile diag-child process must start");
+        QTRY_VERIFY_WITH_TIMEOUT(child.state() != QProcess::Running, 20000);
+        QCOMPARE(child.exitStatus(), QProcess::NormalExit);
+        QCOMPARE(child.exitCode(), 0);
+        QVERIFY2(!envelopes.isEmpty(), "hostile-all must send real diagnostic envelopes");
+        QVERIFY2(requestHeaders.size() == envelopes.size(), "every envelope must have captured request headers");
+        for (const QByteArray& headers : requestHeaders) {
+            QVERIFY2(!headers.toLower().contains("content-encoding:"),
+                     "diagnostic envelope unexpectedly used Content-Encoding");
+        }
+
+        const EnvelopeScan scan = scanEnvelopes(envelopes);
+        QStringList emittedSteps;
+        int recoveredPairingRecords = 0;
+        for (const ParsedLogItem& log : scan.logs) {
+            if (log.body != QLatin1String("play.step")) {
+                continue;
+            }
+            const auto value = [&log](const QString& key) {
+                return log.attributes.value(key).toObject().value(QStringLiteral("value"));
+            };
+            emittedSteps.append(value(QStringLiteral("step")).toString());
+            if (value(QStringLiteral("step")).toString() == QLatin1String("pair_handshake")
+                && value(QStringLiteral("outcome")).toString() == QLatin1String("ok")
+                && value(QStringLiteral("failure_class")).toString() == QLatin1String("in_progress")
+                && value(QStringLiteral("attempt")).toInt() == 2
+                && log.level == QLatin1String("info")) {
+                ++recoveredPairingRecords;
+            }
+        }
+        for (const QString& step : { QStringLiteral("allocate"), QStringLiteral("rig_wait"),
+                                     QStringLiteral("pair_authorize"),
+                                     QStringLiteral("pair_server_info"),
+                                     QStringLiteral("pair_handshake"),
+                                     QStringLiteral("engine_prepare"),
+                                     QStringLiteral("engine_connect"), QStringLiteral("stream"),
+                                     QStringLiteral("reconnect"), QStringLiteral("teardown") }) {
+            QVERIFY2(emittedSteps.contains(step),
+                         qPrintable(QStringLiteral("hostile-all omitted play.step for %1").arg(step)));
+        }
+        QVERIFY2(!emittedSteps.contains(QStringLiteral("first_frame")),
+                 "first_frame remains deferred to the quality sampler");
+
+        const QHash<QString, QSet<QString>> closedClasses = {
+            {QStringLiteral("allocate"), {QStringLiteral("no_host"), QStringLiteral("refused_balance"),
+                QStringLiteral("refused_state"), QStringLiteral("unreachable"),
+                QStringLiteral("server_error"), QStringLiteral("bad_response")}},
+            {QStringLiteral("rig_wait"), {QStringLiteral("ok"), QStringLiteral("server_ended")}},
+            {QStringLiteral("pair_authorize"), {QStringLiteral("deadline"), QStringLiteral("refused"),
+                QStringLiteral("bad_response"), QStringLiteral("no_seam"),
+                QStringLiteral("unreachable_deadline")}},
+            {QStringLiteral("pair_server_info"), {QStringLiteral("no_address"), QStringLiteral("net_refused"),
+                QStringLiteral("net_closed"), QStringLiteral("net_host_not_found"),
+                QStringLiteral("net_timeout"), QStringLiteral("net_tls"), QStringLiteral("net_proxy"),
+                QStringLiteral("net_other"), QStringLiteral("http_4xx"), QStringLiteral("http_5xx")}},
+            {QStringLiteral("pair_handshake"), {QStringLiteral("pin_rejected"), QStringLiteral("in_progress"),
+                QStringLiteral("failed"), QStringLiteral("net_refused"), QStringLiteral("net_closed"),
+                QStringLiteral("net_host_not_found"), QStringLiteral("net_timeout"),
+                QStringLiteral("net_tls"), QStringLiteral("net_proxy"), QStringLiteral("net_other"),
+                QStringLiteral("http_4xx"), QStringLiteral("http_5xx"), QStringLiteral("crypto_init"),
+                QStringLiteral("other")}},
+            {QStringLiteral("engine_prepare"), {QStringLiteral("no_app"), QStringLiteral("app_count"),
+                QStringLiteral("engine_create"), QStringLiteral("start_refused"),
+                QStringLiteral("app_list_failed")}},
+            {QStringLiteral("engine_connect"), {QStringLiteral("platform_init"),
+                QStringLiteral("name_resolution"), QStringLiteral("audio_init"),
+                QStringLiteral("rtsp_handshake"), QStringLiteral("control_init"),
+                QStringLiteral("video_init"), QStringLiteral("input_init"),
+                QStringLiteral("control_start"), QStringLiteral("video_start"),
+                QStringLiteral("audio_start"), QStringLiteral("input_start"),
+                QStringLiteral("launch_error")}},
+            {QStringLiteral("stream"), {QStringLiteral("graceful"), QStringLiteral("no_video_traffic"),
+                QStringLiteral("no_video_frame"), QStringLiteral("early_termination"),
+                QStringLiteral("protected_content"), QStringLiteral("frame_conversion"),
+                QStringLiteral("net_other")}},
+            {QStringLiteral("reconnect"), {QStringLiteral("attempt_pair_failed"),
+                QStringLiteral("attempt_engine_failed"), QStringLiteral("grace_expired"),
+                QStringLiteral("reconnect_limit"), QStringLiteral("ok")}},
+            {QStringLiteral("teardown"), {QStringLiteral("failed_net"), QStringLiteral("failed_api"),
+                QStringLiteral("failed_auth"), QStringLiteral("failed_local"), QStringLiteral("ok")}},
+        };
+        const QSet<QString> streamLogKeys = {
+            "n", "coverage_pct", "dropped_samples", "partial", "res", "fps_avg", "fps_min",
+            "net_drop_avg", "net_drop_p95", "jitter_drop_avg", "jitter_drop_p95", "rtt_avg", "rtt_p95",
+            "decode_avg", "decode_p95", "queue_avg", "queue_p95", "render_avg", "render_p95",
+            "host_avg", "host_p95", "backlog_spool_lines", "backlog_retry_files", "bad_s",
+            "stream_s", "reconnects", "rollups", "bad_episodes", "bad_seconds", "sampling_gap_s",
+            "cfg_res", "cfg_fps", "cfg_bitrate_kbps", "t_first_frame_ms"};
+        const QSet<QString> allowedLogKeys = {
+            QStringLiteral("step"), QStringLiteral("outcome"), QStringLiteral("failure_class"),
+            QStringLiteral("http_status"), QStringLiteral("net_error"),
+            QStringLiteral("engine_error"), QStringLiteral("engine_stage"),
+            QStringLiteral("failing_ports"), QStringLiteral("elapsed_ms"),
+            QStringLiteral("attempt"), QStringLiteral("end_reason"),
+            QStringLiteral("exit_path"), QStringLiteral("last_step"),
+            QStringLiteral("reason"), QStringLiteral("session_id"),
+            QStringLiteral("host_id"), QStringLiteral("seathub.trace_id"),
+            QStringLiteral("seathub.logged_at"), QStringLiteral("user.id")};
+        const QSet<QString> closedEndReasons = {
+            QStringLiteral("READINESS_TIMEOUT"), QStringLiteral("CONNECT_FAILED"),
+            QStringLiteral("GRACE_EXPIRED"), QStringLiteral("RECONNECT_LIMIT"),
+            QStringLiteral("HOST_LOST"), QStringLiteral("SESSION_LOST"),
+            QStringLiteral("LEASE_GUARD_LOST"), QStringLiteral("OWNER_RESERVATION"),
+            QStringLiteral("MODE_BOOT_TIMEOUT"), QStringLiteral("CONNECT_TIMEOUT"),
+            QStringLiteral("CUSTOMER_ENDED"), QStringLiteral("WALLET_EMPTY"),
+            QStringLiteral("OPERATOR_FORCED"), QStringLiteral("CLIENT_SILENT"),
+            QStringLiteral("BALANCE_EXHAUSTED"), QStringLiteral("TEARDOWN_TIMEOUT"),
+            QStringLiteral("CLIENT_ABSENT")};
+        for (const ParsedLogItem& log : scan.logs) {
+            if (log.body != QLatin1String("play.step")) {
+                if (log.body == QLatin1String("stream.rollup") || log.body == QLatin1String("stream.quality_bad")
+                    || log.body == QLatin1String("stream.quality_ok") || log.body == QLatin1String("play.summary")) {
+                    for (const auto& key : log.attributes.keys()) {
+                        QVERIFY2(allowedLogKeys.contains(key) || streamLogKeys.contains(key)
+                            || key.startsWith("sentry.") || key.startsWith("os."), qPrintable(key));
+                    }
+                    if (log.body == QLatin1String("play.summary")) {
+                        QCOMPARE(log.attributes.value("exit_path").toObject().value("value").toString(), QStringLiteral("ended"));
+                        QCOMPARE(log.attributes.value("outcome").toObject().value("value").toString(), QStringLiteral("ok"));
+                        QCOMPARE(log.attributes.value("last_step").toObject().value("value").toString(), QStringLiteral("stream"));
+                        QCOMPARE(log.attributes.value("failure_class").toObject().value("value").toString(), QStringLiteral("graceful"));
+                    }
+                    if (log.body.startsWith("stream.quality_")) {
+                        QCOMPARE(log.attributes.value("reason").toObject().value("value").toString(), QStringLiteral("engine_poor"));
+                    }
+                }
+                continue;
+            }
+            for (const QString& key : log.attributes.keys()) {
+                QVERIFY2(allowedLogKeys.contains(key) || key.startsWith(QLatin1String("sentry."))
+                             || key.startsWith(QLatin1String("os.")),
+                         qPrintable(QStringLiteral("play.step attribute outside closed set: %1").arg(key)));
+            }
+            const auto value = [&log](const QString& key) {
+                return log.attributes.value(key).toObject().value(QStringLiteral("value")).toString();
+            };
+            const QString step = value(QStringLiteral("step"));
+            const QString outcome = value(QStringLiteral("outcome"));
+            const QString failureClass = value(QStringLiteral("failure_class"));
+            QVERIFY2(closedClasses.contains(step), qPrintable(QStringLiteral("unknown step token: %1").arg(step)));
+            QVERIFY2(closedClasses.value(step).contains(failureClass),
+                     qPrintable(QStringLiteral("unknown %1 failure_class: %2").arg(step, failureClass)));
+            QVERIFY(outcome == QLatin1String("failed") || outcome == QLatin1String("cancelled")
+                    || outcome == QLatin1String("ok"));
+            if (log.attributes.contains(QStringLiteral("attempt"))) {
+                const int attempt = log.attributes.value(QStringLiteral("attempt")).toObject()
+                                       .value(QStringLiteral("value")).toInt(-1);
+                QVERIFY(attempt == 1 || attempt == 2);
+            }
+            if (log.attributes.contains(QStringLiteral("end_reason"))) {
+                const QString endReason = log.attributes.value(QStringLiteral("end_reason")).toObject()
+                                              .value(QStringLiteral("value")).toString();
+                QVERIFY2(closedEndReasons.contains(endReason),
+                         qPrintable(QStringLiteral("unknown end_reason token: %1").arg(endReason)));
+            }
+        }
+        const QSet<QString> allowedMetricKeys = {QStringLiteral("step"), QStringLiteral("outcome"),
+                                                  QStringLiteral("failure_class")};
+        for (const ParsedMetric& metric : scan.metrics) {
+            QVERIFY(metric.name == QLatin1String("seathub.play.step_result")
+                    || metric.name == QLatin1String("seathub.play.step_duration")
+                    || metric.name == QLatin1String("seathub.client.launch")
+                    || metric.name.startsWith(QLatin1String("seathub.stream.")));
+            for (const QString& key : metric.attributes.keys()) {
+                QVERIFY2(allowedMetricKeys.contains(key) || key.startsWith(QLatin1String("sentry."))
+                             || key.startsWith(QLatin1String("os.")),
+                         qPrintable(QStringLiteral("metric dimension outside closed set: %1").arg(key)));
+            }
+            QVERIFY(!metric.attributes.contains(QStringLiteral("session_id")));
+            QVERIFY(!metric.attributes.contains(QStringLiteral("host_id")));
+            QVERIFY(!metric.attributes.contains(QStringLiteral("user.id")));
+            if (metric.attributes.contains(QStringLiteral("step"))) {
+                const QString step = metric.attributes.value(QStringLiteral("step")).toObject()
+                                         .value(QStringLiteral("value")).toString();
+                QVERIFY(closedClasses.contains(step));
+            }
+            if (metric.attributes.contains(QStringLiteral("failure_class"))) {
+                const QString step = metric.attributes.value(QStringLiteral("step")).toObject()
+                                         .value(QStringLiteral("value")).toString();
+                const QString failureClass = metric.attributes.value(QStringLiteral("failure_class"))
+                                                 .toObject().value(QStringLiteral("value")).toString();
+                QVERIFY(closedClasses.value(step).contains(failureClass));
+            }
+        }
+        QCOMPARE(recoveredPairingRecords, 1);
+        QVERIFY2(findLog(scan, QStringLiteral("client.telemetry")).found,
+                 "hostile-all omitted client.telemetry");
+        QVERIFY2(findMetric(scan, QStringLiteral("seathub.play.step_result")) != nullptr,
+                 "hostile-all omitted step-result metrics");
+        QVERIFY2(findMetric(scan, QStringLiteral("seathub.play.step_duration")) != nullptr,
+                 "hostile-all omitted step-duration metrics");
+        int recoveredMetrics = 0;
+        for (const ParsedMetric& metric : scan.metrics) {
+            if (metric.name != QLatin1String("seathub.play.step_result")) {
+                continue;
+            }
+            const auto value = [&metric](const QString& key) {
+                return metric.attributes.value(key).toObject().value(QStringLiteral("value")).toString();
+            };
+            if (value(QStringLiteral("step")) == QLatin1String("pair_handshake")
+                && value(QStringLiteral("outcome")) == QLatin1String("ok")
+                && value(QStringLiteral("failure_class")) == QLatin1String("in_progress")) {
+                ++recoveredMetrics;
+            }
+        }
+        QCOMPARE(recoveredMetrics, 1);
+        for (const QString& body : {QStringLiteral("stream.rollup"), QStringLiteral("stream.quality_bad"),
+                                   QStringLiteral("stream.quality_ok"), QStringLiteral("play.summary")}) {
+            QVERIFY2(findLog(scan, body).found, qPrintable(QStringLiteral("hostile-all omitted %1").arg(body)));
+        }
+        QVERIFY(findMetric(scan, QStringLiteral("seathub.stream.fps.avg")) != nullptr);
+
+        const QList<QByteArray> hostileValues = {
+            QByteArray(HostileFixtures::RigAddress), QByteArray(HostileFixtures::RigAddressWithPort),
+            QByteArray(HostileFixtures::Pin), QByteArray(HostileFixtures::Bearer),
+            QByteArray(HostileFixtures::PemHeader), QByteArray(HostileFixtures::Email),
+            QByteArray(HostileFixtures::Phone), QByteArray(HostileFixtures::PairingSecret),
+            QByteArray(HostileFixtures::ResponseFragment),
+        };
+        for (const QByteArray& envelope : envelopes) {
+            for (const QByteArray& hostile : hostileValues) {
+                QVERIFY2(!envelope.contains(hostile),
+                         qPrintable(QStringLiteral("hostile value reached a Sentry envelope: %1")
+                                        .arg(QString::fromLatin1(hostile))));
+            }
+        }
+    }
+
+    void offlineDiagnosticsAreDeliveredByTheNextProcess()
+    {
+        QTemporaryDir dbDir;
+        QVERIFY(dbDir.isValid());
+        QTemporaryDir spoolDir;
+        QVERIFY(spoolDir.isValid());
+        QTemporaryDir runStateDir;
+        QVERIFY(runStateDir.isValid());
+
+        QTcpServer closedPort;
+        QVERIFY(closedPort.listen(QHostAddress::LocalHost, 0));
+        const quint16 unavailablePort = closedPort.serverPort();
+        closedPort.close();
+        const QString offlineDsn =
+            QStringLiteral("http://publickey@127.0.0.1:%1/1").arg(unavailablePort);
+        QProcess offlineChild;
+        offlineChild.setProgram(m_appPath);
+        offlineChild.setArguments({QStringLiteral("--diag-child"), QStringLiteral("offline-queue"),
+                                   offlineDsn, dbDir.path(), m_handlerPath, spoolDir.path(),
+                                   runStateDir.path()});
+        offlineChild.start();
+        QVERIFY(offlineChild.waitForStarted(5000));
+        QTRY_VERIFY_WITH_TIMEOUT(offlineChild.state() != QProcess::Running, 20000);
+        QCOMPARE(offlineChild.exitStatus(), QProcess::NormalExit);
+        QCOMPARE(offlineChild.exitCode(), 0);
+        const QByteArray offlineOutput = offlineChild.readAllStandardOutput();
+        const QRegularExpression emitted(QStringLiteral("EMISSION_MS=(\\d+)"));
+        const auto emissionMatch = emitted.match(QString::fromUtf8(offlineOutput));
+        QVERIFY(emissionMatch.hasMatch());
+        QVERIFY(emissionMatch.captured(1).toLongLong() < 2000);
+        const QStringList queuedFiles =
+            QDir(spoolDir.path()).entryList({QStringLiteral("spool-*.jsonl")}, QDir::Files);
+        QVERIFY2(!queuedFiles.isEmpty(),
+                 "the offline process must persist its diagnostic before exiting");
+        QFile queuedFile(QDir(spoolDir.path()).filePath(queuedFiles.first()));
+        QVERIFY(queuedFile.open(QIODevice::ReadOnly));
+        const QByteArray queued = queuedFile.readAll();
+        QVERIFY2(queued.contains("play.step"),
+                 "the persisted offline line must be the expected diagnostic");
+        QVERIFY(queued.contains("stream.rollup"));
+        QVERIFY(queued.contains("play.summary"));
+
+        QTcpServer server;
+        QList<QByteArray> envelopes;
+        wireEnvelopeCollector(&server, &envelopes);
+        QVERIFY(server.listen(QHostAddress::LocalHost, 0));
+        const QString onlineDsn =
+            QStringLiteral("http://publickey@127.0.0.1:%1/1").arg(server.serverPort());
+        QProcess drainChild;
+        drainChild.setProgram(m_appPath);
+        drainChild.setArguments({QStringLiteral("--diag-child"), QStringLiteral("offline-drain"),
+                                 onlineDsn, dbDir.path(), m_handlerPath, spoolDir.path(),
+                                 runStateDir.path()});
+        drainChild.start();
+        QVERIFY(drainChild.waitForStarted(5000));
+        QTRY_VERIFY_WITH_TIMEOUT(!envelopes.isEmpty(), 20000);
+        QTRY_VERIFY_WITH_TIMEOUT(drainChild.state() != QProcess::Running, 20000);
+        QCOMPARE(drainChild.exitStatus(), QProcess::NormalExit);
+        QCOMPARE(drainChild.exitCode(), 0);
+        const ParsedLogItem launch = findLog(scanEnvelopes(envelopes), QStringLiteral("client.telemetry"));
+        QVERIFY2(launch.found, "the drain process must report its adoption snapshot");
+        const int adopted = launch.attributes.value(QStringLiteral("spool_lines_adopted"))
+                                .toObject().value(QStringLiteral("value")).toInt();
+        QVERIFY2(adopted >= 1, "the second process must adopt the prior spool file");
+        QVERIFY2(hasLog(envelopes, QStringLiteral("play.step")),
+                 "the next process did not deliver the prior offline play.step");
+        QVERIFY(hasLog(envelopes, QStringLiteral("stream.rollup")));
+        QVERIFY(hasLog(envelopes, QStringLiteral("play.summary")));
+    }
+
 private:
     QTemporaryDir m_handlerDir;
     QString m_handlerPath;
@@ -1183,6 +2534,25 @@ int main(int argc, char* argv[])
     QCoreApplication::setApplicationName(QStringLiteral("SeatHub"));
     QStandardPaths::setTestModeEnabled(true);
 
+    if (argc > 1 && std::strcmp(argv[1], "--installer-child") == 0) {
+        QCoreApplication app(argc, argv);
+        SeatHubTelemetry::deleteCache();
+        SeatHubTelemetry::Options options;
+        options.dsn = QString::fromLocal8Bit(argv[2]);
+        options.databaseDir = QString::fromLocal8Bit(argv[3]);
+        options.handlerPath = QString::fromLocal8Bit(argv[4]);
+        options.environment = "test"; options.release = "seathub@0.0.0-installer";
+        if (!options.dsn.isEmpty()) SeatHubTelemetry::writeCache({options.dsn, "test", false});
+        if (!SeatHubTelemetry::startWith(options)) return 2;
+        const QString folder = QString::fromLocal8Bit(argv[5]);
+        const QString retry = QString::fromLocal8Bit(argv[6]);
+        SeatHubTelemetry::adoptInstallerJournal(folder, retry, QDateTime::currentDateTimeUtc());
+        SeatHubTelemetry::adoptInstallerJournal(folder, retry, QDateTime::currentDateTimeUtc());
+        SeatHubTelemetry::captureTestMessageForTests("ordinary-nonfatal-must-not-arrive", false);
+        SeatHubTelemetry::flush(2000);
+        return 0;
+    }
+
     if (argc > 1 && std::strcmp(argv[1], "--crash-child") == 0) {
         return runCrashChild(argc, argv);
     }
@@ -1203,6 +2573,9 @@ int main(int argc, char* argv[])
     }
     if (argc > 1 && std::strcmp(argv[1], "--logs-child") == 0) {
         return runLogsChild(argc, argv);
+    }
+    if (argc > 1 && std::strcmp(argv[1], "--diag-child") == 0) {
+        return runDiagChild(argc, argv);
     }
 
     QCoreApplication app(argc, argv);

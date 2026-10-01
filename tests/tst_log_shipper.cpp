@@ -41,6 +41,7 @@
 #include <cstring>
 #include <mutex>
 #include <thread>
+#include <vector>
 
 // This file defines `main()` below. `<SDL.h>` otherwise `#define`s `main` to `SDL_main` - the
 // same fix `tst_log_tee.cpp` uses for the same reason (log_tee.cpp needs SDL2).
@@ -134,6 +135,29 @@ void appendRawSpoolLine(const QString& directory, const QString& body, double lo
     obj.insert(QStringLiteral("trace_id"), QString());
 
     QFile file(ownSpoolFilePath(directory));
+    file.open(QIODevice::Append | QIODevice::Text);
+    file.write(QJsonDocument(obj).toJson(QJsonDocument::Compact));
+    file.write("\n");
+}
+
+/// The same line written for ANOTHER pid - a leftover spool file from a process that is no longer
+/// running, which `LogSpool::adoptLeftovers()` reclaims at the next `start()`. The pid is chosen
+/// so it can never be this process's own (which `adoptLeftovers()` skips by construction) and
+/// cannot be a live one either; no `.lock` companion is written, so the adoption's `tryLock()`
+/// takes a fresh lock exactly as it does for a real leftover whose owner died.
+void appendLeftoverSpoolLine(const QString& directory, qint64 deadPid, const QString& body,
+                             double loggedAt)
+{
+    QDir().mkpath(directory);
+    QJsonObject obj;
+    obj.insert(QStringLiteral("level"), static_cast<int>(LogLevel::Info));
+    obj.insert(QStringLiteral("body"), body);
+    obj.insert(QStringLiteral("logged_at"), loggedAt);
+    obj.insert(QStringLiteral("session_id"), QString());
+    obj.insert(QStringLiteral("host_id"), QString());
+    obj.insert(QStringLiteral("trace_id"), QString());
+
+    QFile file(QDir(directory).filePath(QStringLiteral("spool-%1.jsonl").arg(deadPid)));
     file.open(QIODevice::Append | QIODevice::Text);
     file.write(QJsonDocument(obj).toJson(QJsonDocument::Compact));
     file.write("\n");
@@ -591,6 +615,46 @@ private slots:
                  "the customer's public IP must survive scrubbing");
     }
 
+    void theCurrentRigAddressIsScrubbedAtBothPasses()
+    {
+        const QString rig = QStringLiteral("203.0.113.77");
+        const QStringList fixtures = {
+            QStringLiteral("Executing request: https://203.0.113.77:47984/serverinfo"),
+            QStringLiteral("Host 203.0.113.77 not found (Error 3)"),
+            QStringLiteral("Connecting to 203.0.113.77:47989")
+        };
+        LogShipper::setRedactions({rig});
+        for (const auto& raw : fixtures) {
+            const QString first = LogShipper::scrub(raw);
+            QVERIFY(!first.contains(rig));
+            QVERIFY(first.contains(QStringLiteral("[rig]")));
+            QCOMPARE(LogShipper::scrub(first), first);
+        }
+        QCOMPARE(LogShipper::scrub(QStringLiteral("Customer 198.51.100.12")),
+                 QStringLiteral("Customer 198.51.100.12"));
+        LogShipper::clearRedactions();
+        for (const auto& raw : fixtures) QCOMPARE(LogShipper::scrub(raw), raw);
+    }
+
+    void concurrentReadersNeverSeeATornRedactionList()
+    {
+        std::atomic<bool> failed{false};
+        std::vector<std::thread> readers;
+        for (int i = 0; i < 4; ++i) readers.emplace_back([&]() {
+            for (int n = 0; n < 1000; ++n) {
+                const QString result = LogShipper::scrub(QStringLiteral("203.0.113.77 203.0.113.78"));
+                if (result != QLatin1String("[rig] [rig]")
+                    && result != QLatin1String("203.0.113.77 203.0.113.78")) failed.store(true);
+            }
+        });
+        for (int n = 0; n < 1000; ++n) {
+            LogShipper::setRedactions({QStringLiteral("203.0.113.77"), QStringLiteral("203.0.113.78")});
+            LogShipper::clearRedactions();
+        }
+        for (auto& reader : readers) reader.join();
+        QVERIFY(!failed.load());
+    }
+
     // --- the per-run shipped-bytes cap ------------------------------------------------------------
 
     void afterTheShippedBytesCapOneCapReachedLineShipsAndNothingMore()
@@ -619,6 +683,151 @@ private slots:
         QCOMPARE(stub.countMatching(QStringLiteral("log cap reached")), 1);
         QCOMPARE(stub.countMatching(QStringLiteral("after-cap-marker")), 0);
         QVERIFY(LogShipper::instance().shippedBytesForTests() <= LogShipper::kShippedBytesPerRun);
+    }
+
+    void diagnosticLinesSurviveTheSpoolWithAttributesAndOldLinesStillRead()
+    {
+        // (1) The diagnostic lane's own fields survive the spool, and a line written by the
+        // release BEFORE this one - no `attrs`, no `diagnostic` key, which is exactly what
+        // `appendRawSpoolLine()` writes - still reads back as the ordinary line it is.
+        QTemporaryDir spoolDir;
+        QVERIFY(spoolDir.isValid());
+        {
+            LogSpool spool(spoolDir.path());
+            ShippedLine diagnostic;
+            diagnostic.level = LogLevel::Warning;
+            diagnostic.body = QStringLiteral("play.step");
+            diagnostic.loggedAt = epochSecondsNow();
+            diagnostic.diagnostic = true;
+            diagnostic.attrs.insert(QStringLiteral("step"), QStringLiteral("pair_handshake"));
+            diagnostic.attrs.insert(QStringLiteral("attempt"), 2);
+            spool.append(diagnostic);
+        }
+        appendRawSpoolLine(spoolDir.path(), QStringLiteral("old-release-line"), epochSecondsNow());
+
+        {
+            LogSpool spool(spoolDir.path());
+            const QList<ShippedLine> lines = spool.takeAll();
+            QCOMPARE(lines.size(), 2);
+
+            const ShippedLine& diagnostic = lines.at(0);
+            QVERIFY2(diagnostic.diagnostic, "the diagnostic flag did not survive the spool");
+            QCOMPARE(diagnostic.body, QStringLiteral("play.step"));
+            QCOMPARE(diagnostic.attrs.value(QStringLiteral("step")).toString(),
+                     QStringLiteral("pair_handshake"));
+            QCOMPARE(diagnostic.attrs.value(QStringLiteral("attempt")).toInt(), 2);
+
+            const ShippedLine& old = lines.at(1);
+            QVERIFY2(!old.diagnostic, "a line from the previous release must not read as a diagnostic");
+            QVERIFY(old.attrs.isEmpty());
+            QCOMPARE(old.body, QStringLiteral("old-release-line"));
+        }
+
+        // (2) Past the 8 MiB byte cap an ordinary line is dropped in silence - a diagnostic line
+        // is exempt: it was already bounded by count at enqueue, and the byte cap would silence
+        // exactly the structured record of what failed.
+        {
+            QTemporaryDir capDir;
+            QVERIFY(capDir.isValid());
+            StubHandOff stub;
+            StopShipperOnScopeExit stopGuard;
+
+            LogShipper::instance().setSpoolDirectoryForTests(capDir.path());
+            LogShipper::instance().start([&stub](const ShippedLine& line) { return stub(line); });
+            LogShipper::instance().setCanShip(true);
+
+            const QString bigBody(500 * 1024, QLatin1Char('y'));
+            for (int i = 0; i < 17; ++i) {
+                qInfo().noquote() << QStringLiteral("big-line-%1 %2").arg(i).arg(bigBody);
+            }
+            qInfo() << "after-byte-cap";
+            QTRY_VERIFY_WITH_TIMEOUT(stub.countMatching(QStringLiteral("log cap reached")) >= 1,
+                                     10000);
+            QCOMPARE(stub.countMatching(QStringLiteral("after-byte-cap")), 0);
+            QCOMPARE(LogShipper::instance().capReachedCount(), 1);
+
+            QJsonObject attributes;
+            attributes.insert(QStringLiteral("step"), QStringLiteral("pair_handshake"));
+            attributes.insert(QStringLiteral("failure_class"), QStringLiteral("pin_rejected"));
+            LogShipper::instance().enqueueDiagnostic(QStringLiteral("play.step"),
+                                                     LogLevel::Warning, attributes);
+
+            QTRY_VERIFY_WITH_TIMEOUT(
+                stub.countMatching(QStringLiteral("play.step")) == 1, 5000);
+        }
+
+        // (3) The lane's own per-run bound: 1,000 diagnostics, then silence, with the trip
+        // counted once - the launch record's `cap_reached` is what a reader sees (V30).
+        {
+            QTemporaryDir capDir;
+            QVERIFY(capDir.isValid());
+            StubHandOff stub;
+            StopShipperOnScopeExit stopGuard;
+
+            LogShipper::instance().setSpoolDirectoryForTests(capDir.path());
+            LogShipper::instance().start([&stub](const ShippedLine& line) { return stub(line); });
+            LogShipper::instance().setCanShip(true);
+            // Hold the worker so the whole burst is enqueued before a single line is handled -
+            // the cap is an ENQUEUE bound, and this is the only way to see it trip at once.
+            LogShipper::instance().holdWorkerForTests(true);
+
+            QJsonObject attributes;
+            attributes.insert(QStringLiteral("step"), QStringLiteral("pair_handshake"));
+            for (int i = 0; i < 1005; ++i) {
+                LogShipper::instance().enqueueDiagnostic(QStringLiteral("play.step"),
+                                                         LogLevel::Warning, attributes);
+            }
+            QCOMPARE(LogShipper::instance().capReachedCount(), 1);
+
+            LogShipper::instance().holdWorkerForTests(false);
+            QTRY_VERIFY_WITH_TIMEOUT(stub.countMatching(QStringLiteral("play.step")) >= 1000,
+                                     20000);
+            QTest::qWait(300);
+            QCOMPARE(stub.countMatching(QStringLiteral("play.step")), 1000);
+        }
+    }
+
+    void agedLeftoverLinesAreDroppedAndCountedWhenStartAdoptsThem()
+    {
+        // The launch record's `dropped_spool_age` is read immediately after
+        // `LogShipper::start()` runs (telemetry's `noteLaunch()` comes later in the same
+        // `SeatHubTelemetry::start()` chain), so a leftover line that is ALREADY older than
+        // `LogSpool::kSpoolMaxAgeDays` has to be counted where it is adopted - otherwise the
+        // record reports 0 while startup is holding lines that will never ship, and
+        // `spool_lines_adopted` counts them as though they were alive. The rule itself is the
+        // existing one: the same 7-day cutoff `takeAll()` has always applied at drain
+        // (`log_shipper.h` kSpoolMaxAgeDays), applied here at the earliest moment the line is
+        // known dead - no new clock policy, no extra scan.
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        // Eight days old - past the 7-day cutoff - and a fresh one beside it, both in one dead
+        // process's spool file (4194305 can never be this process's own pid, and no `.lock`
+        // companion exists, so adoption takes a fresh lock exactly as for a real leftover).
+        appendLeftoverSpoolLine(dir.path(), 4194305, QStringLiteral("aged-leftover-line"),
+                                epochSecondsNow() - 8.0 * 24.0 * 3600.0);
+        appendLeftoverSpoolLine(dir.path(), 4194305, QStringLiteral("fresh-leftover-line"),
+                                epochSecondsNow());
+
+        StubHandOff stub;
+        StopShipperOnScopeExit stopGuard;
+        LogShipper::instance().setSpoolDirectoryForTests(dir.path());
+        LogShipper::instance().start([&stub](const ShippedLine& line) { return stub(line); });
+
+        // Both are adopted, and the aged one is already counted as dropped the moment start()
+        // returns - before any drain has run.
+        QCOMPARE(LogShipper::instance().adoptedSpoolLines(), 2);
+        QCOMPARE(LogShipper::instance().droppedSpoolAgeCount(), 1);
+
+        // The fresh leftover still ships; the aged one never does.
+        LogShipper::instance().setCanShip(true);
+        QTRY_VERIFY_WITH_TIMEOUT(stub.countMatching(QStringLiteral("fresh-leftover-line")) == 1,
+                                 10000);
+        QTest::qWait(300);
+        QCOMPARE(stub.countMatching(QStringLiteral("aged-leftover-line")), 0);
+
+        // And the counter never counts the same line twice (the aged one is not in the spool for
+        // a later drain to drop again).
+        QCOMPARE(LogShipper::instance().droppedSpoolAgeCount(), 1);
     }
 
 private:

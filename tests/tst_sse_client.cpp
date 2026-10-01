@@ -474,12 +474,21 @@ private slots:
         controlPlane.setStreamNetworkAccessManager(&net);
         controlPlane.setBaseUrl(QStringLiteral("https://example.test"));
 
+        bool firstWasAborted = false;
+        QObject abortObserver;
         SseClient client;
         client.setControlPlane(&controlPlane);
         client.setDeadStreamTimeoutMs(50);
         client.setJitterProvider([]() { return 0.0; });
         client.start();
 
+        auto* firstReply = net.replies.first();
+        // handleFinished() disconnects the client and defers reply deletion. Observe the
+        // abort synchronously with an independent receiver, never through a dangling reply.
+        QVERIFY(QObject::connect(firstReply, &QNetworkReply::finished, &abortObserver,
+                                 [&firstWasAborted, firstReply]() {
+                                     firstWasAborted = firstReply->wasAborted();
+                                 }, Qt::DirectConnection));
         QJsonObject helloData;
         helloData.insert(QStringLiteral("connection_id"), QStringLiteral("c-test"));
         helloData.insert(QStringLiteral("server_time"), QStringLiteral("2026-09-27T10:00:01.123Z"));
@@ -488,12 +497,9 @@ private slots:
         helloData.insert(QStringLiteral("alive_ms"), 20000);
         net.replies.first()->pushBytes(sseFrame(QStringLiteral("stream.hello"), helloData));
 
-        QVERIFY(!net.replies.first()->wasAborted());
-        // The 50 ms dead-stream bound, plus the schedule's 1 s reconnect floor (jitter pinned to
-        // 0 above) - generous margin for a slow CI box.
-        QTest::qWait(1500);
-        QVERIFY(net.replies.first()->wasAborted());
-        QCOMPARE(net.replies.count(), 2);
+        QVERIFY(!firstWasAborted);
+        QTRY_VERIFY(firstWasAborted);
+        QTRY_COMPARE(net.replies.count(), 2);
     }
 
     void reconnectDelayUsesTheScheduleWithJitter()

@@ -35,10 +35,12 @@
 // it here does not widen who touches the SDK.
 
 #include "log_shipper.h"
+#include "install_journal.h"
 
 #include <QJsonObject>
 #include <QString>
 
+#include <cstdint>
 #include <optional>
 
 namespace SeatHubTelemetry {
@@ -107,6 +109,12 @@ void removeLegacyDumps(const QString& dir);
 /// True once a `startWith()` call has returned `sentry_init(...) == 0`. False before any call, and
 /// false if the only call so far failed.
 bool started();
+
+/// ADR-0070: the named non-fatal installer exception, independent of sign-in/logs.
+bool emitInstallerEvent(const InstallJournalRecord& record);
+void adoptInstallerJournal(const QString& folder, const QString& retryStatePath,
+                           const QDateTime& now);
+QString installerJournalDirectory();
 
 /// The `HandOff` `start()` registers with `LogShipper::instance()`: builds `seathub.logged_at`
 /// (and, when set, `session_id`/`host_id`/`seathub.trace_id`) attributes from `line` and calls
@@ -219,6 +227,88 @@ int initCallCount();
 /// re-init and at quit, and quit never reaches this code).
 int closeCallCount();
 
+// --- Plan 09 (ADR-0072): the diagnostic lane, the metric hooks, the flush and the launch record
+// ---
+//
+// The one TU that touches `sentry.h` owns all of it, exactly as above: `emitDiagnostic()` is a
+// thin front door onto `LogShipper::enqueueDiagnostic()` (so it inherits `canShip`, the spool and
+// every kill switch for free), the emitters below call `sentry_metrics_*` directly, and
+// `flush()` wraps `sentry_flush()` - never `sentry_close()` (ADR-0072 item 9, SPIKE T11).
+
+/// Queues one structured diagnostic line - a fixed-token body (`play.step`,
+/// `client.telemetry`, ...) with scalar attributes - through the shipper's diagnostic lane
+/// (ADR-0072 item 7). Attributes must be within the ADR-0072 allow-list; the caller is what
+/// chooses them, and no caller ever passes `PairingHandshakeResult::engineError`,
+/// `SeatHubFailure::diagnostic` or any other raw text as one (item 2). No-op before `start()`,
+/// like any other line.
+void emitDiagnostic(const QString& body, LogLevel level, const QJsonObject& attributes);
+
+/// `sentry_flush(timeoutMs)` behind this fork's one telemetry door (ADR-0072 item 9, V31): a 2 s
+/// budget at quit and 2 s after a terminal summary, `sentry_close()` never. Returns true when the
+/// flush completed inside the budget. Safe to call in a process that never initialised the SDK -
+/// `sentry_flush()` finds no options and returns at once - which is what lets `~SeatHubClient()`
+/// call it unconditionally.
+bool flush(uint64_t timeoutMs);
+
+/// `seathub.play.step_result` (count: `step`, `outcome`, `failure_class`) and
+/// `seathub.play.step_duration` (distribution in milliseconds: `step`, `outcome`) - the fleet
+/// view of one attempt step's outcome (ADR-0072 item 6). Discarded by `before_send_metric` while
+/// this client is not shipping (item 7), so calling it signed out is harmless and silent.
+void emitStepMetric(const QString& step, const QString& outcome, const QString& failureClass,
+                    double elapsedMs);
+
+/// Emits the 17 `seathub.stream.*` Sentry gauges derived from a `stream.rollup` window
+/// (ADR-0072, D-11, Plan 13 Task 1). The gauge names and units are frozen by the ADR; call
+/// immediately after `emitDiagnostic("stream.rollup", ...)` with the SAME attrs object.
+/// No attributes beyond the SDK's own defaults are added to each gauge (plan 13 threat
+/// T-06.7-61: `before_send_metric` strips session_id/host_id/user.id). Absent fields stay
+/// absent — a gauge is only emitted when its key is present in `attrs`.
+///
+/// Gauge names / units (frozen by ADR-0072):
+///   seathub.stream.fps.avg         (none)
+///   seathub.stream.fps.min         (none)
+///   seathub.stream.net_drop.avg    (none)
+///   seathub.stream.net_drop.p95    (none)
+///   seathub.stream.jitter_drop.avg (none)
+///   seathub.stream.jitter_drop.p95 (none)
+///   seathub.stream.rtt.avg         (millisecond)
+///   seathub.stream.rtt.p95         (millisecond)
+///   seathub.stream.decode.avg      (millisecond)
+///   seathub.stream.decode.p95      (millisecond)
+///   seathub.stream.queue.avg       (millisecond)
+///   seathub.stream.queue.p95       (millisecond)
+///   seathub.stream.render.avg      (millisecond)
+///   seathub.stream.render.p95      (millisecond)
+///   seathub.stream.host.avg        (millisecond)
+///   seathub.stream.host.p95        (millisecond)
+///   seathub.stream.samples         (none)
+void emitRollupMetrics(const QJsonObject& attrs);
+// Cross-thread delivery snapshot; no identity or SDK handles leave this TU.
+QJsonObject rollupDeliveryHealth();
+
+/// `seathub.client.launch` (count) - one per process, emitted the first time this client can
+/// actually ship, so the metric never counts a launch the gate then threw away (ADR-0072 item 8).
+void emitLaunchMetric();
+
+/// The per-launch `client.telemetry` record (ADR-0072 item 8, D-13): one INFO diagnostic line
+/// carrying `dsn_source`, `logs_enabled`, `signed_in`, `crashed_last_run`, `prev_exit`,
+/// `spool_lines_adopted`, `retry_files`, `dropped_queue`, `dropped_spool_age` and `cap_reached`,
+/// plus this run's own clean-exit marker written for the next launch to read. Called once, from
+/// `start()`, after the cache read and the shipper's own start, so every counter it reports is
+/// this launch's own.
+void noteLaunch();
+
+/// Removes this run's clean-exit marker `run-state` - the last act of a CLEAN quit (called from
+/// `~SeatHubClient()`), which is what makes the next launch's `prev_exit` read `clean`. A crash,
+/// a kill or a power loss never reaches it, so the marker the next launch finds is exactly an
+/// unclean one.
+void markCleanExit();
+
+/// Test seam: the directory the `run-state` marker lives in (production:
+/// `QStandardPaths::AppLocalDataLocation`, i.e. `%LOCALAPPDATA%\Seven Hills\SeatHub`). Call
+/// before `start()`/`noteLaunch()`.
+void setRunStateDirectoryForTests(const QString& directory);
+
 #ifdef SEATHUB_TEST_ALLOW_LOOPBACK_DSN
 /// Test-only (CR-01 regression), compile-time gated exactly like `acceptDsn()`'s own
 /// `SEATHUB_TEST_ALLOW_LOOPBACK_DSN` guard above - never declared, let alone defined, in a shipped
@@ -227,7 +317,7 @@ int closeCallCount();
 /// (D-11 only lets fatal-level events through). This is the only way a test can observe the
 /// scope's LIVE user/tags/trace after `adoptFirstDsn()`'s re-init - a crash-based test cannot,
 /// short of decoding crashpad's own gzipped, msgpack-encoded minidump upload.
-void captureTestMessageForTests(const QString& message);
+void captureTestMessageForTests(const QString& message, bool fatal = true);
 #endif
 
 // --- identity (D-09, D-13, G.4): state SeatHub keeps itself, so a test can assert it without a

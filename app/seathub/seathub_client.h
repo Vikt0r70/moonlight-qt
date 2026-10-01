@@ -15,6 +15,8 @@
 // an explicitly injected fake (`stub_engine_session.h`), never as a fallback.
 
 #include <QJsonObject>
+#include <QElapsedTimer>
+#include <QHash>
 #include <QObject>
 #include <QString>
 #include <QTimer>
@@ -35,6 +37,8 @@
 #include "error_map.h"
 #include "hud_overlay.h"
 #include "liveness_timer.h"
+#include "engine_status.h"
+#include "stream_quality_sampler.h"
 #include "log_tee.h"
 #include "moonlight_engine_session.h"
 #include "pairing_controller.h"
@@ -250,6 +254,8 @@ class SeatHubClient : public QObject
     /// out through `handleCredentialRefused()`. Deferred, notice included, until a running stream
     /// ends (Phase 3 D-33): a control-plane channel never ends a paid stream.
     Q_PROPERTY(bool signedOutNotice READ signedOutNotice NOTIFY signedOutNoticeChanged)
+    /// ADR-0070 item 9: local acknowledgement only; never an upload gate.
+    Q_PROPERTY(bool diagnosticsNoticePending READ diagnosticsNoticePending NOTIFY diagnosticsNoticePendingChanged)
 
     /// True while the profile is showing. Like Settings it is a view inside the home state, not an
     /// appState of its own, so it keeps the signed-in header and a session that ends while it is open
@@ -299,6 +305,12 @@ public:
     /// `liveness()` already are: so a test can drive the real object through the real facade.
     SseClient* sse() const { return m_sse; }
     PairingController* pairing() const { return m_pairing; }
+    /// The classification of the pairing result the seam last reported (ADR-0072, Plan 09):
+    /// `attemptStep`, `stepClass` and `attempts` as separate members of one
+    /// `PairingHandshakeResult` - never `engineError`, which stays a local diagnostic. Copied
+    /// from `ProductionPairingSeam::handshakeClassified`, which always leaves the seam ahead of
+    /// the `pairingFailed` / `pairingCompleted` it belongs to; each handler consumes it once.
+    const PairingHandshakeResult& pairingClassification() const { return m_pairingClassification; }
     TeardownController* teardown() const { return m_teardown; }
     /// The in-stream HUD and the liveness reporter that feeds it a balance. Exposed the way
     /// `session()` and `teardown()` are: so a test can drive the real objects through the real
@@ -332,6 +344,8 @@ public:
     bool signedIn() const { return m_signedIn; }
     bool liveUpdatesPaused() const { return m_liveUpdatesPaused; }
     bool signedOutNotice() const { return m_signedOutNotice; }
+    bool diagnosticsNoticePending() const { return m_diagnosticsNoticePending; }
+    Q_INVOKABLE void acknowledgeDiagnosticsNotice();
     bool liveSession() const { return m_liveSession; }
     bool retryBusy() const { return m_retryBusy; }
     bool reconnecting() const { return m_reconnecting; }
@@ -521,6 +535,7 @@ signals:
     void signedInChanged();
     void liveUpdatesPausedChanged();
     void signedOutNoticeChanged();
+    void diagnosticsNoticePendingChanged();
     void liveSessionChanged();
     void retryBusyChanged();
     void reconnectingChanged();
@@ -659,6 +674,11 @@ private:
     /// is paused. Its own 401 starts the D-07 signed-out sequence (`timing.md` L9), never an
     /// immediate sign-out.
     void fetchAccountStateFallback();
+    void noteStepOutcome(const QString& step, const QString& outcome,
+                         const QString& failureClass, qint64 elapsedMs, int attempt = 0,
+                         const QString& endReason = {});
+    void finishPlay(const QString& exitPath, const QString& outcome,
+                    const QString& lastStep = {}, const QString& failureClass = {});
     /// The D-07 signed-out sequence itself (the owner's design A-87), started by
     /// `handleSseRevoked()`, the fallback read's own 401, or a running stream's own end applying
     /// a deferred one (`m_pendingSignedOutNotice`, Phase 3 D-33). While the engine's stream is
@@ -672,6 +692,7 @@ private:
     void clearSignedOutNotice();
     /// The one writer of `m_signedIn`, so `signedInChanged()` can never be missed.
     void setSignedIn(bool signedIn);
+    void updateDiagnosticsNotice();
     /// The one writer of `m_sessionId`, and of whether that session has ended, so `liveSession` can
     /// never be left stale by a path that forgot to say so.
     void setAttachedSession(const QString& sessionId);
@@ -763,6 +784,8 @@ private:
     /// `AccountInfo::displayName`/`username`/etc. worth re-filling `m_account`/`m_identity` from a
     /// second time, having just set both from what the customer typed).
     void setAccount(const AccountInfo& account);
+    void adoptJournal();
+    bool m_journalAdopted = false;
     /// D-17/Plan 30: resends every quality report this outbox is holding for `m_accountId`, once
     /// both it and an access token are known. A no-op otherwise (see `QualityOutbox::drain()`'s
     /// own no-op conditions, including one already in flight and a token generation an earlier
@@ -897,6 +920,8 @@ private:
     /// offline restore cannot fill - is what "signed in" means: the screens a session ends on
     /// (Home or sign-in) follow it.
     bool m_signedIn = false;
+    bool m_diagnosticsNoticePending = false;
+    bool m_diagnosticsNoticeAcknowledged = false;
     bool m_restoreStarted = false;
     /// Bumped by every sign-in, restore result and sign-out. A reply issued under an older value
     /// (a wallet read, a sign-out's own revoke) must not touch what a newer one set up.
@@ -949,6 +974,23 @@ private:
     /// thread with the controller it serves, and never exposed: it is the only object in the
     /// process that ever holds the PIN, and it holds it only for the length of one handshake.
     ProductionPairingSeam* m_pairingSeam = nullptr;
+    /// What that seam's last reported result carried (ADR-0072, Plan 09): the step and the class
+    /// `handlePairingFailed()` needs, and the frozen recovered record `handlePairingCompleted()`
+    /// turns into its ONE INFO `play.step`, copied from `handshakeClassified` on whichever thread
+    /// the seam reports from. Consumed - not merely read - by whichever handler runs next, so no
+    /// later failure can inherit it. Empty until a result arrives.
+    PairingHandshakeResult m_pairingClassification;
+    EngineLaunchReason m_engineLaunchReason = EngineLaunchReason::Started;
+    QString m_lastFailedStep;
+    QElapsedTimer m_playElapsed;
+    QString m_samplerPlayId;
+    QHash<QString, QVariantMap> m_stepTimings;
+    QString m_lastFailureClass;
+    bool m_playSummaryPending = false;
+    QJsonObject m_playConfiguration;
+    qint64 m_streamStartMs = -1;
+    std::atomic<qint64> m_firstFrameMs{-1};
+    std::atomic<quint64> m_playGeneration{0};
     TeardownController* m_teardown = nullptr;
 
     // D-31/D-34 and D-33. Both must outlive the stream and neither is a Q_PROPERTY: the UI has
@@ -966,6 +1008,11 @@ private:
     StatsWatcher* m_statsWatcher = nullptr;
     LogTee::SinkHandle m_statsSinkHandle = 0;
     LogTee::SinkHandle m_terminationSinkHandle = 0;
+    LogTee::SinkHandle m_statusSinkHandle = 0;
+    /// D-11, Plan 13 Task 1: the 60-second roll-up sampler. Lives on the control-plane's
+    /// network thread (moved alongside `m_liveness` in `startNetworkThreads()`). The compositor
+    /// taps each parsed stats block into it via a function-pointer installed by the facade.
+    StreamQualitySampler* m_sampler = nullptr;
     /// WR-04: combines every decoder segment's own block (a fullscreen toggle, a display
     /// move/resize, or a renderer reset each recreate the decoder mid-stream) into one report for
     /// the whole session. Started at `handleConnectionStarted()`, fed by every

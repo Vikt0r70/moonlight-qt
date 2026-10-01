@@ -40,9 +40,11 @@ TARGET = tst_engine_seam
 DESTDIR = $$OUT_PWD
 
 INCLUDEPATH += $$PWD/.. $$PWD/../app
+win32:INCLUDEPATH += $$PWD/../libs/windows/include $$PWD/../libs/windows/include/x64
 
 SOURCES += \
     tst_engine_seam.cpp \
+    ../app/seathub/engine_status.cpp \
     ../app/seathub/engine_session.cpp \
     ../app/seathub/session_lifecycle.cpp \
     ../app/seathub/pairing_seam.cpp \
@@ -51,6 +53,7 @@ SOURCES += \
 
 HEADERS += \
     ../app/seathub/engine_session.h \
+    ../app/seathub/engine_status.h \
     ../app/seathub/session_lifecycle.h \
     ../app/seathub/teardown_guard.h \
     ../app/seathub/pairing_seam.h \
