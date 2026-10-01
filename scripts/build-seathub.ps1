@@ -114,6 +114,18 @@ if ($versionHeader -notmatch 'SEATHUB_VERSION\s+"([^"]+)"') {
 $Version = $Matches[1]
 Write-Host "SeatHub  : $Version"
 
+# Exact equality between the two homes of one release number (T-06.7-89, plan 06.7-21). The
+# comparison against the built exe below only prefix-matches (`-notlike "$Version*"`), so 0.1.2
+# would pass against 0.1.25 there. This check is what makes a mismatch fail the build instead of
+# publishing a setup whose feed version disagrees with the client binary (A-90: both files move
+# together, in one commit).
+$versionTxtPath = Join-Path $RepoRoot 'app\version.txt'
+Require $versionTxtPath 'app\version.txt'
+$VersionTxt = (Get-Content -LiteralPath $versionTxtPath -Raw).Trim()
+if ($VersionTxt -ne $Version) {
+    throw "version files disagree: app\version.txt says '$VersionTxt' but app\seathub\seathub_version.h says '$Version'. Bump both together in one commit (A-90)."
+}
+
 # ---------------------------------------------------------------- sentry-native (06.3.1 D-02, D-18)
 # Built here, not only in CI: this script is "the recipe of record" (see the header above), and
 # two build recipes for the same dependency would drift. The pin (version + SHA-256) is mirrored
@@ -390,10 +402,48 @@ Set-Content -LiteralPath $licensePath -Value ($writtenOffer + "`r`n" + $gplText)
 # The installer's own icon. IFW looks the file up by appending '.ico' on Windows.
 Copy-Item -LiteralPath (Join-Path $RepoRoot 'app\seathub.ico') -Destination (Join-Path $InstallerSource 'config\seathub.ico') -Force
 
+# The setup must know its own version: the control script reads installer.value("ProductVersion")
+# for the install journal's `to` field (ADR-0070 items 6 and 10). The tracked config.xml and
+# package.xml stay unstamped templates on purpose, so the stamp is a BUILD-TIME COPY that
+# binarycreator reads - never an in-place edit of a tracked file. (Updates.xml is the one tracked
+# file the existing build already rewrites, with the installer's SHA-256 below; it is handled by
+# the release record commit, not by this stamp.) IFW resolves <ControlScript> and the icon
+# relative to the -c config file's directory, so the copy carries the whole config directory; on
+# the package side only meta is copied (package.xml is what IFW reads) and the payload data
+# directory is junctioned instead of copying the ~157 MB deploy tree a second time.
+$StampRoot = Join-Path $BuildRoot 'installer-stamp'
+if (Test-Path -LiteralPath $StampRoot) {
+    # rmdir removes a junction itself; Remove-Item -Recurse could follow it into the payload.
+    cmd /c "rmdir /s /q `"$StampRoot`"" | Out-Null
+    if (Test-Path -LiteralPath $StampRoot) { Remove-Item -LiteralPath $StampRoot -Recurse -Force }
+}
+$StampConfig = Join-Path $StampRoot 'config'
+$StampPackages = Join-Path $StampRoot 'packages'
+$StampPackageDir = Join-Path $StampPackages 'com.seathub.client'
+New-Item -ItemType Directory -Force -Path $StampConfig, (Join-Path $StampPackageDir 'meta') | Out-Null
+Copy-Item -Path (Join-Path $InstallerSource 'config\*') -Destination $StampConfig -Force
+Copy-Item -Path (Join-Path $PackageMeta '*') -Destination (Join-Path $StampPackageDir 'meta') -Force
+$StampData = Join-Path $StampPackageDir 'data'
+try {
+    New-Item -ItemType Junction -Path $StampData -Target $PackageData | Out-Null
+} catch {
+    Write-Host "junction failed ($($_.Exception.Message)); copying the payload instead"
+    Copy-Item -LiteralPath $PackageData -Destination $StampData -Recurse -Force
+}
+foreach ($stampFile in @((Join-Path $StampConfig 'config.xml'), (Join-Path $StampPackageDir 'meta\package.xml'))) {
+    $stamped = Get-Content -LiteralPath $stampFile -Raw
+    $stamped = $stamped -replace '<Version>[^<]*</Version>', "<Version>$Version</Version>"
+    if ($stamped -notmatch "<Version>$([regex]::Escape($Version))</Version>") {
+        throw "version stamp failed: $stampFile does not carry <Version>$Version</Version>"
+    }
+    Set-Content -LiteralPath $stampFile -Value $stamped -Encoding UTF8
+}
+Write-Host "Stamped $Version into the build-time config.xml and package.xml ($StampRoot)"
+
 New-Item -ItemType Directory -Force -Path $InstallerFolder | Out-Null
 $installerName = "SeatHub-Setup-$Version.exe"
 $installerPath = Join-Path $InstallerFolder $installerName
-& $binarycreator --offline-only -c (Join-Path $InstallerSource 'config\config.xml') -p (Join-Path $InstallerSource 'packages') $installerPath
+& $binarycreator --offline-only -c (Join-Path $StampConfig 'config.xml') -p $StampPackages $installerPath
 if ($LASTEXITCODE -ne 0) { throw "binarycreator failed with exit code $LASTEXITCODE" }
 Require $installerPath 'installer'
 
