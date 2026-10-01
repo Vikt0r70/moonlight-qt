@@ -25,7 +25,7 @@ Controller.prototype.TargetDirectoryPageCallback = function()
     if (!installer.isInstaller() || seathubAttempt) return;
     var x = seathubChosenTargetDir();
     if (!x) return;
-    seathubRecover(x);
+    seathubRecoverInterruptedSwap(x);
     // Nonempty directories without a tool are staged too: never accept an overwrite prompt.
     if (!installer.fileExists(x)) return;
     var entries = seathubPs("@(Get-ChildItem -LiteralPath " + seathubPsQuote(x) + " -Force).Count");
@@ -54,7 +54,7 @@ Controller.prototype.TargetDirectoryPageCallback = function()
         seathubFail("installer.locked_file", "stop_client", SEATHUB_STOP_FAILURE);
         return;
     }
-    var pf = installer.toNativeSeparators(installer.environmentVariable("ProgramFiles")).toLowerCase();
+    var pf = seathubProgramFiles().toLowerCase();
     if (pf && x.toLowerCase().indexOf(pf + "\\") === 0 && !installer.hasAdminRights()
             && !seathubGainAdminRights()) {
         seathubFail("installer.access_denied", "preflight", SEATHUB_FAILURE);
@@ -95,6 +95,7 @@ Controller.prototype.seathubFinished = function()
         return;
     }
     a.step = "verify";
+    seathubHook("before_verify");
     // Finished fires on abort too. Never rename the old app without these payload sentinels.
     if (!installer.fileExists(seathubJoin(a.stage, SEATHUB_MAINTENANCE_TOOL))
             || !installer.fileExists(seathubJoin(a.stage, SEATHUB_CLIENT))
@@ -141,6 +142,7 @@ function seathubFail(cls, step, text)
     QMessageBox.critical("SeatHubUpdateFailed", SEATHUB_TITLE, text);
     // interrupt() cancels ongoing installation; reject() also closes a pre-install wizard.
     installer.interrupt();
+    installer.setCanceled();
     gui.reject();
 }
 
@@ -153,9 +155,14 @@ function seathubRandomId()
 }
 
 function seathubHook(name) {}
+function seathubProgramFiles()
+{
+    return installer.toNativeSeparators(installer.environmentVariable("ProgramFiles"));
+}
 // Journal routines are intentionally supplied by the journal-writer task, after failure tests.
 function seathubJournalOwnerTrusted(dir) { return false; }
 function seathubJournalStart() {}
+function seathubJournalRecovered(state) {}
 function seathubJournalEnd(outcome, step, cls)
 {
     if (seathubAttempt) seathubAttempt.ended = true;
@@ -225,28 +232,47 @@ function seathubAbandon()
     if (!seathubAttempt) return;
     var a = seathubAttempt;
     seathubDeleteRows(a.stage);
-    seathubRemoveTree(a.stage);
+    if (!seathubRemoveTree(a.stage)) {
+        // An extraction ACL denial can survive IFW's rollback. Repair only this attempt's
+        // newly-created stage, never the live tree or arbitrary stale/locked siblings.
+        installer.execute(seathubSystemTool("icacls.exe"), [a.stage,"/reset","/T","/C","/L"], "");
+        seathubRemoveTree(a.stage);
+    }
     if (installer.fileExists(seathubJoin(a.final, SEATHUB_CLIENT)))
         installer.performOperation("CreateShortcut", [seathubJoin(a.final, SEATHUB_CLIENT),
             installer.value("AllUsersStartMenuProgramsPath") + "/SeatHub.lnk", "workingDirectory=" + a.final,
             "iconPath=" + seathubJoin(a.final, SEATHUB_CLIENT), "description=SeatHub"]);
 }
 
-function seathubRecover(x)
+function seathubRecoverInterruptedSwap(x)
 {
-    // Recovery-table implementation is expanded by the failure-matrix task.
+    // ADR-0070 recovery table: newest old first; cleanup must never require an uninstaller.
     var r = seathubPs("$x=" + seathubPsQuote(x) + ";$parent=Split-Path $x;$leaf=Split-Path $x -Leaf;"
-        + "$dirs=@(Get-ChildItem -LiteralPath $parent -Directory -ErrorAction SilentlyContinue | Where-Object {$_.Name -match ('^'+[regex]::Escape($leaf)+'\\.(stage|old)-[0-9a-f]{16}$')} | Sort-Object LastWriteTimeUtc -Descending);"
+        + "$dirs=@(Get-ChildItem -LiteralPath $parent -Directory -ErrorAction SilentlyContinue | Where-Object {$_.Name -match ('^'+[regex]::Escape($leaf)+'\\.(stage|old)-.+$')} | Sort-Object LastWriteTimeUtc -Descending);"
         + "$dirs.FullName -join [Environment]::NewLine");
     if (r.length < 2 || Number(r[1]) !== 0) return;
     var dirs = String(r[0]).split(/[\r\n]+/).filter(function(p){return p !== "";});
     if (!installer.fileExists(x)) {
         for (var i = 0; i < dirs.length; ++i)
-            if (dirs[i].indexOf(x + ".old-") === 0 && seathubRename(dirs[i], x)) break;
+            if (dirs[i].indexOf(x + ".old-") === 0 && seathubRename(dirs[i], x)) {
+                seathubLog("recovered_after_interrupted_swap");
+                seathubJournalRecovered("old_intact");
+                break;
+            }
     }
     for (var j = 0; j < dirs.length; ++j) {
+        if (dirs[j].indexOf(x + ".old-") === 0 && installer.fileExists(x)) {
+            // A kill after swap leaves the new GUID registered under its now-missing stage path.
+            var stage = x + ".stage-" + dirs[j].substring((x + ".old-").length);
+            var rows = seathubRows(stage);
+            if (!installer.fileExists(stage) && rows.length === 1 && seathubPatchRows(stage, x)) {
+                seathubDeleteRows(x, rows);
+                seathubJournalRecovered("new_live");
+            }
+        }
         if (dirs[j].indexOf(x + ".stage-") === 0) seathubDeleteRows(dirs[j]);
-        if (installer.fileExists(x)) seathubRemoveTree(dirs[j]);
+        // Only-stage, missing-X is a fresh install. Locked stale folders are best-effort cleanup.
+        seathubRemoveTree(dirs[j]);
     }
 }
 
@@ -298,7 +324,7 @@ function seathubStopClient(client, imageName, pathScopedKill)
         // be run (no PowerShell, an unexpected script failure), skip the kill entirely rather than
         // fall back to an unscoped `taskkill /IM` - the existing wait/ladder above already gave
         // this process every other chance to stop, and the uninstall/update still proceeds (or
-        // fails cleanly at the purge step below) exactly as it did before this elevated fallback
+        // fails cleanly at the rename step) exactly as it did before this elevated fallback
         // existed.
         if (!seathubKillProcessByPath(client))
             seathubLog("could not confirm the path-scoped kill ran for " + client + "; skipping it");
