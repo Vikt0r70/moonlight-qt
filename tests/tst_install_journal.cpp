@@ -39,6 +39,21 @@ class TstInstallJournal : public QObject
         return result;
     }
 private slots:
+    void installerWriterOutputParsesThroughThePublishedReader()
+    {
+        QTemporaryDir fallback;
+        QVERIFY(fallback.isValid());
+        QString folder = qEnvironmentVariable("SEATHUB_TEST_WRITER_JOURNAL");
+        const bool external = !folder.isEmpty();
+        if (!external) {
+            folder = fallback.path();
+            put(folder, name(), QJsonDocument(record()).toJson());
+        }
+        const auto rows = InstallJournal::adopt(folder, external ? QDateTime::currentDateTimeUtc() : now);
+        QCOMPARE(rows.size(), 1);
+        QCOMPARE(rows.first().mode, QString("staged"));
+        QCOMPARE(rows.first().toJson().keys(), record().keys());
+    }
     void aWellFormedEndFileParsesToTheRecord()
     {
         QTemporaryDir dir;
