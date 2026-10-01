@@ -1,134 +1,257 @@
-// SeatHub installer control script (config.xml <ControlScript>).
-//
-// Why this exists: the setup refused to install over an existing SeatHub. IFW's target directory
-// page rejects any folder that already holds the maintenance tool ("TargetDirectoryInUse"), so an
-// update - by hand or from the in-app updater - needed a manual uninstall first. This script
-// removes the installed SeatHub before that check runs, and keeps the customer signed in while it
-// does (owner decision, 2026-09-21). A real uninstall still wipes everything (D-45): nothing here
-// changes what installscript.qs registers.
-//
-// This is a CONTROL script, not a component script. Page callbacks only fire in the control
-// script (Controller Scripting, noninteractive.html); installscript.qs is a component script and
-// Controller.prototype callbacks there never run.
-//
-// Everything below is read out of the shipped IFW 4.7 manual
-// (C:\Qt\Tools\QtInstallerFramework\4.7\doc\html) or, where the manual is silent, out of the
-// IFW 4.7.0 source (qtproject/installer-framework, tag 4.7.0). What the manual does not say:
-//
-//   1. WHEN the refusal happens. TargetDirectoryPage::validatePage() calls
-//      PackageManagerCore::installationAllowedToDirectory(), i.e. on Next. The page callback runs
-//      from PackageManagerGui::currentPageChanged(), i.e. on ENTERING the page. So
-//      TargetDirectoryPageCallback is early enough; no Next override is needed.
-//   2. WHAT the refusal keys on: only <TargetDir>/<MaintenanceToolName>.exe. A missing or empty
-//      folder is accepted outright. The <Version> values in config.xml and package.xml play no part.
-//   3. The installed maintenance tool cannot elevate itself in command-line mode:
-//      PackageManagerCore::gainAdminRights() throws "Cannot elevate access rights while running
-//      from command line" and runUninstaller() calls it before undoing anything when the folder is
-//      not writable. The setup elevates lazily (RequiresAdminRights is on the component, and
-//      runInstaller() asks only after the wizard; the owner's 0.1.3 InstallationLog.txt shows
-//      "Starting elevated process" after the pages). So a double-clicked setup is not elevated
-//      here, and the in-app update (ShellExecuteW "runas") is. After installer.gainAdminRights()
-//      the child processes installer.execute() starts run in IFW's elevated server
-//      (QProcessWrapper::start -> connectToServer).
-//   4. `purge` deletes the folder AFTER the tool exits: deleteMaintenanceTool() starts a detached
-//      %TEMP%\uninstall.vbs that deletes the tool once a second until it can, then the whole folder.
-//      Letting the install start before that script finishes would let it delete the new files.
-
-var SEATHUB_TITLE = "SeatHub Setup";                        // config.xml <Title>
-var SEATHUB_MAINTENANCE_TOOL = "SeatHubMaintenanceTool.exe"; // config.xml <MaintenanceToolName> + .exe
-var SEATHUB_CLIENT = "SeatHub.exe";                          // config.xml <RunProgram>
-// 06.3.1 D-02: sentry-native's out-of-process crashpad handler, shipped beside SeatHub.exe. It
-// outlives the client by about 1 s (sends the last pending report, then exits - SPIKE T8a/T8b), so
-// it must be waited for too, or a still-running handler locks its own exe during the purge below.
+// IFW 4.7 controller. ADR-0070: extract beside the live app, then swap; never run an uninstaller.
+// Local 4.7 scripting-installer.html/noninteractive.html are the API authority.
+var SEATHUB_TITLE = "SeatHub Setup";
+var SEATHUB_MAINTENANCE_TOOL = "SeatHubMaintenanceTool.exe";
+var SEATHUB_CLIENT = "SeatHub.exe";
 var SEATHUB_CRASH_HANDLER = "crashpad_handler.exe";
-var SEATHUB_REMOVED_KEY = "SeatHubPreviousInstallRemoved";
-var SEATHUB_TOOL_WAIT_SECONDS = 30;
-
-// ifw-cli.html: `purge` - "Uninstall all packages and remove the program directory" (`remove`
-// would leave the maintenance tool, and the tool is what the refusal keys on).
-// `--confirm-command` confirms without user input. `--default-answer` answers every message query
-// with its default: an undo step that fails asks "installationErrorWithIgnore", default Ignore.
-// Long forms on purpose: `-c` is also --create-local-repository in the same option table.
-var SEATHUB_PURGE_ARGS = ["purge", "--confirm-command", "--default-answer"];
+// docs/spec V36 and ADR-0070 item 1: two waits only, on failure; no success-path delay.
+var SEATHUB_RENAME_TRIES = 3;
+var SEATHUB_RENAME_WAIT_S = 1;
+var SEATHUB_FAILURE = "SeatHub could not finish updating. Your current version is unchanged and still works. SeatHub will try again by itself.";
+var SEATHUB_STOP_FAILURE = "SeatHub is still running and could not be closed. Close it and run this setup again.";
+var seathubAttempt = null;
+var seathubLogLines = [];
 
 function Controller()
 {
+    if (!installer.isInstaller()) return;
+    installer.installationStarted.connect(this, this.seathubStarted);
+    installer.installationFinished.connect(this, this.seathubFinished);
+    installer.installationInterrupted.connect(this, this.seathubInterrupted);
 }
 
-// noninteractive.html, "Target Directory Page": TargetDirectoryPageCallback() and its
-// TargetDirectoryLineEdit widget.
 Controller.prototype.TargetDirectoryPageCallback = function()
 {
-    // scripting-installer.html: isInstaller(). The maintenance tool embeds this script too.
-    if (!installer.isInstaller() || installer.value(SEATHUB_REMOVED_KEY) === "true")
-        return;
-
-    var targetDir = seathubChosenTargetDir();
-    if (targetDir === "" || !installer.fileExists(seathubJoin(targetDir, SEATHUB_MAINTENANCE_TOOL)))
-        return;
-
-    // scripting-qmessagebox.html: question(identifier, title, text, buttons, button).
-    var answer = QMessageBox.question("SeatHubRemovePreviousInstall", SEATHUB_TITLE,
-        "SeatHub is already installed in this folder. Setup will remove it first, then install "
-        + "this version. You stay signed in.",
-        QMessageBox.Ok | QMessageBox.Cancel, QMessageBox.Ok);
-    if (answer != QMessageBox.Ok) {
-        seathubLog("kept the installed SeatHub; the folder check will refuse it on Next");
+    if (!installer.isInstaller() || seathubAttempt) return;
+    var x = seathubChosenTargetDir();
+    if (!x) return;
+    seathubRecover(x);
+    // Nonempty directories without a tool are staged too: never accept an overwrite prompt.
+    if (!installer.fileExists(x)) return;
+    var entries = seathubPs("@(Get-ChildItem -LiteralPath " + seathubPsQuote(x) + " -Force).Count");
+    if (entries.length >= 2 && Number(entries[1]) === 0 && Number(entries[0]) === 0) return;
+    var id = seathubRandomId();
+    seathubAttempt = {id:id, final:x, stage:x + ".stage-" + id, old:x + ".old-" + id,
+        started:new Date().toISOString(), clock:Date.now(), stageMs:0, swapMs:0,
+        outcome:"failed", step:"preflight", cls:"installer.unknown", code:0,
+        rollback:"not_needed", state:"old_intact", interrupted:false, ended:false};
+    installer.setValue("SeatHubFinalDir", x);
+    installer.setValue("SeatHubAttemptId", id);
+    // Retarget before any nested execute/kill/UAC event loop can deliver queued Next clicks.
+    installer.setValue("TargetDir", seathubAttempt.stage);
+    var page = gui.currentPageWidget();
+    if (page && page.TargetDirectoryLineEdit) {
+        page.TargetDirectoryLineEdit.setText(seathubAttempt.stage);
+        page.TargetDirectoryLineEdit.enabled = false;
+    }
+    if (page && page.MessageLabel)
+        page.MessageLabel.setText("SeatHub is already installed here. Setup installs the new version next to it and swaps it in when it is ready. You stay signed in.");
+    seathubLog("retarget " + x + " -> " + seathubAttempt.stage);
+    seathubJournalStart();
+    seathubAttempt.step = "stop_client";
+    if (!seathubStopClient(seathubJoin(x, SEATHUB_CLIENT), SEATHUB_CLIENT, false)
+            || !seathubStopClient(seathubJoin(x, SEATHUB_CRASH_HANDLER), SEATHUB_CRASH_HANDLER, true)) {
+        seathubFail("installer.locked_file", "stop_client", SEATHUB_STOP_FAILURE);
         return;
     }
-
-    var removed = false;
-    try {
-        removed = seathubRemovePreviousInstall(targetDir);
-    } catch (e) {
-        seathubLog("removal stopped by a script error: " + e);
-    }
-
-    if (removed) {
-        installer.setValue(SEATHUB_REMOVED_KEY, "true");
-        seathubLog("previous install removed from " + targetDir);
+    var pf = installer.toNativeSeparators(installer.environmentVariable("ProgramFiles")).toLowerCase();
+    if (pf && x.toLowerCase().indexOf(pf + "\\") === 0 && !installer.hasAdminRights()
+            && !seathubGainAdminRights()) {
+        seathubFail("installer.access_denied", "preflight", SEATHUB_FAILURE);
         return;
     }
-
-    QMessageBox.critical("SeatHubRemovePreviousInstallFailed", SEATHUB_TITLE,
-        "The installed SeatHub couldn't be removed, so this version can't be installed here yet. "
-        + "Remove SeatHub in Windows Settings > Apps, then run this setup again.");
+    seathubHook("callback_done");
 };
 
-function seathubRemovePreviousInstall(targetDir)
+Controller.prototype.seathubStarted = function()
 {
-    var tool = seathubJoin(targetDir, SEATHUB_MAINTENANCE_TOOL);
-
-    if (!seathubStopClient(seathubJoin(targetDir, SEATHUB_CLIENT), SEATHUB_CLIENT, false))
-        return false;
-
-    // The crash handler outlives SeatHub.exe by about 1 s (comment at the constant above), so it
-    // is waited for right after the client, on the same ladder, before the purge below runs.
-    // `pathScopedKill=true` (CR-03): crashpad_handler.exe is a name other vendors' own crash
-    // handlers share - never kill it by bare image name.
-    if (!seathubStopClient(seathubJoin(targetDir, SEATHUB_CRASH_HANDLER), SEATHUB_CRASH_HANDLER, true))
-        return false;
-
-    // The purge replays installscript.qs's registerPathForUninstallation(tokenDir, wipe=true),
-    // which would sign the customer out. Copy the token store aside first and put it back after,
-    // whatever the purge did. No copy, no purge: keeping sign-in is the owner's decision.
-    var tokenDir = seathubTokenDir();
-    var backup = seathubBackUpTokens(tokenDir);
-    if (backup === null)
-        return false;
-
-    var removed = false;
-    try {
-        removed = seathubPurge(tool) && seathubWaitForToolToGo(targetDir, tool);
-    } finally {
-        if (backup !== "")
-            seathubRestoreTokens(backup, tokenDir);
+    if (!seathubAttempt) return;
+    var actual = installer.toNativeSeparators(installer.value("TargetDir"));
+    if (actual.toLowerCase() !== seathubAttempt.stage.toLowerCase()) {
+        // A different successful install must never be swapped/abandoned as this attempt's stage.
+        installer.setValue("SeatHubFinalDir", "");
+        seathubJournalEnd("cancelled", "preflight", "installer.unknown");
+        seathubAttempt = null;
+        return;
     }
-    return removed;
+    seathubAttempt.step = "extract";
+    seathubHook("mid_extract");
+};
+
+Controller.prototype.seathubInterrupted = function()
+{
+    if (seathubAttempt) seathubAttempt.interrupted = true;
+};
+
+Controller.prototype.seathubFinished = function()
+{
+    if (!seathubAttempt || seathubAttempt.ended) { seathubFlushLog(); return; }
+    var a = seathubAttempt;
+    a.stageMs = Date.now() - a.clock;
+    if (a.interrupted || installer.status != QInstaller.Success) {
+        seathubAbandon();
+        seathubJournalEnd("cancelled", "extract", "installer.extract_error");
+        seathubFlushLog();
+        return;
+    }
+    a.step = "verify";
+    // Finished fires on abort too. Never rename the old app without these payload sentinels.
+    if (!installer.fileExists(seathubJoin(a.stage, SEATHUB_MAINTENANCE_TOOL))
+            || !installer.fileExists(seathubJoin(a.stage, SEATHUB_CLIENT))
+            || !installer.fileExists(seathubJoin(a.stage, SEATHUB_CRASH_HANDLER))) {
+        seathubAbandon();
+        seathubFail("installer.verify_failed", "verify", SEATHUB_FAILURE);
+        return;
+    }
+    var swapClock = Date.now();
+    a.step = "swap_aside";
+    if (!seathubRename(a.final, a.old)) {
+        seathubAbandon();
+        seathubFail("installer.locked_file", "swap_aside", SEATHUB_FAILURE);
+        return;
+    }
+    seathubHook("between_renames");
+    a.step = "swap_in";
+    if (!seathubRename(a.stage, a.final)) {
+        a.rollback = seathubRename(a.old, a.final) ? "ok" : "failed";
+        a.state = a.rollback === "ok" ? "old_intact" : "none";
+        seathubAbandon();
+        seathubFail(a.rollback === "ok" ? "installer.locked_file" : "installer.rollback_failed", "swap_in", SEATHUB_FAILURE);
+        return;
+    }
+    a.swapMs = Date.now() - swapClock;
+    a.state = "new_live";
+    seathubHook("after_swap");
+    a.step = "registry";
+    var newRows = seathubRows(a.stage);
+    var registryOk = seathubPatchRows(a.stage, a.final);
+    if (registryOk) seathubDeleteRows(a.final, newRows);
+    installer.setValue("TargetDir", a.final);
+    a.step = "cleanup";
+    seathubRemoveTree(a.old);
+    seathubJournalEnd("success", registryOk ? "cleanup" : "registry", registryOk ? "installer.unknown" : "installer.script_error");
+    seathubFlushLog();
+};
+
+function seathubFail(cls, step, text)
+{
+    seathubLog("failed " + step + " " + cls);
+    seathubJournalEnd("failed", step, cls);
+    seathubFlushLog();
+    QMessageBox.critical("SeatHubUpdateFailed", SEATHUB_TITLE, text);
+    // interrupt() cancels ongoing installation; reject() also closes a pre-install wizard.
+    installer.interrupt();
+    gui.reject();
+}
+
+function seathubRandomId()
+{
+    var r = seathubPs("[guid]::NewGuid().ToString('N').Substring(0,16)");
+    var id = String(r[0]).replace(/\s/g, "");
+    if (!/^[0-9a-f]{16}$/.test(id)) throw new Error("attempt id unavailable");
+    return id;
+}
+
+function seathubHook(name) {}
+// Journal routines are intentionally supplied by the journal-writer task, after failure tests.
+function seathubJournalOwnerTrusted(dir) { return false; }
+function seathubJournalStart() {}
+function seathubJournalEnd(outcome, step, cls)
+{
+    if (seathubAttempt) seathubAttempt.ended = true;
+}
+
+function seathubPsQuote(s) { return "'" + String(s).replace(/'/g, "''") + "'"; }
+function seathubPs(script)
+{
+    return installer.execute(seathubJoin(installer.environmentVariable("SystemRoot"),
+        "System32/WindowsPowerShell/v1.0/powershell.exe"),
+        ["-NoProfile", "-NonInteractive", "-Command", "$ErrorActionPreference='Stop';" + script], "");
+}
+
+function seathubRename(source, destination)
+{
+    for (var i = 0; i < SEATHUB_RENAME_TRIES; ++i) {
+        var r = seathubPs("[IO.Directory]::Move(" + seathubPsQuote(source) + "," + seathubPsQuote(destination) + ")");
+        if (r.length >= 2 && Number(r[1]) === 0) { seathubLog("rename ok " + source + " -> " + destination); return true; }
+        if (i + 1 < SEATHUB_RENAME_TRIES)
+            for (var s = 0; s < SEATHUB_RENAME_WAIT_S; ++s) seathubSleepOneSecond();
+    }
+    return false;
+}
+
+function seathubRemoveTree(path)
+{
+    // cmd rmdir removes a junction itself, not its destination. Never execute an uninstaller here.
+    var r = installer.execute(seathubSystemTool("cmd.exe"), ["/c", "rmdir", "/s", "/q", path], "");
+    return !installer.fileExists(path);
+}
+
+function seathubRows(location)
+{
+    var ps = "$loc=" + seathubPsQuote(location) + ";"
+        + "foreach($root in @('HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall','HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall','HKLM:\\Software\\Wow6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall')){"
+        + "Get-ChildItem -LiteralPath $root -ErrorAction SilentlyContinue | ForEach-Object {"
+        + "$p=Get-ItemProperty -LiteralPath $_.PSPath;if($p.DisplayName -eq 'SeatHub' -and $p.InstallLocation -eq $loc){$_.Name}}}";
+    var r = seathubPs(ps);
+    return r.length >= 2 && Number(r[1]) === 0 ? String(r[0]).split(/[\r\n]+/).filter(function(s){return s.indexOf("HKEY_") === 0;}) : [];
+}
+
+function seathubPatchRows(stage, finalDir)
+{
+    var rows = seathubRows(stage);
+    var tool = seathubJoin(finalDir, SEATHUB_MAINTENANCE_TOOL);
+    var fields = [["InstallLocation",finalDir],["UninstallString",'"' + tool + '"'],
+        ["ModifyPath",'"' + tool + '"'],["DisplayIcon",seathubJoin(finalDir, SEATHUB_CLIENT)]];
+    if (rows.length !== 1) return false;
+    for (var j = 0; j < fields.length; ++j) {
+        var r = installer.execute(seathubSystemTool("reg.exe"), ["add",rows[0],"/v",fields[j][0],"/t","REG_SZ","/d",fields[j][1],"/f"], "");
+        if (r.length < 2 || Number(r[1]) !== 0) return false;
+        seathubLog("registry write ok " + fields[j][0]);
+    }
+    return true;
+}
+
+function seathubDeleteRows(location, exclude)
+{
+    var rows = seathubRows(location);
+    exclude = exclude || [];
+    for (var i = 0; i < rows.length; ++i)
+        if (exclude.indexOf(rows[i]) < 0) installer.execute(seathubSystemTool("reg.exe"), ["delete",rows[i],"/f"], "");
+}
+
+function seathubAbandon()
+{
+    if (!seathubAttempt) return;
+    var a = seathubAttempt;
+    seathubDeleteRows(a.stage);
+    seathubRemoveTree(a.stage);
+    if (installer.fileExists(seathubJoin(a.final, SEATHUB_CLIENT)))
+        installer.performOperation("CreateShortcut", [seathubJoin(a.final, SEATHUB_CLIENT),
+            installer.value("AllUsersStartMenuProgramsPath") + "/SeatHub.lnk", "workingDirectory=" + a.final,
+            "iconPath=" + seathubJoin(a.final, SEATHUB_CLIENT), "description=SeatHub"]);
+}
+
+function seathubRecover(x)
+{
+    // Recovery-table implementation is expanded by the failure-matrix task.
+    var r = seathubPs("$x=" + seathubPsQuote(x) + ";$parent=Split-Path $x;$leaf=Split-Path $x -Leaf;"
+        + "$dirs=@(Get-ChildItem -LiteralPath $parent -Directory -ErrorAction SilentlyContinue | Where-Object {$_.Name -match ('^'+[regex]::Escape($leaf)+'\\.(stage|old)-[0-9a-f]{16}$')} | Sort-Object LastWriteTimeUtc -Descending);"
+        + "$dirs.FullName -join [Environment]::NewLine");
+    if (r.length < 2 || Number(r[1]) !== 0) return;
+    var dirs = String(r[0]).split(/[\r\n]+/).filter(function(p){return p !== "";});
+    if (!installer.fileExists(x)) {
+        for (var i = 0; i < dirs.length; ++i)
+            if (dirs[i].indexOf(x + ".old-") === 0 && seathubRename(dirs[i], x)) break;
+    }
+    for (var j = 0; j < dirs.length; ++j) {
+        if (dirs[j].indexOf(x + ".stage-") === 0) seathubDeleteRows(dirs[j]);
+        if (installer.fileExists(x)) seathubRemoveTree(dirs[j]);
+    }
 }
 
 // The in-app updater quits SeatHub on its own, but a hand-run setup may find it open, and open
-// files make the purge leave the folder behind.
+// files can prevent the live folder from being renamed.
 // `imageName` is the bare filename taskkill's /IM wants (SEATHUB_CLIENT only - see `pathScopedKill`
 // below); `client` is the full path isProcessRunning()/killProcess() key on. They used to be the
 // same hardcoded constant, which meant this function could only ever wait for SeatHub.exe; naming
@@ -216,132 +339,6 @@ function seathubKillProcessByPath(fullPath)
     return true;
 }
 
-function seathubPurge(tool)
-{
-    if (seathubRunPurge(tool) === 0)
-        return true;
-    if (installer.hasAdminRights())
-        return false;
-
-    // See point 3 at the top: under Program Files a non-elevated purge fails before it removes
-    // anything, so it is safe to elevate and try once more. This is also why a folder the user can
-    // write to needs no UAC prompt at all.
-    seathubLog("purge needs elevated rights; asking for them");
-    if (!seathubGainAdminRights())
-        return false;
-    return seathubRunPurge(tool) === 0;
-}
-
-function seathubRunPurge(tool)
-{
-    // scripting-installer.html: execute() "Returns an empty array if the program could not be
-    // executed, otherwise the output of command as the first item, and the return code as the
-    // second." An empty stdIn closes the tool's input, so it can never sit waiting on it.
-    seathubLog("running " + tool + " " + SEATHUB_PURGE_ARGS.join(" "));
-    var result = installer.execute(tool, SEATHUB_PURGE_ARGS, "");
-    if (result.length < 2) {
-        seathubLog("the installed maintenance tool could not be started");
-        return -1;
-    }
-    var output = String(result[0]);
-    seathubLog("purge exit code " + result[1] + "; output tail: "
-        + output.substring(Math.max(0, output.length - 1500)));
-    return Number(result[1]);
-}
-
-// Point 4 at the top: `purge` hands the deletion to a detached %TEMP%\uninstall.vbs. MEASURED
-// (scratch harness, 2026-09-22): that script deletes the maintenance tool in ~0.2 s, then makes ONE
-// attempt at the whole folder and exits by ~1.1 s. So wait for the TOOL, not the folder. IFW's
-// TargetDirectoryInUse refusal keys only on <dir>/SeatHubMaintenanceTool.exe; a single leftover file
-// that something still holds open (antivirus, a lingering handle) keeps the FOLDER present forever.
-// Polling the folder is what froze the wizard here: it ran all 30 waits (~30 s, non-pumping GUI ->
-// "(Not Responding)") on a folder that never cleared, even though the tool had gone ~0.2 s in. Polling
-// the tool returns in a fraction of a second in that same case.
-function seathubWaitForToolToGo(targetDir, tool)
-{
-    for (var i = 0; i < SEATHUB_TOOL_WAIT_SECONDS; ++i) {
-        if (!installer.fileExists(tool)) {
-            // Tool gone -> IFW will accept this folder. If the folder is gone too the vbs finished;
-            // if not, give its one-shot folder delete a moment to fire so it cannot delete the files
-            // this install is about to write, then continue. A non-empty folder WITHOUT the tool is
-            // not refused; IFW only asks before reusing it ("OverwriteTargetDirectory").
-            if (installer.fileExists(targetDir)) {
-                seathubSleepOneSecond();
-                seathubLog("tool removed; " + targetDir + " still has leftovers, continuing");
-            } else {
-                // The vbs finished its one-shot folder delete: the folder is already gone, so IFW
-                // accepts it outright (no "OverwriteTargetDirectory" ask). Logged on purpose - this
-                // is the only place that says the clean path ran, so a real update tells us whether
-                // the folder was gone at continue-time (WINDOWS #22 could not, run 1 returned silently).
-                seathubLog("tool removed; " + targetDir + " is gone");
-            }
-            return true;
-        }
-        seathubSleepOneSecond();
-    }
-    // Tool still present after the cap: IFW would refuse. Report failure; the caller shows the box.
-    seathubLog("the maintenance tool is still in " + targetDir);
-    return false;
-}
-
-// Token store backup. TokenStore::defaultDirectory() is %APPDATA%\Seven Hills\SeatHub, built here
-// exactly the way installscript.qs builds the path it registers, so the two always agree. Local
-// test runs point APPDATA at a scratch folder, which moves both.
-function seathubTokenDir()
-{
-    // scripting-installer.html: environmentVariable() - "An empty string is returned if the
-    // environment variable is not set."
-    var base = installer.environmentVariable("APPDATA");
-    if (base === "")
-        return "";
-    return installer.toNativeSeparators(base + "/Seven Hills/SeatHub");
-}
-
-// Returns the backup folder, "" when there is nothing to keep, or null when the copy failed.
-//
-// operations.html: "CopyDirectory" sourcePath targetPath [forceOverwrite]; "Mkdir" path.
-// scripting-installer.html: performOperation(name, arguments) - "Instantly performs the operation",
-// so nothing is recorded for uninstall. MEASURED from the 4.7.0 source (copydirectoryoperation.cpp),
-// not stated in the manual: both folders must already exist, and files land under the PARENT of
-// targetPath plus the source folder's own name. Copying .../SeatHub onto an existing <backup>/SeatHub
-// therefore fills <backup>/SeatHub, and the same holds in reverse.
-function seathubBackUpTokens(tokenDir)
-{
-    if (tokenDir === "" || !installer.fileExists(tokenDir))
-        return "";
-    var temp = installer.environmentVariable("TEMP");
-    if (temp === "") {
-        seathubLog("TEMP is not set; cannot keep the sign-in");
-        return null;
-    }
-    var backup = seathubJoin(temp, "SeatHub-sign-in-" + Date.now());
-    var copy = seathubJoin(backup, seathubLeaf(tokenDir));
-    if (!installer.performOperation("Mkdir", [copy])
-            || !installer.performOperation("CopyDirectory", [tokenDir, copy])) {
-        seathubLog("could not copy " + tokenDir + " to " + copy);
-        return null;
-    }
-    seathubLog("sign-in kept in " + copy);
-    return backup;
-}
-
-function seathubRestoreTokens(backup, tokenDir)
-{
-    var copy = seathubJoin(backup, seathubLeaf(tokenDir));
-    if (!installer.performOperation("Mkdir", [tokenDir])
-            || !installer.performOperation("CopyDirectory", [copy, tokenDir, "forceOverwrite"])) {
-        // Not fatal to the install: the customer signs in again. The copy stays for recovery.
-        seathubLog("could not restore the sign-in; the copy stays in " + copy);
-        return false;
-    }
-    seathubLog("sign-in restored to " + tokenDir);
-    // The copy holds the customer's (DPAPI-encrypted) credentials, so do not leave it in TEMP.
-    // Only ever a folder this script named.
-    if (backup.indexOf("SeatHub-sign-in-") !== -1)
-        installer.execute(seathubSystemTool("cmd.exe"), ["/c", "rmdir", "/s", "/q", backup], "");
-    return true;
-}
-
 function seathubGainAdminRights()
 {
     // scripting-installer.html: gainAdminRights() - "Tries to gain admin rights. On success, it
@@ -387,25 +384,25 @@ function seathubLeaf(path)
     return parts[parts.length - 1];
 }
 
-// Every line is also appended to %TEMP%\SeatHub-update-log.txt, beside the SeatHub-sign-in-<ms>
-// backup folder. InstallationLog.txt lives in the install folder, which the purge above deletes, so
-// after a real update it can hold none of this - and WINDOWS #22 (a verified 0.1.3 -> 0.1.4 update
-// that left the backup behind and signed the customer out) could not say which branch ran. This
-// file survives the purge. It never carries a credential: the lines above name paths, exit codes
-// and outcomes only. The client also carries the sign-in across an update on its own
-// (TokenStore::recoverAtStartup), so a failure to write this file must never affect the update.
+// IFW AppendFile makes a backup when its destination already exists. Buffer, then write once
+// to a new attempt-specific local debug path; this log is not the machine-wide typed journal.
 function seathubLog(message)
 {
     console.log("SeatHub: " + message);
+    seathubLogLines.push(new Date().toISOString() + " SeatHub: " + message + "\r\n");
+}
+
+function seathubFlushLog()
+{
     try {
         var temp = installer.environmentVariable("TEMP");
-        if (temp !== "") {
-            // operations.html: "AppendFile" filename text - text is treated as ASCII.
+        if (temp !== "" && seathubLogLines.length) {
+            var path = seathubJoin(temp, "SeatHub-update-" + seathubRandomId() + ".txt");
             installer.performOperation("AppendFile",
-                [seathubJoin(temp, "SeatHub-update-log.txt"),
-                 new Date().toISOString() + " SeatHub: " + message + "\r\n"]);
+                [path, seathubLogLines.join("")]);
+            seathubLogLines = [];
         }
     } catch (e) {
-        // The log is evidence, not part of the update.
+        // Local debug logging cannot change the update outcome.
     }
 }

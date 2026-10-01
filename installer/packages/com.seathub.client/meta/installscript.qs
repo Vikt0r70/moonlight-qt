@@ -53,11 +53,12 @@ Component.prototype.createOperations = function()
     // navigating to Program Files. Per-machine install (D-42), so it lands in the All Users Programs
     // folder (@AllUsersStartMenuProgramsPath@ is a documented predefined variable). IFW undoes the
     // operations added here on uninstall, so the shortcut needs no separate cleanup registration.
+    var launchDir = installer.value("SeatHubFinalDir") || "@TargetDir@";
     component.addOperation("CreateShortcut",
-                           "@TargetDir@/SeatHub.exe",
+                           launchDir + "/SeatHub.exe",
                            "@AllUsersStartMenuProgramsPath@/SeatHub.lnk",
-                           "workingDirectory=@TargetDir@",
-                           "iconPath=@TargetDir@/SeatHub.exe",
+                           "workingDirectory=" + launchDir,
+                           "iconPath=" + launchDir + "/SeatHub.exe",
                            "description=SeatHub");
 
     var paths = [
@@ -65,14 +66,14 @@ Component.prototype.createOperations = function()
         statePath("APPDATA", "/Seven Hills/SeatHub"),
         // %LOCALAPPDATA%\Seven Hills\SeatHub\crash-db and \log-spool (06.3.1 D-02, D-14, client.md):
         // crashpad's per-user crash database and SeatHub's bounded log spool. Removed at uninstall,
-        // like every other piece of customer state (D-45). An upgrade's purge also clears whatever
-        // pending crash reports or spooled lines were sitting there; that is accepted in SEATHUB
-        // D.3 because the launch right before an update already tried to upload/ship them. This is
+        // like every other piece of customer state (D-45). A staged upgrade leaves these untouched.
+        // This is
         // a different directory from %LOCALAPPDATA%\SeatHub below - it carries the same
         // "Seven Hills" prefix as the Roaming token path above, so it cannot collide with the
         // retired Tauri client's install folder.
         statePath("LOCALAPPDATA", "/Seven Hills/SeatHub/crash-db"),
-        statePath("LOCALAPPDATA", "/Seven Hills/SeatHub/log-spool")
+        statePath("LOCALAPPDATA", "/Seven Hills/SeatHub/log-spool"),
+        statePath("LOCALAPPDATA", "/Seven Hills/SeatHub/update")
         // F-6: %LOCALAPPDATA%\SeatHub (no "Seven Hills" prefix) is deliberately NOT registered.
         // SeatHub never writes there (`TokenStore::defaultDirectory()` resolves to the Roaming path
         // above), but the retired Tauri client was installed there: registering it would delete
