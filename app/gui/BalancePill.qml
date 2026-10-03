@@ -30,10 +30,12 @@ Rectangle {
     /// The SeatHubClient facade (D-35): `balanceMinutes`, `balanceText`, `balanceStale`.
     property var client
 
-    // `SeatHubClient.balanceMinutes` is -1 until a read has succeeded.
+    // `SeatHubClient.balanceMinutes` is signed (a negative balance is real, ADR-0075) and reads 0
+    // until a read has succeeded, so it cannot say whether the number is known: `balanceText`
+    // can, because it is empty until then and `durationText()` never returns empty for a number.
     readonly property real minutes: client && client.balanceMinutes !== undefined
-                                    ? Number(client.balanceMinutes) : -1
-    readonly property bool known: root.minutes >= 0
+                                    ? Number(client.balanceMinutes) : 0
+    readonly property bool known: root.balanceKnownNow()
     readonly property bool stale: client ? client.balanceStale === true : false
 
     // `screens.md` section 25: warn at 10 minutes and under, danger at 2 minutes and under. Only
@@ -72,23 +74,34 @@ Rectangle {
     // the first known value, and never for a read that answers with the same figure.
     property bool everKnownMinutes: false
     property real previousKnownMinutes: 0
-    onMinutesChanged: {
-        // Read straight off `root.minutes` (this handler's own trigger, always fresh) rather than
-        // `root.known`: a readonly property one binding hop further away can still be evaluating
-        // last tick's value at the instant a sibling property's own change handler runs, and
-        // `root.minutes < 0` says exactly what `!root.known` would once it catches up.
-        if (root.minutes < 0) {
+
+    // True when the facade holds a balance (negative included); read straight off the facade.
+    function balanceKnownNow() {
+        return client ? (client.balanceText !== undefined && String(client.balanceText) !== "") : false
+    }
+
+    function noteBalance() {
+        // Read straight off the facade rather than `root.minutes` / `root.known`: a readonly
+        // property one binding hop further away can still be evaluating last tick's value at the
+        // instant a sibling property's own change handler runs.
+        if (!root.balanceKnownNow()) {
             // Nothing to compare a later value against yet (still loading, or every read has
             // failed with none ever succeeding) - and no pulse for going stale either.
             return
         }
-        if (root.everKnownMinutes && root.minutes !== root.previousKnownMinutes
-                && client && client.animationEffects !== false) {
+        var current = Number(client.balanceMinutes)
+        if (root.everKnownMinutes && current !== root.previousKnownMinutes
+                && client.animationEffects !== false) {
             pulseAnimation.restart()
         }
         root.everKnownMinutes = true
-        root.previousKnownMinutes = root.minutes
+        root.previousKnownMinutes = current
     }
+
+    // Both triggers: the first read can leave the number at 0 (unknown reads 0 too), so only the
+    // known flip tells that a value has arrived. Calling twice for one change is harmless.
+    onMinutesChanged: root.noteBalance()
+    onKnownChanged: root.noteBalance()
 
     height: Metrics.s8
     implicitWidth: Math.max(Metrics.s24, layout.implicitWidth + Metrics.s4 * 2)

@@ -816,6 +816,9 @@ private:
                                                      QString::fromLatin1(kAccessToken)));
         client.restoreSession();
         QTRY_COMPARE_WITH_TIMEOUT(client.appState(), QStringLiteral("home"), 15000);
+        // An unknown balance also reads 0 (ADR-0075: no number stands for "unknown"), so a first
+        // read of 0 is told apart only by the text.
+        QTRY_VERIFY_WITH_TIMEOUT(!client.balanceText().isEmpty(), 15000);
         QTRY_COMPARE_WITH_TIMEOUT(client.balanceMinutes(), qint64(minutes), 15000);
     }
 
@@ -1228,7 +1231,7 @@ private slots:
         // Constructed in "restoring", not "signed_out": the sign-in form must never be shown while
         // the stored credential is being checked (CUST-08). `restoreSession()` resolves it.
         QCOMPARE(client.appState(), QStringLiteral("restoring"));
-        QCOMPARE(client.balanceMinutes(), qint64(-1));
+        QCOMPARE(client.balanceMinutes(), qint64(0));
         QVERIFY(client.balanceText().isEmpty());
         QVERIFY(!client.balanceStale());
         QVERIFY(client.identity().isEmpty());
@@ -1641,7 +1644,7 @@ private slots:
 
         // The wallet could not be read either, and no read has ever succeeded: nothing to show.
         QTRY_VERIFY_WITH_TIMEOUT(client.balanceStale(), 15000);
-        QCOMPARE(client.balanceMinutes(), qint64(-1));
+        QCOMPARE(client.balanceMinutes(), qint64(0));
         QVERIFY(client.balanceText().isEmpty());
     }
 
@@ -2017,7 +2020,8 @@ private slots:
         QVERIFY(client.signedIn());
         // The wallet read failed and none ever succeeded: the header's word is `Unavailable`.
         QTRY_VERIFY_WITH_TIMEOUT(client.balanceStale(), 15000);
-        QCOMPARE(client.balanceMinutes(), qint64(-1));
+        QCOMPARE(client.balanceMinutes(), qint64(0));
+        QVERIFY(client.balanceText().isEmpty());
     }
 
     void aRefusedCredentialIsNeverSignedIn()
@@ -4572,7 +4576,7 @@ private slots:
         QCOMPARE(client.appState(), QStringLiteral("signed_out"));
         QVERIFY(client.identity().isEmpty());
         QVERIFY(client.account().isEmpty());
-        QCOMPARE(client.balanceMinutes(), qint64(-1));
+        QCOMPARE(client.balanceMinutes(), qint64(0));
         QVERIFY(client.balanceText().isEmpty());
         QVERIFY(!QFile::exists(tokenPath));
         QCOMPARE(QDir(m_dir->path()).entryList(QDir::Files).size(), 0);
@@ -6568,6 +6572,62 @@ private slots:
         QCOMPARE(client.balanceText(), QStringLiteral("2 h 05 min"));
         QVERIFY(!client.balanceStale());
         QCOMPARE(balanceSpy.count(), 1);
+    }
+
+    void signedBalanceRendersMinus()
+    {
+        // INTENT SC25, ADR-0075: a balance below zero is a real number, drawn with a leading minus
+        // in the same hours-and-minutes shape as a positive one - never `0 min`, never "unknown".
+        SeatHubClient client;
+
+        // Before any read: unknown, which reads 0 with no text.
+        QCOMPARE(client.balanceMinutes(), qint64(0));
+        QVERIFY(client.balanceText().isEmpty());
+
+        // A real -1 is a balance, not the unknown state (the old -1 sentinel is gone).
+        reachHome(client, -1);
+        QVERIFY(!QTest::currentTestFailed());
+        QCOMPARE(client.balanceMinutes(), qint64(-1));
+        QCOMPARE(client.balanceText(), QStringLiteral("-1 min"));
+        QVERIFY(!client.balanceStale());
+
+        // Wallet reads: -3, -75, 0 and 27 minutes.
+        struct Case { int minutes; const char* text; };
+        const Case cases[] = { { -3, "-3 min" }, { -75, "-1 h 15 min" }, { 0, "0 min" },
+                               { 27, "27 min" } };
+        for (const Case& c : cases) {
+            m_fake->answerWallet(200, walletBody(c.minutes));
+            client.refreshBalance();
+            QTRY_COMPARE_WITH_TIMEOUT(client.balanceText(), QString::fromLatin1(c.text), 15000);
+            QCOMPARE(client.balanceMinutes(), qint64(c.minutes));
+            QVERIFY(!client.balanceStale());
+        }
+
+        // A pushed `account.state` carries the negative balance unclamped.
+        client.sse()->feed(QByteArrayLiteral(
+            "event: account.state\n"
+            "data: {\"topic\":\"account:acc-1\",\"at\":\"2026-09-27T00:00:00Z\","
+            "\"account\":{\"wallet\":{\"balance_minutes\":-3},\"live_session_id\":\"\","
+            "\"open_topup_notice\":null,\"signup_stage\":\"complete\"}}\n"
+            "\n"));
+        QTRY_COMPARE_WITH_TIMEOUT(client.balanceText(), QStringLiteral("-3 min"), 15000);
+        QCOMPARE(client.balanceMinutes(), qint64(-3));
+
+        // So does the fallback `GET /api/account-state` read.
+        client.setAccountFallbackMs(50);
+        m_fake->answerAccountState(200, QByteArrayLiteral(
+            "{\"topic\":\"account:acc-1\",\"at\":\"2026-09-27T00:00:00Z\","
+            "\"account\":{\"wallet\":{\"balance_minutes\":-75},\"live_session_id\":\"\","
+            "\"open_topup_notice\":null,\"signup_stage\":\"complete\"}}"));
+        emit client.sse()->pausedChanged(true);
+        QTRY_COMPARE_WITH_TIMEOUT(client.balanceText(), QStringLiteral("-1 h 15 min"), 15000);
+        QCOMPARE(client.balanceMinutes(), qint64(-75));
+        emit client.sse()->pausedChanged(false);
+
+        // Signing out forgets it: the next customer never sees this one's debt.
+        client.signOut();
+        QCOMPARE(client.balanceMinutes(), qint64(0));
+        QVERIFY(client.balanceText().isEmpty());
     }
 
     void aChangedTopupNoticeReloadsTheProfileLists()

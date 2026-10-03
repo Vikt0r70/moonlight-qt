@@ -1173,10 +1173,15 @@ private slots:
         QJsonObject nul;
         nul.insert(QStringLiteral("balance_minutes"), QJsonValue::Null);
         QVERIFY(!WalletInfo::parse(nul, &wallet));
-        // The schema says `ge: 0`; a negative one is a broken body, not a debt to display.
+        // ADR-0075: a valid delayed debit can leave the balance below zero, and that is a real
+        // balance to display, not a broken body.
         QJsonObject negative;
         negative.insert(QStringLiteral("balance_minutes"), -5);
-        QVERIFY(!WalletInfo::parse(negative, &wallet));
+        QVERIFY(WalletInfo::parse(negative, &wallet));
+        QCOMPARE(wallet.balanceMinutes, qint64(-5));
+        negative.insert(QStringLiteral("balance_minutes"), -3);
+        QVERIFY(WalletInfo::parse(negative, &wallet));
+        QCOMPARE(wallet.balanceMinutes, qint64(-3));
     }
 
     void logout_postsWithTheCredentialAndA204IsSuccess()
@@ -1637,7 +1642,15 @@ private slots:
         QCOMPARE(usage.minutesPlayed, qint64(0));
         QCOMPARE(usage.balanceMinutes, qint64(0));
 
-        // A body missing either total, carrying text, or negative is not a total.
+        // A negative balance is a real, signed balance (ADR-0075); the played total is a count.
+        QJsonObject signedBalance;
+        signedBalance.insert(QStringLiteral("minutes_played"), 11);
+        signedBalance.insert(QStringLiteral("balance_minutes"), -3);
+        QVERIFY(UsageInfo::parse(signedBalance, &usage));
+        QCOMPARE(usage.minutesPlayed, qint64(11));
+        QCOMPARE(usage.balanceMinutes, qint64(-3));
+
+        // A body missing either total, carrying text, or with a negative played total is not a total.
         QVERIFY(!UsageInfo::parse(QJsonObject(), &usage));
         QJsonObject onlyOne;
         onlyOne.insert(QStringLiteral("minutes_played"), 30);

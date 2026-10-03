@@ -21,10 +21,8 @@ bool AccountStateInfo::parse(const QJsonObject& account, AccountStateInfo* out)
 
     const QJsonObject wallet = account.value(QStringLiteral("wallet")).toObject();
     const QJsonValue balance = wallet.value(QStringLiteral("balance_minutes"));
+    // Signed (ADR-0075): a negative pushed balance is shown as it is, never drawn as `0 min`.
     info.balanceMinutes = balance.isDouble() ? static_cast<qint64>(balance.toDouble()) : 0;
-    if (info.balanceMinutes < 0) {
-        info.balanceMinutes = 0;
-    }
 
     info.liveSessionId = account.value(QStringLiteral("live_session_id")).toString();
 

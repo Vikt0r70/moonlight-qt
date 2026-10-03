@@ -35,7 +35,8 @@ class ControlPlaneClient;
 /// malformed or absent field reads empty/zero, never a crash (T-06.4-46).
 struct AccountStateInfo
 {
-    /// `wallet.balance_minutes`. Never negative on the wire; a malformed/absent value reads 0.
+    /// `wallet.balance_minutes`, signed (ADR-0075: negative after a valid delayed debit exceeded the
+    /// balance). A malformed/absent value reads 0.
     qint64 balanceMinutes = 0;
     /// `live_session_id`. Empty when the account has no live session.
     QString liveSessionId;

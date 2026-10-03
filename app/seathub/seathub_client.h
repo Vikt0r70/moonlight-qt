@@ -212,8 +212,10 @@ class SeatHubClient : public QObject
     /// read it. Never a credential.
     Q_PROPERTY(QVariantMap account READ account NOTIFY identityChanged)
 
-    /// The customer's balance in whole minutes as `GET /api/wallet` last reported it, or -1 when
-    /// no read has ever succeeded. The client does no arithmetic on it (CUST-06,
+    /// The customer's balance in whole minutes as `GET /api/wallet` last reported it, signed (a
+    /// valid delayed debit can leave it negative, ADR-0075), or 0 when no read has ever succeeded.
+    /// A real number is told from "unknown" only by `balanceText`, which is empty while unknown;
+    /// read this only while that is non-empty. The client does no arithmetic on it (CUST-06,
     /// `docs/spec/client.md` §Wallet authority); the view compares it to the warning thresholds
     /// and nothing else.
     Q_PROPERTY(qint64 balanceMinutes READ balanceMinutes NOTIFY balanceChanged)
@@ -927,7 +929,9 @@ private:
     /// (a wallet read, a sign-out's own revoke) must not touch what a newer one set up.
     quint64 m_authEpoch = 0;
 
-    qint64 m_balanceMinutes = -1;
+    /// Signed; meaningful only while `m_balanceKnown`. No numeric value stands for "unknown".
+    qint64 m_balanceMinutes = 0;
+    bool m_balanceKnown = false;
     QString m_balanceText;
     bool m_balanceStale = false;
 

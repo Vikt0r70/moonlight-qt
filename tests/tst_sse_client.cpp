@@ -387,6 +387,22 @@ private slots:
         QCOMPARE(malformed.signupStage, QString());
     }
 
+    void accountStateCarriesANegativeBalanceUnclamped()
+    {
+        // ADR-0075: a valid delayed debit can leave the balance below zero; the pushed frame says
+        // so and the client shows it, never `0`.
+        SseClient client;
+        QSignalSpy spy(&client, &SseClient::accountState);
+        client.feed(QByteArrayLiteral(
+            "event: account.state\n"
+            "data: {\"topic\":\"account:acc-1\",\"at\":\"2026-09-27T00:00:00Z\","
+            "\"account\":{\"wallet\":{\"balance_minutes\":-3},\"live_session_id\":\"\","
+            "\"open_topup_notice\":null,\"signup_stage\":\"complete\"}}\n"
+            "\n"));
+        QCOMPARE(spy.count(), 1);
+        QCOMPARE(spy.at(0).at(0).value<AccountStateInfo>().balanceMinutes, qint64(-3));
+    }
+
     // --- Task 2: the connection --------------------------------------------------------------
 
     void liveOnlyAfterAliveWhenHelloNamesIt()

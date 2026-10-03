@@ -220,7 +220,7 @@ struct AccountInfo
 /// authority).
 struct WalletInfo
 {
-    /// Whole minutes, never negative on the wire.
+    /// Whole minutes, signed: negative after a valid delayed debit exceeded the balance (ADR-0075).
     qint64 balanceMinutes = 0;
     QString updatedAt;
 
@@ -313,6 +313,7 @@ struct UsageInfo
 {
     /// The sum of the customer's session-debit ledger minutes (OD-09: a refund is not played).
     qint64 minutesPlayed = 0;
+    /// Signed, like `WalletInfo::balanceMinutes` (ADR-0075).
     qint64 balanceMinutes = 0;
 
     static bool parse(const QJsonObject& body, UsageInfo* out);

@@ -209,10 +209,9 @@ bool WalletInfo::parse(const QJsonObject& body, WalletInfo* out)
     }
 
     WalletInfo wallet;
+    // A negative value is a real balance, not a broken body: a valid delayed debit larger than the
+    // remaining credit leaves a signed balance (ADR-0075), and it is shown as it is.
     wallet.balanceMinutes = static_cast<qint64>(balance.toDouble());
-    if (wallet.balanceMinutes < 0) {
-        return false;
-    }
     wallet.updatedAt = body.value(QStringLiteral("updated_at")).toString();
 
     *out = wallet;
@@ -376,10 +375,11 @@ bool TopupNoticePage::parse(const QJsonObject& body, TopupNoticePage* out)
 
 bool UsageInfo::parse(const QJsonObject& body, UsageInfo* out)
 {
+    // `minutes_played` is a count and stays non-negative; `balance_minutes` is signed (ADR-0075).
     qint64 played = 0;
     qint64 balance = 0;
     if (!out || !minutesOf(body, "minutes_played", &played)
-            || !minutesOf(body, "balance_minutes", &balance) || played < 0 || balance < 0) {
+            || !minutesOf(body, "balance_minutes", &balance) || played < 0) {
         return false;
     }
 

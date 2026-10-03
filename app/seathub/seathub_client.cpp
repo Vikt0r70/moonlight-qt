@@ -2273,6 +2273,7 @@ void SeatHubClient::applyWalletResult(quint64 epoch, const ControlPlaneResult& r
 void SeatHubClient::setBalance(qint64 minutes)
 {
     m_balanceMinutes = minutes;
+    m_balanceKnown = true;
     m_balanceText = durationText(minutes);
     m_balanceStale = false;
     emit balanceChanged();
@@ -2281,8 +2282,9 @@ void SeatHubClient::setBalance(qint64 minutes)
 void SeatHubClient::applyLiveBalance(qint64 minutes)
 {
     // Signed out since the read was made (a queued answer can outlive the stream that asked): not
-    // this session's to show. And nothing to say when it is what is already held.
-    if (!m_signedIn || (m_balanceMinutes == minutes && !m_balanceStale)) {
+    // this session's to show. And nothing to say when it is what is already held (a real value held,
+    // not the unknown state, which reads 0 and must still take a first 0 or -1).
+    if (!m_signedIn || (m_balanceKnown && m_balanceMinutes == minutes && !m_balanceStale)) {
         return;
     }
     setBalance(minutes);
@@ -2290,10 +2292,11 @@ void SeatHubClient::applyLiveBalance(qint64 minutes)
 
 void SeatHubClient::resetBalance()
 {
-    if (m_balanceMinutes == -1 && m_balanceText.isEmpty() && !m_balanceStale) {
+    if (!m_balanceKnown && m_balanceText.isEmpty() && !m_balanceStale) {
         return;
     }
-    m_balanceMinutes = -1;
+    m_balanceMinutes = 0;
+    m_balanceKnown = false;
     m_balanceText.clear();
     m_balanceStale = false;
     emit balanceChanged();
@@ -2443,7 +2446,7 @@ void SeatHubClient::handleConnectionStarted()
     // The last balance read before the stream (D-16: the seed never shows Time left, however low
     // it is - it can be old, so it arms no reminder; the report below reads the wallet at once and
     // that read is the first thing that can).
-    if (m_balanceMinutes >= 0) {
+    if (m_balanceKnown) {
         m_hud.seedCreditMinutes(m_balanceMinutes);
     }
 
