@@ -12,9 +12,9 @@ name: SeatHub build (Windows)
 
 on:
   pull_request:
-    branches: [seathub/main]
+    branches: [main]
   push:
-    branches: [seathub/main]
+    branches: [main]
 
 jobs:
   diff-gate:
@@ -202,7 +202,7 @@ jobs:
               Write-Host "::warning::Sentry symbol upload skipped: SENTRY_AUTH_TOKEN is not set; skipping the symbol upload on this pull request."
               exit 0
             }
-            throw "SENTRY_AUTH_TOKEN is empty on a push to seathub/main -- the owner's secret (A-44) is missing or was revoked (D-12)"
+            throw "SENTRY_AUTH_TOKEN is empty on a push to main -- the owner's secret (A-44) is missing or was revoked (D-12)"
           }
 
           $sentryCliSha256 = '2257cf6805a616f5c3ee291a549ebbba021190048b646adc006beb4e8cdef7fd'
@@ -331,14 +331,14 @@ jobs:
   # `is_current` and clears the previous one in a single transaction (see app/releases.py), so this
   # supersedes the retired Tauri `client` row without a manual delete.
   #
-  # Only runs on a push to seathub/main (never on PRs). If the release secrets are not set on this
+  # Only runs on a push to main (never on PRs). If the release secrets are not set on this
   # repo yet, the build still succeeds and this job SKIPS with a loud warning rather than failing red
   # — set the five secrets below to turn publishing on.
   publish:
     name: Publish client to the release feed
     needs: seathub-windows-build
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' && github.ref == 'refs/heads/seathub/main'
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     # `contents: write` is only for the GitHub Release at the end (owner decision A-22).
     permissions:
       contents: write
