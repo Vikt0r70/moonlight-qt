@@ -119,6 +119,68 @@ QByteArray refusedBody(const QString& error, const QString& reference)
     return QJsonDocument(object).toJson(QJsonDocument::Compact);
 }
 
+// The same session body for any session id, so a reply can be told to belong to one session.
+QByteArray sessionBodyFor(const QString& id, const QString& state)
+{
+    QJsonObject object = QJsonDocument::fromJson(sessionBody(state)).object();
+    object.insert(QStringLiteral("id"), id);
+    return QJsonDocument(object).toJson(QJsonDocument::Compact);
+}
+
+// A reply that stays open until the test answers it, so a late reply can be made to arrive after a
+// newer teardown has begun - the order a real network produces and a canned one cannot.
+class HeldReply : public QNetworkReply
+{
+    Q_OBJECT
+
+public:
+    explicit HeldReply(QObject* parent)
+        : QNetworkReply(parent)
+    {
+        open(QIODevice::ReadOnly);
+    }
+
+    void answer(int httpStatus, const QByteArray& body)
+    {
+        setAttribute(QNetworkRequest::HttpStatusCodeAttribute, QVariant(httpStatus));
+        m_buffer.setData(body);
+        m_buffer.open(QIODevice::ReadOnly);
+        setFinished(true);
+        emit finished();
+    }
+
+    void abort() override {}
+    qint64 readData(char* data, qint64 maxSize) override
+    {
+        return m_buffer.read(data, maxSize);
+    }
+    qint64 bytesAvailable() const override
+    {
+        return m_buffer.size() + QNetworkReply::bytesAvailable();
+    }
+
+private:
+    QBuffer m_buffer;
+};
+
+class HeldNetworkAccessManager : public QNetworkAccessManager
+{
+    Q_OBJECT
+
+public:
+    QStringList paths;
+    QList<HeldReply*> replies;
+
+protected:
+    QNetworkReply* createRequest(Operation, const QNetworkRequest& request, QIODevice*) override
+    {
+        auto* reply = new HeldReply(this);
+        paths.append(request.url().path());
+        replies.append(reply);
+        return reply;
+    }
+};
+
 } // namespace
 
 class TstTeardown : public QObject
@@ -575,6 +637,85 @@ private slots:
 
         // And the flag is claimed exactly once, so a duplicate cannot re-run a teardown.
         QVERIFY2(!guard.markStarted(), "a session's teardown is claimed exactly once");
+    }
+
+    // PF14-c, UD-04 R06: an end or verify reply of one teardown arriving after a newer teardown
+    // began is a late step of an ended session. It cannot advance, finish or fail the newer one,
+    // and a teardown that was cancelled hears nothing from its own late reply either.
+    void teardownCallbackFencedToAttempt()
+    {
+        const QString sessionA = QStringLiteral("session-a");
+        const QString sessionB = QStringLiteral("session-b");
+        const QString sessionC = QStringLiteral("session-c");
+        const QString sessionD = QStringLiteral("session-d");
+        const QString uuid = QString::fromLatin1(kClientUuid);
+
+        TeardownController controller;
+        auto* client = new ControlPlaneClient(&controller);
+        auto* held = new HeldNetworkAccessManager;
+        client->setNetworkAccessManager(held);
+        controller.setControlPlane(client);
+        controller.setVerifyIntervalMs(1);
+
+        QSignalSpy completed(&controller, &TeardownController::teardownCompleted);
+        QSignalSpy failed(&controller, &TeardownController::teardownFailed);
+
+        // --- an END reply of A, arriving while B is the teardown that is running
+        controller.teardown(sessionA, uuid);
+        QTRY_COMPARE(held->replies.size(), 1);
+        controller.teardown(sessionB, uuid);
+        QTRY_COMPARE(held->replies.size(), 2);
+        QCOMPARE(held->paths.at(1), QStringLiteral("/api/sessions/session-b/end"));
+
+        held->replies.at(0)->answer(202, sessionBodyFor(sessionA, QStringLiteral("ENDING")));
+        QTest::qWait(30);
+        // B's own `POST /end` has not been answered: A's reply moved B nowhere and started no poll.
+        QCOMPARE(controller.stage(), TeardownStage::Disable);
+        QCOMPARE(held->replies.size(), 2);
+        QCOMPARE(completed.count(), 0);
+        QCOMPARE(failed.count(), 0);
+
+        // B's own reply is the one that advances it, to a poll of B and of nothing else.
+        held->replies.at(1)->answer(202, sessionBodyFor(sessionB, QStringLiteral("ENDING")));
+        QTRY_COMPARE(held->replies.size(), 3);
+        QCOMPARE(held->paths.at(2), QStringLiteral("/api/sessions/session-b"));
+        QCOMPARE(controller.stage(), TeardownStage::Verify);
+
+        // --- a VERIFY reply of B, arriving while C is the teardown that is running
+        controller.teardown(sessionC, uuid);
+        QTRY_COMPARE(held->replies.size(), 4);
+        QCOMPARE(held->paths.at(3), QStringLiteral("/api/sessions/session-c/end"));
+
+        // B's session is over, and says so - to a teardown that is no longer the current one.
+        held->replies.at(2)->answer(200, sessionBodyFor(sessionB, QStringLiteral("COMPLETED")));
+        QTest::qWait(30);
+        QCOMPARE(completed.count(), 0);
+        QCOMPARE(failed.count(), 0);
+        QCOMPARE(controller.stage(), TeardownStage::Disable);
+        QCOMPARE(held->replies.size(), 4);
+
+        // C runs to its own end, and the result is reported for C - not for the session whose
+        // reply came first, and not once per teardown that ever ran.
+        held->replies.at(3)->answer(202, sessionBodyFor(sessionC, QStringLiteral("ENDING")));
+        QTRY_COMPARE(held->replies.size(), 5);
+        QCOMPARE(held->paths.at(4), QStringLiteral("/api/sessions/session-c"));
+        held->replies.at(4)->answer(200, sessionBodyFor(sessionC, QStringLiteral("COMPLETED")));
+        QTRY_COMPARE(completed.count(), 1);
+        QCOMPARE(failed.count(), 0);
+        QCOMPARE(completed.at(0).at(1).toString(), sessionC);
+        QCOMPARE(completed.at(0).at(0).value<SessionInfo>().id, sessionC);
+        QCOMPARE(controller.stage(), TeardownStage::Done);
+
+        // --- a teardown that was cancelled hears nothing from its own late reply
+        controller.teardown(sessionD, uuid);
+        QTRY_COMPARE(held->replies.size(), 6);
+        controller.cancel();
+        held->replies.at(5)->answer(202, sessionBodyFor(sessionD, QStringLiteral("ENDING")));
+        QTest::qWait(30);
+        QCOMPARE(held->replies.size(), 6);
+        QCOMPARE(controller.stage(), TeardownStage::Idle);
+        QCOMPARE(completed.count(), 1);
+        QCOMPARE(failed.count(), 0);
     }
 };
 

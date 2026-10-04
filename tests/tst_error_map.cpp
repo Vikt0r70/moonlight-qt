@@ -90,6 +90,7 @@ private slots:
     void stageFailure_unmappedFallsBackToGeneric();
     void diagnostic_neverReachesTheViewModel();
     void apiFailure_passesTheServerReferenceThrough();
+    void ownSessionRefusal_showsTheServersSentenceVerbatim();
     void errorScreen_rendersReasonAndMonoReference();
     void mapEndBlame();
 };
@@ -205,6 +206,29 @@ void TstErrorMap::apiFailure_passesTheServerReferenceThrough()
         SeatHubFailure::api(500, QStringLiteral("Something went wrong on our side."), QString());
     QVERIFY2(noCode.reference.isEmpty(),
              "the client must not manufacture a reference the control plane never issued");
+}
+
+void TstErrorMap::ownSessionRefusal_showsTheServersSentenceVerbatim()
+{
+    // LK01: when the server still holds the customer's previous session, the refusal Play meets is
+    // `USER_HAS_NONTERMINAL_SESSION`, and the customer reads the SERVER's sentence for it - the
+    // existing mapping carries it through untouched, with no client-side string standing in for it
+    // and no reference the control plane did not issue.
+    const QString sentence = QStringLiteral("The server's own sentence about the earlier session.");
+    const SeatHubFailure failure = SeatHubFailure::api(
+        409, sentence, QStringLiteral("SH-4F7KQ2"), QStringLiteral("USER_HAS_NONTERMINAL_SESSION"));
+
+    QCOMPARE(failure.error, sentence);
+    QCOMPARE(failure.failure, QStringLiteral("USER_HAS_NONTERMINAL_SESSION"));
+    QCOMPARE(failure.reference, QStringLiteral("SH-4F7KQ2"));
+
+    const QVariantMap viewModel = failure.toVariantMap();
+    QCOMPARE(viewModel.value(QStringLiteral("error")).toString(), sentence);
+    QCOMPARE(viewModel.value(QStringLiteral("reference")).toString(), QStringLiteral("SH-4F7KQ2"));
+    QCOMPARE(viewModel.value(QStringLiteral("failure")).toString(),
+             QStringLiteral("USER_HAS_NONTERMINAL_SESSION"));
+    QVERIFY2(viewModel.value(QStringLiteral("error")).toString() != SeatHubFailure::generic().error,
+             "a refusal the server worded is never replaced by the generic sentence");
 }
 
 void TstErrorMap::errorScreen_rendersReasonAndMonoReference()

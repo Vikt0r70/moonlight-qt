@@ -5,7 +5,8 @@
 
 Q_LOGGING_CATEGORY(seathubTeardown, "seathub.teardown")
 
-// The rig-side sequence this controller waits on, in the order STREAM-10 and D-10 require -
+// The rig-side sequence the Node Agent runs when a session ends, in the order STREAM-10 and D-10
+// require -
 //  1. disable   POST /api/clients/update {uuid, enabled:false}   Node Agent
 //  2. unpair    POST /api/clients/unpair {uuid}                  Node Agent
 //  3. verify    GET  /api/clients/list  (the `listClients` call)  Node Agent
@@ -13,10 +14,16 @@ Q_LOGGING_CATEGORY(seathubTeardown, "seathub.teardown")
 // `/api/clients/*` path), and this client holds no Sunshine admin credential, so it calls none
 // of them - `03-RESEARCH.md` §Teardown order: "The client must not call Sunshine admin endpoints
 // directly because the specification forbids exposing those credentials; Node Agent owns those
-// calls." The order still binds this client, because it is why the client waits: a session
-// reaches a terminal state only after the rig side has finished the three steps in that order,
-// so "the session is terminal" is this client's evidence that they happened. Waiting on the
-// control plane instead of doing the work is what keeps the client outside the admin boundary.
+// calls."
+//
+// What this controller can know is only what the control plane says: it asks for the end
+// (`POST /end`) and then waits until the session is terminal on the server, bounded by the
+// teardown grace. A terminal session is the SERVER's ending. It is not this client's proof that
+// the renter pairing was physically removed from the rig: that removal is the Node Agent's, it
+// removes only the renter's own entry and reads it back (`docs/spec/host.md` step 11), it can be
+// deliberately left in place when a free return hold keeps the pairing warm, and whether it was
+// removed is the rig side's to establish, not something this client reads off the session.
+// Nothing here reports a pairing as revoked.
 
 namespace {
 
@@ -142,9 +149,16 @@ void TeardownController::teardown(const QString& sessionId, const QString& clien
     }
 
     if (sessionId.isEmpty()) {
+        // A failure for no session: it must not be reported under the previous teardown's id.
+        m_sessionId.clear();
         fail(SeatHubFailure::local(QString::fromLatin1(kTeardownFailedSentence)));
         return;
     }
+
+    // A new teardown: whatever the previous one still has in flight - a reply, or a verify tick -
+    // no longer belongs here (PF14-c).
+    ++m_attempt;
+    m_verifyTimer->stop();
 
     m_sessionId = sessionId;
     m_clientUuid = clientUuid;
@@ -166,8 +180,9 @@ void TeardownController::teardown(const QString& sessionId, const QString& clien
 
     // Step 1 on the rig, requested through the only route this client has. `POST /end` is
     // idempotent, so pressing End twice is not an error.
-    m_client->endSession(sessionId, failed, report, [this](const ControlPlaneResult& result) {
-        handleEndResult(result);
+    const quint64 attempt = m_attempt;
+    m_client->endSession(sessionId, failed, report, [this, attempt](const ControlPlaneResult& result) {
+        handleEndResult(attempt, result);
     });
 }
 
@@ -178,6 +193,8 @@ void TeardownController::cancel()
         return;
     }
 
+    // The teardown ends here: a reply still in flight for it is dropped when it arrives.
+    ++m_attempt;
     m_verifyTimer->stop();
     m_finished = true;
     m_clock.invalidate();
@@ -186,9 +203,11 @@ void TeardownController::cancel()
     setState(QString::fromLatin1(kStateIdle));
 }
 
-void TeardownController::handleEndResult(const ControlPlaneResult& result)
+void TeardownController::handleEndResult(quint64 attempt, const ControlPlaneResult& result)
 {
-    if (m_finished) {
+    // An end reply of an earlier teardown must not advance this one to waiting on the session: this
+    // one's own `POST /end` has not been answered.
+    if (attempt != m_attempt || m_finished) {
         return;
     }
 
@@ -240,14 +259,20 @@ void TeardownController::verifySession()
         return;
     }
 
-    m_client->fetchSession(m_sessionId, [this](const ControlPlaneResult& result) {
-        handleVerifyResult(result);
+    // The attempt and the session are read once, here, and travel with the request: the reply is
+    // judged against them and reported for them, never against whatever the members hold when it
+    // arrives (PF14-c).
+    const quint64 attempt = m_attempt;
+    const QString sessionId = m_sessionId;
+    m_client->fetchSession(sessionId, [this, attempt, sessionId](const ControlPlaneResult& result) {
+        handleVerifyResult(attempt, sessionId, result);
     });
 }
 
-void TeardownController::handleVerifyResult(const ControlPlaneResult& result)
+void TeardownController::handleVerifyResult(quint64 attempt, const QString& sessionId,
+                                            const ControlPlaneResult& result)
 {
-    if (m_finished) {
+    if (attempt != m_attempt || m_finished) {
         return;
     }
 
@@ -274,11 +299,16 @@ void TeardownController::handleVerifyResult(const ControlPlaneResult& result)
         return;
     }
 
+    // The session is terminal on the server: its end is final. That is all this read proves. It
+    // does not prove the renter pairing is gone from the rig - the Node Agent removes it and reads
+    // the removal back, or keeps it warm for a free return hold - so nothing below, and no signal
+    // this controller emits, claims a physical revocation.
+    //
     // Step 4: leave nothing behind. STREAM-10 - "the client keeps no stored rig, address or
     // pairing of its own" - is what this stage stands for, and it holds by construction: the
     // client's only stored data is the customer's sign-in credential (`TokenStore`), the rig, its
     // address and the pairing live in the engine's session and are dropped with it, and nothing of
-    // them is ever written to disk here.
+    // them is ever written to disk here. It is about this PC only.
     //
     // This stage used to sweep the token store as well ("every credential this client holds is
     // removed"). That was written before ADR-0050 made sessions permanent, and it means a customer
@@ -297,8 +327,8 @@ void TeardownController::handleVerifyResult(const ControlPlaneResult& result)
         return;
     }
 
-    qCInfo(seathubTeardown) << "teardown complete for session" << m_sessionId;
-    emit teardownCompleted(info);
+    qCInfo(seathubTeardown) << "teardown complete for session" << sessionId;
+    emit teardownCompleted(info, sessionId);
 }
 
 void TeardownController::fail(const SeatHubFailure& failure, const QString& failureCode)
@@ -316,5 +346,5 @@ void TeardownController::fail(const SeatHubFailure& failure, const QString& fail
     qCWarning(seathubTeardown) << "teardown failed; reference" << reported.reference
                                << "failure" << reported.failure;
 
-    emit teardownFailed(reported);
+    emit teardownFailed(reported, m_sessionId);
 }

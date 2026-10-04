@@ -645,7 +645,10 @@ QByteArray ControlPlaneClient::buildEndRequest(bool failed, const EndReport& rep
     // session; anything else - no body, at all - is the ordinary customer-initiated end
     // (`CUSTOMER_ENDED`) and is ignored on an ACTIVE one either way. A report has nothing to add
     // to an end that is not itself a failure, so `failed == false` still posts no body at all.
-    if (!failed) {
+    // O01: nor does a deliberate quit, which is not a failure whatever the caller passed - a Cancel
+    // before the stream or the in-stream quit shortcut ends `CUSTOMER_ENDED` at no charge, never
+    // `CONNECT_FAILED` with a rig blamed.
+    if (!failed || report.customerQuit) {
         return QByteArray();
     }
     QJsonObject object;

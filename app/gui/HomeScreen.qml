@@ -8,8 +8,8 @@ import SeatHub.Tokens 1.0
 //
 // Every state §23 requires is here (audit F1):
 //
-//   ready     nothing but Play. While a session is live the control reads `Resume session` and
-//             resumes that session instead of asking for another one (`client.liveSession`). When the
+//   ready     nothing but Play. Play always starts a NEW session: there is no Resume, and nothing
+//             here reattaches an earlier session after a sign-in, restart, close or crash. When the
 //             previous session ended, its end reason sits above Play as one quiet sentence.
 //   checking  `client.homeStatus` is "checking": Play has been pressed and the control plane is being
 //             asked for a rig. The line names the thing loading (copy.md §5) and Play is busy.
@@ -39,9 +39,6 @@ Item {
                                      ? String(client.homeStatus) : "ready"
     readonly property bool checking: root.status === "checking"
     readonly property bool refused: root.status === "refused"
-
-    /// A session is live: Play becomes Resume session.
-    readonly property bool live: client && client.liveSession === true ? true : false
 
     // The one line above Play for the states that have one. `copy.md` §Play flow gives the first two
     // and §Support & errors the third, each verbatim.
@@ -157,7 +154,7 @@ Item {
             objectName: "playButton"
             width: parent.width
             implicitHeight: Metrics.s16
-            text: root.live ? qsTr("Resume session") : qsTr("Play")
+            text: qsTr("Play")
             enabled: !root.checking
             busy: root.checking
 

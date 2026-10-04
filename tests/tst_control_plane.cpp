@@ -736,6 +736,65 @@ private slots:
         QCOMPARE(fake->lastBody, QByteArrayLiteral("{}"));
     }
 
+    // UD-04 O01: a customer's own quit - a Cancel, an End session press, or the in-stream quit
+    // shortcut - is not a reported failure, whatever the attempt last recorded. A real connection
+    // failure still is.
+    void deliberateQuitIsNeverReportedFailed()
+    {
+        // The report of a quit that also carries a step a failure would have: `rig_wait` is where the
+        // session was when the customer quit, not something that failed.
+        EndReport quit;
+        quit.customerQuit = true;
+        quit.stage = QStringLiteral("connecting");
+        quit.attemptStep = QStringLiteral("rig_wait");
+
+        EndReport failure;
+        failure.stage = QStringLiteral("connecting");
+        failure.attemptStep = QStringLiteral("engine_connect");
+
+        // The request-shape rule first, without a socket: a quit builds no body even when the caller
+        // asks for `failed`, and a failure still builds one.
+        QVERIFY2(ControlPlaneClient::buildEndRequest(true, quit).isEmpty(),
+                 "a deliberate quit must never build a failed body");
+        QVERIFY(ControlPlaneClient::buildEndRequest(false, quit).isEmpty());
+        const QJsonObject built =
+            QJsonDocument::fromJson(ControlPlaneClient::buildEndRequest(true, failure)).object();
+        QCOMPARE(built.value(QStringLiteral("failed")).toBool(), true);
+        QCOMPARE(built.value(QStringLiteral("attempt_step")).toString(),
+                 QStringLiteral("engine_connect"));
+        QVERIFY2(!built.contains(QStringLiteral("customerQuit"))
+                     && !built.contains(QStringLiteral("customer_quit")),
+                 "the quit marker is the client's own and never travels on the wire");
+
+        // And on the wire.
+        ControlPlaneClient client;
+        auto* fake = new FakeNetworkAccessManager;
+        client.setNetworkAccessManager(fake);
+        fake->status = 202;
+        fake->body = okBody();
+
+        bool called = false;
+        client.endSession(QStringLiteral("aaaabbbb-cccc-dddd-eeee-ffff00001111"), true, quit,
+                          [&](const ControlPlaneResult& result) {
+                              QVERIFY(result.ok);
+                              called = true;
+                          });
+        QTRY_VERIFY(called);
+        QCOMPARE(fake->lastBody, QByteArrayLiteral("{}"));
+
+        called = false;
+        client.endSession(QStringLiteral("aaaabbbb-cccc-dddd-eeee-ffff00001111"), true, failure,
+                          [&](const ControlPlaneResult& result) {
+                              QVERIFY(result.ok);
+                              called = true;
+                          });
+        QTRY_VERIFY(called);
+        const QJsonObject posted = QJsonDocument::fromJson(fake->lastBody).object();
+        QCOMPARE(posted.value(QStringLiteral("failed")).toBool(), true);
+        QCOMPARE(posted.value(QStringLiteral("attempt_step")).toString(),
+                 QStringLiteral("engine_connect"));
+    }
+
     void sessionFetch_parsesTheSessionSchema()
     {
         ControlPlaneClient client;

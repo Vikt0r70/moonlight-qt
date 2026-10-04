@@ -1408,7 +1408,7 @@ private slots:
 
         client.beginSession(QStringLiteral("session-one"));
         emit engine->connectionStarted();
-        QVERIFY2(client.liveSession(), "a session that has streamed is offered for resume (C5)");
+        QVERIFY2(!client.attachedSessionId().isEmpty(), "a session that has streamed stays attached");
 
         QSignalSpy completed(client.teardown(), &TeardownController::teardownCompleted);
         QSignalSpy failed(client.teardown(), &TeardownController::teardownFailed);
@@ -1420,7 +1420,7 @@ private slots:
 
         QTRY_COMPARE_WITH_TIMEOUT(completed.count(), 1, 15000);
         QCOMPARE(failed.count(), 0);
-        QVERIFY2(!client.liveSession(), "a session that has been torn down is not offered for resume");
+        QVERIFY2(client.attachedSessionId().isEmpty(), "a session that has been torn down is no longer attached");
 
         // Step 1 went out on the documented route, for this session.
         QCOMPARE(m_fake->countOfPathEndingWith(QStringLiteral("/end")), 1);
@@ -2093,7 +2093,7 @@ private slots:
             // showing; the client did not turn the refusal into a failure screen.
             QCOMPARE(client.failure().value(QStringLiteral("error")).toString(), sentence);
             QCOMPARE(client.reference(), QStringLiteral("SH-4F7KQ2"));
-            QVERIFY(!client.liveSession());
+            QVERIFY(client.attachedSessionId().isEmpty());
         }
         if (expectedHome == QLatin1String("busy") || expectedHome == QLatin1String("offline")) {
             QVERIFY(client.failure().isEmpty());
@@ -2108,36 +2108,35 @@ private slots:
         QCOMPARE(client.appState(), QStringLiteral("home"));
     }
 
-    // D-05/C2/C5: a session that never streamed is never "live" (Resume is not offered for it),
-    // and a failed step before the stream starts ends it at once rather than leaving it attached
-    // for Play to find later. This test used to be named the other way around
+    // D-05/C2: a failed step before the stream starts ends the session at once rather than leaving
+    // it attached for Play to find later. This test used to be named the other way around
     // ("...IsLiveAndPlayResumesItInsteadOfAskingForAnother") when the pre-D-05 contract left a
-    // failed, never-streamed session attached and resumable; D-05 replaces that.
+    // failed, never-streamed session attached and resumable; D-05 replaces that, and UD-04 R14
+    // removes Resume altogether.
     void aSessionThatFailsBeforeStreamingIsEndedAndPlayStartsAFreshOne()
     {
         SeatHubClient client;
         reachHome(client, 90);
         QVERIFY(!QTest::currentTestFailed());
-        QVERIFY(!client.liveSession());
+        QVERIFY(client.attachedSessionId().isEmpty());
         m_fake->answerSession(QStringLiteral("session-live"), QStringLiteral("CANCELLED"));
         client.teardown()->setVerifyIntervalMs(1);
 
         // A session is attached (Play's allocation returned it), but it never streams: the rig has
         // no answer in this test, so pairing fails - and D-05/C2 ends the session at once.
         client.beginSession(QStringLiteral("session-live"));
-        QVERIFY2(!client.liveSession(), "a session that has not streamed is never live (C5)");
+        QCOMPARE(client.attachedSessionId(), QStringLiteral("session-live"));
         QTRY_VERIFY_WITH_TIMEOUT(client.connectFailed(), 15000);
         QCOMPARE(client.appState(), QStringLiteral("connecting"));
-        QVERIFY2(!client.liveSession(), "a pre-stream failure ends the session (C2)");
         QTRY_VERIFY_WITH_TIMEOUT(
             m_fake->requestPaths().contains(QStringLiteral("/api/sessions/session-live/end")),
             15000);
 
-        // Back on Home, Play is a fresh Play: the ended session is never offered for Resume and
-        // is never asked to resume.
+        // Back on Home, Play is a fresh Play: the ended session is detached and never asked to
+        // resume.
         client.dismissError();
         QCOMPARE(client.appState(), QStringLiteral("home"));
-        QVERIFY(!client.liveSession());
+        QTRY_VERIFY_WITH_TIMEOUT(client.attachedSessionId().isEmpty(), 15000);
 
         m_fake->answerPlay(201, QByteArrayLiteral("{\"id\":\"session-live-2\"}"));
         client.start();
@@ -2147,12 +2146,12 @@ private slots:
             m_fake->requestPaths().contains(QStringLiteral("/api/sessions/session-live-2/pairing")),
             15000);
 
-        // Sign-out forgets it either way: the next customer on this PC is never offered a session.
+        // Sign-out forgets it either way: the next customer on this PC inherits no session.
         client.signOut();
-        QVERIFY(!client.liveSession());
+        QVERIFY(client.attachedSessionId().isEmpty());
     }
 
-    void aSessionTheServerReportsOverIsNoLongerOfferedForResume()
+    void aSessionTheServerReportsOverIsEndedAndPlayAsksForANewOne()
     {
         SeatHubClient client;
         auto* engine = new FakeEngineSession;
@@ -2170,7 +2169,7 @@ private slots:
         client.beginSession(QStringLiteral("session-live"));
         emit engine->connectionStarted();
         QCOMPARE(client.appState(), QStringLiteral("streaming"));
-        QVERIFY2(client.liveSession(), "a session that streamed is live (C5)");
+        QVERIFY2(!client.attachedSessionId().isEmpty(), "a session that streamed stays attached");
 
         // The control plane says it is over (the wallet ran out, an operator ended it). It arrives on
         // the session channel, on the network thread, and reaches the facade the way it does in
@@ -2183,7 +2182,8 @@ private slots:
         QMetaObject::invokeMethod(
             channel, [channel, info]() { emit channel->sessionStateReceived(info); },
             Qt::BlockingQueuedConnection);
-        QTRY_VERIFY_WITH_TIMEOUT(!client.liveSession(), 15000);
+        // The facade has handled the server's ending: it marked the session ended and said why.
+        QTRY_VERIFY_WITH_TIMEOUT(!client.endReasonText().isEmpty(), 15000);
 
         // The engine acknowledges the interrupt the way it does in production: SDL finishes
         // tearing down and the lifecycle reports `readyForDeletion`, which is what actually
@@ -2202,7 +2202,7 @@ private slots:
         delete engine;
     }
 
-    void aSessionThatEndsAndTearsDownIsNoLongerLive()
+    void aSessionThatEndsAndTearsDownIsDetached()
     {
         SeatHubClient client;
         auto* engine = new FakeEngineSession;
@@ -2219,12 +2219,12 @@ private slots:
 
         client.beginSession(QStringLiteral("session-one"));
         emit engine->connectionStarted();
-        QVERIFY(client.liveSession());
+        QVERIFY(!client.attachedSessionId().isEmpty());
 
         QSignalSpy completed(client.teardown(), &TeardownController::teardownCompleted);
         emit engine->readyForDeletion();
         QTRY_COMPARE_WITH_TIMEOUT(completed.count(), 1, 15000);
-        QTRY_VERIFY_WITH_TIMEOUT(!client.liveSession(), 15000);
+        QTRY_VERIFY_WITH_TIMEOUT(client.attachedSessionId().isEmpty(), 15000);
 
         client.session()->attachSession(nullptr);
         delete engine;
@@ -2270,7 +2270,7 @@ private slots:
             15000);
         QCOMPARE(m_fake->requestPaths().count(QStringLiteral("/api/sessions")), 1);
         emit engine->connectionStarted();
-        QVERIFY2(client.liveSession(), "a session that streamed is live (C5)");
+        QVERIFY2(!client.attachedSessionId().isEmpty(), "a session that streamed stays attached");
 
         // Every request of this Play carries the same trace id - the session create itself
         // first of all - and only the span differs (D-27, ADR-0060 item 10).
@@ -2299,7 +2299,7 @@ private slots:
         QSignalSpy completed(client.teardown(), &TeardownController::teardownCompleted);
         emit engine->readyForDeletion();
         QTRY_COMPARE_WITH_TIMEOUT(completed.count(), 1, 15000);
-        QTRY_VERIFY_WITH_TIMEOUT(!client.liveSession(), 15000);
+        QTRY_VERIFY_WITH_TIMEOUT(client.attachedSessionId().isEmpty(), 15000);
 
         // A request outside any Play, once teardown has completed, carries no traceparent - the
         // id this Play used is gone (`handleTeardownCompleted`).
@@ -2491,7 +2491,7 @@ private slots:
                                                    QStringLiteral("SH-2K2XQ1")));
         client.beginSession(QStringLiteral("aaaaaaaa-2222-2222-2222-222222222222"));
         emit engine->connectionStarted();
-        QVERIFY2(client.liveSession(), "a session that streamed is live (C5)");
+        QVERIFY2(!client.attachedSessionId().isEmpty(), "a session that streamed stays attached");
 
         m_fake->answerEnd(401);
         QSignalSpy failed(client.teardown(), &TeardownController::teardownFailed);
@@ -2579,7 +2579,7 @@ private slots:
 
         client.beginSession(QStringLiteral("aaaaaaaa-3333-3333-3333-333333333333"));
         emit engine->connectionStarted();
-        QVERIFY2(client.liveSession(), "a session that streamed is live (C5)");
+        QVERIFY2(!client.attachedSessionId().isEmpty(), "a session that streamed stays attached");
 
         emitStatsBlock(42.0);
 
@@ -2624,7 +2624,7 @@ private slots:
 
         client.beginSession(QStringLiteral("aaaaaaaa-4444-4444-4444-444444444444"));
         emit engine->connectionStarted();
-        QVERIFY2(client.liveSession(), "a session that streamed is live (C5)");
+        QVERIFY2(!client.attachedSessionId().isEmpty(), "a session that streamed stays attached");
 
         emitStatsBlock(55.0);
 
@@ -2767,7 +2767,7 @@ private slots:
                                                    QStringLiteral("SH-2K2XQ1")));
         client.beginSession(QStringLiteral("aaaaaaaa-5555-5555-5555-555555555555"));
         emit engine->connectionStarted();
-        QVERIFY2(client.liveSession(), "a session that streamed is live (C5)");
+        QVERIFY2(!client.attachedSessionId().isEmpty(), "a session that streamed stays attached");
 
         emitStatsBlock(48.0);
         m_fake->answerQuality(503); // Retryable - kept, never dropped
@@ -2830,7 +2830,7 @@ private slots:
                                                    QStringLiteral("SH-2K2XQ1")));
         client.beginSession(sessionA);
         emit engine->connectionStarted();
-        QVERIFY2(client.liveSession(), "a session that streamed is live (C5)");
+        QVERIFY2(!client.attachedSessionId().isEmpty(), "a session that streamed stays attached");
 
         emitStatsBlock(48.0);
 
@@ -2915,7 +2915,7 @@ private slots:
         // The moment the stream truly begins - starts the aggregator's clock, and (C1/C5) is what
         // makes this session live.
         emit client.session()->connectionStarted();
-        QVERIFY2(client.liveSession(), "a session that streamed is live (C5)");
+        QVERIFY2(!client.attachedSessionId().isEmpty(), "a session that streamed stays attached");
 
         QThread::msleep(50);
         emitStatsBlock(30.0); // segment 1 (a decoder that ran ~50 ms)
@@ -3344,8 +3344,6 @@ private slots:
         QCOMPARE(client.connectStage(), reached);
         report(client, sessionIn(QStringLiteral("ACTIVE")));
         QCOMPARE(client.connectStage(), reached);
-        // The server ended it, so it is not a session Home offers to resume.
-        QVERIFY(!client.liveSession());
         // A second failure while this one is showing does not rewrite what the customer read.
         emit client.pairing()->pairingFailed(SeatHubFailure::local(QStringLiteral("Something else.")));
         QCOMPARE(client.stalledReasonText(), styled);
@@ -3444,8 +3442,7 @@ private slots:
         QCOMPARE(client.stalledReasonText(), QStringLiteral("The rig didn't finish connecting. Try again."));
         QVERIFY(client.reference().isEmpty());
         // D-05/C2: the client's own pairing deadline ends the session at once - it is never left
-        // for Try again to find, and is never offered for Resume.
-        QVERIFY2(!client.liveSession(), "a pre-stream failure ends the session (C2)");
+        // for Try again to find.
         QTRY_VERIFY_WITH_TIMEOUT(
             m_fake->requestPaths().contains(QStringLiteral("/api/sessions/s-stages/end")), 15000);
         QVERIFY(m_fake->bodyFor(QStringLiteral("/api/sessions/s-stages/end"))
@@ -3851,7 +3848,6 @@ private slots:
         over.endReason = QStringLiteral("READINESS_TIMEOUT");
         report(client, over);
         QVERIFY(client.connectFailed());
-        QVERIFY(!client.liveSession());
 
         // Try again asks the server for a session, exactly as Play does: the server chooses the rig
         // (CUST-03). The client names none and offers none.
@@ -3892,7 +3888,7 @@ private slots:
 
         // The connecting failure view stays on screen: the teardown completing does not carry the
         // customer away from what they are reading (C2's own contract).
-        QTRY_VERIFY_WITH_TIMEOUT(!client.liveSession(), 15000);
+        QTRY_VERIFY_WITH_TIMEOUT(client.attachedSessionId().isEmpty(), 15000);
         QCOMPARE(client.appState(), QStringLiteral("connecting"));
         QVERIFY(client.connectFailed());
     }
@@ -3917,7 +3913,7 @@ private slots:
         const QJsonObject endBody = QJsonDocument::fromJson(
             m_fake->bodyFor(QStringLiteral("/api/sessions/s-stages/end"))).object();
         QCOMPARE(endBody.value(QStringLiteral("failed")).toBool(), true);
-        QTRY_VERIFY_WITH_TIMEOUT(!client.liveSession(), 15000);
+        QTRY_VERIFY_WITH_TIMEOUT(client.attachedSessionId().isEmpty(), 15000);
     }
 
     // --- 06.1's ADR item 4 / J-22: the report goes up, the blame comes back ---------------------
@@ -4022,7 +4018,7 @@ private slots:
             beginStagedSession(client);
             QVERIFY(!QTest::currentTestFailed());
             emit engine->connectionStarted();
-            QVERIFY(client.liveSession());
+            QVERIFY(!client.attachedSessionId().isEmpty());
 
             QTemporaryDir spoolDir;
             QVERIFY(spoolDir.isValid());
@@ -4284,9 +4280,8 @@ private slots:
         QTRY_COMPARE_WITH_TIMEOUT(m_fake->requestPaths().count(QStringLiteral("/api/sessions")), 1,
                                   15000);
         QCOMPARE(client.appState(), QStringLiteral("connecting"));
-        QVERIFY2(!client.liveSession(), "the fresh session has not streamed yet (C5)");
         // Pairing polls the NEW session, never the old one again - proof this was a fresh Play,
-        // never the Resume branch (which would have addressed "s-stages").
+        // never a reattachment (which would have addressed "s-stages").
         QTRY_VERIFY_WITH_TIMEOUT(
             m_fake->requestPaths().contains(QStringLiteral("/api/sessions/s-fresh/pairing")), 15000);
     }
@@ -4392,7 +4387,100 @@ private slots:
         QTRY_COMPARE_WITH_TIMEOUT(client.appState(), QStringLiteral("signed_out"), 15000);
     }
 
-    void resumeOnlyAfterStreamStarted()
+    // UD-04 R14, RS01 (SC2): there is no customer Resume. A process that dies mid-session leaves the
+    // session with the server; the relaunched app, signed in again, offers Play only, reattaches
+    // nothing, and a Play it makes meets the server's own refusal for the session still held.
+    void noCustomerResumeAfterRestart()
+    {
+        const QString sentence = QStringLiteral("The server's own sentence about the session it holds.");
+
+        // Process one: the stream starts, then the process dies before anything ends the session.
+        {
+            auto* engine = new FakeEngineSession;
+            {
+                SeatHubClient first;
+                first.session()->attachSession(engine);
+                beginStagedSession(first);
+                QVERIFY(!QTest::currentTestFailed());
+                emit engine->connectionStarted();
+                QCOMPARE(first.appState(), QStringLiteral("streaming"));
+                QCOMPARE(first.attachedSessionId(), QStringLiteral("s-stages"));
+                first.session()->attachSession(nullptr);
+            }
+            delete engine;
+            m_fake = nullptr;
+        }
+
+        // Process two: the same customer signs in again (a stored credential restores it).
+        SeatHubClient second;
+        reachHome(second, 90);
+        QVERIFY(!QTest::currentTestFailed());
+        QCOMPARE(second.appState(), QStringLiteral("home"));
+        QVERIFY2(second.attachedSessionId().isEmpty(), "a restart reattaches no session");
+
+        // Play is the only way on, and the server still holds the earlier session.
+        m_fake->answerPlay(409, playRefusalBody(sentence, QStringLiteral("SH-4F7KQ2"),
+                                                QStringLiteral("USER_HAS_NONTERMINAL_SESSION")));
+        second.start();
+        QTRY_COMPARE_WITH_TIMEOUT(second.homeStatus(), QStringLiteral("refused"), 15000);
+        QCOMPARE(second.appState(), QStringLiteral("home"));
+
+        // LK01: the server's own sentence and reference, unchanged, on Home.
+        QCOMPARE(second.failure().value(QStringLiteral("error")).toString(), sentence);
+        QCOMPARE(second.reference(), QStringLiteral("SH-4F7KQ2"));
+
+        // A NEW session was asked for, once. Nothing addressed the earlier one: no pairing, no read,
+        // no end - a session route would show here, and none does.
+        QCOMPARE(m_fake->requestPaths().count(QStringLiteral("/api/sessions")), 1);
+        for (const QString& path : m_fake->requestPaths()) {
+            QVERIFY2(!path.startsWith(QStringLiteral("/api/sessions/")), qPrintable(path));
+        }
+        QVERIFY(second.attachedSessionId().isEmpty());
+    }
+
+    // The same rule inside one process: a streamed session whose end could not reach the server is
+    // still held there, and Play asks for a new session instead of picking it up again.
+    void playNeverReattachesAStreamedSessionTheServerStillHolds()
+    {
+        const QString sentence = QStringLiteral("The server's own sentence about the session it holds.");
+        auto* engine = new FakeEngineSession;
+        {
+            SeatHubClient client;
+            client.session()->attachSession(engine);
+            beginStagedSession(client);
+            QVERIFY(!QTest::currentTestFailed());
+            client.teardown()->setVerifyIntervalMs(1);
+            emit engine->connectionStarted();
+            QCOMPARE(client.appState(), QStringLiteral("streaming"));
+
+            // The stream ends and the end cannot reach the server: the session stays held there.
+            m_fake->answerEnd(0);
+            QSignalSpy failed(client.teardown(), &TeardownController::teardownFailed);
+            emit engine->readyForDeletion();
+            QTRY_COMPARE_WITH_TIMEOUT(failed.count(), 1, 15000);
+            QTRY_COMPARE_WITH_TIMEOUT(client.appState(), QStringLiteral("error"), 15000);
+            client.dismissError();
+            QCOMPARE(client.appState(), QStringLiteral("home"));
+            QCOMPARE(client.attachedSessionId(), QStringLiteral("s-stages"));
+
+            m_fake->answerPlay(409, playRefusalBody(sentence, QStringLiteral("SH-4F7KQ2"),
+                                                    QStringLiteral("USER_HAS_NONTERMINAL_SESSION")));
+            client.start();
+            QTRY_COMPARE_WITH_TIMEOUT(client.homeStatus(), QStringLiteral("refused"), 15000);
+
+            // Home, with the server's sentence: a pick-up of the held session would be `connecting`.
+            QCOMPARE(client.appState(), QStringLiteral("home"));
+            QCOMPARE(client.failure().value(QStringLiteral("error")).toString(), sentence);
+            QCOMPARE(m_fake->requestPaths().count(QStringLiteral("/api/sessions")), 1);
+
+            client.session()->attachSession(nullptr);
+        }
+        delete engine;
+    }
+
+    // UD-04 O01: a customer's own quit is not a reported failure. The server's ending a session as
+    // `CONNECT_FAILED` blames a rig, so a quit - which blames nothing - must not look like one.
+    void theInStreamQuitShortcutBeforeActiveIsNotReportedFailed()
     {
         auto* engine = new FakeEngineSession;
         {
@@ -4400,21 +4488,88 @@ private slots:
             client.session()->attachSession(engine);
             beginStagedSession(client);
             QVERIFY(!QTest::currentTestFailed());
+            client.teardown()->setVerifyIntervalMs(1);
+            m_fake->answerSession(QStringLiteral("s-stages"), QStringLiteral("CANCELLED"));
 
-            QVERIFY2(!client.liveSession(),
-                     "a session that has not streamed is not offered for resume (C5)");
-
+            // The rig was still being prepared when the session was last read, which records the
+            // progress marker `rig_wait`; the stream then starts arriving, and the customer quits
+            // with the in-stream shortcut before the server marks the session ACTIVE.
+            report(client, sessionIn(QStringLiteral("PREPARING")));
             emit engine->connectionStarted();
             QCOMPARE(client.appState(), QStringLiteral("streaming"));
-            QVERIFY2(client.liveSession(), "a session that streamed is offered for resume (C5)");
+            emit engine->readyForDeletion();
 
-            // C1: a Resume of the SAME session id must not clear the streamed flag.
-            client.beginSession(QStringLiteral("s-stages"));
-            QVERIFY2(client.liveSession(), "resuming the same session keeps it live (C1)");
+            QTRY_VERIFY_WITH_TIMEOUT(
+                m_fake->requestPaths().contains(QStringLiteral("/api/sessions/s-stages/end")),
+                15000);
+            const QJsonObject sent = QJsonDocument::fromJson(
+                m_fake->bodyFor(QStringLiteral("/api/sessions/s-stages/end"))).object();
+            QVERIFY2(!sent.value(QStringLiteral("failed")).toBool(),
+                     "a quit once the stream arrived must not be reported as a failure");
+            QVERIFY(!sent.contains(QStringLiteral("attempt_step")));
 
             client.session()->attachSession(nullptr);
         }
         delete engine;
+    }
+
+    void aCancelWhileTheEngineConnectsIsNotReportedFailed()
+    {
+        auto* engine = new FakeEngineSession;
+        {
+            SeatHubClient client;
+            client.session()->attachSession(engine);
+            beginStagedSession(client);
+            QVERIFY(!QTest::currentTestFailed());
+            client.teardown()->setVerifyIntervalMs(1);
+            m_fake->answerSession(QStringLiteral("s-stages"), QStringLiteral("CANCELLED"));
+
+            // The engine is running (its connect stage), and the customer presses Cancel. The
+            // engine's interrupted connection then surfaces as a stage failure - which here is the
+            // customer's own quit, not a connection failure.
+            QVERIFY(client.session()->start(nullptr));
+            client.interrupt();
+            QCOMPARE(engine->interrupts, 1);
+            emit engine->stageFailed(QStringLiteral("RTSP handshake"), -1, QString());
+
+            QTRY_VERIFY_WITH_TIMEOUT(
+                m_fake->requestPaths().contains(QStringLiteral("/api/sessions/s-stages/end")),
+                15000);
+            const QJsonObject sent = QJsonDocument::fromJson(
+                m_fake->bodyFor(QStringLiteral("/api/sessions/s-stages/end"))).object();
+            QVERIFY2(!sent.value(QStringLiteral("failed")).toBool(),
+                     "a Cancel must not be reported as a connection failure");
+
+            emit engine->readyForDeletion();
+            client.session()->attachSession(nullptr);
+        }
+        delete engine;
+    }
+
+    // R06: the teardown of a session that has ended finishes after a newer session was attached. It
+    // must not stop, detach or end anything of the newer one.
+    void aLateTeardownOfAnEndedSessionNeverActsOnTheNewerSession()
+    {
+        SeatHubClient client;
+        beginStagedSession(client);
+        QVERIFY(!QTest::currentTestFailed());
+        QCOMPARE(client.attachedSessionId(), QStringLiteral("s-stages"));
+
+        // A newer session is attached (its pairing polls run), then the older one's teardown ends.
+        client.beginSession(QStringLiteral("s-newer"));
+        QCOMPARE(client.attachedSessionId(), QStringLiteral("s-newer"));
+        QCOMPARE(client.appState(), QStringLiteral("connecting"));
+
+        SessionInfo old = sessionIn(QStringLiteral("COMPLETED"), QStringLiteral("s-stages"));
+        old.endReason = QStringLiteral("CUSTOMER_ENDED");
+        emit client.teardown()->teardownCompleted(old, QStringLiteral("s-stages"));
+        emit client.teardown()->teardownFailed(SeatHubFailure::local(QStringLiteral("late")),
+                                               QStringLiteral("s-stages"));
+        QTest::qWait(30);
+
+        QCOMPARE(client.attachedSessionId(), QStringLiteral("s-newer"));
+        QCOMPARE(client.appState(), QStringLiteral("connecting"));
+        QVERIFY(client.failure().isEmpty());
     }
 
     void backToHomeLeavesTheStalledViewAndForgetsIt()
@@ -5909,7 +6064,7 @@ private slots:
         client.start();
         QTRY_COMPARE_WITH_TIMEOUT(client.appState(), QStringLiteral("connecting"), 15000);
         emit engine->connectionStarted();
-        QVERIFY2(client.liveSession(), "a session that streamed is live (C5)");
+        QVERIFY2(!client.attachedSessionId().isEmpty(), "a session that streamed stays attached");
 
         QVERIFY(!SeatHubTelemetry::currentTraceId().isEmpty());
         // The session create is still the first request a Play makes (the existing trace-id tests
@@ -5937,7 +6092,7 @@ private slots:
         client.start();
         QTRY_COMPARE_WITH_TIMEOUT(client.appState(), QStringLiteral("connecting"), 15000);
         emit engine->connectionStarted();
-        QVERIFY2(client.liveSession(), "a session that streamed is live (C5)");
+        QVERIFY2(!client.attachedSessionId().isEmpty(), "a session that streamed stays attached");
 
         QVERIFY(!SeatHubTelemetry::currentUserId().isEmpty());
         QCOMPARE(SeatHubTelemetry::currentSessionId(), QStringLiteral("s-signout"));
@@ -6009,7 +6164,7 @@ private slots:
         emit secondEngine->connectionStarted();
         QCOMPARE(client.appState(), QStringLiteral("streaming"));
         QVERIFY(!client.reconnecting());
-        QVERIFY2(client.liveSession(), "the same session, resumed");
+        QCOMPARE(client.attachedSessionId(), QStringLiteral("s-live"));  // the same session recovered
 
         // `SessionLifecycle` refuses to detach an engine it still considers active
         // (`start()`/`readyForDeletion()` are the only two things that change that) - the same

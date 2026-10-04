@@ -768,6 +768,10 @@ void SeatHubClient::beginSession(const QString& sessionId)
     setAttachedSession(sessionId);
     setAttachedSessionEnded(false);
     m_lastFailedStep.clear();
+    // O01: whether the customer quit, and whether the engine named a failure, are facts about one
+    // attempt. A quit or a failure of the attempt before this one never colours this one's end.
+    m_customerQuit = false;
+    m_engineFailed = false;
     m_engineLaunchReason = EngineLaunchReason::Started;
     if (!m_playSummaryPending) {
         m_stepTimings.clear();
@@ -792,7 +796,7 @@ void SeatHubClient::beginSession(const QString& sessionId)
     // sessions in one run never tear down (defect F-9; `teardown_guard.h`).
     m_teardownGuard.reset();
 
-    // 06.1-19/J-07: a fresh Play or Resume starts with no termination code known yet for the
+    // 06.1-19/J-07: a fresh Play starts with no termination code known yet for the
     // session it is about to attach, and no reconnect episode of its own - a code (or an ended
     // reconnect) left over from whatever this client streamed before must never leak into this
     // one's own first `handleDisplayLaunchError()`.
@@ -933,9 +937,7 @@ void SeatHubClient::acknowledgeDiagnosticsNotice()
 
 void SeatHubClient::setAttachedSession(const QString& sessionId)
 {
-    // C1: a genuinely new session id starts with no stream yet. Re-attaching the SAME id - the
-    // Resume branch of `start()` calling `beginSession(m_sessionId)` - is not a change and must
-    // not clear a flag `handleConnectionStarted()` already set for it.
+    // C1: a genuinely new session id starts with no stream yet.
     if (sessionId != m_sessionId) {
         m_streamStarted = false;
     }
@@ -943,26 +945,36 @@ void SeatHubClient::setAttachedSession(const QString& sessionId)
     if (sessionId.isEmpty()) {
         m_sessionEnded = false;
     }
-    updateLiveSession();
 }
 
 void SeatHubClient::setAttachedSessionEnded(bool ended)
 {
     m_sessionEnded = ended;
-    updateLiveSession();
 }
 
-void SeatHubClient::updateLiveSession()
+EndReport SeatHubClient::newEndReport() const
 {
-    // C5: Resume is offered only for a session that reached ACTIVE on this client's side - a
-    // pre-stream session is never one Home resumes, even before anything has ended it.
-    const bool live = !m_sessionId.isEmpty() && !m_sessionEnded && m_streamStarted;
-    if (m_liveSession == live) {
-        return;
+    EndReport report;
+    report.customerQuit = endIsCustomerQuit();
+    return report;
+}
+
+bool SeatHubClient::isLateStepOfEndedSession(const QString& sessionId) const
+{
+    return !sessionId.isEmpty() && !m_sessionId.isEmpty() && sessionId != m_sessionId;
+}
+
+bool SeatHubClient::endIsCustomerQuit() const
+{
+    if (m_customerQuit) {
+        return true;
     }
-    qCInfo(seathubClient) << "live session" << m_liveSession << "->" << live;
-    m_liveSession = live;
-    emit liveSessionChanged();
+    // The in-stream quit shortcut ends the engine without a word: the stream had started, the
+    // engine named no failure for this attempt, and no termination line was logged, which only a
+    // connection ended from the other side produces. A stream that really failed has one of the
+    // three, so it is still reported as a failure.
+    return m_streamStarted && !m_engineFailed
+        && m_lastTerminationCode.load(std::memory_order_relaxed) == kNoTerminationCode;
 }
 
 void SeatHubClient::setRetryBusy(bool busy)
@@ -1024,6 +1036,13 @@ void SeatHubClient::enterReconnect()
         m_reconnectStillTrying = false;
         emit reconnectStillTryingChanged();
     }
+    // O02: a minutes figure belongs to one interruption. The previous interruption's deadline is
+    // not this one's, so no figure shows until a read of THIS interruption returns
+    // `grace_deadline_at` (`applyReconnectSessionFields()`).
+    if (m_graceMinutesLeft != -1) {
+        m_graceMinutesLeft = -1;
+        emit graceMinutesLeftChanged();
+    }
     // `setAppState()` itself would unlock Settings/the updater here (leaving "streaming"); this
     // relocks them at once, for the whole episode (T-06.1-57).
     setAppState(QString::fromLatin1(kStateConnecting));
@@ -1046,9 +1065,10 @@ void SeatHubClient::resumeAfterReconnect()
     m_settings->prepareForSession();
     startNetworkThreads();
     // STREAM-10: the client keeps no stored pairing of its own, so this is a full, fresh
-    // handshake against the same session id - the same thing `beginSession()`'s own Resume branch
-    // runs, just without resetting `appState`, the stepper or `m_liveness` (none of those stopped
-    // across the drop).
+    // handshake against the same session id, which `beginSession()` also runs for a new session,
+    // just without resetting `appState`, the stepper or `m_liveness` (none of those stopped
+    // across the drop). This is the in-process recovery of an `ACTIVE` session only (UD-04 R14);
+    // nothing reattaches a session after a restart, close, crash or sign-in.
     const QString sessionId = m_sessionId;
     onClientThread(m_pairing, [this, sessionId]() { m_pairing->start(sessionId); });
 }
@@ -1168,6 +1188,8 @@ void SeatHubClient::endHeldSession()
     if (!m_reconnecting) {
         return;
     }
+    // O01: the customer's own End session press, never a reported failure.
+    m_customerQuit = true;
     finishPlay(QStringLiteral("ended_held"), QStringLiteral("cancelled"), QStringLiteral("reconnect"));
     m_reconnectTimer->stop();
     m_reconnecting = false;
@@ -1397,15 +1419,10 @@ void SeatHubClient::start()
         return;
     }
 
-    // A session this client already has, and the server has not reported over, is Resume session:
-    // it is picked up again, not replaced by a request for another one - the control plane would
-    // refuse that request anyway (a customer has at most one live session).
-    if (m_liveSession) {
-        qCInfo(seathubClient) << "resuming the attached session";
-        beginSession(m_sessionId);
-        return;
-    }
-
+    // Play always asks for a NEW session (UD-04 R14, RS01). A session this client already streamed
+    // is never picked up again, in this process or after a restart or sign-in: if the server still
+    // holds it, the request below is refused and the customer reads the server's own sentence
+    // (`USER_HAS_NONTERMINAL_SESSION`, LK01; `applyPlayFailure()`).
     beginPlayRequest();
 }
 
@@ -1599,7 +1616,7 @@ void SeatHubClient::retry()
 
     setAppState(QString::fromLatin1(kStateHome));
 
-    // D-05/C4/C7: Try again is always a fresh Play, never a Resume of a session that did not
+    // D-05/C4/C7: Try again is always a fresh Play, never a reattachment of a session that did not
     // stream - `start()` itself now ends a session left attached here first
     // (`endAttachedSessionBeforePlay()`), the same one sequence C4's second half asks Play from
     // Home to run too.
@@ -1616,6 +1633,10 @@ void SeatHubClient::interrupt()
     // cancels pairing, stops liveness, ends the session through C2's one path with `failed:
     // false` (C6: no charge either way, the server's call to make), and returns Home at once -
     // not once the network answers (`screens.md` §24).
+    //
+    // O01: whichever branch runs, this is the customer's own quit. It is remembered for the
+    // attempt, so the end that follows (the engine's, below) is never reported as a failure.
+    m_customerQuit = true;
     if (!m_session->active()) {
         finishPlay(QStringLiteral("cancelled"), QStringLiteral("cancelled"), m_lastFailedStep);
         onClientThread(m_pairing, [this]() { m_pairing->cancel(); });
@@ -2341,6 +2362,9 @@ void SeatHubClient::handleStageFailed(const QString& stage, int errorCode, const
         return;
     }
 
+    // O01: the engine named a failure for this attempt, so its end is not a quit.
+    m_engineFailed = true;
+
     // D-11: the server sees exactly what the customer's screen is about to say, before liveness
     // stops - the engine's own stage, its code and the ports it named, whether this failure is
     // pre-stream or (rarely) mid-stream.
@@ -2374,7 +2398,7 @@ void SeatHubClient::handleStageFailed(const QString& stage, int errorCode, const
         // 3-argument overload is only ever called with a real platform code.
         if (inControlPlaneSession()) {
             setAttachedSessionEnded(true);
-            EndReport report;
+            EndReport report = newEndReport();
             report.stage = QStringLiteral("connecting");
             report.engineStage = stage;
             report.hasEngineError = true;
@@ -2426,21 +2450,24 @@ void SeatHubClient::handleConnectionStarted()
     advanceConnectStage(kStageStreamingNow);
     setAppState(QString::fromLatin1(kStateStreaming));
 
-    // C1 (D-05): the session reached ACTIVE on this client's side - from here Home may offer
-    // Resume (C5), and Try again must never treat this session as one to end and replace (C4).
+    // C1 (D-05): the stream started on this client's side. Try again must never treat this
+    // session as one to end and replace (C4). Nothing offers to resume it afterwards: Play always
+    // asks for a NEW session (UD-04 R14).
     m_streamStarted = true;
-    updateLiveSession();
 
-    // The HUD is begun before liveness starts, because the reads liveness makes feed it:
-    // `beginSession()` resets Time left's own state (D-11), so a wallet read that beat it would
-    // be wiped. This fires before the engine creates its SDL window (D-01), so the first publish
-    // may arrive before the renderer has registered; the 1 Hz heartbeat re-publishes and the
-    // stream picks Time left up on its first eligible read.
+    // The HUD's own session begins here, at the stream (`HudOverlay::beginSession()`, not this
+    // facade's `SeatHubClient::beginSession()`). It resets Time left's state (D-11), so a wallet
+    // read that liveness made earlier in this Play - liveness has run since the facade's
+    // `beginSession()` - is not kept by the HUD; the last known balance is seeded again below and
+    // the next liveness read is the first that can show Time left. This fires before the engine
+    // creates its SDL window (D-01), so the first publish may arrive before the renderer has
+    // registered; the 1 Hz heartbeat re-publishes and the stream picks Time left up on its first
+    // eligible read.
     m_hud.beginSession();
 
     // WR-04: the moment the stream truly begins is the right anchor for the first decoder
-    // segment's own duration - not `beginSession()`, which can run well before the first frame
-    // while pairing and connecting happen and would otherwise overstate it.
+    // segment's own duration - not the facade's `beginSession()`, which can run well before the
+    // first frame while pairing and connecting happen and would otherwise overstate it.
     if (firstConnection) m_statsAggregator.start();
 
     // The last balance read before the stream (D-16: the seed never shows Time left, however low
@@ -2455,10 +2482,11 @@ void SeatHubClient::handleConnectionStarted()
     // network thread; `start()` re-invokes itself queued when called from another thread.
     m_sampler->start(m_samplerPlayId);
 
-    // D-31/D-34/D-11: liveness itself started at `beginSession()` (session begin, not the stream's
-    // first frame - RESEARCH Q1); from here it keeps reporting every 10 s, now with `state`
-    // "streaming" (ADR-0041's meaning is unchanged, only the moment `start()` itself runs has
-    // moved) and stage `streaming`, and it keeps reading the wallet on the same tick (CUST-15).
+    // D-31/D-34/D-11: liveness itself started at the facade's `beginSession()` (session begin, not
+    // the stream's first frame - RESEARCH Q1) and has reported since; from here it keeps reporting
+    // every 10 s, now with `state` "streaming" (ADR-0041's meaning is unchanged, only the moment
+    // `start()` itself runs has moved) and stage `streaming`, and it keeps reading the wallet on
+    // the same tick (CUST-15).
     if (inControlPlaneSession()) {
         m_liveness->setReportedState(QStringLiteral("streaming"));
         m_liveness->setStage(QStringLiteral("streaming"));
@@ -2482,6 +2510,9 @@ void SeatHubClient::handleDisplayLaunchError(const QString& text)
         return;
     }
 
+    // O01: the engine named a failure for this attempt, so its end is not a quit.
+    m_engineFailed = true;
+
     // Never shown verbatim (T-03-05). `mapLaunchError` keeps `text` as diagnostic only.
     if (connectingSession()) {
         m_lastFailedStep = QStringLiteral("engine_connect");
@@ -2491,7 +2522,7 @@ void SeatHubClient::handleDisplayLaunchError(const QString& text)
         finishPlay(QStringLiteral("launch_failed"), QStringLiteral("failed"),
                    m_lastFailedStep, QStringLiteral("launch_error"));
         if (inControlPlaneSession()) {
-            EndReport report;
+            EndReport report = newEndReport();
             report.stage = QStringLiteral("connecting");
             report.attemptStep = m_lastFailedStep;
             endPreStreamSessionWithReport(m_teardownGuard, m_teardown, m_sessionId,
@@ -2606,9 +2637,13 @@ void SeatHubClient::handleReadyForDeletion()
     // `teardownCompleted()`. The flag is also atomic, which removes the unsynchronised
     // cross-thread read the security re-audit flagged on the same line (defect F-9).
     if (inControlPlaneSession() && m_teardownGuard.markStarted()) {
-        EndReport report;
+        // O01: the customer's own quit (Cancel, End session, or the in-stream shortcut) is never a
+        // reported failure, whatever step the attempt last recorded - `m_lastFailedStep` also holds
+        // progress markers such as `rig_wait`, which say where a session was, not that it failed.
+        EndReport report = newEndReport();
         report.attemptStep = m_lastFailedStep;
-        m_teardown->teardown(m_sessionId, m_clientUuid, !report.attemptStep.isEmpty(), report);
+        const bool failed = !report.customerQuit && !report.attemptStep.isEmpty();
+        m_teardown->teardown(m_sessionId, m_clientUuid, failed, report);
     }
 
     // The engine session is finished with - the signal that arrived here was its own. Released
@@ -2914,8 +2949,9 @@ void SeatHubClient::handleSessionState(const SessionInfo& session)
     if (session.isTerminal()) {
         const bool wasAlreadyEnded = m_sessionEnded;
         // The server considers this session over - the wallet ran out, the owner's reservation
-        // arrived, or an operator ended it. Home no longer offers to resume it, even while its
-        // teardown is still running. Stop locally; teardown follows from `handleReadyForDeletion()`.
+        // arrived, or an operator ended it. It is marked ended at once, so a late step for it (a
+        // handshake result, say) is dropped even while its teardown is still running. Stop
+        // locally; teardown follows from `handleReadyForDeletion()`.
         if (session.id.isEmpty() || session.id == m_sessionId) {
             setAttachedSessionEnded(true);
         }
@@ -3747,8 +3783,20 @@ void SeatHubClient::flushUntaggedQualityReports()
     m_untaggedQualityReports.clear();
 }
 
-void SeatHubClient::handleTeardownCompleted(const SessionInfo& finalSession)
+void SeatHubClient::handleTeardownCompleted(const SessionInfo& finalSession,
+                                            const QString& sessionId)
 {
+    // R06: a teardown that finishes after a newer session was attached is a late step of a session
+    // that has ended. It must not stop that session's liveness, detach it, clear its teardown claim
+    // or send the customer home. Its quality report is bound to its own session id, so that one
+    // piece still goes out.
+    if (isLateStepOfEndedSession(sessionId)) {
+        qCInfo(seathubClient) << "dropping the teardown result of a session that is no longer attached:"
+                              << sessionId;
+        postOrStoreQualityReport();
+        return;
+    }
+
     noteStepOutcome(QStringLiteral("teardown"), QStringLiteral("ok"), QStringLiteral("ok"),
                     m_playElapsed.isValid() ? m_playElapsed.elapsed() : -1);
     postOrStoreQualityReport();
@@ -3825,8 +3873,18 @@ void SeatHubClient::handleTeardownCompleted(const SessionInfo& finalSession)
     }
 }
 
-void SeatHubClient::handleTeardownFailed(const SeatHubFailure& failure)
+void SeatHubClient::handleTeardownFailed(const SeatHubFailure& failure, const QString& sessionId)
 {
+    // R06: see `handleTeardownCompleted()`. A failure to finish an ended session's teardown says
+    // nothing about the session now attached, so it neither raises an error over it nor releases
+    // its teardown claim.
+    if (isLateStepOfEndedSession(sessionId)) {
+        qCInfo(seathubClient) << "dropping the teardown failure of a session that is no longer attached:"
+                              << sessionId;
+        storeQualityReportToOutbox();
+        return;
+    }
+
     QString teardownClass;
     switch (failure.kind) {
     case FailureKind::Network:

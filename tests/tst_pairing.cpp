@@ -28,8 +28,10 @@
 #include <QSignalSpy>
 #include <QTcpServer>
 #include <QTcpSocket>
+#include <QThreadPool>
 #include <QTimer>
 
+#include <atomic>
 #include <type_traits>
 
 #include "seathub/attempt_vocab.h"
@@ -107,6 +109,9 @@ public:
     QString sessionId = QLatin1String(kSessionId);
     int sessionReads = 0;
     int pairingPolls = 0;
+    /// Answers for the first `/pairing` requests, one each and in order. Once they are used up the
+    /// documented 409 below answers, as it always did.
+    QList<QPair<int, QByteArray>> authorizations;
 
 protected:
     QNetworkReply* createRequest(Operation, const QNetworkRequest& request, QIODevice*) override
@@ -114,6 +119,10 @@ protected:
         const QString path = request.url().path();
         if (path.endsWith(QLatin1String("/pairing"))) {
             ++pairingPolls;
+            if (!authorizations.isEmpty()) {
+                const QPair<int, QByteArray> answer = authorizations.takeFirst();
+                return new FakeReply(answer.first, answer.second, this);
+            }
             QJsonObject object;
             object.insert(QStringLiteral("status_code"), 409);
             object.insert(QStringLiteral("status"), false);
@@ -259,6 +268,49 @@ std::function<void(bool, const QString&, const QString&)> recordInto(SeamReport*
         report->diagnostics.append(diagnostic);
     };
 }
+
+/// Cuts the global pool to one thread and holds that thread, for as long as the object lives or
+/// until `open()`. Everything queued behind it then runs strictly in the order it was queued once
+/// it opens, which is what lets a test say "this clear was queued BEFORE the newer handshake
+/// started, and runs AFTER it" without a sleep. `drain()` waits the pool out so nothing is left
+/// running against the test's locals.
+class SerialPool
+{
+public:
+    SerialPool()
+        : m_pool(QThreadPool::globalInstance()),
+          m_previous(m_pool->maxThreadCount())
+    {
+        m_pool->setMaxThreadCount(1);
+        m_pool->start([this]() { m_gate.acquire(); });
+    }
+
+    ~SerialPool()
+    {
+        drain();
+        m_pool->setMaxThreadCount(m_previous);
+    }
+
+    void open()
+    {
+        if (!m_open) {
+            m_open = true;
+            m_gate.release();
+        }
+    }
+
+    void drain()
+    {
+        open();
+        m_pool->waitForDone(10000);
+    }
+
+private:
+    QThreadPool* m_pool;
+    int m_previous;
+    QSemaphore m_gate;
+    bool m_open = false;
+};
 
 } // namespace
 
@@ -1534,6 +1586,148 @@ private slots:
         controller.start(QString::fromLatin1(kSessionId));
         controller.cancel();
         QCOMPARE(seam->clears, 0);
+    }
+
+    // PF15-b, UD-04 R06: everything attempt A leaves in flight - the rig-side clear it asked for, the
+    // handshake it started, the poll replies it was waiting on - is fenced to A. None of it can
+    // cancel, clear, pair or fail attempt B, and none of it needs a sleep to be harmless.
+    void staleClearCannotTouchNewAttempt()
+    {
+        const QString session = QString::fromLatin1(kSessionId);
+
+        // --- the seam: A is cancelled, B starts before A's clear has run. The rig has one pending
+        // pairing slot; the clear aimed at A would cancel B's pairing, so it must never go out.
+        {
+            SerialPool pool;
+            ProductionPairingSeam seam;
+            std::atomic<int> cancels{0};
+            std::atomic<int> handshakes{0};
+            seam.setCancelRequest([&cancels](const QString&, int) {
+                ++cancels;
+                return true;
+            });
+            seam.setHandshake([&handshakes](const PairingTarget& target) {
+                ++handshakes;
+                if (target.sessionId == QLatin1String("session-a")) {
+                    // A's handshake ends in the rig's already-pairing conflict, which would send its
+                    // own clear and then a retry if it were still the current attempt.
+                    PairingHandshakeResult conflict =
+                        handshakeResult(false, QString(), QStringLiteral("stale"));
+                    conflict.pairingConflict = true;
+                    return conflict;
+                }
+                return handshakeResult(true, QStringLiteral("b-identity"));
+            });
+
+            PairingTarget targetA = pairingTarget();
+            targetA.sessionId = QStringLiteral("session-a");
+            PairingTarget targetB = pairingTarget();
+            targetB.sessionId = QStringLiteral("session-b");
+
+            SeamReport reportA;
+            SeamReport reportB;
+            seam.pair(targetA, recordInto(&reportA));
+            seam.clearPendingPairing(targetA);          // A is cancelled; its clear is queued
+            seam.pair(targetB, recordInto(&reportB));   // B starts before that clear has run
+            pool.open();
+
+            QTRY_COMPARE(reportB.count(), 1);
+            QCOMPARE(reportB.outcomes.first(), true);
+            pool.drain();
+            QCOMPARE(cancels.load(), 0);      // not A's clear, and not A's own recovery clear
+            QCOMPARE(handshakes.load(), 2);   // A ran once and was not retried
+            QCOMPARE(reportA.count(), 0);     // and A never speaks again
+        }
+
+        // --- the same cancel with no newer attempt: A's clear still goes out, once, and the
+        // abandoned handshake adds neither a clear nor a retry of its own.
+        {
+            SerialPool pool;
+            ProductionPairingSeam seam;
+            std::atomic<int> cancels{0};
+            std::atomic<int> handshakes{0};
+            seam.setCancelRequest([&cancels](const QString&, int) {
+                ++cancels;
+                return true;
+            });
+            seam.setHandshake([&handshakes](const PairingTarget&) {
+                ++handshakes;
+                PairingHandshakeResult conflict =
+                    handshakeResult(false, QString(), QStringLiteral("stale"));
+                conflict.pairingConflict = true;
+                return conflict;
+            });
+
+            PairingTarget targetA = pairingTarget();
+            targetA.sessionId = QStringLiteral("session-a");
+            SeamReport reportA;
+            seam.pair(targetA, recordInto(&reportA));
+            seam.clearPendingPairing(targetA);
+            pool.open();
+            pool.drain();
+
+            QCOMPARE(cancels.load(), 1);
+            QCOMPARE(handshakes.load(), 1);
+            QTest::qWait(30);                 // let any queued result reach the seam
+            QCOMPARE(reportA.count(), 0);
+        }
+
+        // --- the controller: A's handshake finishes after A was cancelled and B began.
+        {
+            PairingController controller;
+            auto* fake = new PathNetworkAccessManager;
+            fake->authorizations.append(qMakePair(
+                200, authorizationBody(QString::fromLatin1(kPin), QStringLiteral("READY"))));
+            auto* seam = new RecordingSeam;
+            seam->responseDelayMs = 100;
+            wire(controller, fake);
+            controller.setSeam(seam);
+            controller.setPollIntervalMs(60000);
+
+            QSignalSpy completed(&controller, &PairingController::pairingCompleted);
+            QSignalSpy failed(&controller, &PairingController::pairingFailed);
+
+            controller.start(session);
+            QTRY_COMPARE(seam->calls, 1);   // A's handshake is in flight
+            controller.cancel();
+            QCOMPARE(seam->clears, 1);      // A's clear was asked of the seam, once
+            controller.start(session);      // B: the same session again, as a reconnect does
+            QTest::qWait(250);              // A's handshake reports in the meantime
+
+            QCOMPARE(completed.count(), 0);
+            QCOMPARE(failed.count(), 0);
+            QCOMPARE(controller.state(), QStringLiteral("authorizing"));
+            QCOMPARE(seam->calls, 1);       // B has not been paired with A's PIN either
+            controller.cancel();
+        }
+
+        // --- the controller: A's poll replies arrive after A was cancelled and B began.
+        {
+            PairingController controller;
+            auto* fake = new PathNetworkAccessManager;
+            fake->authorizations.append(qMakePair(
+                200, authorizationBody(QString::fromLatin1(kPin), QStringLiteral("READY"))));
+            auto* seam = new RecordingSeam;
+            wire(controller, fake);
+            controller.setSeam(seam);
+            controller.setPollIntervalMs(60000);
+
+            QSignalSpy reads(&controller, &PairingController::sessionRead);
+            QSignalSpy granted(&controller, &PairingController::authorizationGranted);
+
+            controller.start(session);      // A: its authorization and session replies are in flight
+            controller.cancel();
+            controller.start(session);      // B: gets the documented 409, not A's READY and PIN
+            QTRY_COMPARE(fake->pairingPolls, 2);
+            QTRY_VERIFY(reads.count() >= 1);
+            QTest::qWait(50);               // every reply of both attempts has been delivered
+
+            QCOMPARE(seam->calls, 0);       // A's PIN never reached the seam on B's behalf
+            QCOMPARE(granted.count(), 0);
+            QCOMPARE(reads.count(), 1);     // only B's own session read speaks for B
+            QCOMPARE(controller.state(), QStringLiteral("authorizing"));
+            controller.cancel();
+        }
     }
 
     void cancelRequest_theWireCarriesTheUpstreamUniqueidAndCancelPhrase()

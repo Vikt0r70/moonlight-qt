@@ -43,10 +43,17 @@ Q_DECLARE_METATYPE(TeardownStage)
 //
 // The first half (`disable`, then `remove`, then verify the removal) happens on the rig. This
 // client holds no Sunshine admin credential and must never call a Sunshine admin route
-// (`03-RESEARCH.md` §Teardown order), so it does not perform those steps. What it does is wait
-// for the control plane to report the result, because a session reaches a terminal state only
-// after the rig side has finished - a teardown still `ENDING` past `TEARDOWN_GRACE_SECONDS`
-// (30 s, `docs/spec/timing.md`) is `TEARDOWN_TIMEOUT` rather than a normal end.
+// (`03-RESEARCH.md` §Teardown order), so it does not perform those steps. What it does is ask the
+// control plane to end the session and wait until the server reports it terminal - a teardown
+// still `ENDING` past `TEARDOWN_GRACE_SECONDS` (30 s, `docs/spec/timing.md`) is
+// `TEARDOWN_TIMEOUT` rather than a normal end. A terminal session is the server's ending, not
+// this client's proof that the renter pairing was physically removed: the Node Agent removes only
+// the renter's own entry and reads it back, or keeps it warm for a free return hold
+// (`docs/spec/host.md` step 11). The client never reports a revocation.
+//
+// Fencing (PF14-c, R06): every reply is judged against the teardown it was issued for, and a
+// result is reported with the session it ran for, so a late reply or result of an ended session
+// never acts on a later one.
 //
 // Threading (HR-01): `m_verifyTimer` is a child of this object, so this object must live on the
 // thread that runs the polling - the network thread `ControlPlaneClient` owns, because every
@@ -109,10 +116,14 @@ signals:
     /// The session reached a terminal state and nothing local remains. `finalSession` is the terminal
     /// read the teardown ended on: the session's own `end_reason` and `minutes_billed`, which is where
     /// Home's end-reason line comes from (CUST-15) now that no socket carries them.
-    void teardownCompleted(const SessionInfo& finalSession);
+    ///
+    /// `sessionId` is the session this teardown ran for, so a listener can tell a late result of an
+    /// ended session from the session it is attached to now (UD-04 R06).
+    void teardownCompleted(const SessionInfo& finalSession, const QString& sessionId);
     /// Teardown failed. Always a SeatHub failure; a rig-side timeout carries
     /// `failure = "TEARDOWN_TIMEOUT"` so support can tell it apart from a transport failure.
-    void teardownFailed(const SeatHubFailure& failure);
+    /// `sessionId` is the session this teardown ran for (see `teardownCompleted`).
+    void teardownFailed(const SeatHubFailure& failure, const QString& sessionId);
     /// Emitted once per stage entry, so the order is observable in a log and by a test.
     void stageEntered(TeardownStage stage);
 
@@ -122,8 +133,13 @@ public slots:
     void verifySession();
 
 private slots:
-    void handleEndResult(const ControlPlaneResult& result);
-    void handleVerifyResult(const ControlPlaneResult& result);
+    // PF14-c: each reply is handled with the attempt it was issued for, and the session that
+    // attempt ran for, both captured when the request went out and never read back from the
+    // members below. An end or verify reply of an earlier teardown therefore cannot advance,
+    // finish or fail a later one, and a result is always reported for its own session.
+    void handleEndResult(quint64 attempt, const ControlPlaneResult& result);
+    void handleVerifyResult(quint64 attempt, const QString& sessionId,
+                            const ControlPlaneResult& result);
 
 private:
     void setState(const QString& state);
@@ -141,6 +157,9 @@ private:
     TeardownStage m_stage = TeardownStage::Idle;
     QString m_sessionId;
     QString m_clientUuid;
+    /// The teardown now running. `teardown()` and `cancel()` each begin a new one, which is what
+    /// tells a reply issued before either apart from one issued after.
+    quint64 m_attempt = 0;
 
     QElapsedTimer m_clock;
     QTimer* m_verifyTimer = nullptr;

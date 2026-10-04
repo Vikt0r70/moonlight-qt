@@ -121,7 +121,9 @@ public:
 
     /// Begin the silent pairing for `sessionId`. No prompt, no dialog, no PIN on screen.
     Q_INVOKABLE void start(const QString& sessionId);
-    /// Stop polling and forget the session. Called from teardown and from `signOut()`.
+    /// Stop polling and forget the session. Called from teardown and from `signOut()`. Ends the
+    /// attempt: anything still in flight for it (a poll reply, a handshake result) is dropped when
+    /// it arrives, and the rig-side clear it asks of the seam is fenced to this attempt there.
     Q_INVOKABLE void cancel();
     /// 06.4/ADR-0067: runs the next authorization read at once rather than waiting out
     /// `pollIntervalMs()` - the account push channel's own `session.state` frame wakes this so
@@ -163,9 +165,13 @@ public slots:
     void pollAuthorization();
 
 private slots:
-    void handleAuthorization(const ControlPlaneResult& result);
-    void handleSessionRead(const QString& polledSession, const ControlPlaneResult& result);
-    void handleSeamResult(bool ok, const QString& clientUuid, const QString& engineError);
+    // Every callback arrives with the attempt it was issued for and is dropped when that is no
+    // longer the current one (`m_attempt`): a reply or a handshake result of attempt A never acts
+    // on attempt B, even for the very same session id (a reconnect starts the same session again).
+    void handleAuthorization(quint64 attempt, const ControlPlaneResult& result);
+    void handleSessionRead(quint64 attempt, const ControlPlaneResult& result);
+    void handleSeamResult(quint64 attempt, bool ok, const QString& clientUuid,
+                          const QString& engineError);
 
 private:
     void setState(const QString& state);
@@ -178,6 +184,10 @@ private:
     QString m_state;
     QString m_sessionId;
     QString m_clientUuid;
+    /// The attempt now running. `start()` and `cancel()` each begin a new one, so a callback issued
+    /// before either is told apart from one issued after, which the session id alone cannot do
+    /// (the same session is started again for each reconnect attempt).
+    quint64 m_attempt = 0;
 
     QElapsedTimer m_clock;
     QTimer* m_pollTimer = nullptr;

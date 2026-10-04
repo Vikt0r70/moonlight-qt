@@ -11,7 +11,6 @@
 #include "backend/nvpairingmanager.h"
 #include "backend/identitymanager.h"
 #include "moonlight_engine_session.h"
-#include "pairing_recovery.h"
 
 Q_LOGGING_CATEGORY(seathubPairingHandshake, "seathub.pairing.handshake")
 
@@ -204,15 +203,12 @@ PairingHandshakeResult runUpstreamPairingHandshake(const PairingTarget& target)
     result.ok = false;
 
     // G-06.2-2: every non-PAIRED outcome leaves the rig holding a pending pairing session keyed
-    // by the shared upstream uniqueid - whether this attempt created it, collided with one from
-    // an earlier attempt, or hit one from another SeatHub install. Send the one client-reachable
-    // clear (Sunshine has no /unpair route in this build; `GET /pair?uniqueid=...&phrase=cancel`
-    // drives `pair()`'s else branch, whose handler erases the map entry). Best-effort and
-    // bounded: the seam's retry logic runs after this returns, whatever the clear did.
-    const bool cleared = sendPairingCancelRequest(target.hostAddress, kPairingControlPort);
-    qCInfo(seathubPairingHandshake)
-        << "pairing cancel request" << (cleared ? "answered" : "not answered");
-
+    // by the shared upstream uniqueid, and the one client-reachable clear for it is the seam
+    // worker's (`HandshakeTask::run()` in `pairing_seam.cpp`). It is NOT sent from here: this
+    // function has no view of which attempt it belongs to, so a clear sent from here goes out even
+    // when a newer `pair()` has superseded this handshake and now owns the rig's single pending
+    // slot (PF15-b) - the worker's clear is gated on that generation, and it is sequenced before
+    // the one retry.
     qCWarning(seathubPairingHandshake) << "upstream pairing handshake did not complete";
     return result;
 }

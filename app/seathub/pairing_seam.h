@@ -142,6 +142,12 @@ public:
     /// thread, so a cancel() on the UI thread never waits on the rig. Never called from
     /// `pair()`'s own path - the worker's recovery loop clears inline, where completion is
     /// sequenced before the retry.
+    ///
+    /// The clear is fenced to the attempt that asked for it (PF15-b): if a newer `pair()` has
+    /// started by the time the pool thread runs it, it is dropped, because the rig has one pending
+    /// pairing slot and the older attempt's clear would cancel the newer attempt's pairing. A
+    /// handshake of `target`'s session that is still pending is abandoned by the same call: its
+    /// result is never reported, and its worker neither clears nor retries.
     void clearPendingPairing(const PairingTarget& target) override;
 
     /// The classification this seam last reported, or a default-constructed result before any

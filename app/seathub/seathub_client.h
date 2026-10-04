@@ -154,19 +154,14 @@ class SeatHubClient : public QObject
     /// a sentence; none of them is a failure, so none of them raises the error screen.
     Q_PROPERTY(QString homeStatus READ homeStatus NOTIFY homeStatusChanged)
 
-    /// True while a control-plane session is attached and the server has not reported it over: Home
-    /// then reads `Resume session` in place of `Play`, and `start()` resumes that session instead of
-    /// asking for a new one. It is derived from what this client itself knows (an attached session
-    /// that has not ended), not from a server read: nothing discovers a live session at launch, so
-    /// after a restart it is false until a session is attached again (`.planning/WINDOWS.md`, the
-    /// resume-after-restart row). The connecting reads of `handleSessionState` do not set it.
-    Q_PROPERTY(bool liveSession READ liveSession NOTIFY liveSessionChanged)
-
     /// D-05/C4: true while `retry()`'s own end-then-fresh-Play sequence is running - the session
     /// attached here never streamed, so it is being ended first and this is waiting for that
     /// teardown to reach a terminal state before asking for a new one. False the rest of the
-    /// time, including for an ordinary Resume (`liveSession`) or a Play from Home with nothing
-    /// attached. The view shows its busy state (as `Play` already does) while this holds.
+    /// time, including for a Play from Home with nothing attached. The view shows its busy state
+    /// (as `Play` already does) while this holds.
+    ///
+    /// There is no customer Resume (UD-04 R14, RS01): Play always starts a NEW session, and the
+    /// client never reattaches an earlier one after a sign-in, restart, close or crash.
     Q_PROPERTY(bool retryBusy READ retryBusy NOTIFY retryBusyChanged)
 
     /// 06.1-19/J-07: the reconnect state (D-03, `screens.md` §24). `appState` deliberately stays
@@ -323,6 +318,10 @@ public:
     /// reads `interval()` to check the doubling (2s, 4s, 8s, capped at 15s) without waiting for it
     /// in real time, and restarts it at 0ms to drive the next attempt at once.
     QTimer* reconnectTimer() const { return m_reconnectTimer; }
+    /// The control-plane session this facade is attached to now, or empty. Exposed the same way, so
+    /// a test can say that a restart or a sign-in reattaches nothing and that a finished teardown
+    /// detaches. Nothing in the app reads it through here, and nothing offers to resume it.
+    QString attachedSessionId() const { return m_sessionId; }
     QVariantMap billing() const { return m_billing; }
     QString sessionWarning() const { return m_sessionWarning; }
     bool inSettings() const { return m_inSettings; }
@@ -348,7 +347,6 @@ public:
     bool signedOutNotice() const { return m_signedOutNotice; }
     bool diagnosticsNoticePending() const { return m_diagnosticsNoticePending; }
     Q_INVOKABLE void acknowledgeDiagnosticsNotice();
-    bool liveSession() const { return m_liveSession; }
     bool retryBusy() const { return m_retryBusy; }
     bool reconnecting() const { return m_reconnecting; }
     int reconnectCount() const { return m_reconnectCount; }
@@ -372,8 +370,9 @@ public:
     Q_INVOKABLE void setHostWindow(QWindow* window);
 
     /// Play (D-35). Asks the control plane for a session (`POST /api/sessions`) when there is an
-    /// access token to ask with, then drives the engine lifecycle from the allocation. While a
-    /// session is live (`liveSession`) it resumes that session instead of asking for a new one.
+    /// access token to ask with, then drives the engine lifecycle from the allocation. It always
+    /// asks for a NEW session (UD-04 R14): a session still held by the server is refused with the
+    /// server's own sentence (`USER_HAS_NONTERMINAL_SESSION`, LK01), never picked up again.
     /// Without a token - the documented Plan 03-02 tracer path - it drives the engine lifecycle
     /// directly.
     Q_INVOKABLE void start();
@@ -538,7 +537,6 @@ signals:
     void liveUpdatesPausedChanged();
     void signedOutNoticeChanged();
     void diagnosticsNoticePendingChanged();
-    void liveSessionChanged();
     void retryBusyChanged();
     void reconnectingChanged();
     void reconnectCountChanged();
@@ -608,8 +606,10 @@ private slots:
     void handleHorizonReached();
     void onLivenessWarning();
     /// `finalSession` is the terminal read teardown ended on: the source of the end reason Home shows.
-    void handleTeardownCompleted(const SessionInfo& finalSession);
-    void handleTeardownFailed(const SeatHubFailure& failure);
+    /// `sessionId` is the session the teardown ran for. One that is no longer the attached session
+    /// is a late step of an ended session and acts on nothing (UD-04 R06).
+    void handleTeardownCompleted(const SessionInfo& finalSession, const QString& sessionId);
+    void handleTeardownFailed(const SeatHubFailure& failure, const QString& sessionId);
     void handlePairingCompleted(const QString& clientUuid);
     void handlePairingFailed(const SeatHubFailure& failure);
 
@@ -695,12 +695,22 @@ private:
     /// The one writer of `m_signedIn`, so `signedInChanged()` can never be missed.
     void setSignedIn(bool signedIn);
     void updateDiagnosticsNotice();
-    /// The one writer of `m_sessionId`, and of whether that session has ended, so `liveSession` can
-    /// never be left stale by a path that forgot to say so.
+    /// The one writer of `m_sessionId`, and of whether that session has ended.
     void setAttachedSession(const QString& sessionId);
     void setAttachedSessionEnded(bool ended);
-    /// Recomputes `m_liveSession` from the three and says so when it changed.
-    void updateLiveSession();
+    /// An `EndReport` for the attempt now running. It carries `customerQuit` when the customer
+    /// deliberately quit this attempt, so no path that fills in a failure can report that quit as
+    /// one (UD-04 O01).
+    EndReport newEndReport() const;
+    /// True when the end now being reported is the customer's own quit: a Cancel or End session
+    /// press, or the in-stream quit shortcut. The shortcut is the engine ending the stream
+    /// gracefully on its own: the stream had started, the engine named no failure for this
+    /// attempt, and the connection was not terminated from the other side (no termination code).
+    bool endIsCustomerQuit() const;
+    /// R06: true for a step that belongs to a session other than the one attached now: both are
+    /// known and they differ. A step with no session id, or arriving with none attached, is not
+    /// late. The caller drops it.
+    bool isLateStepOfEndedSession(const QString& sessionId) const;
     /// The one writer of `m_retryBusy`.
     void setRetryBusy(bool busy);
     /// D-05/C2: the one pre-stream end path. Marks the attached session ended and, if this
@@ -759,8 +769,8 @@ private:
     /// D-05/C4/C7: shared by `retry()` and `start()` - a session still attached here that never
     /// streamed is ended first (idempotent if C2 already started it), with `retryBusy` held until
     /// the wait resolves, before a fresh Play goes out. Returns false (and starts nothing) with no
-    /// session attached, or one that already streamed - the ordinary Resume/Play branches then
-    /// decide. Covers both Try again (a session that failed before streaming) and Play from Home
+    /// session attached, or one that already streamed - the ordinary Play branch then asks for a
+    /// new session and the server answers for one it still holds. Covers both Try again (a session that failed before streaming) and Play from Home
     /// (C7: the same session's earlier `/end` that could not reach the server offline) with the
     /// one sequence, so neither path can race the "one nonterminal session per customer" rule
     /// (409 `USER_HAS_NONTERMINAL_SESSION`, `openapi.yaml`).
@@ -1058,17 +1068,21 @@ private:
 
     /// The session the real control-plane path is running, or empty when no session is attached.
     QString m_sessionId;
-    /// True once the control plane has reported `m_sessionId` terminal. A session that is over is not
-    /// one Home offers to resume, even while its teardown has not finished.
+    /// True once the control plane has reported `m_sessionId` terminal, or this client has started
+    /// ending it. A late step for a session that is over (a handshake result, say) is dropped.
     bool m_sessionEnded = false;
     /// C1 (D-05): true once `handleConnectionStarted()` has run for `m_sessionId` - the session
     /// reached ACTIVE on this client's side. Cleared in `setAttachedSession()` whenever a
-    /// genuinely new session id is attached; kept across a Resume of the same id (`start()`'s own
-    /// `beginSession(m_sessionId)` call re-attaches the same id, which is not a change). Gates
-    /// both `updateLiveSession()` (C5: Resume only after ACTIVE) and `retry()` (C4: never resume
-    /// a session that did not stream).
+    /// genuinely new session id is attached. Gates `retry()`/`start()` (C4: a session that did not
+    /// stream is ended before a fresh Play; one that did is left to the server's own ending).
     bool m_streamStarted = false;
-    bool m_liveSession = false;
+    /// UD-04 O01: the customer pressed Cancel or End session for the attempt now running. Cleared
+    /// by `beginSession()`, so it belongs to one attempt and never reaches the next.
+    bool m_customerQuit = false;
+    /// True once the engine named a failure for the attempt now running (a stage failure, or a
+    /// launch error). Cleared by `beginSession()`. Tells the in-stream quit shortcut, which ends
+    /// the engine without naming anything, from a stream that really failed.
+    bool m_engineFailed = false;
     /// D-05/C4: see the `retryBusy` Q_PROPERTY.
     bool m_retryBusy = false;
 

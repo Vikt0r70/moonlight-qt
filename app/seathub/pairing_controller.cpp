@@ -85,6 +85,8 @@ bool PairingController::deadlineExceeded() const
 void PairingController::start(const QString& sessionId)
 {
     LogShipper::clearRedactions();
+    // A new attempt: whatever the previous one still has in flight no longer belongs here.
+    ++m_attempt;
     if (sessionId.isEmpty()) {
         fail(SeatHubFailure::local(QString::fromLatin1(kNoAuthorization)));
         return;
@@ -112,6 +114,9 @@ void PairingController::start(const QString& sessionId)
 
 void PairingController::cancel()
 {
+    // The attempt ends here: a poll reply or a handshake result still in flight for it is dropped
+    // when it arrives, so it cannot finish, fail or pair a later attempt.
+    ++m_attempt;
     m_pollTimer->stop();
     m_finished = true;
     m_clock.invalidate();
@@ -171,25 +176,25 @@ void PairingController::pollAuthorization()
     }
 
     ++m_polls;
+    const quint64 attempt = m_attempt;
     m_client->fetchSessionAuthorization(
         m_sessionId,
-        [this](const ControlPlaneResult& result) { handleAuthorization(result); });
+        [this, attempt](const ControlPlaneResult& result) { handleAuthorization(attempt, result); });
 
     // The session itself, on the same tick (ADR-0055): the state the connecting stages come from.
     // Fire and forget - it never decides when the next poll is, so a slow or failed read cannot
     // slow pairing down or spend its deadline.
-    const QString polledSession = m_sessionId;
-    m_client->fetchSession(polledSession, [this, polledSession](const ControlPlaneResult& result) {
-        handleSessionRead(polledSession, result);
+    m_client->fetchSession(m_sessionId, [this, attempt](const ControlPlaneResult& result) {
+        handleSessionRead(attempt, result);
     });
 }
 
-void PairingController::handleSessionRead(const QString& polledSession,
-                                          const ControlPlaneResult& result)
+void PairingController::handleSessionRead(quint64 attempt, const ControlPlaneResult& result)
 {
     // After pairing has finished (or was cancelled) the engine owns what the customer sees, and a
-    // reply for an earlier session must never speak for this one.
-    if (m_finished || polledSession != m_sessionId || !result.ok) {
+    // reply for an earlier attempt - an earlier session, or the same session started again - must
+    // never speak for this one.
+    if (attempt != m_attempt || m_finished || !result.ok) {
         return;
     }
 
@@ -200,9 +205,11 @@ void PairingController::handleSessionRead(const QString& polledSession,
     emit sessionRead(info);
 }
 
-void PairingController::handleAuthorization(const ControlPlaneResult& result)
+void PairingController::handleAuthorization(quint64 attempt, const ControlPlaneResult& result)
 {
-    if (m_finished) {
+    // A reply issued for an earlier attempt is not this attempt's to act on: it would otherwise
+    // reschedule this attempt's polls, spend its clock, or pair a PIN of the other attempt.
+    if (attempt != m_attempt || m_finished) {
         return;
     }
 
@@ -308,14 +315,21 @@ void PairingController::handleAuthorization(const ControlPlaneResult& result)
     m_handshakeStarted = true;
     m_handshakeInFlight = true;
     m_inFlightSessionId = target.sessionId;
-    m_seam->pair(target, [this](bool ok, const QString& uuid, const QString& engineError) {
-        handleSeamResult(ok, uuid, engineError);
+    // `attempt` is the current one (checked at the top): the handshake's result is held to it.
+    m_seam->pair(target, [this, attempt](bool ok, const QString& uuid, const QString& engineError) {
+        handleSeamResult(attempt, ok, uuid, engineError);
     });
 }
 
-void PairingController::handleSeamResult(bool ok, const QString& clientUuid,
+void PairingController::handleSeamResult(quint64 attempt, bool ok, const QString& clientUuid,
                                          const QString& engineError)
 {
+    // The handshake of an earlier attempt finishing late: it neither completes nor fails this one,
+    // and it does not touch this attempt's in-flight flag, which belongs to its own handshake.
+    if (attempt != m_attempt) {
+        return;
+    }
+
     if (m_finished) {
         m_handshakeInFlight = false;
         return;

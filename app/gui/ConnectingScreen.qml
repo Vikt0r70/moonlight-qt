@@ -49,14 +49,17 @@ Item {
                                             ? Number(root.client.graceMinutesLeft) : -1
     readonly property bool reconnectStillTrying: root.client && root.client.reconnectStillTrying === true
 
-    // `Connection lost. Reconnecting… (n of 5)` until the first attempt has failed or timed out,
-    // then `Still trying. {minutes} left to reconnect.` from the server's own grace deadline -
-    // never a client-owned countdown (`{minutes}` uses `1 minute` in the singular, copy.md).
+    // `Connection lost. Reconnecting… (n of 5)` until the first attempt has failed or timed out
+    // AND the server has returned `grace_deadline_at` for this interruption (the facade reports
+    // `graceMinutesLeft` as -1 until then), then `Still trying. {minutes} left to reconnect.` from
+    // that deadline - never a client-owned countdown, and never a figure of this screen's own
+    // while the server's is unknown (`{minutes}` uses `1 minute` in the singular, copy.md).
+    readonly property bool deadlineKnown: root.graceMinutesLeft >= 0
     readonly property string reconnectLineText: {
-        if (!root.reconnectStillTrying) {
+        if (!root.reconnectStillTrying || !root.deadlineKnown) {
             return qsTr("Connection lost. Reconnecting… (%1 of 5)").arg(root.reconnectCount + 1)
         }
-        var minutes = Math.max(root.graceMinutesLeft, 0)
+        var minutes = root.graceMinutesLeft
         return minutes === 1
             ? qsTr("Still trying. 1 minute left to reconnect.")
             : qsTr("Still trying. %1 minutes left to reconnect.").arg(minutes)

@@ -313,6 +313,8 @@ class FakeShellClient : public QObject
     // D-07, ADR-0067.
     Q_PROPERTY(bool signedOutNotice READ signedOutNotice NOTIFY signedOutNoticeChanged)
     Q_PROPERTY(bool diagnosticsNoticePending READ diagnosticsNoticePending NOTIFY diagnosticsNoticePendingChanged)
+    // Not a property of the real facade any more (UD-04 R14: no customer Resume). Kept here so a
+    // stand-in that still CLAIMS a live session proves the screens ignore it.
     Q_PROPERTY(bool liveSession READ liveSession NOTIFY liveSessionChanged)
     Q_PROPERTY(int connectStage READ connectStage NOTIFY connectStageChanged)
     Q_PROPERTY(bool connectFailed READ connectFailed NOTIFY connectFailedChanged)
@@ -815,7 +817,9 @@ private slots:
     void metricsAreParsedFromTheGeneratedTokens();
     void everyShellScreenLoads();
     void homeScreenRendersEachHomeState();
-    void homePlayReadsResumeSessionWhileASessionIsLiveAndResumesIt();
+    void homePlayNeverReadsResumeSessionWhateverTheFacadeClaims();
+    void noCustomerResumeAfterRestart();
+    void reconnectMinutesWaitForServerDeadline();
     void homeShowsTheServersRefusalVerbatimWithAQuietTopUpBeneathPlay();
     void noHomeStateRendersACountAQueuePositionOrANotifyControl();
     void homeWrapsLongSentencesAndNeverBreaksAReference();
@@ -1118,7 +1122,7 @@ void TstUiScreens::homeScreenRendersEachHomeState()
     QVERIFY2(!findVisibleTextItem(screen.data(), offline), "a state's line must not outlive the state");
 }
 
-void TstUiScreens::homePlayReadsResumeSessionWhileASessionIsLiveAndResumesIt()
+void TstUiScreens::homePlayNeverReadsResumeSessionWhateverTheFacadeClaims()
 {
     QQuickStyle::setStyle(QStringLiteral("Basic"));
     QQmlEngine engine;
@@ -1134,19 +1138,21 @@ void TstUiScreens::homePlayReadsResumeSessionWhileASessionIsLiveAndResumesIt()
 
     QCOMPARE(play->property("text").toString(), QStringLiteral("Play"));
 
-    // copy.md C3: the label changes while a session is live, and it is still the one control.
+    // UD-04 R14 (copy.md: the `Resume session` string is retired): even a stand-in that claims a
+    // live session leaves Play as Play, and it is still the one control.
     client.setLiveSession(true);
-    QCOMPARE(play->property("text").toString(), QStringLiteral("Resume session"));
-    QVERIFY(!findVisibleTextItem(screen.data(), QStringLiteral("Play")));
+    QCOMPARE(play->property("text").toString(), QStringLiteral("Play"));
+    QVERIFY(findVisibleTextItem(screen.data(), QStringLiteral("Play")));
+    QVERIFY(!findVisibleTextItem(screen.data(), QStringLiteral("Resume session")));
 
-    // Pressing it is the facade's `start()`, which resumes rather than asks for another session (the
-    // facade's own test asserts that half).
+    // Pressing it is the facade's `start()`, which always asks for a NEW session (the facade's own
+    // tests assert that half).
     QVERIFY(QMetaObject::invokeMethod(play, "clicked"));
     QCOMPARE(client.starts(), 1);
 
-    // A live session does not change the state lines: resume and the no-rig line are separate.
+    // The state lines are unchanged by it.
     client.setHomeStatus(QStringLiteral("busy"));
-    QCOMPARE(play->property("text").toString(), QStringLiteral("Resume session"));
+    QCOMPARE(play->property("text").toString(), QStringLiteral("Play"));
 
     client.setLiveSession(false);
     QCOMPARE(play->property("text").toString(), QStringLiteral("Play"));
@@ -1157,6 +1163,46 @@ void TstUiScreens::homePlayReadsResumeSessionWhileASessionIsLiveAndResumesIt()
         if (button != play) {
             QVERIFY(button->property("implicitHeight").toInt() < 64);
         }
+    }
+}
+
+// UD-04 R14, RS01 (SC2): the relaunched app. Whatever the server still holds for this customer,
+// Home offers Play and nothing that reattaches it; if Play meets the server's refusal for the
+// session it holds, the server's own sentence is what is read (LK01), under Play, with no Resume
+// anywhere on screen.
+void TstUiScreens::noCustomerResumeAfterRestart()
+{
+    QQuickStyle::setStyle(QStringLiteral("Basic"));
+    QQmlEngine engine;
+    registerTokenSingletons(&engine);
+
+    FakeShellClient client;
+    QString error;
+    QScopedPointer<QObject> screen(instantiate(&engine, QStringLiteral("HomeScreen.qml"), &error));
+    QVERIFY2(screen, qPrintable(error));
+    QVERIFY(screen->setProperty("client", QVariant::fromValue(static_cast<QObject*>(&client))));
+    QObject* play = screen->findChild<QObject*>(QStringLiteral("playButton"));
+    QVERIFY(play);
+
+    // Just launched and signed in: Play only.
+    QCOMPARE(play->property("text").toString(), QStringLiteral("Play"));
+    QVERIFY(!findVisibleTextItem(screen.data(), QStringLiteral("Resume session")));
+    const QList<QObject*> buttons = visibleButtons(screen.data());
+    QCOMPARE(buttons.size(), 1);
+    QCOMPARE(buttons.first(), play);
+
+    // Play meets the server's refusal for the session it still holds.
+    const QString sentence = QStringLiteral("You already have a session. Wait for it to finish.");
+    client.setFailure(sentence, QStringLiteral("SH-4F7KQ2"));
+    client.setHomeStatus(QStringLiteral("refused"));
+    QVERIFY2(findVisibleTextItem(screen.data(), sentence),
+             "the server's own sentence for the session it holds is shown");
+    QCOMPARE(play->property("text").toString(), QStringLiteral("Play"));
+    QVERIFY(!findVisibleTextItem(screen.data(), QStringLiteral("Resume session")));
+    for (QObject* button : visibleButtons(screen.data())) {
+        QVERIFY2(!button->property("text").toString().contains(QStringLiteral("Resume"),
+                                                              Qt::CaseInsensitive),
+                 qPrintable(button->property("text").toString()));
     }
 }
 
@@ -1283,8 +1329,7 @@ void TstUiScreens::noHomeStateRendersACountAQueuePositionOrANotifyControl()
                          qPrintable(label));
                 if (button->property("variant").toString() == QStringLiteral("primary")) {
                     ++bright;
-                    QVERIFY(label == QStringLiteral("Play")
-                            || label == QStringLiteral("Resume session"));
+                    QCOMPARE(label, QStringLiteral("Play"));
                 }
             }
             QCOMPARE(bright, 1);
@@ -4350,6 +4395,49 @@ void TstUiScreens::stillTryingReadsTheServersDeadline()
     client.setReconnecting(/*reconnectCount=*/2, /*stillTrying=*/true, /*graceMinutesLeft=*/1);
     QCOMPARE(itemNamed(screen.data(), QStringLiteral("reconnectLine"))->property("text").toString(),
              QStringLiteral("Still trying. 1 minute left to reconnect."));
+}
+
+// UD-04 O02: no minutes figure until the server has returned `grace_deadline_at` for THIS
+// interruption, and never one that disagrees with the server's own remaining time.
+void TstUiScreens::reconnectMinutesWaitForServerDeadline()
+{
+    QQuickStyle::setStyle(QStringLiteral("Basic"));
+    QQmlEngine engine;
+    registerTokenSingletons(&engine);
+    FakeShellClient client;
+
+    QString error;
+    QScopedPointer<QObject> screen(connectingScreen(&engine, &client, &error));
+    QVERIFY2(screen, qPrintable(error));
+    client.setConnectStage(3);
+    QObject* line = itemNamed(screen.data(), QStringLiteral("reconnectLine"));
+    QVERIFY(line);
+
+    const QString firstAttempt = QStringLiteral("Connection lost. Reconnecting… (2 of 5)");
+
+    // The first attempt has not reconnected, but the server has not returned a deadline yet: the
+    // screen keeps the first-attempt line and shows no minutes figure at all - not 0, not a guess.
+    client.setReconnecting(/*reconnectCount=*/1, /*stillTrying=*/true, /*graceMinutesLeft=*/-1);
+    QCOMPARE(line->property("text").toString(), firstAttempt);
+    QVERIFY(!line->property("text").toString().contains(QStringLiteral("minute")));
+
+    // The server's deadline arrives: the figure is exactly its remaining whole minutes.
+    client.setReconnecting(/*reconnectCount=*/1, /*stillTrying=*/true, /*graceMinutesLeft=*/3);
+    QCOMPARE(line->property("text").toString(),
+             QStringLiteral("Still trying. 3 minutes left to reconnect."));
+
+    // Under a minute left is the server's 0, shown as it is.
+    client.setReconnecting(/*reconnectCount=*/1, /*stillTrying=*/true, /*graceMinutesLeft=*/0);
+    QCOMPARE(line->property("text").toString(),
+             QStringLiteral("Still trying. 0 minutes left to reconnect."));
+
+    // A new interruption: the previous one's deadline is gone, so the figure is gone with it.
+    client.setReconnecting(/*reconnectCount=*/0, /*stillTrying=*/false, /*graceMinutesLeft=*/-1);
+    QCOMPARE(line->property("text").toString(),
+             QStringLiteral("Connection lost. Reconnecting… (1 of 5)"));
+    client.setReconnecting(/*reconnectCount=*/0, /*stillTrying=*/true, /*graceMinutesLeft=*/-1);
+    QCOMPARE(line->property("text").toString(),
+             QStringLiteral("Connection lost. Reconnecting… (1 of 5)"));
 }
 
 void TstUiScreens::aStalledConnectOffersTryAgainAndBackToHomeAndNoOtherRig()

@@ -113,6 +113,11 @@ struct EndReport
     /// Empty when unknown, and then the field is absent from the body like every other optional
     /// field here. `POST /api/sessions/{id}/end` carries it for every failed Play (contract 3.8.0).
     QString attemptStep;
+    /// UD-04 O01: the end is the customer's own quit (a Cancel, an End session press, or the
+    /// in-stream quit shortcut). A deliberate quit is never a reported failure, so a report that
+    /// carries this builds no `failed` body whatever else it holds: the server ends the session
+    /// `CUSTOMER_ENDED`, with no rig blame. Never sent on the wire itself.
+    bool customerQuit = false;
 };
 
 /// `GET /api/sessions/{session_id}/pairing` (`SessionAuthorization`). Short-lived and scoped

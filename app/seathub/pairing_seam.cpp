@@ -212,12 +212,40 @@ void ProductionPairingSeam::clearPendingPairing(const PairingTarget& target)
         return;
     }
 
+    // The caller cancelled the attempt this clear belongs to (`PairingController::cancel()`). If its
+    // handshake is still pending, it is over: nobody is waiting for its result, so it must not
+    // report one later (a late classification or host would reach whatever attempt is current by
+    // then), and its worker must not clear or retry against the rig (PF15-b). A new generation
+    // does both at once: `finish()` drops the old one's result and the worker's own gate no longer
+    // matches. The deadline belongs to the abandoned handshake, so it stops with it.
+    if (m_pending && m_sessionId == target.sessionId) {
+        m_pending = false;
+        m_deadline->stop();
+        m_done = nullptr;
+        ++m_generation;
+        m_currentGeneration->store(m_generation);
+    }
+
     // Fire-and-forget: one clear on the pool thread, so the caller (the UI thread calling
     // `cancel()`) never waits on the rig. Best-effort by construction - `sendPairingCancelRequest`
     // reports its outcome in the log and returns a result nobody reads here. The task dies with
     // its own copy of the request and the target, exactly like `HandshakeTask` above.
+    //
+    // PF15-b: the clear belongs to the attempt that asked for it, named by the generation read
+    // here. It runs later on a pool thread, and by then a newer `pair()` may have started its own
+    // handshake against the same rig: the rig's pending-pairing session is one shared slot
+    // (`kPairingControlPort`, one uniqueid), so a clear aimed by the older attempt would cancel the
+    // newer one's pairing. The same atomic the handshake worker's recovery loop reads gates it: a
+    // clear whose generation is no longer current is dropped without touching the rig.
+    const quint64 generation = m_generation;
     QThreadPool::globalInstance()->start(
-        [cancelRequest = m_cancelRequest, target]() mutable {
+        [cancelRequest = m_cancelRequest, target, generation,
+         currentGeneration = m_currentGeneration]() mutable {
+            if (generation != currentGeneration->load()) {
+                qCInfo(seathubPairingSeam)
+                    << "dropping a pairing clear that belongs to a superseded attempt";
+                return;
+            }
             cancelRequest(target.hostAddress, kPairingControlPort);
         });
 }
