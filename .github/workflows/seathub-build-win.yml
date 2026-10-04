@@ -346,7 +346,7 @@ jobs:
       group: client-app-publish
       cancel-in-progress: false
     steps:
-      # The optional floor must come from the same commit as the build, not the artifact name.
+      # ADR-0077: the newest published release is the floor; the publish body carries none.
       - uses: actions/checkout@v4
 
       - uses: actions/download-artifact@v4
@@ -460,15 +460,6 @@ jobs:
         run: |
           set -euo pipefail
           tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
-          min_version=""
-          if [ -f app/min_version.txt ]; then
-            min_version=$(tr -d '[:space:]' < app/min_version.txt)
-            if [ -n "$min_version" ] && ! [[ "$min_version" =~ ^[0-9]{1,4}(\.[0-9]{1,4}){1,3}$ ]]; then
-              echo "::error::app/min_version.txt must contain a numeric version (two to four components, one to four digits each)."
-              exit 1
-            fi
-          fi
-          echo "MIN_VERSION=$min_version" >> "$GITHUB_ENV"
           # Excerpt of a server reply that is safe to log: credentials struck out, echoed input/ctx
           # keys dropped, one line, cut to 300 chars.
           snippet() {
@@ -499,9 +490,7 @@ jobs:
             --arg url "$CONTROL_URL/downloads/$INSTALLER" \
             --arg sha256 "$digest" \
             --arg notes "SeatHub client $VERSION" \
-            --arg min_version "$min_version" \
-            '{app: "client", version: $version, url: $url, sha256: $sha256, notes: $notes}
-             + (if $min_version == "" then {} else {min_version: $min_version} end)')
+            '{app: "client", version: $version, url: $url, sha256: $sha256, notes: $notes}')
           status=$(curl -sS -o "$tmp/publish.json" -w '%{http_code}' -X POST "$CONTROL_URL/api/operator/releases" \
             -H 'Content-Type: application/json' -H "Authorization: Bearer $token" \
             -d "$body" 2>/dev/null) || { echo "::error::Could not reach the control plane to publish (curl exit $?)."; exit 1; }
@@ -522,9 +511,6 @@ jobs:
           echo "$feed" | jq .
           [ "$(echo "$feed" | jq -r '.version')" = "$VERSION" ] || { echo "::error::feed is not serving $VERSION"; exit 1; }
           [ "$(echo "$feed" | jq -r '.sha256')" != "null" ] || { echo "::error::feed row has no sha256, so no installed client can verify this build"; exit 1; }
-          if [ -n "$MIN_VERSION" ]; then
-            [ "$(echo "$feed" | jq -r '.min_version')" = "$MIN_VERSION" ] || { echo "::error::feed min_version does not match app/min_version.txt ($MIN_VERSION)"; exit 1; }
-          fi
           echo "Feed now serves client $VERSION with a checksum. The retired Tauri row is superseded."
 
       # Owner decision A-22 (seven-hills-alpha OWNER-ACTIONS.md): every published build is also a

@@ -139,6 +139,44 @@ private slots:
         put(dir.path(), name(), QJsonDocument(record()).toJson());
         QCOMPARE(InstallJournal::adopt(dir.path(), now).size(), 1);
     }
+    void numericFailureSurvivesToJournal_data()
+    {
+        // INTENT SC8 / ADR-0077 item 9: the first failing operation's real Windows number reaches the
+        // report unchanged, whatever class names it. 5 is access denied, 32 a sharing violation, 183 an
+        // existing target, 1223 a declined prompt, and the negatives are HRESULTs the script could not map.
+        QTest::addColumn<QString>("failureClass"); QTest::addColumn<qint64>("code"); QTest::addColumn<qint32>("expected");
+        QTest::newRow("access-denied") << QString("installer.access_denied") << qint64(5) << qint32(5);
+        QTest::newRow("locked-sharing") << QString("installer.locked_file") << qint64(32) << qint32(32);
+        QTest::newRow("locked-lock") << QString("installer.locked_file") << qint64(33) << qint32(33);
+        QTest::newRow("unknown-exists") << QString("installer.unknown") << qint64(183) << qint32(183);
+        QTest::newRow("script-declined") << QString("installer.access_denied") << qint64(1223) << qint32(1223);
+        QTest::newRow("hresult") << QString("installer.unknown") << qint64(-2147467259) << qint32(-2147467259);
+        QTest::newRow("int-min") << QString("installer.unknown") << qint64(-2147483648LL) << qint32(std::numeric_limits<qint32>::min());
+        QTest::newRow("int-max") << QString("installer.unknown") << qint64(2147483647LL) << qint32(std::numeric_limits<qint32>::max());
+        QTest::newRow("above-int-max-clamps") << QString("installer.unknown") << qint64(9000000000LL) << qint32(std::numeric_limits<qint32>::max());
+        QTest::newRow("zero-means-no-number") << QString("installer.unknown") << qint64(0) << qint32(0);
+    }
+    void numericFailureSurvivesToJournal()
+    {
+        QFETCH(QString, failureClass); QFETCH(qint64, code); QFETCH(qint32, expected);
+        QTemporaryDir dir; QVERIFY(dir.isValid());
+        auto raw = record();
+        raw.insert("class", failureClass); raw.insert("code", double(code));
+        put(dir.path(), name(), QJsonDocument(raw).toJson());
+        const auto rows = InstallJournal::adopt(dir.path(), now);
+        QCOMPARE(rows.size(), 1);
+        QCOMPARE(rows.first().failureClass, failureClass);
+        QCOMPARE(rows.first().code, expected);
+        // What is handed to the once-only report carries the same number, never a typed class with 0.
+        QCOMPARE(qint32(rows.first().toJson().value("code").toInteger()), expected);
+        // An interrupted start record still reports whatever number the setup had recorded.
+        auto start = record(); start.remove("ended"); start.insert("code", double(code));
+        QTemporaryDir interrupted; QVERIFY(interrupted.isValid());
+        put(interrupted.path(), name(id, "start"), QJsonDocument(start).toJson(), 1800);
+        const auto interruptedRows = InstallJournal::adopt(interrupted.path(), now);
+        QCOMPARE(interruptedRows.size(), 1);
+        QCOMPARE(interruptedRows.first().code, expected);
+    }
     void theReaderNeverWritesOrDeletesInTheJournalFolder()
     {
         QTemporaryDir dir;

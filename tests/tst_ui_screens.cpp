@@ -698,7 +698,6 @@ class FakeUpdates : public QObject
     Q_PROPERTY(bool blockedBySession READ blockedBySession NOTIFY changed)
     Q_PROPERTY(bool readyToInstall READ readyToInstall NOTIFY changed)
     Q_PROPERTY(bool mandatory READ mandatory NOTIFY changed)
-    Q_PROPERTY(bool optionalOffer READ optionalOffer NOTIFY changed)
     Q_PROPERTY(bool exhausted READ exhausted NOTIFY changed)
     Q_PROPERTY(QString nextAttemptText READ nextAttemptText NOTIFY changed)
 
@@ -710,7 +709,6 @@ public:
     bool blockedBySession() const { return m_blockedBySession; }
     bool readyToInstall() const { return false; }
     bool mandatory() const { return m_mandatory; }
-    bool optionalOffer() const { return !m_mandatory && !m_dismissed && m_state != "failed"; }
     bool exhausted() const { return m_exhausted; }
     QString nextAttemptText() const { return m_when; }
     void variant(bool required, bool exhausted, const QString& state, const QString& when = {})
@@ -720,7 +718,6 @@ public:
                                                     {"reference", "SUPPORT-REF"}} : QVariantMap{};
         emit changed();
     }
-    Q_INVOKABLE void dismissOptional() { m_dismissed = true; emit changed(); }
     Q_INVOKABLE bool openManualDownload() { ++m_opens; return true; }
     Q_INVOKABLE bool tryAgain() { ++m_installs; return true; }
 
@@ -749,7 +746,7 @@ private:
     bool m_blockedBySession = false;
     int m_downloads = 0;
     int m_installs = 0;
-    bool m_mandatory = true, m_exhausted = false, m_dismissed = false;
+    bool m_mandatory = true, m_exhausted = false;
     QString m_when;
     int m_opens = 0;
 };
@@ -2913,20 +2910,15 @@ void TstUiScreens::updateWindowShowsTheFrozenVariantsInARealWindow()
     QVERIFY(findVisibleTextItem(modal.data(), "SeatHub could not update itself. Download the new version and install it to keep playing."));
     QTRY_VERIFY(modal->findChild<QObject*>("downloadAction"));
     QVERIFY(modal->findChild<QObject*>("updateAction"));
+    // ADR-0077: every offer is required, so a variant that reports it as not mandatory still
+    // shows the single Update action, never a Not now action, and cannot be dismissed.
     updates.variant(false, false, "available");
-    QVERIFY(findVisibleTextItem(modal.data(), "SeatHub update"));
-    QVERIFY(findVisibleTextItem(modal.data(), "Version 9.9.9 is ready. Update now, or later."));
-    QTRY_VERIFY(modal->findChild<QQuickItem*>("notNowAction"));
-    auto* later = modal->findChild<QQuickItem*>("notNowAction");
-    auto* primary = modal->findChild<QQuickItem*>("updateAction");
-    // A variant's bindings update before Row's next polish. Click only after its real layout
-    // has placed the two controls side by side, and assert they do not overlap.
-    QTRY_VERIFY(later->mapToScene(QPointF()).x()
-                >= primary->mapToScene(QPointF()).x() + primary->width());
-    QTest::mouseClick(&window, Qt::LeftButton, Qt::NoModifier,
-                     later->mapToScene(QPointF(later->width()/2, later->height()/2)).toPoint());
-    QTRY_VERIFY(!item->isVisible());
-    updates.variant(false, false, "failed"); QVERIFY(!item->isVisible());
+    QVERIFY(findVisibleTextItem(modal.data(), "Version 9.9.9 is available. SeatHub has to restart to finish updating."));
+    QTRY_VERIFY(modal->findChild<QQuickItem*>("updateAction"));
+    QVERIFY(!modal->findChild<QObject*>("notNowAction"));
+    QTest::keyClick(&window, Qt::Key_Escape); QVERIFY(item->isVisible());
+    updates.variant(false, false, "failed"); QVERIFY(item->isVisible());
+    QVERIFY(!modal->findChild<QObject*>("notNowAction"));
     updates.variant(true, false, "downloading"); QVERIFY(item->isVisible());
     QVERIFY(findVisibleTextItem(modal.data(), "Downloading: 0%"));
 }

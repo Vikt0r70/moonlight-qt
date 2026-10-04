@@ -1,9 +1,31 @@
 // IFW 4.7 controller. ADR-0070: extract beside the live app, then swap; never run an uninstaller.
 // Local 4.7 scripting-installer.html/noninteractive.html are the API authority.
+//
+// ADR-0077 / INTENT SC8 + SC9. What this script now guarantees, and the IFW 4.7.0 facts it rests on:
+//   * runInstaller() calls dropAdminRights() BEFORE it emits installationFinished
+//     (packagemanagercore_p.cpp, "if (adminRightsGained) m_core->dropAdminRights();"), so a setup that
+//     was elevated only by IFW's internal elevation runs this whole handler unelevated: installer.execute
+//     goes through QProcessWrapper, which only reaches the elevated server while RemoteClient is active.
+//     seathubRegainElevation() re-activates the already started server first (no second UAC prompt:
+//     RemoteClientPrivate::maybeStartServer returns at once when m_serverStarted is set).
+//   * Every failing operation records its real numeric Windows error; the FIRST one wins and later
+//     rollback/cleanup results never overwrite it (journal `code`, V37 clamp unchanged).
+//   * Registration rows are addressed by hive + view + key, where the key must equal the ProductUUID that
+//     the maintenance tool stores, plus the install/maintenance paths. A failed query is unknown, every
+//     write and delete is read back, and only proven-dead owned rows are removed.
+//   * Pre-journal quiescence (ADR-0077 item 7) is a STATE rule: no relevant installer, child or elevation
+//     owner remains, and the mutation boundary is exclusively acquired. No duration is encoded anywhere
+//     (docs/spec/timing.md V38 is open). Journal age (V35, the journal-start rule) is never read here.
 var SEATHUB_TITLE = "SeatHub Setup";
 var SEATHUB_MAINTENANCE_TOOL = "SeatHubMaintenanceTool.exe";
 var SEATHUB_CLIENT = "SeatHub.exe";
 var SEATHUB_CRASH_HANDLER = "crashpad_handler.exe";
+var SEATHUB_PUBLISHER = "Seven Hills"; // config.xml <Publisher>
+var SEATHUB_UNINSTALL_ROOTS = [
+    "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall",
+    "HKCU:\\Software\\Wow6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall",
+    "HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall",
+    "HKLM:\\Software\\Wow6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall"];
 // docs/spec V36 and ADR-0070 item 1: two waits only, on failure; no success-path delay.
 var SEATHUB_RENAME_TRIES = 3;
 var SEATHUB_RENAME_WAIT_S = 1;
@@ -11,6 +33,8 @@ var SEATHUB_FAILURE = "SeatHub could not finish updating. Your current version i
 var SEATHUB_STOP_FAILURE = "SeatHub is still running and could not be closed. Close it and run this setup again.";
 var seathubAttempt = null;
 var seathubLogLines = [];
+var seathubBoundaryHeld = false;
+var seathubLastExit = NaN;
 
 function Controller()
 {
@@ -28,17 +52,48 @@ Controller.prototype.TargetDirectoryPageCallback = function()
     if (!installer.isInstaller() || seathubAttempt) return;
     var x = seathubChosenTargetDir();
     if (!x) return;
-    seathubRecoverInterruptedSwap(x);
+    var dirs = seathubSiblingDirs(x);
     seathubPrepareJournal();
-    // Nonempty directories without a tool are staged too: never accept an overwrite prompt.
-    if (!installer.fileExists(x)) return;
-    var entries = seathubPs("@(Get-ChildItem -LiteralPath " + seathubPsQuote(x) + " -Force).Count");
-    if (entries.length >= 2 && Number(entries[1]) === 0 && Number(entries[0]) === 0) return;
+    var interrupted = dirs !== null && dirs.length > 0;
+    if (!installer.fileExists(x) && !interrupted) return;
+    if (!interrupted) {
+        // Nonempty directories without a tool are staged too: never accept an overwrite prompt.
+        var entries = seathubPs("@(Get-ChildItem -LiteralPath " + seathubPsQuote(x) + " -Force).Count");
+        if (entries.length >= 2 && Number(entries[1]) === 0 && Number(entries[0]) === 0) return;
+    }
     var id = seathubRandomId();
     seathubAttempt = {id:id, final:x, stage:x + ".stage-" + id, old:x + ".old-" + id,
         started:new Date().toISOString(), clock:Date.now(), stageMs:0, swapMs:0,
         outcome:"failed", step:"preflight", cls:"installer.unknown", code:0,
-        rollback:"not_needed", state:"old_intact", interrupted:false, ended:false};
+        rollback:"not_needed", state:"old_intact", interrupted:false, ended:false,
+        needsAdmin:seathubNeedsAdmin(x), oldId:"", newId:""};
+    // ADR-0077 item 7: admit a mutation only when no other installer is live. Ambiguity is blocked, not
+    // abandoned: nothing on disk is touched and the client's retry state tries again later.
+    var other = seathubOtherSetupState();
+    if (other !== "none") {
+        seathubLog("another SeatHub setup is " + other + "; not mutating");
+        seathubBlock("installer.locked_file", SEATHUB_FAILURE);
+        return;
+    }
+    if (interrupted) {
+        // Recovery renames and deletes inside the install parent: it needs the same elevation as the swap.
+        if (seathubAttempt.needsAdmin && !installer.hasAdminRights() && !seathubGainAdminRights()) {
+            seathubFail("installer.access_denied", "preflight", SEATHUB_FAILURE);
+            return;
+        }
+        seathubPrepareJournal();
+        if (seathubAcquireBoundary() !== "acquired") {
+            seathubBlock("installer.locked_file", SEATHUB_FAILURE);
+            return;
+        }
+        seathubRecoverInterruptedSwap(x, dirs);
+        if (!installer.fileExists(x)) {
+            // Only a stage remained: this is a fresh install, which IFW handles by itself.
+            seathubReleaseBoundary();
+            seathubAttempt = null;
+            return;
+        }
+    }
     installer.setValue("SeatHubFinalDir", x);
     installer.setValue("SeatHubAttemptId", id);
     // Retarget before any nested execute/kill/UAC event loop can deliver queued Next clicks.
@@ -64,7 +119,12 @@ Controller.prototype.TargetDirectoryPageCallback = function()
         seathubFail("installer.access_denied", "preflight", SEATHUB_FAILURE);
         return;
     }
+    seathubPrepareJournal();
     if (!seathubAttempt.journalStarted) seathubJournalStart();
+    if (seathubAcquireBoundary() !== "acquired") {
+        seathubBlock("installer.locked_file", SEATHUB_FAILURE);
+        return;
+    }
     seathubHook("callback_done");
 };
 
@@ -104,6 +164,9 @@ Controller.prototype.seathubFinished = function()
 {
     if (!seathubAttempt || seathubAttempt.ended) { seathubFlushLog(); return; }
     var a = seathubAttempt;
+    // IFW dropped its internal elevation before emitting this signal. Everything below (rename, registry,
+    // stage removal, shortcut, journal) must run with the same elevation as the rest of the install.
+    seathubRegainElevation(a);
     a.stageMs = Date.now() - a.clock;
     if (a.interrupted || installer.status != QInstaller.Success) {
         seathubAbandon();
@@ -122,40 +185,56 @@ Controller.prototype.seathubFinished = function()
         seathubFail("installer.verify_failed", "verify", SEATHUB_FAILURE);
         return;
     }
+    // The ProductUUID each maintenance tool stores is the proof that ties a registry row to an install.
+    a.newId = seathubToolId(a.stage);
+    a.oldId = seathubToolId(a.final);
     var swapClock = Date.now();
     a.step = "swap_aside";
     if (!seathubRename(a.final, a.old)) {
         seathubAbandon();
-        seathubFail("installer.locked_file", "swap_aside", SEATHUB_FAILURE);
+        seathubFail(seathubClassForCode(seathubLastExit, "installer.unknown"), "swap_aside", SEATHUB_FAILURE);
         return;
     }
     seathubHook("between_renames");
     a.step = "swap_in";
     if (!seathubRename(a.stage, a.final)) {
+        var inFailure = seathubLastExit;
         a.rollback = seathubRename(a.old, a.final) ? "ok" : "failed";
         a.state = a.rollback === "ok" ? "old_intact" : "none";
         seathubAbandon();
-        seathubFail(a.rollback === "ok" ? "installer.locked_file" : "installer.rollback_failed", "swap_in", SEATHUB_FAILURE);
+        seathubFail(a.rollback === "ok" ? seathubClassForCode(inFailure, "installer.unknown") : "installer.rollback_failed",
+            "swap_in", SEATHUB_FAILURE);
         return;
     }
     a.swapMs = Date.now() - swapClock;
     a.state = "new_live";
     seathubHook("after_swap");
     a.step = "registry";
-    var newRows = seathubRows(a.stage);
-    var registryOk = seathubPatchRows(a.stage, a.final);
-    if (registryOk) seathubDeleteRows(a.final, newRows);
+    var registryOk = seathubRepairRegistration({final:a.final, stage:a.stage, old:a.old,
+        newId:a.newId || seathubToolId(a.final), oldId:a.oldId});
     installer.setValue("TargetDir", a.final);
+    seathubEnsureShortcut(a.final);
     a.step = "cleanup";
     seathubRemoveTree(a.old);
-    seathubJournalEnd("success", registryOk ? "cleanup" : "registry", registryOk ? "installer.unknown" : "installer.script_error");
+    // A rejected registry write or delete never reports success: the app is updated, the journal says what is left.
+    seathubJournalEnd(registryOk ? "success" : "failed", registryOk ? "cleanup" : "registry",
+        registryOk ? "installer.unknown" : "installer.script_error");
     seathubFlushLog();
 };
 
-function seathubFail(cls, step, text)
+// A quiescence block is not a failure: nothing was mutated and the old app is untouched, so the attempt is
+// journaled as `cancelled`. The client never reports a cancelled record and it spends none of the four
+// attempts, which is the same policy as its own blocks (ADR-0077 item 7: blocked, not abandoned).
+function seathubBlock(cls, text)
 {
-    seathubLog("failed " + step + " " + cls);
-    seathubJournalEnd("failed", step, cls);
+    seathubFail(cls, "preflight", text, "cancelled");
+}
+
+function seathubFail(cls, step, text, outcome)
+{
+    outcome = outcome || "failed";
+    seathubLog(outcome + " " + step + " " + cls);
+    seathubJournalEnd(outcome, step, cls);
     seathubFlushLog();
     QMessageBox.critical("SeatHubUpdateFailed", SEATHUB_TITLE, text);
     // interrupt() cancels ongoing installation; reject() also closes a pre-install wizard.
@@ -194,6 +273,128 @@ function seathubProgramFiles()
 {
     return installer.toNativeSeparators(installer.environmentVariable("ProgramFiles"));
 }
+
+// ---------------------------------------------------------------------------------------- numeric errors
+
+function seathubIsOk(r) { return r && r.length >= 2 && Number(r[1]) === 0; }
+
+function seathubExitCode(r) { return r && r.length >= 2 ? Number(r[1]) : NaN; }
+
+// The first failing operation's real number is the one the journal keeps; rollback, abandon and cleanup
+// run after it and must never replace it. Zero is "no failure" and an operation that never started has
+// no number, so neither is recorded.
+function seathubNoteCode(code)
+{
+    var a = seathubAttempt;
+    code = Number(code);
+    if (!a || !isFinite(code) || code === 0) return;
+    if (a.code === 0) a.code = code;
+}
+
+// 5 is ERROR_ACCESS_DENIED, 32/33 are the sharing and lock violations. Anything else stays honest.
+function seathubClassForCode(code, fallback)
+{
+    if (code === 5) return "installer.access_denied";
+    if (code === 32 || code === 33) return "installer.locked_file";
+    return fallback;
+}
+
+// Exits with the Win32 error of the innermost exception: the low word of an 0x8007xxxx HRESULT, otherwise
+// the HRESULT itself. -2147024896 is 0x80070000 as a signed 32-bit integer, -65536 is 0xFFFF0000.
+function seathubMoveScript(source, destination)
+{
+    return "try{[IO.Directory]::Move(" + seathubPsQuote(source) + "," + seathubPsQuote(destination) + ")}"
+        + "catch{$e=$_.Exception;while($e.InnerException){$e=$e.InnerException};$h=[int]$e.HResult;"
+        + "if($h -eq 0){exit 1};if(($h -band -65536) -eq -2147024896){exit ($h -band 65535)}else{exit $h}}";
+}
+
+// ---------------------------------------------------------------------------------------- elevation
+
+function seathubUnderProgramFiles(path)
+{
+    var pf = seathubProgramFiles().toLowerCase();
+    return pf !== "" && path.toLowerCase().indexOf(pf + "\\") === 0;
+}
+
+// True when renaming beside the install needs more than the launching token: Program Files, or any folder
+// whose parent this token cannot write to (IFW elevates for those too, and drops the elevation again).
+function seathubNeedsAdmin(dir)
+{
+    if (seathubUnderProgramFiles(dir)) return true;
+    var probe = seathubJoin(seathubParent(dir), ".seathub-write-" + Date.now());
+    var r = seathubPs("$f=[IO.File]::Open(" + seathubPsQuote(probe) + ",[IO.FileMode]::CreateNew);$f.Dispose();Remove-Item -LiteralPath "
+        + seathubPsQuote(probe) + " -Force");
+    return !seathubIsOk(r);
+}
+
+function seathubRegainElevation(a)
+{
+    if (!a.needsAdmin || installer.hasAdminRights()) return true;
+    var regained = seathubGainAdminRights();
+    seathubLog("admin rights were dropped by IFW; regained " + regained);
+    return regained;
+}
+
+// ---------------------------------------------------------------------------------------- quiescence
+
+// Is any other SeatHub setup or maintenance tool process alive? Our own process chain (this PowerShell,
+// the installer and, once elevated, its server child) is excluded. A failed query is "unknown".
+function seathubOtherSetupState()
+{
+    var self = seathubLeaf(installer.value("InstallerFilePath"));
+    var r = seathubPs("$self=" + seathubPsQuote(self) + ";$all=@(Get-CimInstance Win32_Process);$mine=@{};$cur=[int]$PID;"
+        + "while($cur -gt 0 -and -not $mine.ContainsKey($cur)){$p=$all | Where-Object {$_.ProcessId -eq $cur} | Select-Object -First 1;"
+        + "if(-not $p){break};$mine[$cur]=1;$cur=[int]$p.ParentProcessId};"
+        + "$others=@($all | Where-Object {($_.Name -like 'SeatHub*Setup*.exe' -or $_.Name -eq 'SeatHubMaintenanceTool.exe' -or ($self -ne '' -and $_.Name -eq $self))"
+        + " -and -not $mine.ContainsKey([int]$_.ProcessId) -and -not ($mine.ContainsKey([int]$_.ParentProcessId) -and $self -ne '' -and $_.Name -eq $self)});"
+        + "$others | ForEach-Object {$_.ProcessId.ToString()+' '+$_.Name}");
+    if (!seathubIsOk(r)) return "unknown";
+    return String(r[0]).replace(/\s/g, "") === "" ? "none" : "live";
+}
+
+function seathubBoundaryDir()
+{
+    return seathubJoin(seathubJoin(installer.environmentVariable("ProgramData"), "SeatHubSetup"), "mutation-boundary");
+}
+
+// The mutation boundary is a directory made by `mkdir`, which fails if it exists, so only one setup holds it.
+// A leftover boundary is reclaimed only on proof: the caller has just seen no other live setup, so its
+// holder is dead. Elapsed time is never the proof.
+function seathubAcquireBoundary()
+{
+    if (seathubBoundaryHeld) return "acquired";
+    var dir = seathubBoundaryDir();
+    // `mkdir` would also create a missing parent with inherited, untrusted permissions: the secured
+    // SeatHubSetup folder must already exist.
+    if (!installer.fileExists(seathubParent(dir))) { seathubLog("mutation boundary unavailable: no secured folder"); return "error"; }
+    for (var pass = 0; pass < 2; ++pass) {
+        var r = installer.execute(seathubSystemTool("cmd.exe"), ["/c", "mkdir", dir], "");
+        if (seathubIsOk(r) && installer.fileExists(dir)) {
+            seathubBoundaryHeld = true;
+            seathubLog("mutation boundary acquired");
+            return "acquired";
+        }
+        if (!installer.fileExists(dir)) { seathubLog("mutation boundary unavailable"); return "error"; }
+        if (pass === 0) {
+            seathubLog("stale mutation boundary: no live setup holds it; reclaiming");
+            installer.execute(seathubSystemTool("cmd.exe"), ["/c", "rmdir", dir], "");
+            if (installer.fileExists(dir)) return "error";
+        }
+    }
+    return "contested";
+}
+
+function seathubReleaseBoundary()
+{
+    if (!seathubBoundaryHeld) return;
+    seathubBoundaryHeld = false;
+    var dir = seathubBoundaryDir();
+    installer.execute(seathubSystemTool("cmd.exe"), ["/c", "rmdir", dir], "");
+    if (installer.fileExists(dir)) seathubLog("mutation boundary could not be released");
+}
+
+// ---------------------------------------------------------------------------------------- journal
+
 var seathubJournalDir = "";
 function seathubJournalOwnerTrusted(dir)
 {
@@ -209,6 +410,19 @@ function seathubJournalOwnerTrusted(dir)
     return r.length >= 2 && Number(r[1]) === 0 && String(r[0]).indexOf("trusted") >= 0;
 }
 
+function seathubJournalAclScript(dir, existing)
+{
+    return "$a=New-Object Security.AccessControl.DirectorySecurity;"
+        + "$a.SetAccessRuleProtection($true,$false);"
+        + "$a.SetOwner((New-Object Security.Principal.SecurityIdentifier('S-1-5-32-544')));"
+        + "foreach($sid in ('S-1-5-18','S-1-5-32-544','S-1-5-32-545')){"
+        + "$s=New-Object Security.Principal.SecurityIdentifier($sid);"
+        + "$rights=if($sid -eq 'S-1-5-32-545'){'ReadAndExecute'}else{'FullControl'};"
+        + "$a.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($s,$rights,'ContainerInherit,ObjectInherit','None','Allow')))};"
+        + (existing ? "(New-Object IO.DirectoryInfo(" + seathubPsQuote(dir) + ")).SetAccessControl($a)"
+                    : "[IO.Directory]::CreateDirectory(" + seathubPsQuote(dir) + ",$a) | Out-Null");
+}
+
 function seathubSecureJournalDirectory(dir)
 {
     var r = seathubPs("$p=" + seathubPsQuote(dir) + ";if(Test-Path -LiteralPath $p){"
@@ -220,18 +434,16 @@ function seathubSecureJournalDirectory(dir)
         if (detached.length < 2 || Number(detached[1]) !== 0) return false;
     }
     if (seathubJournalOwnerTrusted(dir)) return true;
-    if (installer.fileExists(dir) && !seathubRemoveTree(dir)) return false;
-    // The permitted test seam can create a protected scratch folder under a non-admin token.
-    if (seathubJournalOwnerTrusted(dir)) return true;
-    r = seathubPs("$a=New-Object Security.AccessControl.DirectorySecurity;"
-        + "$a.SetAccessRuleProtection($true,$false);"
-        + "$a.SetOwner((New-Object Security.Principal.SecurityIdentifier('S-1-5-32-544')));"
-        + "foreach($sid in ('S-1-5-18','S-1-5-32-544','S-1-5-32-545')){"
-        + "$s=New-Object Security.Principal.SecurityIdentifier($sid);"
-        + "$rights=if($sid -eq 'S-1-5-32-545'){'ReadAndExecute'}else{'FullControl'};"
-        + "$a.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($s,$rights,'ContainerInherit,ObjectInherit','None','Allow')))};"
-        + "[IO.Directory]::CreateDirectory(" + seathubPsQuote(dir) + ",$a) | Out-Null");
-    if (r.length < 2 || Number(r[1]) !== 0 || !seathubJournalOwnerTrusted(dir)) return false;
+    // A folder that fails the trust check is repaired IN PLACE. It may hold the only record of a failed
+    // attempt, so it is never deleted; if the repair is refused (no elevation) the journal stays untouched.
+    var existing = installer.fileExists(dir);
+    if (existing) seathubLog("journal folder failed the trust check; repairing in place");
+    r = seathubPs(seathubJournalAclScript(dir, existing));
+    if (!seathubIsOk(r)) {
+        seathubLog("journal folder not trusted and not repairable, exit " + seathubExitCode(r));
+        return false;
+    }
+    if (!seathubJournalOwnerTrusted(dir)) return false;
     var acl = installer.execute(seathubSystemTool("icacls.exe"), [dir], "");
     return acl.length >= 2 && Number(acl[1]) === 0;
 }
@@ -277,22 +489,42 @@ function seathubJournalRecord(a, outcome, step, cls, end)
         elevated:installer.hasAdminRights()};
 }
 
+// Fallback when the IFW AppendFile operation is refused: create-new through the same (elevated) process path.
+function seathubWriteFileViaPs(file, text)
+{
+    var r = seathubPs("$s=[IO.File]::Open(" + seathubPsQuote(file) + ",[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None);"
+        + "try{$b=[Text.Encoding]::UTF8.GetBytes(" + seathubPsQuote(text) + ");$s.Write($b,0,$b.Length)}finally{$s.Dispose()}");
+    if (!seathubIsOk(r)) seathubLog("journal fallback write failed, exit " + seathubExitCode(r));
+    return seathubIsOk(r);
+}
+
 function seathubJournalWrite(a, outcome, step, cls, end)
 {
+    var kind = end ? "end" : "start";
     // Reserve both new paths before start. Ready-page rejection must not enter
     // execute()'s nested event loop after Qt has posted last-window quit.
     var closingBeforeInstall = end && a.journalStarted
         && (a.step === "preflight" || a.step === "stop_client");
     var dir = closingBeforeInstall ? seathubJournalDir : seathubPrepareJournal();
-    if (!dir) return false;
+    if (!dir) { seathubLog("journal " + kind + " unavailable: folder not prepared"); return false; }
     var text = JSON.stringify(seathubJournalRecord(a, outcome, step, cls, end));
     var file = seathubJoin(dir, "attempt-" + a.id + (end ? ".end.json" : ".start.json"));
     if (!closingBeforeInstall) {
         var prune = seathubPruneJournal(end ? 1 : 2);
-        if (prune.length < 2 || Number(prune[1]) !== 0) return false;
+        if (!seathubIsOk(prune)) {
+            seathubLog("journal prune failed, exit " + seathubExitCode(prune));
+            // The bound is reserved ahead of the end record, so losing the end record is the worse failure.
+            if (!end) return false;
+        }
     }
-    if (text.length > 4096 || installer.fileExists(file)) return false;
-    if (!installer.performOperation("AppendFile", [file, text])) return false;
+    if (text.length > 4096) { seathubLog("journal " + kind + " unavailable: record too large"); return false; }
+    if (installer.fileExists(file)) { seathubLog("journal " + kind + " unavailable: already exists"); return false; }
+    var wrote = installer.performOperation("AppendFile", [file, text]);
+    if (!wrote) {
+        seathubLog("journal " + kind + " AppendFile refused");
+        wrote = seathubWriteFileViaPs(file, text);
+    }
+    if (!wrote || !installer.fileExists(file)) { seathubLog("journal " + kind + " unavailable: not written"); return false; }
     if (end) installer.performOperation("Delete", [seathubJoin(dir, "attempt-" + a.id + ".start.json")]);
     return true;
 }
@@ -316,7 +548,10 @@ function seathubJournalEnd(outcome, step, cls)
     if (!seathubAttempt || seathubAttempt.ended) return;
     seathubAttempt.ended = true;
     if (!seathubJournalWrite(seathubAttempt, outcome, step, cls, true)) seathubLog("journal end unavailable");
+    seathubReleaseBoundary();
 }
+
+// ---------------------------------------------------------------------------------------- operations
 
 function seathubPsQuote(s) { return "'" + String(s).replace(/'/g, "''") + "'"; }
 function seathubPs(script)
@@ -328,12 +563,17 @@ function seathubPs(script)
 
 function seathubRename(source, destination)
 {
+    var last = NaN;
     for (var i = 0; i < SEATHUB_RENAME_TRIES; ++i) {
-        var r = seathubPs("[IO.Directory]::Move(" + seathubPsQuote(source) + "," + seathubPsQuote(destination) + ")");
-        if (r.length >= 2 && Number(r[1]) === 0) { seathubLog("rename ok " + source + " -> " + destination); return true; }
+        var r = seathubPs(seathubMoveScript(source, destination));
+        if (seathubIsOk(r)) { seathubLastExit = 0; seathubLog("rename ok " + source + " -> " + destination); return true; }
+        last = seathubExitCode(r);
+        seathubLog("rename failed " + (isNaN(last) ? "(no exit code)" : "code " + last));
         if (i + 1 < SEATHUB_RENAME_TRIES)
             for (var s = 0; s < SEATHUB_RENAME_WAIT_S; ++s) seathubSleepOneSecond();
     }
+    seathubLastExit = last;
+    seathubNoteCode(last);
     return false;
 }
 
@@ -344,64 +584,200 @@ function seathubRemoveTree(path)
     return !installer.fileExists(path);
 }
 
-function seathubRows(location)
+function seathubShortcutPath()
 {
-    var ps = "$loc=" + seathubPsQuote(location) + ";"
-        + "foreach($root in @('HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall','HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall','HKLM:\\Software\\Wow6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall')){"
-        + "Get-ChildItem -LiteralPath $root -ErrorAction SilentlyContinue | ForEach-Object {"
-        + "$p=Get-ItemProperty -LiteralPath $_.PSPath;if($p.DisplayName -eq 'SeatHub' -and $p.InstallLocation -eq $loc){$_.Name}}}";
-    var r = seathubPs(ps);
-    return r.length >= 2 && Number(r[1]) === 0 ? String(r[0]).split(/[\r\n]+/).filter(function(s){return s.indexOf("HKEY_") === 0;}) : [];
+    return installer.toNativeSeparators(installer.value("AllUsersStartMenuProgramsPath") + "/SeatHub.lnk");
 }
 
-function seathubPatchRows(stage, finalDir)
+// IFW's CreateShortcut with a working directory goes through COM in the calling process, not through the
+// elevated server, so after a rollback it can be refused. Read the result back and recreate it elevated.
+function seathubEnsureShortcut(dir)
 {
-    var rows = seathubRows(stage);
+    var exe = seathubJoin(dir, SEATHUB_CLIENT);
+    var link = seathubShortcutPath();
+    if (!installer.fileExists(exe) || installer.fileExists(link)) return true;
+    installer.performOperation("CreateShortcut", [exe, installer.value("AllUsersStartMenuProgramsPath") + "/SeatHub.lnk",
+        "workingDirectory=" + dir, "iconPath=" + exe, "description=SeatHub"]);
+    if (installer.fileExists(link)) return true;
+    var r = seathubPs("$s=(New-Object -ComObject WScript.Shell).CreateShortcut(" + seathubPsQuote(link) + ");"
+        + "$s.TargetPath=" + seathubPsQuote(exe) + ";$s.WorkingDirectory=" + seathubPsQuote(dir) + ";"
+        + "$s.IconLocation=" + seathubPsQuote(exe + ",0") + ";$s.Description='SeatHub';$s.Save()");
+    if (!seathubIsOk(r)) seathubLog("shortcut recreate failed, exit " + seathubExitCode(r));
+    return installer.fileExists(link);
+}
+
+// ---------------------------------------------------------------------------------------- registration
+
+// ProductUUID is stored in the maintenance tool's .ini as an escaped QVariant: \0 for NUL and \xHH for
+// the characters that follow one. Decode it and read the braced UUID that follows the key name.
+function seathubToolId(dir)
+{
+    var ini = seathubJoin(dir, SEATHUB_MAINTENANCE_TOOL.replace(/\.exe$/i, ".ini"));
+    if (!installer.fileExists(ini)) return "";
+    var r = seathubPs("$t=[IO.File]::ReadAllText(" + seathubPsQuote(ini) + ");"
+        + "$t=[regex]::Replace($t,'\\x5cx([0-9a-fA-F]{1,2})',{param($m)[string][char][Convert]::ToInt32($m.Groups[1].Value,16)});"
+        + "$t=$t.Replace('\\0','');"
+        + "if($t -match 'ProductUUID[^{]{0,16}(\\{[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\\})'){$Matches[1]}else{exit 7}");
+    if (!seathubIsOk(r)) return "";
+    var id = String(r[0]).replace(/\s/g, "").toLowerCase();
+    return /^\{[0-9a-f-]{36}\}$/.test(id) ? id : "";
+}
+
+// Every SeatHub uninstall row in every hive and view, with a flag that is false when any part of the
+// query failed: a failed query is unknown, never "no rows".
+function seathubQueryRows()
+{
+    var roots = SEATHUB_UNINSTALL_ROOTS.map(seathubPsQuote).join(",");
+    var r = seathubPs("$o=@();$bad=0;foreach($root in @(" + roots + ")){"
+        + "if(-not (Test-Path -LiteralPath $root)){continue};"
+        + "try{$items=@(Get-ChildItem -LiteralPath $root -ErrorAction Stop)}catch{$bad=1;continue};"
+        + "foreach($i in $items){try{$p=Get-ItemProperty -LiteralPath $i.PSPath -ErrorAction Stop}catch{$bad=1;continue};"
+        + "if($p.DisplayName -eq 'SeatHub'){$o+=($i.Name+'|'+$p.Publisher+'|'+$p.InstallLocation+'|'+$p.UninstallString)}}};"
+        + "$o;if($bad){exit 9}");
+    if (!seathubIsOk(r)) return {ok:false, rows:[]};
+    var rows = [];
+    var lines = String(r[0]).split(/[\r\n]+/);
+    for (var i = 0; i < lines.length; ++i) {
+        var f = lines[i].split("|");
+        if (f.length < 4 || f[0].indexOf("HKEY_") !== 0) continue;
+        rows.push({key:f[0], id:f[0].substring(f[0].lastIndexOf("\\") + 1).toLowerCase(),
+            publisher:f[1], location:f[2], uninstall:f.slice(3).join("|")});
+    }
+    return {ok:true, rows:rows};
+}
+
+function seathubNormalPath(p)
+{
+    return installer.toNativeSeparators(String(p)).replace(/^"|"$/g, "").replace(/[\\\/]+$/, "").toLowerCase();
+}
+
+// A row is OURS only when the publisher, an install location we manage and the maintenance tool path all
+// agree. The display name alone never decides, and neither does a version.
+function seathubOwnedRow(row, ctx)
+{
+    if (row.publisher !== SEATHUB_PUBLISHER) return false;
+    var dirs = [ctx.final, ctx.stage, ctx.old].map(seathubNormalPath);
+    var tools = [ctx.final, ctx.stage, ctx.old].map(function(d) { return seathubNormalPath(seathubJoin(d, SEATHUB_MAINTENANCE_TOOL)); });
+    return dirs.indexOf(seathubNormalPath(row.location)) >= 0 && tools.indexOf(seathubNormalPath(row.uninstall)) >= 0;
+}
+
+function seathubRegFields(finalDir)
+{
     var tool = seathubJoin(finalDir, SEATHUB_MAINTENANCE_TOOL);
-    var fields = [["InstallLocation",finalDir],["UninstallString",'"' + tool + '"'],
-        ["ModifyPath",'"' + tool + '"'],["DisplayIcon",seathubJoin(finalDir, SEATHUB_CLIENT)]];
-    if (rows.length !== 1) return false;
+    return [["InstallLocation", finalDir], ["UninstallString", '"' + tool + '"'],
+        ["ModifyPath", '"' + tool + '"'], ["DisplayIcon", seathubJoin(finalDir, SEATHUB_CLIENT)]];
+}
+
+function seathubReadValues(key, fields)
+{
+    var script = "$k=Get-ItemProperty -LiteralPath " + seathubPsQuote("Registry::" + key) + ";";
+    for (var i = 0; i < fields.length; ++i) script += "'" + fields[i][0] + "='+$k." + fields[i][0] + ";";
+    var r = seathubPs(script);
+    if (!seathubIsOk(r)) return null;
+    var out = {};
+    var lines = String(r[0]).split(/[\r\n]+/);
+    for (var j = 0; j < lines.length; ++j) {
+        var at = lines[j].indexOf("=");
+        if (at > 0) out[lines[j].substring(0, at)] = lines[j].substring(at + 1);
+    }
+    return out;
+}
+
+// Write every field, then read every field back. A partial patch is left addressable by its key (the
+// ProductUUID), so the next run finds it without relying on the half-patched InstallLocation.
+function seathubPatchRow(key, finalDir)
+{
+    var fields = seathubRegFields(finalDir);
     for (var j = 0; j < fields.length; ++j) {
-        var r = installer.execute(seathubSystemTool("reg.exe"), ["add",rows[0],"/v",fields[j][0],"/t","REG_SZ","/d",fields[j][1],"/f"], "");
-        if (r.length < 2 || Number(r[1]) !== 0) return false;
+        var r = installer.execute(seathubSystemTool("reg.exe"), ["add", key, "/v", fields[j][0], "/t", "REG_SZ", "/d", fields[j][1], "/f"], "");
+        if (!seathubIsOk(r)) { seathubNoteCode(seathubExitCode(r)); seathubLog("registry write failed " + fields[j][0]); return false; }
         seathubLog("registry write ok " + fields[j][0]);
     }
+    var back = seathubReadValues(key, fields);
+    if (!back) { seathubLog("registry readback unknown"); return false; }
+    for (var k = 0; k < fields.length; ++k)
+        if (back[fields[k][0]] !== fields[k][1]) { seathubLog("registry readback differs " + fields[k][0]); return false; }
     return true;
 }
 
-function seathubDeleteRows(location, exclude)
+// Delete exactly these keys, then query again: a delete that was reported but did not stick is a failure.
+function seathubDeleteKeys(keys)
 {
-    var rows = seathubRows(location);
-    exclude = exclude || [];
-    for (var i = 0; i < rows.length; ++i)
-        if (exclude.indexOf(rows[i]) < 0) installer.execute(seathubSystemTool("reg.exe"), ["delete",rows[i],"/f"], "");
+    var ok = true;
+    for (var i = 0; i < keys.length; ++i) {
+        var r = installer.execute(seathubSystemTool("reg.exe"), ["delete", keys[i], "/f"], "");
+        if (!seathubIsOk(r)) { seathubNoteCode(seathubExitCode(r)); seathubLog("registry delete failed"); ok = false; }
+    }
+    if (!keys.length) return true;
+    var after = seathubQueryRows();
+    if (!after.ok) return false;
+    for (var j = 0; j < after.rows.length; ++j)
+        if (keys.indexOf(after.rows[j].key) >= 0) { seathubLog("registry delete read back as still present"); ok = false; }
+    return ok;
+}
+
+// Patch the new row, prove it is usable, and only then remove the rows that are provably dead: owned by
+// us, and not the live maintenance tool's ProductUUID. Returns true only when no owned duplicate remains.
+function seathubRepairRegistration(ctx)
+{
+    var q = seathubQueryRows();
+    if (!q.ok) { seathubLog("registry query unknown; changing nothing"); return false; }
+    var live = [];
+    for (var i = 0; i < q.rows.length; ++i)
+        if (ctx.newId && q.rows[i].id === ctx.newId && seathubOwnedRow(q.rows[i], ctx)) live.push(q.rows[i]);
+    if (live.length !== 1) { seathubLog("registry: expected one row for the live ProductUUID, found " + live.length); return false; }
+    var keep = live[0].key;
+    if (!seathubPatchRow(keep, ctx.final)) return false;
+    if (!installer.fileExists(seathubJoin(ctx.final, SEATHUB_MAINTENANCE_TOOL))) return false;
+    var again = seathubQueryRows();
+    if (!again.ok) return false;
+    var dead = [];
+    for (var j = 0; j < again.rows.length; ++j)
+        if (again.rows[j].key !== keep && seathubOwnedRow(again.rows[j], ctx)) dead.push(again.rows[j].key);
+    return seathubDeleteKeys(dead);
+}
+
+// An abandoned stage left its own row behind: owned, and registered at the stage folder.
+function seathubDeleteRowsAt(location, ctx)
+{
+    var q = seathubQueryRows();
+    if (!q.ok) { seathubLog("registry query unknown; leaving stage rows"); return false; }
+    var dead = [];
+    for (var i = 0; i < q.rows.length; ++i)
+        if (seathubNormalPath(q.rows[i].location) === seathubNormalPath(location) && seathubOwnedRow(q.rows[i], ctx))
+            dead.push(q.rows[i].key);
+    return seathubDeleteKeys(dead);
 }
 
 function seathubAbandon()
 {
     if (!seathubAttempt) return;
     var a = seathubAttempt;
-    seathubDeleteRows(a.stage);
+    seathubDeleteRowsAt(a.stage, {final:a.final, stage:a.stage, old:a.old});
     if (!seathubRemoveTree(a.stage)) {
         // An extraction ACL denial can survive IFW's rollback. Repair only this attempt's
         // newly-created stage, never the live tree or arbitrary stale/locked siblings.
         installer.execute(seathubSystemTool("icacls.exe"), [a.stage,"/reset","/T","/C","/L"], "");
         seathubRemoveTree(a.stage);
     }
-    if (installer.fileExists(seathubJoin(a.final, SEATHUB_CLIENT)))
-        installer.performOperation("CreateShortcut", [seathubJoin(a.final, SEATHUB_CLIENT),
-            installer.value("AllUsersStartMenuProgramsPath") + "/SeatHub.lnk", "workingDirectory=" + a.final,
-            "iconPath=" + seathubJoin(a.final, SEATHUB_CLIENT), "description=SeatHub"]);
+    // IFW's rollback undoes the stage's shortcut, which replaced the live one.
+    seathubEnsureShortcut(a.final);
 }
 
-function seathubRecoverInterruptedSwap(x)
+function seathubSiblingDirs(x)
 {
-    // ADR-0070 recovery table: newest old first; cleanup must never require an uninstaller.
     var r = seathubPs("$x=" + seathubPsQuote(x) + ";$parent=Split-Path $x;$leaf=Split-Path $x -Leaf;"
         + "$dirs=@(Get-ChildItem -LiteralPath $parent -Directory -ErrorAction SilentlyContinue | Where-Object {$_.Name -match ('^'+[regex]::Escape($leaf)+'\\.(stage|old)-.+$')} | Sort-Object LastWriteTimeUtc -Descending);"
         + "$dirs.FullName -join [Environment]::NewLine");
-    if (r.length < 2 || Number(r[1]) !== 0) return;
-    var dirs = String(r[0]).split(/[\r\n]+/).filter(function(p){return p !== "";});
+    if (!seathubIsOk(r)) return null;
+    return String(r[0]).split(/[\r\n]+/).filter(function(p){return p !== "";});
+}
+
+function seathubRecoverInterruptedSwap(x, dirs)
+{
+    // ADR-0070 recovery table: newest old first; cleanup must never require an uninstaller.
+    if (!dirs) dirs = seathubSiblingDirs(x);
+    if (!dirs) return;
     if (!installer.fileExists(x)) {
         for (var i = 0; i < dirs.length; ++i)
             if (dirs[i].indexOf(x + ".old-") === 0 && seathubRename(dirs[i], x)) {
@@ -412,15 +788,16 @@ function seathubRecoverInterruptedSwap(x)
     }
     for (var j = 0; j < dirs.length; ++j) {
         if (dirs[j].indexOf(x + ".old-") === 0 && installer.fileExists(x)) {
-            // A kill after swap leaves the new GUID registered under its now-missing stage path.
+            // A kill after swap leaves the new GUID registered under its now-missing stage path, possibly
+            // half patched. The row is found by the live tool's ProductUUID, not by InstallLocation.
             var stage = x + ".stage-" + dirs[j].substring((x + ".old-").length);
-            var rows = seathubRows(stage);
-            if (!installer.fileExists(stage) && rows.length === 1 && seathubPatchRows(stage, x)) {
-                seathubDeleteRows(x, rows);
+            var liveId = seathubToolId(x);
+            if (!installer.fileExists(stage) && liveId
+                    && seathubRepairRegistration({final:x, stage:stage, old:dirs[j], newId:liveId, oldId:seathubToolId(dirs[j])}))
                 seathubJournalRecovered("new_live");
-            }
         }
-        if (dirs[j].indexOf(x + ".stage-") === 0) seathubDeleteRows(dirs[j]);
+        if (dirs[j].indexOf(x + ".stage-") === 0)
+            seathubDeleteRowsAt(dirs[j], {final:x, stage:dirs[j], old:x + ".old-" + dirs[j].substring((x + ".stage-").length)});
         // Only-stage, missing-X is a fresh install. Locked stale folders are best-effort cleanup.
         seathubRemoveTree(dirs[j]);
     }
@@ -556,8 +933,15 @@ function seathubJoin(dir, name)
 
 function seathubLeaf(path)
 {
-    var parts = path.split(/[\\\/]/);
+    var parts = String(path).split(/[\\\/]/);
     return parts[parts.length - 1];
+}
+
+function seathubParent(path)
+{
+    var parts = String(path).split(/[\\\/]/);
+    parts.pop();
+    return parts.join("\\");
 }
 
 // IFW AppendFile makes a backup when its destination already exists. Buffer, then write once

@@ -1307,10 +1307,11 @@ private slots:
                 QVERIFY2(shipped.contains("play.summary"), "actual diagnostic hand-off must not wait for OK");
             }
             QVERIFY(!QSettings().contains(key));
-            // Drive actual feed replies, including optional/required precedence and clearing.
-            for (const bool required : {true, false}) {
+            // Drive actual feed replies. ADR-0077: every offer is mandatory, so a feed row that
+            // still carries an old min_version is mandatory too (the floor is the newest release).
+            for (const bool withMinVersion : {false, true}) {
                 QFile feed(feedPath + "/client"); QVERIFY(feed.open(QIODevice::WriteOnly));
-                feed.write(required
+                feed.write(!withMinVersion
                     ? QByteArrayLiteral("{\"version\":\"3.0.0\",\"url\":\"https://example.invalid/setup.exe\"}")
                     : QByteArrayLiteral("{\"version\":\"3.0.0\",\"min_version\":\"1.0.0\",\"url\":\"https://example.invalid/setup.exe\"}"));
                 feed.close();
@@ -1319,7 +1320,7 @@ private slots:
                 checked.clear(); // exclude the stream-end check that was already in flight
                 QVERIFY(client.updates()->checkForUpdates());
                 QTRY_VERIFY(!checked.isEmpty());
-                QCOMPARE(client.updates()->mandatory(), required);
+                QVERIFY(client.updates()->mandatory());
                 QVERIFY(!client.property("diagnosticsNoticePending").toBool());
                 QVERIFY(feed.open(QIODevice::WriteOnly)); feed.write("{\"version\":\"2.0.0\"}"); feed.close();
                 checked.clear(); QVERIFY(client.updates()->checkForUpdates());

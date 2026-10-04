@@ -50,8 +50,9 @@ class UpdateFeedClient : public QObject
     Q_PROPERTY(bool blockedBySession READ blockedBySession NOTIFY blockedBySessionChanged)
     /// True once a verified package is on disk and waiting to be run.
     Q_PROPERTY(bool readyToInstall READ readyToInstall NOTIFY readyToInstallChanged)
+    /// ADR-0077: the newest published release is the floor. Every offer is mandatory: an installed
+    /// version that differs from the current release, newer or older, is blocked by the update window.
     Q_PROPERTY(bool mandatory READ mandatory NOTIFY availableUpdateChanged)
-    Q_PROPERTY(bool optionalOffer READ optionalOffer NOTIFY availableUpdateChanged)
     Q_PROPERTY(bool exhausted READ exhausted NOTIFY retryChanged)
     Q_PROPERTY(QString nextAttemptText READ nextAttemptText NOTIFY retryChanged)
     Q_PROPERTY(QString manualDownloadUrl READ manualDownloadUrl NOTIFY availableUpdateChanged)
@@ -72,6 +73,8 @@ public:
     static bool isNewerVersion(const QString& candidate, const QString& current);
     /// True when the feed's row is an earlier version than the one installed (a rollback).
     static bool isRollback(const QString& candidate, const QString& current);
+    /// ADR-0077 item 2: a client is current only when its version equals the release's.
+    static bool isSameVersion(const QString& left, const QString& right);
 
     /// Parses a feed response into an offer, or an empty map when there is nothing to do.
     /// A 404 body ("nothing published yet") and a same-version row both land here as empty.
@@ -93,15 +96,24 @@ public:
     /// Runs by itself once a download verifies (one press, D-41). Callers only need it to retry
     /// a launch that failed - a declined UAC prompt - while the verified package is still on disk.
     Q_INVOKABLE bool installDownloaded();
-    Q_INVOKABLE void dismissOptional();
-    Q_INVOKABLE bool openManualDownload();
+    /// ADR-0077 item 5: re-reads the current release from the feed, then downloads and verifies THAT
+    /// row's installer and runs it. No cached address and no cached setup is used. True when the
+    /// attempt started; an unreachable feed starts nothing, shows why and consumes no attempt.
     Q_INVOKABLE bool tryAgain();
+    /// Re-reads the current release from the feed, then opens only that row's installer address after
+    /// the https and control-plane host check (client.md § Website links). Never opens a cached address.
+    Q_INVOKABLE bool openManualDownload();
     bool mandatory() const;
-    bool optionalOffer() const;
     bool exhausted() const { return m_retry.exhausted(); }
     QString nextAttemptText() const;
     QString manualDownloadUrl() const;
     static QString installerArguments(const QString& installed, int attempt);
+    /// ADR-0077 item 7: the facts the pre-journal quiescence rule reads. The default reads the machine;
+    /// tests replace it. It carries no clock and no duration.
+    using ObservationProbe = std::function<InstallerObservation(const UpdateRetryState&)>;
+    void setObservationProbe(ObservationProbe probe) { m_probe = std::move(probe); }
+    static InstallerObservation observeMachine(const UpdateRetryState& retry, const QString& journalFolder,
+                                              InstallerTrace* trace = nullptr);
     using UrlOpener = std::function<bool(const QUrl&)>;
     void setUrlOpener(UrlOpener opener) { m_urlOpener = std::move(opener); }
     using InstallerReporter = std::function<bool(const InstallJournalRecord&)>;
@@ -156,7 +168,11 @@ signals:
 
 private:
     /// The production launcher: an elevated start of the per-machine installer (D-42).
-    static bool launchInstaller(const QString& path, const QString& arguments);
+    static bool launchInstaller(const QString& path, const QString& arguments, InstallerTrace* trace);
+    bool installerQuiescent();
+    void recordObservation(const InstallerObservation& observation);
+    void startFreshDownload();
+    void finishPendingActions(bool feedRead);
     void adoptOffer(const QVariantMap& offer);
     void persistRetry();
     void inspectPendingLaunch();
@@ -192,8 +208,13 @@ private:
     QVariantMap m_failure;
     UpdateRetryState m_retry;
     QString m_retryStatePath = UpdateRetryState::defaultPath(), m_journalFolder;
-    bool m_optionalDismissed = false, m_manualAttempt = false;
-    bool m_outcomeChecked = false, m_silentRetry = false;
+    bool m_manualAttempt = false, m_outcomeChecked = false;
+    // True only while the offer in `m_available` came from a feed read made by THIS process. An offer
+    // restored from the retry state keeps the window up but never launches an installer (ADR-0077 item 3).
+    bool m_offerFresh = false;
+    // Try again and Download first re-read the feed; these carry the press across that read.
+    bool m_pendingTryAgain = false, m_pendingDownload = false;
+    ObservationProbe m_probe;
     UrlOpener m_urlOpener;
     InstallerReporter m_reporter;
 };

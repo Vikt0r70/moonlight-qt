@@ -4,8 +4,8 @@ import SeatHub.Tokens 1.0
 
 // The forced-update modal (D-38, D-41, D-42, D-43).
 //
-// ADR-0070 / screens.md §49: required updates remain blocking. A newer release above its floor
-// is optional and can be dismissed for this launch; a failed optional update renders nothing.
+// ADR-0077 / screens.md §49: the newest published release is the floor, so every offer is required.
+// There is no optional offer and no way to dismiss the window, and a failed update never hides it.
 //
 // It is never shown while a stream is running (Pitfall 8): `SeatHubClient` refuses to check,
 // refuse to download, and refuse to install during a session, and this file renders nothing
@@ -29,10 +29,9 @@ Item {
     }
     readonly property bool hasOffer: offeredVersion.length > 0
     // D-41 + Pitfall 8: nothing while a stream is running.
-    readonly property bool requiredUpdate: hasOffer && updates.mandatory === true
+    readonly property bool requiredUpdate: hasOffer
     readonly property bool exhausted: requiredUpdate && updates.exhausted === true
-    readonly property bool shown: hasOffer && (requiredUpdate || updates.optionalOffer === true)
-                                 && updates.blockedBySession !== true
+    readonly property bool shown: hasOffer && updates.blockedBySession !== true
     // `ready` is a verified download on its way to `installing`: the client starts the installer
     // by itself, because the one press that began the download is the only one there is (D-41).
     readonly property bool busy: updates !== null && updates !== undefined
@@ -108,7 +107,7 @@ Item {
 
             Text {
                 width: parent.width
-                text: modal.requiredUpdate ? qsTr("Update SeatHub") : qsTr("SeatHub update")
+                text: qsTr("Update SeatHub")
                 wrapMode: Text.Wrap
                 color: Tokens.foregroundDefault
                 font.family: Tokens.fontDisplayDefault
@@ -122,9 +121,7 @@ Item {
                 width: parent.width
                 wrapMode: Text.Wrap
                 text: {
-                    // Exact frozen copy: copy.md §Update window, ADR-0070 items 8/9.
-                    if (!modal.requiredUpdate)
-                        return qsTr("Version %1 is ready. Update now, or later.").arg(modal.offeredVersion)
+                    // Exact frozen copy: copy.md §Update window, ADR-0070 item 9, ADR-0077.
                     if (modal.exhausted)
                         return qsTr("SeatHub could not update itself. Download the new version and install it to keep playing.")
                     if (updates && updates.state === "failed")
@@ -260,14 +257,15 @@ Item {
                 Loader {
                     id: secondaryAction
                     width: (parent.width - parent.spacing) / 2
-                    active: modal.hasOffer && (modal.exhausted || updates.optionalOffer === true)
+                    // The second action exists only once retries are used up: there is no `Not now`.
+                    active: modal.hasOffer && modal.exhausted
                     sourceComponent: Component {
                         SeatHubButton {
                             width: secondaryAction.width
                             variant: "ghost"
-                            objectName: modal.exhausted ? "downloadAction" : "notNowAction"
+                            objectName: "downloadAction"
                             enabled: !modal.busy
-                            text: modal.exhausted ? qsTr("Download") : qsTr("Not now")
+                            text: qsTr("Download")
                             Keys.onPressed: function(event) {
                                 if (event.key === Qt.Key_Tab || event.key === Qt.Key_Backtab) {
                                     updateAction.forceActiveFocus()
@@ -276,12 +274,8 @@ Item {
                                 if (event.key === Qt.Key_Escape)
                                     event.accepted = true
                             }
-                            onClicked: {
-                                if (modal.exhausted)
-                                    updates.openManualDownload()
-                                else
-                                    updates.dismissOptional()
-                            }
+                            // Re-reads the current release first; opens only that row's address.
+                            onClicked: updates.openManualDownload()
                         }
                     }
                 }
