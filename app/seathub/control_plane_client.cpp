@@ -111,6 +111,12 @@ bool SessionAuthorization::parse(const QJsonObject& body, SessionAuthorization* 
     auth.leaseSeq = lease.value(QStringLiteral("lease_seq")).toInt();
     auth.connectDeadlineAt = lease.value(QStringLiteral("connect_deadline_at")).toString();
 
+    // ADR-0074 W03: `warm_return` is an optional boolean, default false. Only the JSON literal
+    // `true` turns it on - a string, a number, null or an absent key leave it false, so a server
+    // that does not know the field, or sends something else, never makes this client skip a PIN.
+    const QJsonValue warmReturn = body.value(QStringLiteral("warm_return"));
+    auth.warmReturn = warmReturn.isBool() && warmReturn.toBool();
+
     *out = auth;
     return true;
 }
@@ -634,6 +640,38 @@ QByteArray ControlPlaneClient::buildSessionCreate()
     return QByteArrayLiteral("{}");
 }
 
+bool ControlPlaneClient::isClientCertSha256(const QString& value)
+{
+    // ADR-0074 X02: `^[0-9a-f]{64}$` - lowercase only. `QRegularExpression`'s `$` also matches
+    // before a final newline, so the length is checked first and the match is anchored whole.
+    static const QRegularExpression pattern(QStringLiteral("\\A[0-9a-f]{64}\\z"));
+    return value.size() == 64 && pattern.match(value).hasMatch();
+}
+
+QByteArray ControlPlaneClient::buildSessionCreate(const QString& clientCertSha256)
+{
+    if (!isClientCertSha256(clientCertSha256)) {
+        return buildSessionCreate();
+    }
+    QJsonObject object;
+    object.insert(QStringLiteral("client_cert_sha256"), clientCertSha256);
+    return QJsonDocument(object).toJson(QJsonDocument::Compact);
+}
+
+QByteArray ControlPlaneClient::buildStreamTimeReport(int segmentNo, qint64 deliveredMs, bool closed)
+{
+    // `StreamTimeReport` (openapi.yaml, ADR-0074 W04): segment_no >= 1, delivered_ms >= 0, and the
+    // schema's `integer` is the column's 32-bit one, so a larger value is held at the largest the
+    // server can store rather than sent as a 422.
+    constexpr qint64 kMaxDeliveredMs = 2147483647;
+    QJsonObject object;
+    object.insert(QStringLiteral("segment_no"), qMax(1, segmentNo));
+    object.insert(QStringLiteral("delivered_ms"),
+                  QJsonValue(qBound<qint64>(0, deliveredMs, kMaxDeliveredMs)));
+    object.insert(QStringLiteral("closed"), closed);
+    return QJsonDocument(object).toJson(QJsonDocument::Compact);
+}
+
 QByteArray ControlPlaneClient::buildEndRequest(bool failed)
 {
     return buildEndRequest(failed, EndReport());
@@ -1033,11 +1071,19 @@ void ControlPlaneClient::fetchUsage(Callback callback)
 
 void ControlPlaneClient::requestSession(Callback callback)
 {
+    requestSession(QString(), callback);
+}
+
+void ControlPlaneClient::requestSession(const QString& clientCertSha256, Callback callback)
+{
     // ADR-0062 decision 11: every Play posts a fresh Idempotency-Key - a new uuid per press,
     // never reused. A retry of the same press is the caller's to make with the same key; this
     // client makes none of its own.
+    //
+    // ADR-0074 X02: the body names the fingerprint of the client certificate this app pairs with
+    // (empty -> `{}`, the pre-3.11.0 body), which is how the rig finds this customer's pairing.
     send(QStringLiteral("POST"), QStringLiteral("/api/sessions"),
-         buildSessionCreate(), true, callback,
+         buildSessionCreate(clientCertSha256), true, callback,
          { { "Idempotency-Key", QUuid::createUuid().toString(QUuid::WithoutBraces).toUtf8() } });
 }
 
@@ -1100,9 +1146,27 @@ void ControlPlaneClient::postLiveness(const QString& sessionId, const QString& s
          buildLiveness(state, errorCode), true, callback);
 }
 
+void ControlPlaneClient::setLivenessBeatObserver(std::function<void()> observer)
+{
+    QMutexLocker locker(&m_beatObserverMutex);
+    m_beatObserver = std::move(observer);
+}
+
 void ControlPlaneClient::postLiveness(const QString& sessionId, const QJsonObject& payload,
                                      Callback callback)
 {
+    // ADR-0074 HI06: the existing beat is the stream-time checkpoint cadence. The function is
+    // copied out and called with the lock released, so an observer that itself posts (the
+    // checkpoint does) cannot deadlock against `setLivenessBeatObserver()`.
+    std::function<void()> observer;
+    {
+        QMutexLocker locker(&m_beatObserverMutex);
+        observer = m_beatObserver;
+    }
+    if (observer) {
+        observer();
+    }
+
     const QByteArray body =
         payload.isEmpty() ? QByteArray() : QJsonDocument(payload).toJson(QJsonDocument::Compact);
     send(QStringLiteral("POST"), QStringLiteral("/api/sessions/") + encodedPathSegment(sessionId)
@@ -1130,4 +1194,15 @@ void ControlPlaneClient::postSessionQuality(const QString& sessionId, const QJso
     send(QStringLiteral("POST"), QStringLiteral("/api/sessions/") + encodedPathSegment(sessionId)
              + QStringLiteral("/quality"),
          body, true, callback);
+}
+
+void ControlPlaneClient::postStreamTime(const QString& sessionId, int segmentNo, qint64 deliveredMs,
+                                        bool closed, Callback callback)
+{
+    // Always authenticated: the customer token is what binds the report to its own session (the
+    // server answers 404 for another customer's), and `encodedPathSegment()` keeps the id one
+    // path segment, so it cannot retarget the route.
+    send(QStringLiteral("POST"), QStringLiteral("/api/sessions/") + encodedPathSegment(sessionId)
+             + QStringLiteral("/stream-time"),
+         buildStreamTimeReport(segmentNo, deliveredMs, closed), true, callback);
 }

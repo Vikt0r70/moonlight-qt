@@ -308,6 +308,9 @@ void PairingController::handleAuthorization(quint64 attempt, const ControlPlaneR
     target.hostAddress = authorization.hostAddress;
     target.httpsPort = authorization.httpsPort;
     target.pairingPin = authorization.pairingPin;
+    // W03: carried as the control plane sent it. Only the seam acts on it, and only with trust this
+    // app run itself pinned (`HeldRigTrust`); absent or false means the normal handshake.
+    target.warmReturn = authorization.warmReturn;
     LogShipper::setRedactions({target.hostAddress});
 
     // The engine seam gets the address and the PIN. Nothing else in this process does.

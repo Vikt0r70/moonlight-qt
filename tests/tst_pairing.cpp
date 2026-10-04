@@ -1795,6 +1795,235 @@ private slots:
                     .isEmpty());
     }
 
+    // -----------------------------------------------------------------------------------------
+    // ADR-0074 W03, the warm return: a NEW session whose authorization says `warm_return: true`
+    // may skip the PIN handshake - and only then, only with host trust this app run pinned itself,
+    // and only when the rig's answer confirms it. Every other case runs the normal pairing.
+    // -----------------------------------------------------------------------------------------
+
+    void theAuthorizationsWarmReturnReachesTheSeamExactlyAsTheControlPlaneSentIt()
+    {
+        struct Case { const char* name; QJsonValue value; bool present; bool expected; };
+        const QVector<Case> cases = {
+            { "true", QJsonValue(true), true, true },
+            { "false", QJsonValue(false), true, false },
+            { "absent", QJsonValue(), false, false },
+            { "null", QJsonValue(QJsonValue::Null), true, false },
+            { "the string true", QJsonValue(QStringLiteral("true")), true, false },
+        };
+        for (const Case& c : cases) {
+            PairingController controller;
+            auto* fake = new FakeNetworkAccessManager;
+            auto* seam = new RecordingSeam;
+            wire(controller, fake);
+            controller.setSeam(seam);
+
+            QJsonObject body = QJsonDocument::fromJson(authorizationBody(QString::fromLatin1(kPin))).object();
+            if (c.present) {
+                body.insert(QStringLiteral("warm_return"), c.value);
+            }
+            fake->statuses = { 200 };
+            fake->bodies = { QJsonDocument(body).toJson(QJsonDocument::Compact) };
+
+            QSignalSpy completed(&controller, &PairingController::pairingCompleted);
+            controller.start(QString::fromLatin1(kSessionId));
+            QTRY_COMPARE_WITH_TIMEOUT(completed.count(), 1, 5000);
+
+            QCOMPARE(seam->calls, 1);
+            QVERIFY2(seam->lastTarget.warmReturn == c.expected, c.name);
+            // A PIN is still issued and still reaches the seam: a normal pairing is always possible.
+            QCOMPARE(seam->lastTarget.pairingPin, QString::fromLatin1(kPin));
+        }
+    }
+
+    void warmReturnWithNoPinIsNotAPairing()
+    {
+        // `warm_return` is advisory. An authorization that carries it but no PIN yet is still "not
+        // ready": the controller keeps polling and the seam is never asked.
+        PairingController controller;
+        auto* fake = new FakeNetworkAccessManager;
+        auto* seam = new RecordingSeam;
+        wire(controller, fake);
+        controller.setSeam(seam);
+        controller.setPollIntervalMs(20);
+
+        QJsonObject body = QJsonDocument::fromJson(authorizationBody(QString())).object();
+        body.insert(QStringLiteral("warm_return"), true);
+        fake->statuses = { 200 };
+        fake->bodies = { QJsonDocument(body).toJson(QJsonDocument::Compact) };
+
+        controller.start(QString::fromLatin1(kSessionId));
+        QTest::qWait(150);
+        QCOMPARE(seam->calls, 0);
+        controller.cancel();
+    }
+
+    void warmReturnSkipsHandshakeOnlyWhenAuthorized()
+    {
+        const QByteArray pinnedEarlierThisRun = QByteArrayLiteral("-----BEGIN CERTIFICATE-----\nHELD\n-----END CERTIFICATE-----\n");
+
+        std::atomic<int> handshakes{0};
+        std::atomic<int> warmChecks{0};
+        QByteArray heldSeenByTheCheck;
+        bool warmCheckOk = true;
+        bool warmCheckHasHost = true;
+
+        const auto makeSeam = [&](ProductionPairingSeam* seam, bool installCheck) {
+            seam->setHandshake([&](const PairingTarget&) {
+                ++handshakes;
+                PairingHandshakeResult result = handshakeResult(true, QStringLiteral("normal-identity"));
+                result.host = std::make_shared<PairedHost>();
+                return result;
+            });
+            if (installCheck) {
+                seam->setWarmReturnCheck([&](const PairingTarget&, const QByteArray& held) {
+                    ++warmChecks;
+                    heldSeenByTheCheck = held;
+                    PairingHandshakeResult result;
+                    result.ok = warmCheckOk;
+                    result.clientIdentity = warmCheckOk ? QStringLiteral("warm-identity") : QString();
+                    if (warmCheckHasHost) {
+                        result.host = std::make_shared<PairedHost>();
+                    }
+                    return result;
+                });
+            }
+        };
+        // The identity the seam reported for one `pair()`, or an empty string on a failed one.
+        QString reported;
+        const auto run = [&](ProductionPairingSeam* seam, bool warmReturn) {
+            PairingTarget target = pairingTarget();
+            target.warmReturn = warmReturn;
+            SeamReport report;
+            seam->pair(target, recordInto(&report));
+            QTRY_COMPARE_WITH_TIMEOUT(report.count(), 1, 5000);
+            reported = report.identities.first();
+        };
+        const auto reset = [&]() {
+            handshakes = 0;
+            warmChecks = 0;
+            heldSeenByTheCheck.clear();
+            warmCheckOk = true;
+            warmCheckHasHost = true;
+        };
+        const auto cleanup = qScopeGuard([]() { HeldRigTrust::clear(); });
+
+        // 1. Authorized, trust held, rig confirms: the handshake does not run, and the check was
+        //    handed exactly the certificate this run pinned.
+        {
+            HeldRigTrust::clear();
+            HeldRigTrust::remember(pinnedEarlierThisRun);
+            reset();
+            ProductionPairingSeam seam;
+            makeSeam(&seam, true);
+            run(&seam, true);
+            QCOMPARE(reported, QStringLiteral("warm-identity"));
+            QCOMPARE(handshakes.load(), 0);
+            QCOMPARE(warmChecks.load(), 1);
+            QCOMPARE(heldSeenByTheCheck, pinnedEarlierThisRun);
+        }
+
+        // 2. Trust held and the check would say yes, but the control plane did not say warm: the
+        //    normal pairing runs and the check is never even asked.
+        {
+            HeldRigTrust::remember(pinnedEarlierThisRun);
+            reset();
+            ProductionPairingSeam seam;
+            makeSeam(&seam, true);
+            run(&seam, false);
+            QCOMPARE(reported, QStringLiteral("normal-identity"));
+            QCOMPARE(handshakes.load(), 1);
+            QCOMPARE(warmChecks.load(), 0);
+        }
+
+        // 3. Authorized but nothing held - a restart, or a sign-out cleared it: normal pairing, and
+        //    no check is asked of the rig with nothing to pin it by.
+        {
+            HeldRigTrust::clear();
+            reset();
+            ProductionPairingSeam seam;
+            makeSeam(&seam, true);
+            run(&seam, true);
+            QCOMPARE(reported, QStringLiteral("normal-identity"));
+            QCOMPARE(handshakes.load(), 1);
+            QCOMPARE(warmChecks.load(), 0);
+        }
+
+        // 4. Authorized and held, but the check fails or the rig answers not paired: the normal
+        //    pairing runs after it, once, and that is what is reported.
+        {
+            HeldRigTrust::remember(pinnedEarlierThisRun);
+            reset();
+            warmCheckOk = false;
+            ProductionPairingSeam seam;
+            makeSeam(&seam, true);
+            run(&seam, true);
+            QCOMPARE(reported, QStringLiteral("normal-identity"));
+            QCOMPARE(warmChecks.load(), 1);
+            QCOMPARE(handshakes.load(), 1);
+        }
+
+        // 5. A check that says yes without handing back a host record cannot start a stream: it
+        //    does not count, and the normal pairing runs.
+        {
+            HeldRigTrust::remember(pinnedEarlierThisRun);
+            reset();
+            warmCheckHasHost = false;
+            ProductionPairingSeam seam;
+            makeSeam(&seam, true);
+            run(&seam, true);
+            QCOMPARE(reported, QStringLiteral("normal-identity"));
+            QCOMPARE(handshakes.load(), 1);
+        }
+
+        // 6. No check installed at all: a warm indication changes nothing.
+        {
+            HeldRigTrust::remember(pinnedEarlierThisRun);
+            reset();
+            ProductionPairingSeam seam;
+            makeSeam(&seam, false);
+            run(&seam, true);
+            QCOMPARE(reported, QStringLiteral("normal-identity"));
+            QCOMPARE(handshakes.load(), 1);
+            QCOMPARE(warmChecks.load(), 0);
+        }
+
+        // 7. The next Play after a warm one is a fresh decision: authorized again it skips again,
+        //    not authorized it pairs, with the same trust still held across both.
+        {
+            HeldRigTrust::remember(pinnedEarlierThisRun);
+            reset();
+            ProductionPairingSeam seam;
+            makeSeam(&seam, true);
+            run(&seam, true);
+            QCOMPARE(reported, QStringLiteral("warm-identity"));
+            run(&seam, false);
+            QCOMPARE(reported, QStringLiteral("normal-identity"));
+            run(&seam, true);
+            QCOMPARE(reported, QStringLiteral("warm-identity"));
+            QCOMPARE(handshakes.load(), 1);
+            QCOMPARE(warmChecks.load(), 2);
+        }
+    }
+
+    void heldRigTrustIsReplacedByTheNextPairingAndClearedOnDemand()
+    {
+        const auto cleanup = qScopeGuard([]() { HeldRigTrust::clear(); });
+        HeldRigTrust::clear();
+        QVERIFY(HeldRigTrust::held().isEmpty());
+
+        HeldRigTrust::remember(QByteArrayLiteral("first"));
+        QCOMPARE(HeldRigTrust::held(), QByteArrayLiteral("first"));
+        HeldRigTrust::remember(QByteArrayLiteral("second"));
+        QCOMPARE(HeldRigTrust::held(), QByteArrayLiteral("second"));
+        HeldRigTrust::remember(QByteArray());
+        QVERIFY2(HeldRigTrust::held().isEmpty(), "an empty pin forgets what was held");
+
+        HeldRigTrust::remember(QByteArrayLiteral("third"));
+        HeldRigTrust::clear();
+        QVERIFY(HeldRigTrust::held().isEmpty());
+    }
+
     void noTelemetryEmitterAcceptsFreeText()
     {
         using StepFailureSignal =

@@ -29,6 +29,7 @@
 #include <atomic>
 #include <functional>
 #include <limits>
+#include <memory>
 
 #include "authorized_through_timer.h"
 #include "control_plane_client.h"
@@ -314,6 +315,9 @@ public:
     /// facade. Nothing in the app reads them through here.
     HudOverlay* hud() { return &m_hud; }
     LivenessTimer* liveness() const { return m_liveness; }
+    /// The delivered-stream-time clock (ADR-0074 HI02), exposed the same way so a test can read the
+    /// real object the facade binds and closes. Nothing in the app reads it through here.
+    DeliveredStreamTime* streamTime() const { return m_streamTime.get(); }
     /// The single-shot backoff timer between reconnect attempts. Exposed the same way: a test
     /// reads `interval()` to check the doubling (2s, 4s, 8s, capped at 15s) without waiting for it
     /// in real time, and restarts it at 0ms to drive the next attempt at once.
@@ -813,14 +817,32 @@ private:
     /// `Refused` one is dropped with a WARN line. WR-06: one with no signed-in account to tag it
     /// with yet is held in `m_untaggedQualityReports` rather than dropped - see that member's own
     /// comment. A no-op when nothing is pending.
-    void postOrStoreQualityReport();
+    ///
+    /// R06 fence: a non-empty `onlyForSession` (the late-teardown paths pass the id of the teardown
+    /// that finished) restricts this to the report bound to THAT session - a pending report that
+    /// belongs to a newer attempt stays held for its own teardown and is neither posted nor stored
+    /// by an older one's late step.
+    void postOrStoreQualityReport(const QString& onlyForSession = QString());
     /// CR-02: the report `handleVideoStatsParsed()` bound to `m_pendingQualitySessionId`, written
     /// straight to the outbox with no further POST attempt - used by `handleTeardownFailed()`
     /// (the teardown POST itself already failed to reach the control plane, so attempting another
     /// one immediately is not worth it) and by `signOut()` (nothing is worth trying once the
     /// customer has already asked to leave). WR-06: with no account id yet, held the same way
-    /// `postOrStoreQualityReport()` does. A no-op when nothing is pending.
-    void storeQualityReportToOutbox();
+    /// `postOrStoreQualityReport()` does. A no-op when nothing is pending. `onlyForSession` is the
+    /// same R06 fence as above.
+    void storeQualityReportToOutbox(const QString& onlyForSession = QString());
+    /// ADR-0074 HI06: one checkpoint of the delivered stream time (`checkpointStreamTime()`), sent
+    /// through the customer token to the app's own current session. Callable from any thread; the
+    /// beat, the segment-closed hook and teardown all end here.
+    void flushStreamTime();
+    /// ADR-0074 HI06: resends the stream-time records a killed or offline run left, to the same
+    /// session ids and the same account only, once both an account and a token are known. Same
+    /// epoch discipline as `drainQualityOutbox()`: the account is captured when the call starts and
+    /// checked again before every send and every reply.
+    void drainStreamTimeOutbox();
+    /// The folder the stream-time records live in: a subfolder of wherever `TokenStore` currently
+    /// is, re-derived on every call like `qualityOutboxDirectory()`.
+    QString streamTimeOutboxDirectory() const;
     /// WR-06: tags and stores every `m_untaggedQualityReports` entry whose epoch is still
     /// `m_authEpoch` - a report parsed before this sign-in's account id was known, now that it is.
     /// Called from `setAccount()` and from `adoptSignIn()`'s own `fetchMe` callback, both right
@@ -1032,6 +1054,14 @@ private:
     /// the whole session. Started at `handleConnectionStarted()`, fed by every
     /// `handleVideoStatsParsed()`, read by `postOrStoreQualityReport()`.
     VideoStatsAggregator m_statsAggregator;
+    /// ADR-0074 HI02/HI06: the clock that measures the stream time this app delivered, and the
+    /// on-disk record it is checkpointed into. Shared pointers because the beat observer and the
+    /// segment-closed hook run on the network thread and capture them by value, so neither depends
+    /// on this object's lifetime. The clock reads the engine's log lines through its own `LogTee`
+    /// sink and nothing from the stats overlay.
+    std::shared_ptr<DeliveredStreamTime> m_streamTime;
+    std::shared_ptr<StreamTimeOutbox> m_streamTimeOutbox;
+    LogTee::SinkHandle m_streamTimeSinkHandle = 0;
     /// The stats block(s) parsed before this session's teardown began (Pitfall 7), held until
     /// `handleTeardownCompleted()`/`handleTeardownFailed()`/`signOut()` disposes of it once
     /// (CR-02). Bound to the session it was parsed for (`m_pendingQualitySessionId`) rather than

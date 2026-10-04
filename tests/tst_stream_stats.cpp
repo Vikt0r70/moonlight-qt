@@ -19,11 +19,17 @@
 
 #include <QtTest>
 
+#include <QBuffer>
 #include <QDir>
 #include <QFile>
+#include <QHash>
 #include <QHostAddress>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QMap>
+#include <QNetworkAccessManager>
+#include <QNetworkReply>
+#include <QNetworkRequest>
 #include <QScopedPointer>
 #include <QSemaphore>
 #include <QString>
@@ -31,8 +37,11 @@
 #include <QTcpSocket>
 #include <QTemporaryDir>
 #include <QThread>
+#include <QTimer>
 
 #include <atomic>
+#include <functional>
+#include <memory>
 
 // This file defines `main()` via `QTEST_MAIN` below. `<SDL.h>` otherwise `#define`s `main` to
 // `SDL_main` (its own cross-platform entry-point redirection), which would rename QTest's
@@ -153,6 +162,154 @@ void previousSdlHandler(void*, int, SDL_LogPriority, const char*)
 {
     ++g_previousSdlHandlerCalls;
 }
+
+// --- ADR-0074 HI02/HI06 fixtures: delivered stream time ---------------------------------------
+
+// The monotonic clock the delivered-time clock reads, driven by the test.
+struct FakeClock
+{
+    qint64 now = 0;
+    DeliveredStreamTime::Clock fn()
+    {
+        return [this]() { return now; };
+    }
+};
+
+// One engine log line through the clock's own sink, exactly as `LogTee` hands it over.
+void engineLine(DeliveredStreamTime& clock, int priority, const QString& text)
+{
+    clock.sink()(priority == SDL_LOG_PRIORITY_ERROR ? LogLevel::Error : LogLevel::Info,
+                 SDL_LOG_CATEGORY_APPLICATION, priority, text);
+}
+
+const QString kQuitLine = QStringLiteral("Quit event received");
+const QString kLostLine = QStringLiteral("Control stream received unexpected disconnect event");
+
+void quitLine(DeliveredStreamTime& clock) { engineLine(clock, SDL_LOG_PRIORITY_INFO, kQuitLine); }
+void lostLine(DeliveredStreamTime& clock) { engineLine(clock, SDL_LOG_PRIORITY_INFO, kLostLine); }
+void terminatedLine(DeliveredStreamTime& clock, int code)
+{
+    engineLine(clock, SDL_LOG_PRIORITY_ERROR, QStringLiteral("Connection terminated: %1").arg(code));
+}
+
+// The segment `segmentNo` of a snapshot, or a default (segmentNo 0) when it is not there.
+StreamSegmentReport segmentOf(const StreamTimeSnapshot& snapshot, int segmentNo)
+{
+    for (const StreamSegmentReport& segment : snapshot.segments) {
+        if (segment.segmentNo == segmentNo) {
+            return segment;
+        }
+    }
+    return StreamSegmentReport();
+}
+
+// The control plane's rule for `POST /api/sessions/{id}/stream-time`, as the W04 text states it:
+// 409 until the session has a `stream_started_at`; otherwise the larger of the stored and the
+// reported `delivered_ms` for the (session, segment) key, never an addition. The total of a session
+// is the sum over its segments.
+struct FakeStreamTimeServer
+{
+    QHash<QString, bool> started;
+    QMap<QPair<QString, int>, qint64> stored;
+    QStringList calls;
+    // Non-zero forces that answer for every call (0 forces a lost reply AFTER the report was applied).
+    int forcedStatus = 200;
+    bool applyThenLoseReply = false;
+
+    qint64 total(const QString& sessionId) const
+    {
+        qint64 sum = 0;
+        for (auto it = stored.constBegin(); it != stored.constEnd(); ++it) {
+            if (it.key().first == sessionId) {
+                sum += it.value();
+            }
+        }
+        return sum;
+    }
+
+    StreamTimeOutbox::PostFn poster()
+    {
+        return [this](const QString& sessionId, const StreamSegmentReport& segment,
+                      ControlPlaneClient::Callback callback) {
+            calls.append(QStringLiteral("%1:%2:%3:%4")
+                             .arg(sessionId).arg(segment.segmentNo).arg(segment.deliveredMs)
+                             .arg(segment.closed ? 1 : 0));
+            ControlPlaneResult result;
+            if (applyThenLoseReply) {
+                apply(sessionId, segment);
+                result.statusCode = 0;
+                callback(result);
+                return;
+            }
+            if (forcedStatus != 200) {
+                result.statusCode = forcedStatus;
+                callback(result);
+                return;
+            }
+            if (!started.value(sessionId, false)) {
+                result.statusCode = 409;
+                callback(result);
+                return;
+            }
+            apply(sessionId, segment);
+            result.ok = true;
+            result.statusCode = 200;
+            callback(result);
+        };
+    }
+
+private:
+    void apply(const QString& sessionId, const StreamSegmentReport& segment)
+    {
+        const QPair<QString, int> key(sessionId, segment.segmentNo);
+        stored[key] = qMax(stored.value(key, 0), segment.deliveredMs);
+    }
+};
+
+// A reply that produces one canned response as soon as the event loop turns.
+class FakeReply : public QNetworkReply
+{
+    Q_OBJECT
+
+public:
+    FakeReply(int httpStatus, const QByteArray& body, QObject* parent) : QNetworkReply(parent)
+    {
+        setAttribute(QNetworkRequest::HttpStatusCodeAttribute, QVariant(httpStatus));
+        m_buffer.setData(body);
+        m_buffer.open(QIODevice::ReadOnly);
+        open(QIODevice::ReadOnly);
+        QTimer::singleShot(0, this, [this]() {
+            setFinished(true);
+            emit finished();
+        });
+    }
+
+    void abort() override {}
+    qint64 readData(char* data, qint64 maxSize) override { return m_buffer.read(data, maxSize); }
+    qint64 bytesAvailable() const override { return m_buffer.size() + QNetworkReply::bytesAvailable(); }
+
+private:
+    QBuffer m_buffer;
+};
+
+// Records every path and body the client sends and answers each with HTTP 200 `{}`.
+class RecordingNetworkAccessManager : public QNetworkAccessManager
+{
+    Q_OBJECT
+
+public:
+    QStringList paths;
+    QList<QByteArray> bodies;
+
+protected:
+    QNetworkReply* createRequest(Operation, const QNetworkRequest& request,
+                                 QIODevice* outgoingData = nullptr) override
+    {
+        paths.append(request.url().path(QUrl::FullyEncoded));
+        bodies.append(outgoingData ? outgoingData->readAll() : QByteArray());
+        return new FakeReply(200, QByteArrayLiteral("{}"), this);
+    }
+};
 
 } // namespace
 
@@ -1501,6 +1658,904 @@ private slots:
         outbox.put(QString::fromLatin1(kSessionA), QStringLiteral("acct-1"), sampleReport());
         QVERIFY(outbox.hasQueuedReports());
     }
+
+    // --- ADR-0074 HI02 / HI06: delivered stream time, reported by the app ---------------------
+    //
+    // `DeliveredStreamTime` times each stream segment on a monotonic clock from the engine's own
+    // signals, `StreamTimeOutbox` keeps the running time on disk, and `checkpointStreamTime()` sends
+    // it. The tests drive a fake clock and a fake control plane that applies the W04 rule (the larger
+    // of the stored and the reported value per session and segment, never an addition).
+
+    void deliveredTimeIgnoresStatsHotkey()
+    {
+        // The same 200 s stream, three ways: the stats overlay on throughout, hidden throughout
+        // (session 6aff8ade: the hotkey was pressed, sampling stopped, 222 s of stream produced 11
+        // samples), and toggled off and on mid-stream. The overlay is the only thing that makes the
+        // sampler's tick count differ; the delivered time reads none of it.
+        struct Variant
+        {
+            const char* name;
+            std::function<bool(qint64 seconds)> overlayShown;
+        };
+        const QVector<Variant> variants = {
+            { "overlay on throughout", [](qint64) { return true; } },
+            { "overlay hidden throughout", [](qint64) { return false; } },
+            { "hotkey toggled mid-stream", [](qint64 s) { return s < 20 || s >= 180; } },
+        };
+
+        VideoStats stats;
+        QVERIFY(parseVideoStatsBlock(productionStatsBlock(), &stats));
+
+        QVector<int> samplerTicks;
+        qint64 shownSecondsWhenHidden = -1;
+        for (int index = 0; index < variants.size(); ++index) {
+            const Variant& variant = variants.at(index);
+            FakeClock clock;
+            DeliveredStreamTime tracker(clock.fn());
+            tracker.beginSession(QString::fromLatin1(kSessionA), QStringLiteral("acct-1"));
+            QCOMPARE(tracker.connectionStarted(), 1);
+            // The ADR-0072 roll-up sampler, fed exactly when the overlay is up (it is the only
+            // thing that feeds it): what T006 found undercounting and falling silent.
+            StreamQualitySampler sampler;
+            sampler.start(QStringLiteral("hotkey"));
+
+            qint64 shownSeconds = 0;
+            for (qint64 second = 1; second <= 200; ++second) {
+                clock.now = second * 1000;
+                if (variant.overlayShown(second)) {
+                    ++shownSeconds;
+                    sampler.feed(stats);
+                    // What the engine logs while the overlay is up: not a segment line, ignored.
+                    tracker.sink()(LogLevel::Info, SDL_LOG_CATEGORY_APPLICATION, SDL_LOG_PRIORITY_INFO,
+                                   productionStatsBlock());
+                }
+                // Mid-stream the running time is the wall time since the segment started.
+                if (second == 100) {
+                    QCOMPARE(segmentOf(tracker.pending(), 1).deliveredMs, qint64(100000));
+                }
+            }
+            quitLine(tracker);
+
+            const StreamTimeSnapshot snapshot = tracker.pending();
+            QCOMPARE(snapshot.segments.size(), 1);
+            QVERIFY2(snapshot.segments.first().closed, variant.name);
+            QCOMPARE(snapshot.segments.first().deliveredMs, qint64(200000));
+            QCOMPARE(tracker.totalMs(), qint64(200000));
+            if (index == 1) {
+                shownSecondsWhenHidden = shownSeconds;
+            }
+            samplerTicks.append(sampler.takeWindow(true).value("n").toInt());
+            sampler.finish();
+            rollupLogs.clear();
+        }
+        // The sampler saw the stream only while the overlay was up: a full window, none at all, and
+        // a fraction - while every run above delivered the same 200000 ms.
+        QVERIFY(samplerTicks.at(0) > samplerTicks.at(2));
+        QVERIFY(samplerTicks.at(2) > 0);
+        QCOMPARE(samplerTicks.at(1), 0);
+        // The hidden run really did show the overlay for none of those seconds, and still delivered
+        // all 200. (Nothing in the clock's API takes a statistics value: its only inputs are the
+        // engine's connection-started signal and three log lines.)
+        QCOMPARE(shownSecondsWhenHidden, qint64(0));
+    }
+
+    void deliveredTimeExcludesGrace()
+    {
+        // One Play with a connection loss in the middle (session 45eb926e's shape, but with the
+        // reconnect that build could not do): 100 s of media, the loss noticed 10 s after it
+        // happened, a minute of detection, pairing and grace, then 30 s of media again.
+        FakeClock clock;
+        DeliveredStreamTime tracker(clock.fn());
+        tracker.beginSession(QString::fromLatin1(kSessionA), QStringLiteral("acct-1"));
+
+        clock.now = 5000;
+        QCOMPARE(tracker.connectionStarted(), 1);
+        // The wire went at 105 s; the engine's 10 s control-stream wait ends at 115 s.
+        clock.now = 115000;
+        lostLine(tracker);
+        QCOMPARE(segmentOf(tracker.pending(), 1).deliveredMs, qint64(100000));
+        QVERIFY(segmentOf(tracker.pending(), 1).closed);
+
+        // The library reports the same loss as a termination right after; nothing is open, so it
+        // changes nothing, and neither does the quit event the engine raises last.
+        clock.now = 115002;
+        terminatedLine(tracker, -1);
+        clock.now = 115010;
+        quitLine(tracker);
+        QCOMPARE(segmentOf(tracker.pending(), 1).deliveredMs, qint64(100000));
+        QVERIFY(!tracker.hasOpenSegment());
+
+        // Sixty seconds of grace, re-pairing and reconnect attempts belong to no segment, at any
+        // moment inside them.
+        clock.now = 150000;
+        QCOMPARE(tracker.totalMs(), qint64(100000));
+        QCOMPARE(tracker.pending().segments.size(), 1);
+
+        clock.now = 175000;
+        QCOMPARE(tracker.connectionStarted(), 2);
+        clock.now = 205000;
+        quitLine(tracker);
+
+        const StreamTimeSnapshot snapshot = tracker.pending();
+        QCOMPARE(snapshot.segments.size(), 2);
+        QCOMPARE(segmentOf(snapshot, 1).deliveredMs, qint64(100000));
+        QCOMPARE(segmentOf(snapshot, 2).deliveredMs, qint64(30000));
+        QVERIFY(segmentOf(snapshot, 2).closed);
+        // 130 s delivered of 200 s of wall time between the first start and the last quit.
+        QCOMPARE(tracker.totalMs(), qint64(130000));
+    }
+
+    void aSegmentEndsAtItsFirstEngineLineAndTheRestChangeNothing()
+    {
+        const QVector<QVector<int>> orders = {
+            // each entry: 0 quit, 1 lost, 2 terminated(-1), 3 terminated(0)
+            { 1, 2, 0 }, { 2, 0 }, { 2, 1, 0 }, { 0, 2 }, { 3, 0 },
+        };
+        const QVector<qint64> expected = { 40000, 40000, 40000, 50000, 50000 };
+        for (int i = 0; i < orders.size(); ++i) {
+            FakeClock clock;
+            DeliveredStreamTime tracker(clock.fn());
+            tracker.beginSession(QString::fromLatin1(kSessionA), QStringLiteral("acct-1"));
+            tracker.connectionStarted();
+            clock.now = 50000;
+            for (int line : orders.at(i)) {
+                switch (line) {
+                case 0: quitLine(tracker); break;
+                case 1: lostLine(tracker); break;
+                case 2: terminatedLine(tracker, -1); break;
+                default: terminatedLine(tracker, 0); break;
+                }
+                clock.now += 5;
+            }
+            QCOMPARE(segmentOf(tracker.pending(), 1).deliveredMs, expected.at(i));
+            QCOMPARE(tracker.pending().segments.size(), 1);
+        }
+    }
+
+    void theTenSecondLossWaitIsTakenOffOnlyWhenTheConnectionWasLost_data()
+    {
+        QTest::addColumn<int>("kind"); // 0 quit, 1 unexpected disconnect, 2 terminated(code)
+        QTest::addColumn<int>("code");
+        QTest::addColumn<qint64>("runMs");
+        QTest::addColumn<qint64>("expectedMs");
+
+        // A lost connection (disconnect line, or any non-zero termination code) loses the wait.
+        QTest::newRow("disconnect 60 s") << 1 << 0 << qint64(60000) << qint64(50000);
+        QTest::newRow("terminated -1") << 2 << -1 << qint64(60000) << qint64(50000);
+        QTest::newRow("terminated -100") << 2 << -100 << qint64(60000) << qint64(50000);
+        QTest::newRow("terminated large negative code") << 2 << -2147483647 << qint64(60000) << qint64(50000);
+        // A graceful engine end and the customer's own quit are not reduced.
+        QTest::newRow("terminated 0 (graceful)") << 2 << 0 << qint64(60000) << qint64(60000);
+        QTest::newRow("quit") << 0 << 0 << qint64(60000) << qint64(60000);
+        // Never before the segment's own start: a loss inside the first 10 s delivers nothing.
+        QTest::newRow("loss at 10000 ms exactly") << 1 << 0 << qint64(10000) << qint64(0);
+        QTest::newRow("loss at 10001 ms") << 1 << 0 << qint64(10001) << qint64(1);
+        QTest::newRow("loss at 9999 ms") << 1 << 0 << qint64(9999) << qint64(0);
+        QTest::newRow("loss at once") << 2 << -1 << qint64(0) << qint64(0);
+        QTest::newRow("graceful at 10000 ms") << 2 << 0 << qint64(10000) << qint64(10000);
+        QTest::newRow("quit at 0 ms") << 0 << 0 << qint64(0) << qint64(0);
+    }
+
+    void theTenSecondLossWaitIsTakenOffOnlyWhenTheConnectionWasLost()
+    {
+        QFETCH(int, kind);
+        QFETCH(int, code);
+        QFETCH(qint64, runMs);
+        QFETCH(qint64, expectedMs);
+
+        FakeClock clock;
+        clock.now = 123456; // a segment need not start at zero
+        DeliveredStreamTime tracker(clock.fn());
+        tracker.beginSession(QString::fromLatin1(kSessionA), QStringLiteral("acct-1"));
+        tracker.connectionStarted();
+        clock.now += runMs;
+        if (kind == 0) {
+            quitLine(tracker);
+        }
+        else if (kind == 1) {
+            lostLine(tracker);
+        }
+        else {
+            terminatedLine(tracker, code);
+        }
+        QVERIFY(!tracker.hasOpenSegment());
+        QCOMPARE(segmentOf(tracker.pending(), 1).deliveredMs, expectedMs);
+        QVERIFY(segmentOf(tracker.pending(), 1).closed);
+    }
+
+    void aSegmentIsExactToTheMillisecondAtTheThirtyMinuteBoundary()
+    {
+        // The history rule needs 30:00.000 told from 30:00.001 (T006's AS-RESOLUTION: the stats-tick
+        // count could not). Milliseconds, not seconds, and no rounding up.
+        const QVector<qint64> runs = { 1799999, 1800000, 1800001 };
+        for (qint64 run : runs) {
+            FakeClock clock;
+            DeliveredStreamTime tracker(clock.fn());
+            tracker.beginSession(QString::fromLatin1(kSessionA), QStringLiteral("acct-1"));
+            tracker.connectionStarted();
+            clock.now = run;
+            QCOMPARE(segmentOf(tracker.pending(), 1).deliveredMs, run); // open: running time
+            quitLine(tracker);
+            QCOMPARE(segmentOf(tracker.pending(), 1).deliveredMs, run); // closed: the same
+        }
+    }
+
+    void theDefaultClockIsMonotonicAndMeasuresRealTime()
+    {
+        DeliveredStreamTime tracker; // the QElapsedTimer clock
+        tracker.beginSession(QString::fromLatin1(kSessionA), QStringLiteral("acct-1"));
+        tracker.connectionStarted();
+        QTest::qWait(60);
+        const qint64 first = segmentOf(tracker.pending(), 1).deliveredMs;
+        QVERIFY2(first >= 50 && first < 5000, qPrintable(QString::number(first)));
+        QTest::qWait(30);
+        QVERIFY(segmentOf(tracker.pending(), 1).deliveredMs >= first);
+        quitLine(tracker);
+        QVERIFY(segmentOf(tracker.pending(), 1).deliveredMs >= first);
+    }
+
+    void connectionStartedWhileASegmentIsOpenClosesItUnreducedAndNumbersContinue()
+    {
+        FakeClock clock;
+        DeliveredStreamTime tracker(clock.fn());
+        tracker.beginSession(QString::fromLatin1(kSessionA), QStringLiteral("acct-1"));
+        QCOMPARE(tracker.connectionStarted(), 1);
+        clock.now = 40000;
+        // Its end line was never seen; the new connection proves it ended, and nothing says lost.
+        QCOMPARE(tracker.connectionStarted(), 2);
+        QCOMPARE(segmentOf(tracker.pending(), 1).deliveredMs, qint64(40000));
+        QVERIFY(segmentOf(tracker.pending(), 1).closed);
+        clock.now = 45000;
+        QCOMPARE(segmentOf(tracker.pending(), 2).deliveredMs, qint64(5000));
+        QVERIFY(!segmentOf(tracker.pending(), 2).closed);
+    }
+
+    void noSessionBoundMeansNothingIsRecorded()
+    {
+        FakeClock clock;
+        DeliveredStreamTime tracker(clock.fn());
+        QCOMPARE(tracker.connectionStarted(), 0);
+        QVERIFY(!tracker.hasOpenSegment());
+        QVERIFY(tracker.pending().segments.isEmpty());
+
+        // A different session starts a fresh count; the same session again keeps counting.
+        tracker.beginSession(QString::fromLatin1(kSessionA), QString());
+        QCOMPARE(tracker.connectionStarted(), 1);
+        tracker.closeOpenSegment();
+        tracker.beginSession(QString::fromLatin1(kSessionA), QStringLiteral("acct-1"));
+        QCOMPARE(tracker.accountId(), QStringLiteral("acct-1")); // filled in later
+        QCOMPARE(tracker.connectionStarted(), 2);
+        tracker.setAccountId(QStringLiteral("acct-2"));
+        QCOMPARE(tracker.accountId(), QStringLiteral("acct-1")); // never replaced
+        tracker.beginSession(QString::fromLatin1(kSessionB), QStringLiteral("acct-1"));
+        QVERIFY(tracker.pending().segments.isEmpty());
+        QCOMPARE(tracker.connectionStarted(), 1);
+
+        tracker.endSession();
+        QCOMPARE(tracker.connectionStarted(), 0);
+        QVERIFY(tracker.sessionId().isEmpty());
+    }
+
+    void onlyTheThreeEngineLinesAtTheRightCategoryAndPriorityEndASegment_data()
+    {
+        QTest::addColumn<int>("category");
+        QTest::addColumn<int>("priority");
+        QTest::addColumn<QString>("text");
+        QTest::addColumn<int>("kind"); // DeliveredStreamTime::EngineLine
+        QTest::addColumn<int>("code");
+
+        const int none = static_cast<int>(DeliveredStreamTime::EngineLine::None);
+        const int quit = static_cast<int>(DeliveredStreamTime::EngineLine::QuitEvent);
+        const int lost = static_cast<int>(DeliveredStreamTime::EngineLine::UnexpectedDisconnect);
+        const int term = static_cast<int>(DeliveredStreamTime::EngineLine::ConnectionTerminated);
+        const int app = SDL_LOG_CATEGORY_APPLICATION;
+        const int info = SDL_LOG_PRIORITY_INFO;
+        const int error = SDL_LOG_PRIORITY_ERROR;
+
+        QTest::newRow("quit") << app << info << QStringLiteral("Quit event received") << quit << 0;
+        QTest::newRow("quit with a line break") << app << info << QStringLiteral("Quit event received\n") << quit << 0;
+        QTest::newRow("lost") << app << info << kLostLine << lost << 0;
+        QTest::newRow("lost with CRLF") << app << info << (kLostLine + QStringLiteral("\r\n")) << lost << 0;
+        QTest::newRow("terminated 0") << app << error << QStringLiteral("Connection terminated: 0") << term << 0;
+        QTest::newRow("terminated -1") << app << error << QStringLiteral("Connection terminated: -1") << term << -1;
+        QTest::newRow("terminated -2147483648") << app << error << QStringLiteral("Connection terminated: -2147483648") << term << int(-2147483647 - 1);
+        QTest::newRow("quit at error priority") << app << error << QStringLiteral("Quit event received") << none << 0;
+        QTest::newRow("lost at error priority") << app << error << kLostLine << none << 0;
+        QTest::newRow("terminated at info priority") << app << info << QStringLiteral("Connection terminated: -1") << none << 0;
+        QTest::newRow("quit in another category") << int(SDL_LOG_CATEGORY_VIDEO) << info << QStringLiteral("Quit event received") << none << 0;
+        QTest::newRow("quit, wrong case") << app << info << QStringLiteral("quit event received") << none << 0;
+        QTest::newRow("quit with a suffix") << app << info << QStringLiteral("Quit event received twice") << none << 0;
+        QTest::newRow("terminated, no digits") << app << error << QStringLiteral("Connection terminated: ") << none << 0;
+        QTest::newRow("terminated, trailing text") << app << error << QStringLiteral("Connection terminated: 12x") << none << 0;
+        QTest::newRow("terminated, overflow") << app << error << QStringLiteral("Connection terminated: 2147483648") << none << 0;
+        QTest::newRow("terminated, a bare minus") << app << error << QStringLiteral("Connection terminated: -") << none << 0;
+        QTest::newRow("terminated, a leading plus") << app << error << QStringLiteral("Connection terminated: +5") << none << 0;
+        QTest::newRow("an unrelated line") << app << info << QStringLiteral("Connection status update: 1") << none << 0;
+        QTest::newRow("the stats block") << app << info << productionStatsBlock() << none << 0;
+        QTest::newRow("empty") << app << info << QString() << none << 0;
+    }
+
+    void onlyTheThreeEngineLinesAtTheRightCategoryAndPriorityEndASegment()
+    {
+        QFETCH(int, category);
+        QFETCH(int, priority);
+        QFETCH(QString, text);
+        QFETCH(int, kind);
+        QFETCH(int, code);
+
+        int parsed = 12345;
+        const DeliveredStreamTime::EngineLine line =
+            DeliveredStreamTime::classifyEngineLine(category, priority, text, &parsed);
+        QCOMPARE(static_cast<int>(line), kind);
+        if (line == DeliveredStreamTime::EngineLine::ConnectionTerminated) {
+            QCOMPARE(parsed, code);
+        }
+        else {
+            QCOMPARE(parsed, 12345); // left untouched on a non-match
+        }
+    }
+
+    void theSinkReadsOnlyEngineLinesAndNeverTheStatsOverlay()
+    {
+        FakeClock clock;
+        DeliveredStreamTime tracker(clock.fn());
+        tracker.beginSession(QString::fromLatin1(kSessionA), QStringLiteral("acct-1"));
+        tracker.connectionStarted();
+        clock.now = 30000;
+        // Lines that are not segment ends - including every kind of statistics line - change nothing.
+        engineLine(tracker, SDL_LOG_PRIORITY_INFO, productionStatsBlock());
+        engineLine(tracker, SDL_LOG_PRIORITY_INFO, QStringLiteral("Connection status update: 1"));
+        engineLine(tracker, SDL_LOG_PRIORITY_ERROR, QStringLiteral("Some other error entirely"));
+        QVERIFY(tracker.hasOpenSegment());
+        QCOMPARE(segmentOf(tracker.pending(), 1).deliveredMs, qint64(30000));
+    }
+
+    void theClosedHookFiresOnceForEachSegmentThatCloses()
+    {
+        FakeClock clock;
+        DeliveredStreamTime tracker(clock.fn());
+        int closedHooks = 0;
+        tracker.setSegmentClosedHook([&]() { ++closedHooks; });
+        tracker.beginSession(QString::fromLatin1(kSessionA), QStringLiteral("acct-1"));
+
+        quitLine(tracker); // nothing open: no hook
+        QCOMPARE(closedHooks, 0);
+        tracker.connectionStarted();
+        lostLine(tracker);
+        terminatedLine(tracker, -1);
+        quitLine(tracker);
+        QCOMPARE(closedHooks, 1);
+        tracker.connectionStarted();
+        tracker.connectionStarted(); // closes the open one, then opens the next
+        QCOMPARE(closedHooks, 2);
+        tracker.closeOpenSegment();
+        QCOMPARE(closedHooks, 3);
+        tracker.closeOpenSegment();
+        QCOMPARE(closedHooks, 3);
+    }
+
+    void killedStreamReplaysRecordedTime()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString sessionA = QString::fromLatin1(kSessionA);
+        FakeStreamTimeServer server;
+        server.started.insert(sessionA, true);
+
+        // ---- the run that is killed: a stream that was 25 s old when the process died ----------
+        {
+            FakeClock clock;
+            auto tracker = std::make_shared<DeliveredStreamTime>(clock.fn());
+            auto outbox = std::make_shared<StreamTimeOutbox>(dir.path());
+            tracker->beginSession(sessionA, QStringLiteral("acct-1"));
+            tracker->connectionStarted();
+
+            // The first beat reaches the server and leaves the record.
+            clock.now = 10000;
+            checkpointStreamTime(tracker, outbox, server.poster());
+            QCOMPARE(server.total(sessionA), qint64(10000));
+            QVERIFY(outbox->entries(sessionA, QStringLiteral("acct-1")).isEmpty());
+
+            // The second beat finds the network down: the record keeps it.
+            clock.now = 20000;
+            server.forcedStatus = 0;
+            checkpointStreamTime(tracker, outbox, server.poster());
+            QCOMPARE(server.total(sessionA), qint64(10000));
+            const QVector<StreamSegmentReport> kept =
+                outbox->entries(sessionA, QStringLiteral("acct-1"));
+            QCOMPARE(kept.size(), 1);
+            QCOMPARE(kept.first().segmentNo, 1);
+            QCOMPARE(kept.first().deliveredMs, qint64(20000));
+            QVERIFY(!kept.first().closed);
+
+            // 5 s later the process is killed: no close line, no teardown, no further beat.
+            clock.now = 25000;
+        }
+
+        // ---- someone else signs in on the relaunched app: nothing of the record is theirs ------
+        {
+            StreamTimeOutbox relaunched(dir.path());
+            server.forcedStatus = 200;
+            server.calls.clear();
+            relaunched.drain(QStringLiteral("gen-other"), QStringLiteral("acct-2"), QString(),
+                             server.poster());
+            QVERIFY2(server.calls.isEmpty(), "a record is never sent under another account");
+            QCOMPARE(server.total(sessionA), qint64(10000));
+            // And it is not deleted either: its own account still has it.
+            QCOMPARE(relaunched.entries(sessionA, QStringLiteral("acct-1")).size(), 1);
+        }
+
+        // ---- the same account relaunches: the record goes to the SAME session, once ------------
+        {
+            StreamTimeOutbox relaunched(dir.path());
+            server.calls.clear();
+            relaunched.drain(QStringLiteral("gen-1"), QStringLiteral("acct-1"), QString(),
+                             server.poster());
+            QCOMPARE(server.calls, QStringList{ sessionA + QStringLiteral(":1:20000:0") });
+            // The kill lost the 5 s after the last checkpoint, and nothing else: no time was
+            // invented for the killed stream and none was counted twice (10 s + 20 s would be 30 s).
+            QCOMPARE(server.total(sessionA), qint64(20000));
+            QVERIFY(relaunched.entries(sessionA, QStringLiteral("acct-1")).isEmpty());
+
+            // A second drain finds nothing left to send.
+            server.calls.clear();
+            relaunched.drain(QStringLiteral("gen-1b"), QStringLiteral("acct-1"), QString(),
+                             server.poster());
+            QVERIFY(server.calls.isEmpty());
+            QCOMPARE(server.total(sessionA), qint64(20000));
+        }
+    }
+
+    void aRecordIsNeverAddedToADifferentSession()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString sessionA = QString::fromLatin1(kSessionA);
+        const QString sessionB = QString::fromLatin1(kSessionB);
+        StreamTimeOutbox outbox(dir.path());
+        outbox.put(sessionA, QStringLiteral("acct-1"), StreamSegmentReport{ 1, 20000, false });
+
+        FakeStreamTimeServer server;
+        server.started.insert(sessionA, true);
+        server.started.insert(sessionB, true);
+        outbox.drain(QStringLiteral("gen-1"), QStringLiteral("acct-1"), QString(), server.poster());
+
+        // Only session A was ever named; session B, started later and also streaming, got nothing.
+        QCOMPARE(server.calls.size(), 1);
+        QVERIFY(server.calls.first().startsWith(sessionA));
+        QCOMPARE(server.total(sessionB), qint64(0));
+        QCOMPARE(server.total(sessionA), qint64(20000));
+    }
+
+    void theLiveSessionsOwnRecordBelongsToTheBeatNotToTheDrain()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        StreamTimeOutbox outbox(dir.path());
+        outbox.put(QString::fromLatin1(kSessionA), QStringLiteral("acct-1"), StreamSegmentReport{ 1, 1000, false });
+        outbox.put(QString::fromLatin1(kSessionB), QStringLiteral("acct-1"), StreamSegmentReport{ 1, 2000, true });
+
+        FakeStreamTimeServer server;
+        server.started.insert(QString::fromLatin1(kSessionA), true);
+        server.started.insert(QString::fromLatin1(kSessionB), true);
+        outbox.drain(QStringLiteral("gen-1"), QStringLiteral("acct-1"),
+                     QString::fromLatin1(kSessionA), server.poster());
+
+        QCOMPARE(server.calls.size(), 1);
+        QVERIFY(server.calls.first().startsWith(QString::fromLatin1(kSessionB)));
+        QCOMPARE(outbox.entries(QString::fromLatin1(kSessionA), QStringLiteral("acct-1")).size(), 1);
+    }
+
+    void streamReportReplayAddsNoTime()
+    {
+        const QString sessionA = QString::fromLatin1(kSessionA);
+        const QString sessionB = QString::fromLatin1(kSessionB);
+        FakeStreamTimeServer server;
+        server.started.insert(sessionA, true);
+        server.started.insert(sessionB, true);
+        const StreamTimeOutbox::PostFn post = server.poster();
+        const auto send = [&](const QString& session, int segment, qint64 ms, bool closed) {
+            post(session, StreamSegmentReport{ segment, ms, closed }, [](const ControlPlaneResult&) {});
+        };
+
+        // A closed first segment, sent three times (a resend, a retry, a replay after a restart).
+        send(sessionA, 1, 30000, true);
+        send(sessionA, 1, 30000, true);
+        send(sessionA, 1, 30000, true);
+        QCOMPARE(server.total(sessionA), qint64(30000));
+
+        // The same segment number replayed with an older, smaller value changes nothing.
+        send(sessionA, 1, 20000, false);
+        QCOMPARE(server.total(sessionA), qint64(30000));
+
+        // A later, fuller report of the same segment raises it - to the new value, not by it.
+        send(sessionA, 1, 35000, true);
+        QCOMPARE(server.total(sessionA), qint64(35000));
+
+        // A new segment number is new time; replaying it and the old ones adds nothing.
+        send(sessionA, 2, 10000, true);
+        QCOMPARE(server.total(sessionA), qint64(45000));
+        send(sessionA, 2, 10000, true);
+        send(sessionA, 1, 35000, true);
+        send(sessionA, 2, 4000, false);
+        QCOMPARE(server.total(sessionA), qint64(45000));
+
+        // The same segment number in another session is another key.
+        send(sessionB, 1, 7000, true);
+        QCOMPARE(server.total(sessionB), qint64(7000));
+        QCOMPARE(server.total(sessionA), qint64(45000));
+    }
+
+    void aLostReplyIsResentWithoutAddingTime()
+    {
+        // The report is applied but its reply is lost: the app cannot know, keeps the entry and
+        // sends it again at the next beat. The server stores it once.
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString sessionA = QString::fromLatin1(kSessionA);
+        FakeStreamTimeServer server;
+        server.started.insert(sessionA, true);
+        server.applyThenLoseReply = true;
+
+        FakeClock clock;
+        auto tracker = std::make_shared<DeliveredStreamTime>(clock.fn());
+        auto outbox = std::make_shared<StreamTimeOutbox>(dir.path());
+        tracker->beginSession(sessionA, QStringLiteral("acct-1"));
+        tracker->connectionStarted();
+        clock.now = 30000;
+        quitLine(*tracker);
+
+        checkpointStreamTime(tracker, outbox, server.poster());
+        QCOMPARE(server.total(sessionA), qint64(30000));
+        QCOMPARE(outbox->entries(sessionA, QStringLiteral("acct-1")).size(), 1);
+        QCOMPARE(tracker->pending().segments.size(), 1); // not settled: the app saw no answer
+
+        for (int beat = 0; beat < 3; ++beat) {
+            checkpointStreamTime(tracker, outbox, server.poster());
+        }
+        QCOMPARE(server.total(sessionA), qint64(30000));
+        QCOMPARE(server.calls.size(), 4);
+
+        // The reply finally gets through: the entry leaves the record and the segment is settled.
+        server.applyThenLoseReply = false;
+        checkpointStreamTime(tracker, outbox, server.poster());
+        QCOMPARE(server.total(sessionA), qint64(30000));
+        QVERIFY(outbox->entries(sessionA, QStringLiteral("acct-1")).isEmpty());
+        QVERIFY(tracker->pending().segments.isEmpty());
+
+        // And a settled segment is not sent again.
+        server.calls.clear();
+        checkpointStreamTime(tracker, outbox, server.poster());
+        QVERIFY(server.calls.isEmpty());
+    }
+
+    void theRecordKeepsTheEndOfASegmentEvenWhenItIsSmallerThanTheLastCheckpoint()
+    {
+        // A lost connection takes the 10 s wait off the end, so the closed value can be smaller
+        // than the last open checkpoint. The record keeps the closed value; an open checkpoint
+        // never reopens a closed segment; open over open keeps the larger.
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        StreamTimeOutbox outbox(dir.path());
+        const QString session = QString::fromLatin1(kSessionA);
+        const QString account = QStringLiteral("acct-1");
+
+        outbox.put(session, account, StreamSegmentReport{ 1, 40000, false });
+        outbox.put(session, account, StreamSegmentReport{ 1, 35000, false });
+        QCOMPARE(outbox.entries(session, account).first().deliveredMs, qint64(40000));
+
+        outbox.put(session, account, StreamSegmentReport{ 1, 32000, true });
+        QCOMPARE(outbox.entries(session, account).first().deliveredMs, qint64(32000));
+        QVERIFY(outbox.entries(session, account).first().closed);
+
+        outbox.put(session, account, StreamSegmentReport{ 1, 50000, false });
+        QCOMPARE(outbox.entries(session, account).first().deliveredMs, qint64(32000));
+        QVERIFY(outbox.entries(session, account).first().closed);
+
+        outbox.put(session, account, StreamSegmentReport{ 2, 1000, false });
+        QCOMPARE(outbox.entries(session, account).size(), 2);
+        QCOMPARE(outbox.entries(session, account).at(0).segmentNo, 1);
+        QCOMPARE(outbox.entries(session, account).at(1).segmentNo, 2);
+    }
+
+    void aDeliveredEntryLeavesTheRecordOnlyWhileItStillHoldsWhatWasSent()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        StreamTimeOutbox outbox(dir.path());
+        const QString session = QString::fromLatin1(kSessionA);
+        const QString account = QStringLiteral("acct-1");
+
+        outbox.put(session, account, StreamSegmentReport{ 1, 10000, false });
+        // A newer checkpoint is written while the older one is still in flight ...
+        outbox.put(session, account, StreamSegmentReport{ 1, 20000, false });
+        // ... and the older one's reply must not delete it.
+        outbox.removeIfUnchanged(session, StreamSegmentReport{ 1, 10000, false });
+        QCOMPARE(outbox.entries(session, account).size(), 1);
+        QCOMPARE(outbox.entries(session, account).first().deliveredMs, qint64(20000));
+
+        outbox.removeIfUnchanged(session, StreamSegmentReport{ 1, 20000, false });
+        QVERIFY(outbox.entries(session, account).isEmpty());
+        QVERIFY2(!QFile::exists(dir.filePath(session + QStringLiteral(".json"))),
+                 "the last entry takes the file with it");
+    }
+
+    void putRefusesWhatCouldEscapeOrBelongToNobody()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        StreamTimeOutbox outbox(dir.path());
+        const StreamSegmentReport good{ 1, 1000, false };
+
+        outbox.put(QStringLiteral("../escape"), QStringLiteral("acct-1"), good);
+        outbox.put(QString::fromLatin1(kSessionA), QString(), good);                        // no account
+        outbox.put(QString::fromLatin1(kSessionA), QStringLiteral("acct-1"), StreamSegmentReport{ 0, 1000, false });
+        outbox.put(QString::fromLatin1(kSessionA), QStringLiteral("acct-1"), StreamSegmentReport{ 1, -1, false });
+        QCOMPARE(QDir(dir.path()).entryList(QDir::Files).size(), 0);
+
+        // A value beyond the server's integer is held at what it can store.
+        outbox.put(QString::fromLatin1(kSessionA), QStringLiteral("acct-1"),
+                   StreamSegmentReport{ 1, qint64(1) << 40, true });
+        QCOMPARE(outbox.entries(QString::fromLatin1(kSessionA), QStringLiteral("acct-1")).first().deliveredMs,
+                 qint64(2147483647));
+    }
+
+    void drain_isJudgedByTheSameOutcomeTableAsTheQualityOutbox_data()
+    {
+        QTest::addColumn<int>("status");
+        QTest::addColumn<bool>("ok");
+        QTest::addColumn<bool>("kept");
+
+        QTest::newRow("200 delivered") << 200 << true << false;
+        QTest::newRow("404 not this account's session") << 404 << false << false;
+        QTest::newRow("409 never streamed") << 409 << false << false;
+        QTest::newRow("422 malformed") << 422 << false << false;
+        QTest::newRow("400 is not a refusal W04 documents") << 400 << false << true;
+        QTest::newRow("413 is not a refusal W04 documents") << 413 << false << true;
+        QTest::newRow("401 kept for the next token") << 401 << false << true;
+        QTest::newRow("403 kept") << 403 << false << true;
+        QTest::newRow("500 retried") << 500 << false << true;
+        QTest::newRow("503 retried") << 503 << false << true;
+        QTest::newRow("429 retried") << 429 << false << true;
+        QTest::newRow("no answer retried") << 0 << false << true;
+    }
+
+    void drain_isJudgedByTheSameOutcomeTableAsTheQualityOutbox()
+    {
+        QFETCH(int, status);
+        QFETCH(bool, ok);
+        QFETCH(bool, kept);
+
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        StreamTimeOutbox outbox(dir.path());
+        const QString session = QString::fromLatin1(kSessionA);
+        outbox.put(session, QStringLiteral("acct-1"), StreamSegmentReport{ 1, 12345, true });
+
+        int sent = 0;
+        outbox.drain(QStringLiteral("gen-1"), QStringLiteral("acct-1"), QString(),
+                     [&](const QString& id, const StreamSegmentReport& segment,
+                         ControlPlaneClient::Callback callback) {
+                         QCOMPARE(id, session);
+                         QCOMPARE(segment.deliveredMs, qint64(12345));
+                         ++sent;
+                         callback(resultWithStatus(status, ok));
+                     });
+        QCOMPARE(sent, 1);
+        QCOMPARE(!outbox.entries(session, QStringLiteral("acct-1")).isEmpty(), kept);
+    }
+
+    void drain_authFailedStopsTheRestAndTheSameTokenIsNotRetried()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        StreamTimeOutbox outbox(dir.path());
+        outbox.put(QString::fromLatin1(kSessionA), QStringLiteral("acct-1"), StreamSegmentReport{ 1, 1, true });
+        outbox.put(QString::fromLatin1(kSessionA), QStringLiteral("acct-1"), StreamSegmentReport{ 2, 2, true });
+        outbox.put(QString::fromLatin1(kSessionB), QStringLiteral("acct-1"), StreamSegmentReport{ 1, 3, true });
+
+        int sent = 0;
+        const StreamTimeOutbox::PostFn refusing = [&](const QString&, const StreamSegmentReport&,
+                                                      ControlPlaneClient::Callback callback) {
+            ++sent;
+            callback(resultWithStatus(401));
+        };
+        outbox.drain(QStringLiteral("gen-1"), QStringLiteral("acct-1"), QString(), refusing);
+        QCOMPARE(sent, 1);
+        outbox.drain(QStringLiteral("gen-1"), QStringLiteral("acct-1"), QString(), refusing);
+        QCOMPARE(sent, 1);
+
+        int sentWithNewToken = 0;
+        outbox.drain(QStringLiteral("gen-2"), QStringLiteral("acct-1"), QString(),
+                     [&](const QString&, const StreamSegmentReport&, ControlPlaneClient::Callback callback) {
+                         ++sentWithNewToken;
+                         callback(resultWithStatus(200, true));
+                     });
+        QCOMPARE(sentWithNewToken, 3);
+        QVERIFY(!outbox.hasRecords());
+    }
+
+    void drain_abortedByASignOutStopsAndKeepsEverything()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        StreamTimeOutbox outbox(dir.path());
+        outbox.put(QString::fromLatin1(kSessionA), QStringLiteral("acct-1"), StreamSegmentReport{ 1, 1, true });
+        outbox.put(QString::fromLatin1(kSessionB), QStringLiteral("acct-1"), StreamSegmentReport{ 1, 2, true });
+
+        int sent = 0;
+        ControlPlaneClient::Callback pending;
+        outbox.drain(QStringLiteral("gen-1"), QStringLiteral("acct-1"), QString(),
+                     [&](const QString&, const StreamSegmentReport&, ControlPlaneClient::Callback callback) {
+                         ++sent;
+                         pending = callback;
+                     });
+        QCOMPARE(sent, 1);
+        outbox.cancel(); // the account signs out mid-drain
+        pending(ControlPlaneResult::aborted());
+        QCOMPARE(sent, 1); // the loop did not carry on under the next account
+        QVERIFY(outbox.hasRecords());
+
+        // The next account's own drain is not swallowed by the abandoned one.
+        int sentAfter = 0;
+        outbox.drain(QStringLiteral("gen-2"), QStringLiteral("acct-1"), QString(),
+                     [&](const QString&, const StreamSegmentReport&, ControlPlaneClient::Callback callback) {
+                         ++sentAfter;
+                         callback(resultWithStatus(200, true));
+                     });
+        QCOMPARE(sentAfter, 2);
+    }
+
+    void drain_withNoTokenOrNoAccountOrAForeignFileSendsNothing()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        StreamTimeOutbox outbox(dir.path());
+        outbox.put(QString::fromLatin1(kSessionA), QStringLiteral("acct-1"), StreamSegmentReport{ 1, 1, true });
+        QFile junk(dir.filePath(QStringLiteral("not-a-record.json")));
+        QVERIFY(junk.open(QIODevice::WriteOnly));
+        junk.write("{ nonsense");
+        junk.close();
+
+        int sent = 0;
+        const StreamTimeOutbox::PostFn post = [&](const QString&, const StreamSegmentReport&,
+                                                  ControlPlaneClient::Callback) { ++sent; };
+        outbox.drain(QString(), QStringLiteral("acct-1"), QString(), post);
+        outbox.drain(QStringLiteral("gen-1"), QString(), QString(), post);
+        QCOMPARE(sent, 0);
+        QVERIFY(QFile::exists(junk.fileName())); // neither call looked at the folder
+
+        // A drain for another account sends nothing, keeps the record, and removes only the junk.
+        outbox.drain(QStringLiteral("gen-1"), QStringLiteral("acct-2"), QString(), post);
+        QCOMPARE(sent, 0);
+        QCOMPARE(outbox.entries(QString::fromLatin1(kSessionA), QStringLiteral("acct-1")).size(), 1);
+        QVERIFY(!QFile::exists(junk.fileName()));
+    }
+
+    void theCheckpointStopsForASessionTheServerRefusesForGood()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString sessionA = QString::fromLatin1(kSessionA);
+        FakeStreamTimeServer server;
+        server.started.insert(sessionA, true);
+        server.forcedStatus = 404;
+
+        FakeClock clock;
+        auto tracker = std::make_shared<DeliveredStreamTime>(clock.fn());
+        auto outbox = std::make_shared<StreamTimeOutbox>(dir.path());
+        tracker->beginSession(sessionA, QStringLiteral("acct-1"));
+        tracker->connectionStarted();
+        clock.now = 10000;
+        checkpointStreamTime(tracker, outbox, server.poster());
+        QCOMPARE(server.calls.size(), 1);
+        QVERIFY(outbox->entries(sessionA, QStringLiteral("acct-1")).isEmpty());
+
+        // The next beat finds nothing to send for this session: it is not hammered every 10 s.
+        clock.now = 20000;
+        checkpointStreamTime(tracker, outbox, server.poster());
+        QCOMPARE(server.calls.size(), 1);
+        QVERIFY(tracker->pending().segments.isEmpty());
+    }
+
+    void aSessionNotYetActiveIsRetriedWhileOpenAndLetGoOnceClosed()
+    {
+        // 409 ("this session never streamed", `stream_started_at` null): the first seconds of a
+        // stream, before the server's ACTIVE. An open segment is simply tried again at the next
+        // beat, by which time the server has started it; a closed one means it never started.
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString sessionA = QString::fromLatin1(kSessionA);
+        FakeStreamTimeServer server; // started not set: every report is a 409
+
+        FakeClock clock;
+        auto tracker = std::make_shared<DeliveredStreamTime>(clock.fn());
+        auto outbox = std::make_shared<StreamTimeOutbox>(dir.path());
+        tracker->beginSession(sessionA, QStringLiteral("acct-1"));
+        tracker->connectionStarted();
+
+        clock.now = 2000;
+        checkpointStreamTime(tracker, outbox, server.poster());
+        QVERIFY(outbox->entries(sessionA, QStringLiteral("acct-1")).isEmpty()); // dropped, as the 409 says
+        QCOMPARE(tracker->pending().segments.size(), 1);
+
+        // ACTIVE arrives: the next beat is taken, with the full running time since the start.
+        server.started.insert(sessionA, true);
+        clock.now = 12000;
+        checkpointStreamTime(tracker, outbox, server.poster());
+        QCOMPARE(server.total(sessionA), qint64(12000));
+
+        // A segment that closes before the server ever started it is let go after one 409.
+        const QString sessionB = QString::fromLatin1(kSessionB);
+        tracker->beginSession(sessionB, QStringLiteral("acct-1"));
+        clock.now = 20000;
+        tracker->connectionStarted();
+        clock.now = 23000;
+        quitLine(*tracker);
+        checkpointStreamTime(tracker, outbox, server.poster());
+        QVERIFY(tracker->pending().segments.isEmpty());
+        QCOMPARE(server.total(sessionB), qint64(0));
+    }
+
+    void anOpenSegmentIsCheckpointedAtEveryLivenessBeat()
+    {
+        // The existing 10-second beat is the cadence: `LivenessTimer::tick()` posts its report
+        // through `ControlPlaneClient`, whose observer runs the checkpoint just before it leaves.
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString sessionA = QString::fromLatin1(kSessionA);
+
+        auto* network = new RecordingNetworkAccessManager;
+        ControlPlaneClient client;
+        client.setNetworkAccessManager(network);
+        client.setAccessToken(QStringLiteral("opaque-access-token"));
+
+        FakeClock clock;
+        auto tracker = std::make_shared<DeliveredStreamTime>(clock.fn());
+        auto outbox = std::make_shared<StreamTimeOutbox>(dir.path());
+        tracker->beginSession(sessionA, QStringLiteral("acct-1"));
+        tracker->connectionStarted();
+        client.setLivenessBeatObserver([&]() {
+            checkpointStreamTime(tracker, outbox,
+                                 [&](const QString& id, const StreamSegmentReport& segment,
+                                     ControlPlaneClient::Callback callback) {
+                                     client.postStreamTime(id, segment.segmentNo, segment.deliveredMs,
+                                                           segment.closed, callback);
+                                 });
+        });
+
+        LivenessTimer liveness;
+        liveness.setControlPlane(&client);
+        liveness.start(sessionA);          // the first beat
+        clock.now = 10000;
+        liveness.tick();                   // the second
+        clock.now = 20000;
+        liveness.tick();                   // the third
+        liveness.stop();
+
+        QStringList streamTimePaths;
+        QList<qint64> reportedMs;
+        for (int i = 0; i < network->paths.size(); ++i) {
+            if (network->paths.at(i).endsWith(QLatin1String("/stream-time"))) {
+                streamTimePaths.append(network->paths.at(i));
+                reportedMs.append(QJsonDocument::fromJson(network->bodies.at(i))
+                                      .object().value(QStringLiteral("delivered_ms")).toInteger());
+            }
+        }
+        QCOMPARE(streamTimePaths.size(), 3);
+        for (const QString& path : streamTimePaths) {
+            QCOMPARE(path, QStringLiteral("/api/sessions/%1/stream-time").arg(sessionA));
+        }
+        QCOMPARE(reportedMs, (QList<qint64>{ 0, 10000, 20000 }));
+        // Each beat also kept its liveness report: the checkpoint added to the beat, not replaced it.
+        int liveness_reports = 0;
+        for (const QString& path : network->paths) {
+            liveness_reports += path.endsWith(QLatin1String("/liveness")) ? 1 : 0;
+        }
+        QCOMPARE(liveness_reports, 3);
+        QTRY_VERIFY(outbox->entries(sessionA, QStringLiteral("acct-1")).isEmpty());
+    }
+
 };
 
 QTEST_MAIN(TstStreamStats)

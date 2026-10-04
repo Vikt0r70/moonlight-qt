@@ -25,6 +25,11 @@ struct PairingTarget {
     int httpsPort = 0;
     /// Dies at the end of the launch. Never persisted (D-30, D-37).
     QString pairingPin;
+    /// ADR-0074 W03: the authorization's own `warm_return` indication for this session (true only
+    /// for a NEW session allocated from the caller's valid free return hold). Advisory: it lets the
+    /// seam try the held trust before running the PIN handshake, and decides nothing else - a PIN
+    /// is still issued, and the rig's own certificate check is what admits the stream.
+    bool warmReturn = false;
 };
 
 // The engine's pairing entry point, as this controller needs it.

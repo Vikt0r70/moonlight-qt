@@ -96,6 +96,34 @@ Q_DECLARE_METATYPE(PairingHandshakeResult)
 /// that a host-side reader of `GET /api/clients/list` can match to this client's record.
 QString clientCertificateFingerprint(const QByteArray& pem);
 
+/// The host certificate this app run itself pinned, held in memory for the warm return
+/// (ADR-0074 W03, `docs/spec/client.md` "Warm return"). The app stores no pairing of its own
+/// (STREAM-10) and persists nothing for this: the bytes live in this process and nowhere else, so a
+/// restart, a crash or a kill leaves nothing to reuse and the next Play pairs normally. It is
+/// cleared at sign-out, and replaced by every successful pairing.
+///
+/// This is the certificate of the RIG, which upstream's pairing pins to authenticate the host's
+/// HTTPS server. It is not a credential for anything the rig would admit by itself: the rig's own
+/// check of the client certificate is what admits a stream.
+class HeldRigTrust
+{
+public:
+    /// Remembers the PEM the pairing handshake pinned. An empty value forgets what was held.
+    static void remember(const QByteArray& hostCertificatePem);
+    /// The held PEM, or empty when this run has pinned none (or it was cleared).
+    static QByteArray held();
+    static void clear();
+};
+
+/// The warm-return check: with the host certificate this run pinned earlier (`heldHostCertificatePem`),
+/// asks the rig's HTTPS `serverinfo` - read with that pin - whether this client is still paired, and
+/// answers like a handshake does: `ok` with the client identity and the host record on a yes, `ok`
+/// false on every other outcome (a refused pin, an unreachable rig, an answer of not paired). Blocks
+/// on a worker thread, never throws, and must not call the control plane. The production one is
+/// `runUpstreamWarmReturnCheck` (`pairing_handshake.h`).
+using WarmReturnCheck =
+    std::function<PairingHandshakeResult(const PairingTarget&, const QByteArray& heldHostCertificatePem)>;
+
 /// Runs one pairing handshake against `target.hostAddress` with `target.pairingPin`.
 ///
 /// Blocks - it is called on a worker thread - and reports what upstream reported. It must not
@@ -124,6 +152,16 @@ public:
     /// The handshake to run. Without one, every `pair()` fails closed: reporting success without
     /// having paired would tell the caller a rig was paired when nothing was.
     void setHandshake(PairingHandshake handshake);
+    /// The warm-return check (ADR-0074 W03). Without one, a target that carries `warmReturn` pairs
+    /// normally, exactly like one that does not.
+    ///
+    /// The PIN handshake is skipped only when ALL of these hold: the target's `warmReturn` is true
+    /// (the control plane said so for this NEW session), this app run holds the host certificate it
+    /// pinned earlier (`HeldRigTrust`), and the check answers `ok`. In every other case - the field
+    /// absent or false, nothing held (a restart, a sign-out), a check that fails or is refused -
+    /// the normal handshake runs, with its own recovery, exactly as before. A PIN is always issued,
+    /// so a normal pairing is always possible.
+    void setWarmReturnCheck(WarmReturnCheck check);
     /// Test seam. Same clock either way.
     void setDeadlineMs(int milliseconds);
     /// Test seam: the clear request the recovery loop (and `clearPendingPairing()`) runs.
@@ -190,6 +228,7 @@ private:
     void finish(quint64 generation, const PairingHandshakeResult& result);
 
     PairingHandshake m_handshake;
+    WarmReturnCheck m_warmCheck;
     PairingCancelRequest m_cancelRequest;
     std::function<void(bool, const QString&, const QString&)> m_done;
     /// The generation token the pool thread reads without touching this object: bumped and

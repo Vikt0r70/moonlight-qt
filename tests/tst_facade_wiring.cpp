@@ -140,9 +140,13 @@ bool g_recoveredHandshakeArmed = false;
 bool g_noAppHandshakeArmed = false;
 bool g_failedRetryHandshakeArmed = false;
 int g_handshakeCalls = 0;
+// ADR-0074 W03: how many times the seam fell back to (or started with) the normal handshake, in any
+// mode. `g_handshakeCalls` above counts only the armed retry scenarios.
+int g_plainHandshakeRuns = 0;
 
 PairingHandshakeResult runUpstreamPairingHandshake(const PairingTarget&)
 {
+    ++g_plainHandshakeRuns;
     if (g_noAppHandshakeArmed) {
         PairingHandshakeResult paired;
         paired.ok = true;
@@ -192,6 +196,30 @@ PairingHandshakeResult runUpstreamPairingHandshake(const PairingTarget&)
     result.ok = false;
     result.engineError = QStringLiteral("no Sunshine host exists in this test environment");
     return result;
+}
+
+// ADR-0074 W03 / X02: the other two entry points of `pairing_handshake.cpp`, substituted the same
+// way. The warm-return check answers "paired" only when a test arms it, and counts every call; the
+// client certificate fingerprint is empty (so a Play body stays `{}`) unless a test sets one.
+bool g_warmCheckArmed = false;
+int g_warmChecks = 0;
+QString g_ownCertFingerprint;
+
+PairingHandshakeResult runUpstreamWarmReturnCheck(const PairingTarget&, const QByteArray&)
+{
+    ++g_warmChecks;
+    PairingHandshakeResult result;
+    if (g_warmCheckArmed) {
+        result.ok = true;
+        result.clientIdentity = QStringLiteral("warm-identity");
+        result.host = std::make_shared<PairedHost>();
+    }
+    return result;
+}
+
+QString ownClientCertificateFingerprint()
+{
+    return g_ownCertFingerprint;
 }
 
 namespace {
@@ -6958,6 +6986,407 @@ private slots:
         QCOMPARE(m_fake->requestPaths().count(QStringLiteral("/api/auth/logout")),
                  logoutsBefore + 1);
     }
+
+    // --- ADR-0074 X02: the Play request names the client certificate ---------------------------
+
+    void thePlayRequestNamesTheClientCertificateTheAppPairsWith()
+    {
+        g_ownCertFingerprint = QStringLiteral("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
+        const auto reset = qScopeGuard([]() { g_ownCertFingerprint.clear(); });
+
+        SeatHubClient client;
+        reachHome(client, 90);
+        QVERIFY(!QTest::currentTestFailed());
+        m_fake->answerPairing(409, playRefusalBody(QStringLiteral("The rig is not ready yet."),
+                                                   QStringLiteral("SH-2K2XQ1")));
+        m_fake->answerPlay(201, QByteArrayLiteral("{\"id\":\"s-x02\"}"));
+
+        client.start();
+        QTRY_VERIFY_WITH_TIMEOUT(m_fake->requestPaths().contains(QStringLiteral("/api/sessions")), 15000);
+
+        const QJsonObject sent =
+            QJsonDocument::fromJson(m_fake->bodyFor(QStringLiteral("/api/sessions"))).object();
+        QCOMPARE(sent.value(QStringLiteral("client_cert_sha256")).toString(), g_ownCertFingerprint);
+        QCOMPARE(sent.size(), 1); // no quality, no rig, nothing else
+    }
+
+    // --- ADR-0074 W03: the warm return ---------------------------------------------------------
+
+    void aWarmReturnAuthorizationSkipsTheHandshakeAndStillStartsTheStream()
+    {
+        g_warmCheckArmed = true;
+        g_noAppHandshakeArmed = true; // if the normal handshake runs, it too pairs: the counters tell
+        g_warmChecks = 0;
+        g_plainHandshakeRuns = 0;
+        const auto disarm = qScopeGuard([]() {
+            g_warmCheckArmed = false;
+            g_noAppHandshakeArmed = false;
+            g_warmChecks = 0;
+            g_plainHandshakeRuns = 0;
+            HeldRigTrust::clear();
+        });
+        HeldRigTrust::remember(QByteArrayLiteral("pinned earlier in this run"));
+
+        SeatHubClient client;
+        reachHome(client, 90);
+        QVERIFY(!QTest::currentTestFailed());
+        auto engine = std::make_unique<FakeEngineSession>();
+        g_engineCreateReason = EngineLaunchReason::Started;
+        g_engineFactoryHook = [&client, enginePtr = engine.get()]() {
+            client.session()->attachSession(enginePtr);
+        };
+        const auto clearFactoryHook = qScopeGuard([]() {
+            g_engineFactoryHook = {};
+            g_engineCreateReason = EngineLaunchReason::CreateFailed;
+        });
+
+        QJsonObject ports;
+        ports.insert(QStringLiteral("https"), 47984);
+        ports.insert(QStringLiteral("control"), 47989);
+        ports.insert(QStringLiteral("rtsp"), 48010);
+        QJsonObject authBody;
+        authBody.insert(QStringLiteral("session_id"), QStringLiteral("s-warm"));
+        authBody.insert(QStringLiteral("pairing_pin"), QStringLiteral("4821"));
+        authBody.insert(QStringLiteral("host_address"), QStringLiteral("127.0.0.1"));
+        authBody.insert(QStringLiteral("ports"), ports);
+        authBody.insert(QStringLiteral("state"), QStringLiteral("READY"));
+        authBody.insert(QStringLiteral("warm_return"), true);
+        m_fake->answerPairing(200, QJsonDocument(authBody).toJson(QJsonDocument::Compact));
+        m_fake->answerPlay(201, QByteArrayLiteral("{\"id\":\"s-warm\"}"));
+
+        client.beginSession(QStringLiteral("s-warm"));
+
+        // The stream starts (the fake engine was run), through the warm path alone.
+        QTRY_VERIFY_WITH_TIMEOUT(!engine->runs.isEmpty(), 20000);
+        QCOMPARE(g_warmChecks, 1);
+        QCOMPARE(g_plainHandshakeRuns, 0);
+
+        // The fake engine finishes, so the ordinary teardown runs and the lifecycle lets go of it.
+        emit engine->readyForDeletion();
+        QTRY_VERIFY_WITH_TIMEOUT(
+            m_fake->requestPaths().contains(QStringLiteral("/api/sessions/s-warm/end")), 15000);
+    }
+
+    void aWarmReturnIndicationWithNoHeldTrustPairsNormally()
+    {
+        g_warmCheckArmed = true;
+        g_noAppHandshakeArmed = true;
+        g_warmChecks = 0;
+        g_plainHandshakeRuns = 0;
+        const auto disarm = qScopeGuard([]() {
+            g_warmCheckArmed = false;
+            g_noAppHandshakeArmed = false;
+            g_warmChecks = 0;
+            g_plainHandshakeRuns = 0;
+        });
+        HeldRigTrust::clear(); // a restart, or a sign-out, left nothing
+
+        SeatHubClient client;
+        reachHome(client, 90);
+        QVERIFY(!QTest::currentTestFailed());
+        auto engine = std::make_unique<FakeEngineSession>();
+        g_engineCreateReason = EngineLaunchReason::Started;
+        g_engineFactoryHook = [&client, enginePtr = engine.get()]() {
+            client.session()->attachSession(enginePtr);
+        };
+        const auto clearFactoryHook = qScopeGuard([]() {
+            g_engineFactoryHook = {};
+            g_engineCreateReason = EngineLaunchReason::CreateFailed;
+        });
+
+        QJsonObject ports;
+        ports.insert(QStringLiteral("https"), 47984);
+        QJsonObject authBody;
+        authBody.insert(QStringLiteral("session_id"), QStringLiteral("s-cold"));
+        authBody.insert(QStringLiteral("pairing_pin"), QStringLiteral("4821"));
+        authBody.insert(QStringLiteral("host_address"), QStringLiteral("127.0.0.1"));
+        authBody.insert(QStringLiteral("ports"), ports);
+        authBody.insert(QStringLiteral("state"), QStringLiteral("READY"));
+        authBody.insert(QStringLiteral("warm_return"), true);
+        m_fake->answerPairing(200, QJsonDocument(authBody).toJson(QJsonDocument::Compact));
+        m_fake->answerPlay(201, QByteArrayLiteral("{\"id\":\"s-cold\"}"));
+
+        client.beginSession(QStringLiteral("s-cold"));
+
+        QTRY_VERIFY_WITH_TIMEOUT(!engine->runs.isEmpty(), 20000);
+        QCOMPARE(g_warmChecks, 0);       // nothing held, so the rig is not even asked
+        QCOMPARE(g_plainHandshakeRuns, 1);
+
+        emit engine->readyForDeletion();
+        QTRY_VERIFY_WITH_TIMEOUT(
+            m_fake->requestPaths().contains(QStringLiteral("/api/sessions/s-cold/end")), 15000);
+    }
+
+    void aSignOutForgetsTheHeldRigTrustSoTheNextPlayPairsNormally()
+    {
+        const auto cleanup = qScopeGuard([]() { HeldRigTrust::clear(); });
+        SeatHubClient client;
+        reachHome(client, 90);
+        QVERIFY(!QTest::currentTestFailed());
+
+        HeldRigTrust::remember(QByteArrayLiteral("pinned earlier in this run"));
+        client.signOut();
+        QVERIFY2(HeldRigTrust::held().isEmpty(), "the held pin must not outlive the sign-in");
+    }
+
+    void aRefusedRestoreForgetsTheHeldRigTrust()
+    {
+        const auto cleanup = qScopeGuard([]() { HeldRigTrust::clear(); });
+        SeatHubClient client;
+        isolateStore(client);
+        client.controlPlane()->setBaseUrl(QStringLiteral("https://control.invalid"));
+        armControlPlane(client);
+        m_fake->answerMe(401, refusedBody());
+        QVERIFY(client.credentialStore()->storeToken(TokenStore::accessTokenName(),
+                                                     QString::fromLatin1(kAccessToken)));
+        HeldRigTrust::remember(QByteArrayLiteral("pinned earlier in this run"));
+
+        client.restoreSession();
+        QTRY_COMPARE_WITH_TIMEOUT(client.appState(), QStringLiteral("signed_out"), 15000);
+        QVERIFY(HeldRigTrust::held().isEmpty());
+    }
+
+    // --- ADR-0074 HI02 / HI06: delivered stream time -------------------------------------------
+
+    void aStreamedSessionDeliversItsOwnMeasuredTimeToItsOwnSessionAtTeardown()
+    {
+        SeatHubClient client;
+        reachHome(client, 90);
+        QVERIFY(!QTest::currentTestFailed());
+
+        auto* engine = new FakeEngineSession;
+        client.session()->attachSession(engine);
+        client.teardown()->setVerifyIntervalMs(1);
+        m_fake->answerPairing(409, playRefusalBody(QStringLiteral("The rig is not ready yet."),
+                                                   QStringLiteral("SH-2K2XQ1")));
+
+        const QString session = QStringLiteral("aaaaaaaa-8888-8888-8888-888888888888");
+        const QString path = QStringLiteral("/api/sessions/%1/stream-time").arg(session);
+        client.beginSession(session);
+        emit engine->connectionStarted();
+        QTest::qWait(150);
+        // The engine's own quit line, through the real LogTee: the segment ends here, with no
+        // statistics overlay anywhere in the picture.
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Quit event received");
+
+        QSignalSpy completed(client.teardown(), &TeardownController::teardownCompleted);
+        emit engine->readyForDeletion();
+        QTRY_COMPARE_WITH_TIMEOUT(completed.count(), 1, 15000);
+        QTRY_VERIFY_WITH_TIMEOUT(m_fake->requestPaths().contains(path), 15000);
+
+        // Every report for this stream went to this session's own route, under the customer token,
+        // and says the same closed segment 1: a resend adds nothing.
+        const QList<QByteArray> bodies = m_fake->bodiesFor(path);
+        QVERIFY(!bodies.isEmpty());
+        qint64 firstDelivered = -1;
+        for (const QByteArray& raw : bodies) {
+            const QJsonObject sent = QJsonDocument::fromJson(raw).object();
+            QCOMPARE(sent.size(), 3);
+            QCOMPARE(sent.value(QStringLiteral("segment_no")).toInt(), 1);
+            const qint64 delivered = sent.value(QStringLiteral("delivered_ms")).toInteger();
+            if (sent.value(QStringLiteral("closed")).toBool()) {
+                if (firstDelivered < 0) {
+                    firstDelivered = delivered;
+                }
+                QCOMPARE(delivered, firstDelivered);
+            }
+        }
+        QVERIFY2(firstDelivered >= 100 && firstDelivered < 10000, qPrintable(QString::number(firstDelivered)));
+        QCOMPARE(m_fake->authorizationFor(path),
+                 QByteArray("Bearer ") + QByteArray(kAccessToken));
+        QVERIFY2(!m_fake->requestPaths().contains(QStringLiteral("/api/sessions/s-newer/stream-time")),
+                 "no other session was named");
+
+        // The control plane took it, so nothing is left in the record.
+        const QString recordPath =
+            QDir(m_dir->path()).filePath(QStringLiteral("stream-time-outbox/%1.json").arg(session));
+        QTRY_VERIFY_WITH_TIMEOUT(!QFile::exists(recordPath), 15000);
+
+        client.session()->attachSession(nullptr);
+        delete engine;
+    }
+
+    void aLostConnectionTakesTheEnginesTenSecondWaitOffTheDeliveredTime()
+    {
+        SeatHubClient client;
+        reachHome(client, 90);
+        QVERIFY(!QTest::currentTestFailed());
+
+        auto* engine = new FakeEngineSession;
+        client.session()->attachSession(engine);
+        client.teardown()->setVerifyIntervalMs(1);
+        m_fake->answerPairing(409, playRefusalBody(QStringLiteral("The rig is not ready yet."),
+                                                   QStringLiteral("SH-2K2XQ1")));
+
+        const QString session = QStringLiteral("aaaaaaaa-9999-9999-9999-999999999999");
+        const QString path = QStringLiteral("/api/sessions/%1/stream-time").arg(session);
+        client.beginSession(session);
+        emit engine->connectionStarted();
+        QTest::qWait(120);
+        // The engine's own account of a lost connection, through the real LogTee: the disconnect
+        // line, then the termination, then the quit event. The stream lasted far less than the
+        // engine's 10 s wait, so none of it was delivered.
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Control stream received unexpected disconnect event");
+        emitConnectionTerminated(-1);
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Quit event received");
+
+        QSignalSpy completed(client.teardown(), &TeardownController::teardownCompleted);
+        emit engine->readyForDeletion();
+        QTRY_COMPARE_WITH_TIMEOUT(completed.count(), 1, 15000);
+        QTRY_VERIFY_WITH_TIMEOUT(m_fake->requestPaths().contains(path), 15000);
+
+        for (const QByteArray& raw : m_fake->bodiesFor(path)) {
+            const QJsonObject sent = QJsonDocument::fromJson(raw).object();
+            if (sent.value(QStringLiteral("closed")).toBool()) {
+                QCOMPARE(sent.value(QStringLiteral("delivered_ms")).toInteger(), qint64(0));
+            }
+        }
+
+        client.session()->attachSession(nullptr);
+        delete engine;
+    }
+
+    void aKilledRunsRecordedStreamTimeIsReplayedAfterRelaunchToTheSameSessionAndAccountOnly()
+    {
+        // What a killed run left on disk: a record for one session of THIS account, and one for a
+        // session of another account on the same PC.
+        const QString dir = QDir(m_dir->path()).filePath(QStringLiteral("stream-time-outbox"));
+        const QString ownSession = QStringLiteral("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa");
+        const QString otherSession = QStringLiteral("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb");
+        const QString ownAccount = QStringLiteral("6f1c6f5e-3a1e-4b1e-9f2e-0f1a2b3c4d5e"); // accountBody()'s id
+        {
+            StreamTimeOutbox left(dir);
+            left.put(ownSession, ownAccount, StreamSegmentReport{ 1, 20000, false });
+            left.put(otherSession, QStringLiteral("someone-else"), StreamSegmentReport{ 1, 99000, true });
+        }
+        const QString ownRecord = QDir(dir).filePath(ownSession + QStringLiteral(".json"));
+        const QString otherRecord = QDir(dir).filePath(otherSession + QStringLiteral(".json"));
+        QVERIFY(QFile::exists(ownRecord));
+        QVERIFY(QFile::exists(otherRecord));
+
+        SeatHubClient client;
+        reachHome(client, 90); // the relaunch: restore, then `setAccount()` drains
+        QVERIFY(!QTest::currentTestFailed());
+
+        const QString ownPath = QStringLiteral("/api/sessions/%1/stream-time").arg(ownSession);
+        const QString otherPath = QStringLiteral("/api/sessions/%1/stream-time").arg(otherSession);
+        QTRY_VERIFY_WITH_TIMEOUT(m_fake->requestPaths().contains(ownPath), 15000);
+
+        const QJsonObject sent =
+            QJsonDocument::fromJson(m_fake->bodiesFor(ownPath).first()).object();
+        QCOMPARE(sent.value(QStringLiteral("segment_no")).toInt(), 1);
+        QCOMPARE(sent.value(QStringLiteral("delivered_ms")).toInteger(), qint64(20000));
+        QCOMPARE(sent.value(QStringLiteral("closed")).toBool(), false); // replayed as recorded
+        QCOMPARE(m_fake->authorizationFor(ownPath), QByteArray("Bearer ") + QByteArray(kAccessToken));
+
+        QTRY_VERIFY_WITH_TIMEOUT(!QFile::exists(ownRecord), 15000);
+        // Another account's record is neither sent under this token nor deleted.
+        QTest::qWait(200);
+        QVERIFY2(!m_fake->requestPaths().contains(otherPath), "another account's record was sent");
+        QVERIFY(QFile::exists(otherRecord));
+        QCOMPARE(m_fake->requestPaths().count(ownPath), 1);
+    }
+
+    void aSignOutForgetsTheDeliveredTimeClocksSession()
+    {
+        SeatHubClient client;
+        reachHome(client, 90);
+        QVERIFY(!QTest::currentTestFailed());
+
+        auto* engine = new FakeEngineSession;
+        client.session()->attachSession(engine);
+        m_fake->answerPairing(409, playRefusalBody(QStringLiteral("The rig is not ready yet."),
+                                                   QStringLiteral("SH-2K2XQ1")));
+        const QString session = QStringLiteral("aaaaaaaa-cccc-cccc-cccc-cccccccccccc");
+        client.beginSession(session);
+        emit engine->connectionStarted();
+        QVERIFY(client.streamTime()->hasOpenSegment());
+
+        client.signOut();
+        QVERIFY2(client.streamTime()->sessionId().isEmpty(),
+                 "the clock must not carry a signed-out account's session");
+        QVERIFY(!client.streamTime()->hasOpenSegment());
+
+        client.session()->attachSession(nullptr);
+        delete engine;
+    }
+
+    // --- R06 (carried from wave 3): a late teardown posts only its own session's report -------------
+
+    void aLateTeardownPostsOnlyItsOwnSessionsQualityReportNeverTheNewerAttemptsOne()
+    {
+        SeatHubClient client;
+        reachHome(client, 90);
+        QVERIFY(!QTest::currentTestFailed());
+        auto* engine = new FakeEngineSession;
+        client.session()->attachSession(engine);
+        m_fake->answerPairing(409, playRefusalBody(QStringLiteral("The rig is not ready yet."),
+                                                   QStringLiteral("SH-2K2XQ1")));
+
+        const QString oldSession = QStringLiteral("aaaaaaaa-d1d1-d1d1-d1d1-d1d1d1d1d1d1");
+        const QString newSession = QStringLiteral("aaaaaaaa-e2e2-e2e2-e2e2-e2e2e2e2e2e2");
+        const QString oldQuality = QStringLiteral("/api/sessions/%1/quality").arg(oldSession);
+        const QString newQuality = QStringLiteral("/api/sessions/%1/quality").arg(newSession);
+
+        // The old session streamed and its stats block is held; then a newer attempt is attached and
+        // ITS stats block replaces the held one (the report is always the latest parsed).
+        client.beginSession(oldSession);
+        emit engine->connectionStarted();
+        client.beginSession(newSession);
+        emit engine->connectionStarted();
+        emitStatsBlock(44.0); // bound to the newer session, the one attached now
+
+        SessionInfo old = sessionIn(QStringLiteral("COMPLETED"), oldSession);
+        old.endReason = QStringLiteral("CUSTOMER_ENDED");
+
+        // The OLD session's teardown finishes late: it is not the newer attempt's to post for.
+        emit client.teardown()->teardownCompleted(old, oldSession);
+        emit client.teardown()->teardownFailed(SeatHubFailure::local(QStringLiteral("late")), oldSession);
+        QTest::qWait(300);
+        QVERIFY2(!m_fake->requestPaths().contains(newQuality),
+                 "a late teardown of an ended session posted the newer attempt's quality report");
+        QVERIFY(!m_fake->requestPaths().contains(oldQuality));
+        QVERIFY(!QFile::exists(QDir(m_dir->path()).filePath(
+            QStringLiteral("quality-outbox/%1.json").arg(newSession))));
+
+        // The newer attempt's own teardown still posts it, once.
+        SessionInfo current = sessionIn(QStringLiteral("COMPLETED"), newSession);
+        emit client.teardown()->teardownCompleted(current, newSession);
+        QTRY_VERIFY_WITH_TIMEOUT(m_fake->requestPaths().contains(newQuality), 15000);
+        QCOMPARE(m_fake->requestPaths().count(newQuality), 1);
+
+        client.session()->attachSession(nullptr);
+        delete engine;
+    }
+
+    void aLateTeardownStillPostsTheEndedSessionsOwnQualityReport()
+    {
+        SeatHubClient client;
+        reachHome(client, 90);
+        QVERIFY(!QTest::currentTestFailed());
+        auto* engine = new FakeEngineSession;
+        client.session()->attachSession(engine);
+        m_fake->answerPairing(409, playRefusalBody(QStringLiteral("The rig is not ready yet."),
+                                                   QStringLiteral("SH-2K2XQ1")));
+
+        const QString oldSession = QStringLiteral("aaaaaaaa-f3f3-f3f3-f3f3-f3f3f3f3f3f3");
+        const QString newSession = QStringLiteral("aaaaaaaa-a4a4-a4a4-a4a4-a4a4a4a4a4a4");
+        const QString oldQuality = QStringLiteral("/api/sessions/%1/quality").arg(oldSession);
+
+        client.beginSession(oldSession);
+        emit engine->connectionStarted();
+        emitStatsBlock(47.0); // bound to the old session
+        client.beginSession(newSession);
+
+        SessionInfo old = sessionIn(QStringLiteral("COMPLETED"), oldSession);
+        emit client.teardown()->teardownCompleted(old, oldSession);
+        QTRY_VERIFY_WITH_TIMEOUT(m_fake->requestPaths().contains(oldQuality), 15000);
+        QCOMPARE(m_fake->requestPaths().count(oldQuality), 1);
+
+        client.session()->attachSession(nullptr);
+        delete engine;
+    }
+
 };
 
 QTEST_MAIN(TstFacadeWiring)

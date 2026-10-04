@@ -147,6 +147,12 @@ struct SessionAuthorization
     int leaseSeq = 0;
     /// The CONNECT lease deadline (RFC 3339 UTC). Empty when absent.
     QString connectDeadlineAt;
+    /// ADR-0074 W03 (`SessionAuthorization.warm_return`, contract 3.11.0): true only for a NEW session
+    /// allocated from the caller's own valid free return hold while the rig keeps that customer's
+    /// pairing warm. Optional, default false: absent, null, false and every non-boolean value read
+    /// as false, so a client that is not told leaves the field out and pairs normally. Advisory
+    /// only - the rig's own certificate check is what admits the stream, and a PIN is still issued.
+    bool warmReturn = false;
 
     static bool parse(const QJsonObject& body, SessionAuthorization* out);
 };
@@ -386,6 +392,17 @@ public:
     /// no quality field at all, since the customer's saved Settings are the only decider of
     /// stream quality (D-06 reversal).
     static QByteArray buildSessionCreate();
+    /// `SessionCreateRequest` with the optional X02 identity (ADR-0074, contract 3.11.0):
+    /// `{"client_cert_sha256": "<64 lowercase hex>"}` when `clientCertSha256` has exactly that
+    /// shape, `{}` otherwise - a value that does not match the contract's pattern is never sent
+    /// (the server would ignore it anyway). Still no quality field.
+    static QByteArray buildSessionCreate(const QString& clientCertSha256);
+    /// True when `value` is the 64 lowercase hexadecimal characters X02's pattern requires.
+    static bool isClientCertSha256(const QString& value);
+    /// `StreamTimeReport` (ADR-0074 W04, contract 3.11.0): `{segment_no, delivered_ms, closed}`.
+    /// `deliveredMs` is clamped to `[0, INT32_MAX]` (the contract's `integer`, `minimum: 0`), and
+    /// `segmentNo` below 1 is raised to 1 (`minimum: 1`).
+    static QByteArray buildStreamTimeReport(int segmentNo, qint64 deliveredMs, bool closed);
     /// `SessionEndRequest` (contract 3.3.0, D-05/D-23): `{"failed": true}` when `failed`, an empty
     /// body otherwise - the same "assert the shape without a socket" rule as the builders above.
     /// Kept for the callers this exact shape still has (tests exercising the builder directly);
@@ -523,6 +540,9 @@ public:
     void fetchUsage(Callback callback);
 
     void requestSession(Callback callback);
+    /// `POST /api/sessions` carrying the X02 identity (`buildSessionCreate(clientCertSha256)`).
+    /// Same fresh `Idempotency-Key` per call as the overload above.
+    void requestSession(const QString& clientCertSha256, Callback callback);
     void fetchSession(const QString& sessionId, Callback callback);
     void fetchSessionAuthorization(const QString& sessionId, Callback callback);
 
@@ -581,6 +601,22 @@ public:
     /// Plan 30 adds the outbox that keeps it.
     void postSessionQuality(const QString& sessionId, const QJsonObject& report, Callback callback);
 
+    /// `POST /api/sessions/{session_id}/stream-time` (ADR-0074 W04, contract 3.11.0): one stream
+    /// segment of the caller's own session per call, authenticated with the customer token and
+    /// bound to `sessionId` by the server's ownership check (another customer's session answers
+    /// 404). The key is the session and `segmentNo`; the server stores the larger of the stored
+    /// and the reported `deliveredMs` and never adds, so a resend or a replay after a restart adds
+    /// nothing. `closed` is false for a checkpoint of an open segment.
+    void postStreamTime(const QString& sessionId, int segmentNo, qint64 deliveredMs, bool closed,
+                        Callback callback);
+
+    /// The one observer of the existing 10-second liveness beat (ADR-0074 HI06). Called, on the
+    /// thread that issues the liveness report - `LivenessTimer`'s own, the network thread, during a
+    /// stream - immediately before each `postLiveness(sessionId, payload, callback)` leaves, so the
+    /// beat the client already keeps is the checkpoint cadence and no timer of its own exists. The
+    /// observer must be cheap and must not block. An empty function removes it.
+    void setLivenessBeatObserver(std::function<void()> observer);
+
 signals:
     /// The transport failed before any response existed. Distinct from a control-plane
     /// refusal so the UI can tell "we could not ask" from "the answer was no".
@@ -618,4 +654,9 @@ private:
     mutable QMutex m_credentialMutex;
     QString m_accessToken;
     QString m_traceId;
+
+    /// `setLivenessBeatObserver()`'s function, under its own lock: set from the facade's thread,
+    /// read where the liveness report is issued.
+    QMutex m_beatObserverMutex;
+    std::function<void()> m_beatObserver;
 };

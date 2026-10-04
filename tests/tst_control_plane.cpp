@@ -1096,6 +1096,200 @@ private slots:
         QCOMPARE(ControlPlaneClient::buildSessionCreate(), QByteArrayLiteral("{}"));
     }
 
+    // ADR-0074 X02 (contract 3.11.0): the one optional field a Play request may now carry is the
+    // SHA-256 of the client certificate, in the contract's own shape (`^[0-9a-f]{64}$`). A value
+    // that does not match is never sent - the server would ignore it - and there is still no
+    // quality field.
+    void sessionCreateNamesTheClientCertificateOnlyWhenItIsWellFormed()
+    {
+        const QString good = QStringLiteral("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
+        const QJsonObject body =
+            QJsonDocument::fromJson(ControlPlaneClient::buildSessionCreate(good)).object();
+        QCOMPARE(body.size(), 1);
+        QCOMPARE(body.value(QStringLiteral("client_cert_sha256")).toString(), good);
+
+        const QStringList notSent = {
+            QString(),
+            good.toUpper(),
+            good.left(63),
+            good + QLatin1Char('0'),
+            good.left(63) + QLatin1Char('g'),
+            good + QLatin1Char('\n'),
+            QStringLiteral(" ") + good.left(63),
+        };
+        for (const QString& value : notSent) {
+            QVERIFY2(!ControlPlaneClient::isClientCertSha256(value), qPrintable(value));
+            QCOMPARE(ControlPlaneClient::buildSessionCreate(value), QByteArrayLiteral("{}"));
+        }
+        QVERIFY(ControlPlaneClient::isClientCertSha256(good));
+    }
+
+    void thePlayRequestCarriesTheClientCertificateAndStillAFreshRetryKey()
+    {
+        ControlPlaneClient client;
+        auto* fake = new FakeNetworkAccessManager;
+        client.setNetworkAccessManager(fake);
+        fake->status = 200;
+        fake->body = okBody();
+        const QString good = QStringLiteral("abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789");
+
+        bool called = false;
+        client.requestSession(good, [&](const ControlPlaneResult&) { called = true; });
+        QTRY_VERIFY(called);
+
+        QCOMPARE(fake->lastPath, QStringLiteral("/api/sessions"));
+        const QJsonObject sent = QJsonDocument::fromJson(fake->lastBody).object();
+        QCOMPARE(sent.value(QStringLiteral("client_cert_sha256")).toString(), good);
+        QVERIFY2(!sent.contains(QStringLiteral("quality_profile")), "a Play request carries no quality");
+        QVERIFY(!fake->lastRequest.rawHeader("Idempotency-Key").isEmpty());
+
+        // The overload with no certificate is the pre-3.11.0 body, unchanged.
+        called = false;
+        client.requestSession([&](const ControlPlaneResult&) { called = true; });
+        QTRY_VERIFY(called);
+        QCOMPARE(fake->lastBody, QByteArrayLiteral("{}"));
+    }
+
+    // ADR-0074 W03: `warm_return` is an optional boolean that defaults to false. Only the JSON
+    // literal `true` turns it on, so a server that does not know the field, or sends something else,
+    // never makes this client skip a PIN.
+    void authorizationWarmReturnIsTrueOnlyForTheBooleanTrue()
+    {
+        const auto parseWith = [](const QJsonValue& value, bool present) {
+            QJsonObject body;
+            body.insert(QStringLiteral("session_id"), QStringLiteral("aaaabbbb-cccc-dddd-eeee-ffff00001111"));
+            if (present) {
+                body.insert(QStringLiteral("warm_return"), value);
+            }
+            SessionAuthorization auth;
+            const bool parsed = SessionAuthorization::parse(body, &auth);
+            return parsed && auth.warmReturn;
+        };
+
+        QVERIFY(parseWith(QJsonValue(true), true));
+        QVERIFY2(!parseWith(QJsonValue(), false), "absent means false");
+        QVERIFY2(!parseWith(QJsonValue(QJsonValue::Null), true), "null means false");
+        QVERIFY(!parseWith(QJsonValue(false), true));
+        QVERIFY2(!parseWith(QJsonValue(QStringLiteral("true")), true), "a string is not the boolean true");
+        QVERIFY2(!parseWith(QJsonValue(1), true), "a number is not the boolean true");
+    }
+
+    // ADR-0074 W04 (contract 3.11.0), the customer app's half: the delivered-time report goes to the
+    // route of the session it names, with the customer token, and its body is exactly the three
+    // fields of `StreamTimeReport`. The server binds it to the caller's own session (another
+    // customer's answers 404); the client's part is that it can name no other route.
+    void streamReportIsSessionBound()
+    {
+        ControlPlaneClient client;
+        auto* fake = new FakeNetworkAccessManager;
+        client.setNetworkAccessManager(fake);
+        client.setAccessToken(QStringLiteral("opaque-access-token"));
+        fake->status = 200;
+        fake->body = QByteArrayLiteral("{\"session_id\":\"aaaabbbb-cccc-dddd-eeee-ffff00001111\",\"delivered_ms\":61234}");
+
+        const QString sessionA = QStringLiteral("aaaabbbb-cccc-dddd-eeee-ffff00001111");
+        const QString sessionB = QStringLiteral("bbbbcccc-dddd-eeee-ffff-000011112222");
+
+        ControlPlaneResult received;
+        bool called = false;
+        client.postStreamTime(sessionA, 2, 61234, false, [&](const ControlPlaneResult& result) {
+            received = result;
+            called = true;
+        });
+        QTRY_VERIFY(called);
+
+        QVERIFY(received.ok);
+        QCOMPARE(fake->lastPath, QStringLiteral("/api/sessions/aaaabbbb-cccc-dddd-eeee-ffff00001111/stream-time"));
+        QCOMPARE(fake->lastMethod, QByteArrayLiteral("POST"));
+        QCOMPARE(fake->lastRequest.rawHeader("Authorization"),
+                 QByteArrayLiteral("Bearer opaque-access-token"));
+        const QJsonObject sent = QJsonDocument::fromJson(fake->lastBody).object();
+        QCOMPARE(sent.size(), 3);
+        QCOMPARE(sent.value(QStringLiteral("segment_no")).toInt(), 2);
+        QCOMPARE(sent.value(QStringLiteral("delivered_ms")).toInteger(), qint64(61234));
+        QVERIFY(sent.value(QStringLiteral("closed")).isBool());
+        QCOMPARE(sent.value(QStringLiteral("closed")).toBool(), false);
+
+        // A second session is a second route; nothing carries over from the first call.
+        called = false;
+        client.postStreamTime(sessionB, 1, 5000, true, [&](const ControlPlaneResult&) { called = true; });
+        QTRY_VERIFY(called);
+        QCOMPARE(fake->lastPath, QStringLiteral("/api/sessions/bbbbcccc-dddd-eeee-ffff-000011112222/stream-time"));
+        const QJsonObject second = QJsonDocument::fromJson(fake->lastBody).object();
+        QCOMPARE(second.value(QStringLiteral("segment_no")).toInt(), 1);
+        QCOMPARE(second.value(QStringLiteral("closed")).toBool(), true);
+
+        // An id that tries to add structure stays one path segment under the same route.
+        called = false;
+        client.postStreamTime(QStringLiteral("aa/../../admin"), 1, 1, false,
+                              [&](const ControlPlaneResult&) { called = true; });
+        QTRY_VERIFY(called);
+        QCOMPARE(fake->lastPath, QStringLiteral("/api/sessions/aa%2F..%2F..%2Fadmin/stream-time"));
+
+        // A refusal is the server's answer to this exact report and is handed back untouched.
+        fake->status = 404;
+        fake->body = refusedBody(QStringLiteral("No such session."), QStringLiteral("SH-3K2XQ1"));
+        called = false;
+        client.postStreamTime(sessionA, 1, 1, false, [&](const ControlPlaneResult& result) {
+            received = result;
+            called = true;
+        });
+        QTRY_VERIFY(called);
+        QVERIFY(!received.ok);
+        QCOMPARE(received.statusCode, 404);
+    }
+
+    // The contract's bounds (`StreamTimeReport`: segment_no >= 1, delivered_ms >= 0, a 32-bit
+    // integer): the body builder holds every value inside them instead of sending a 422.
+    void streamReportBodyStaysInsideTheContractsBounds()
+    {
+        const auto parse = [](int segment, qint64 ms, bool closed) {
+            return QJsonDocument::fromJson(ControlPlaneClient::buildStreamTimeReport(segment, ms, closed)).object();
+        };
+        QCOMPARE(parse(0, 10, false).value(QStringLiteral("segment_no")).toInt(), 1);
+        QCOMPARE(parse(-4, 10, false).value(QStringLiteral("segment_no")).toInt(), 1);
+        QCOMPARE(parse(1, -5, false).value(QStringLiteral("delivered_ms")).toInteger(), qint64(0));
+        QCOMPARE(parse(1, qint64(1) << 40, true).value(QStringLiteral("delivered_ms")).toInteger(),
+                 qint64(2147483647));
+        QCOMPARE(parse(3, 0, true).value(QStringLiteral("delivered_ms")).toInteger(), qint64(0));
+    }
+
+    // ADR-0074 HI06: the existing liveness beat is the checkpoint cadence. The observer runs once
+    // before each full liveness report leaves, and not for anything else; clearing it stops it.
+    void theLivenessBeatObserverRunsBeforeEachLivenessReportAndNothingElse()
+    {
+        ControlPlaneClient client;
+        auto* fake = new FakeNetworkAccessManager;
+        client.setNetworkAccessManager(fake);
+        fake->status = 200;
+        fake->body = okBody();
+
+        int observed = 0;
+        QVector<int> requestsSeenByObserver;
+        client.setLivenessBeatObserver([&]() {
+            ++observed;
+            requestsSeenByObserver.append(fake->paths.size());
+        });
+
+        int answered = 0;
+        const ControlPlaneClient::Callback done = [&](const ControlPlaneResult&) { ++answered; };
+        const QString session = QStringLiteral("aaaabbbb-cccc-dddd-eeee-ffff00001111");
+        client.postLiveness(session, QJsonObject(), done);
+        client.postLiveness(session, QJsonObject(), done);
+        client.fetchWallet(done);
+        client.fetchSession(session, done);
+        QTRY_COMPARE(answered, 4);
+
+        QCOMPARE(observed, 2);
+        // Before each report left, not after: the first saw no request yet, the second one.
+        QCOMPARE(requestsSeenByObserver, (QVector<int>{ 0, 1 }));
+
+        client.setLivenessBeatObserver({});
+        client.postLiveness(session, QJsonObject(), done);
+        QTRY_COMPARE(answered, 5);
+        QCOMPARE(observed, 2);
+    }
+
     // --- Phase 5 plan 02: the launch, balance, sign-out and password routes ------------------
 
     void fetchMe_getsTheDocumentedRouteWithTheCredentialAndParsesTheAccount()

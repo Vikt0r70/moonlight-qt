@@ -2,6 +2,8 @@
 
 #include <QCryptographicHash>
 #include <QLoggingCategory>
+#include <QMutex>
+#include <QMutexLocker>
 #include <QRunnable>
 #include <QSslCertificate>
 #include <QThreadPool>
@@ -34,10 +36,12 @@ class HandshakeTask : public QObject, public QRunnable
     Q_OBJECT
 
 public:
-    HandshakeTask(PairingHandshake handshake, PairingCancelRequest cancelRequest,
+    HandshakeTask(PairingHandshake handshake, WarmReturnCheck warmCheck,
+                  PairingCancelRequest cancelRequest,
                   PairingTarget target, quint64 generation,
                   std::shared_ptr<std::atomic<quint64>> currentGeneration)
         : m_handshake(std::move(handshake)),
+          m_warmCheck(std::move(warmCheck)),
           m_cancelRequest(std::move(cancelRequest)),
           m_target(std::move(target)),
           m_generation(generation),
@@ -52,7 +56,29 @@ public:
         // (T-06.6-53) can be told apart from the current one - upstream's own blocking call cannot
         // be aborted, so this task keeps running to completion regardless; only its result's fate
         // changes. Nothing copies the target anywhere else, and nothing logs it.
-        PairingHandshakeResult result = m_handshake(m_target);
+        PairingHandshakeResult result;
+
+        // ADR-0074 W03, the warm return: the PIN handshake is skipped only when the control plane
+        // said so for this NEW session (`warmReturn`), this app run still holds the host
+        // certificate it pinned earlier, and the check - the rig's HTTPS serverinfo read with that
+        // pin - answers paired. Anything else (the field absent or false, nothing held after a
+        // restart or a sign-out, a failed or refused check) falls through to the normal
+        // handshake below, untouched: a PIN is always issued, so a normal pairing is always
+        // possible, and the rig's own certificate check is what admits the stream either way.
+        bool warmReturned = false;
+        if (m_target.warmReturn && m_warmCheck) {
+            const QByteArray held = HeldRigTrust::held();
+            if (!held.isEmpty()) {
+                PairingHandshakeResult warm = m_warmCheck(m_target, held);
+                if (warm.ok && !warm.clientIdentity.isEmpty() && warm.host) {
+                    result = warm;
+                    warmReturned = true;
+                }
+            }
+        }
+        if (!warmReturned) {
+            result = m_handshake(m_target);
+        }
 
         // G-06.2-2 recovery, once (T-06.2-12-02: one retry, never a loop). A conflicting failure -
         // the rig's 409 on getservercert, or ALREADY_IN_PROGRESS out of the handshake - means a
@@ -97,6 +123,7 @@ signals:
 
 private:
     PairingHandshake m_handshake;
+    WarmReturnCheck m_warmCheck;
     PairingCancelRequest m_cancelRequest;
     PairingTarget m_target;
     quint64 m_generation;
@@ -119,6 +146,43 @@ QString clientCertificateFingerprint(const QByteArray& pem)
     // SHA-256, not the `QSslCertificate::digest()` default of MD5: this value is an identity, and
     // MD5 is not one (collisions are cheap).
     return QString::fromLatin1(certificate.digest(QCryptographicHash::Sha256).toHex());
+}
+
+namespace {
+
+// The held certificate lives here and nowhere else: process memory, one lock, no file. Written by
+// the handshake's pool thread after a pairing, read by the next handshake's, cleared on the
+// facade's thread at sign-out.
+QMutex& heldRigTrustMutex()
+{
+    static QMutex mutex;
+    return mutex;
+}
+
+QByteArray& heldRigTrustBytes()
+{
+    static QByteArray bytes;
+    return bytes;
+}
+
+} // namespace
+
+void HeldRigTrust::remember(const QByteArray& hostCertificatePem)
+{
+    QMutexLocker locker(&heldRigTrustMutex());
+    heldRigTrustBytes() = hostCertificatePem;
+}
+
+QByteArray HeldRigTrust::held()
+{
+    QMutexLocker locker(&heldRigTrustMutex());
+    return heldRigTrustBytes();
+}
+
+void HeldRigTrust::clear()
+{
+    QMutexLocker locker(&heldRigTrustMutex());
+    heldRigTrustBytes().clear();
 }
 
 ProductionPairingSeam::ProductionPairingSeam(QObject* parent)
@@ -152,6 +216,11 @@ ProductionPairingSeam::~ProductionPairingSeam() = default;
 void ProductionPairingSeam::setHandshake(PairingHandshake handshake)
 {
     m_handshake = std::move(handshake);
+}
+
+void ProductionPairingSeam::setWarmReturnCheck(WarmReturnCheck check)
+{
+    m_warmCheck = std::move(check);
 }
 
 void ProductionPairingSeam::setDeadlineMs(int milliseconds)
@@ -200,8 +269,8 @@ void ProductionPairingSeam::pair(const PairingTarget& target,
     // it now counts down 90 s from THIS `pair()` call, not from whatever remained of the old one.
     m_deadline->start(m_deadlineMs);
 
-    HandshakeTask* task = new HandshakeTask(m_handshake, m_cancelRequest, target, generation,
-                                            m_currentGeneration);
+    HandshakeTask* task = new HandshakeTask(m_handshake, m_warmCheck, m_cancelRequest, target,
+                                            generation, m_currentGeneration);
     connect(task, &HandshakeTask::finished, this, &ProductionPairingSeam::handleHandshakeResult);
     QThreadPool::globalInstance()->start(task);
 }

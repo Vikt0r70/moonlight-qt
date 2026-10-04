@@ -305,6 +305,27 @@ void endPreStreamSessionWithReport(SessionTeardownGuard& guard, TeardownControll
     // `endAttachedSessionBeforeStream()`'s own comment.
 }
 
+// ADR-0074 HI06: the one stream-time checkpoint, as a function that depends on nothing but the
+// pieces it captures by value - the clock, its record and the control-plane client, which owns the
+// beat observer that calls it and so outlives every call. The liveness beat (on the network thread),
+// the segment-closed hook (queued onto that thread) and `flushStreamTime()` (teardown, on the
+// facade's) all run this same function, so a checkpoint never reads the facade and never needs it
+// alive.
+std::function<void()> makeStreamTimeCheckpoint(const std::shared_ptr<DeliveredStreamTime>& clock,
+                                               const std::shared_ptr<StreamTimeOutbox>& outbox,
+                                               ControlPlaneClient* controlPlane)
+{
+    return [clock, outbox, controlPlane]() {
+        checkpointStreamTime(
+            clock, outbox,
+            [controlPlane](const QString& sessionId, const StreamSegmentReport& segment,
+                           ControlPlaneClient::Callback callback) {
+                controlPlane->postStreamTime(sessionId, segment.segmentNo, segment.deliveredMs,
+                                             segment.closed, std::move(callback));
+            });
+    };
+}
+
 } // namespace
 
 // Control-plane callbacks arrive on the network thread once `startNetworkThreads()` has moved the
@@ -448,6 +469,26 @@ SeatHubClient::SeatHubClient(QObject* parent)
         }
     });
 
+    // ADR-0074 HI02/HI06: the delivered-stream-time clock and its record. The clock reads the
+    // engine's three segment-ending log lines through its own sink on the one `LogTee` (the stats
+    // overlay is never read, so the stats hotkey cannot change it). It is sent at the existing
+    // 10-second liveness beat - observed from `ControlPlaneClient`, no timer of its own - and the
+    // moment a segment closes.
+    m_streamTime = std::make_shared<DeliveredStreamTime>();
+    m_streamTimeOutbox = std::make_shared<StreamTimeOutbox>();
+    m_streamTimeSinkHandle = LogTee::addSink(m_streamTime->sink());
+    {
+        const std::function<void()> checkpoint =
+            makeStreamTimeCheckpoint(m_streamTime, m_streamTimeOutbox, m_controlPlane);
+        ControlPlaneClient* const controlPlane = m_controlPlane;
+        m_controlPlane->setLivenessBeatObserver(checkpoint);
+        // The hook runs on whichever thread logged the segment's last line; a sink never blocks,
+        // so the checkpoint itself is queued onto the control plane's own thread.
+        m_streamTime->setSegmentClosedHook([controlPlane, checkpoint]() {
+            QMetaObject::invokeMethod(controlPlane, checkpoint, Qt::QueuedConnection);
+        });
+    }
+
     // The sign-in field's data: read from the binary, never fetched (Phase 5 D-02).
     qRegisterMetaType<SessionInfo>("SessionInfo");
     qRegisterMetaType<AccountStateInfo>("AccountStateInfo");
@@ -486,6 +527,9 @@ SeatHubClient::SeatHubClient(QObject* parent)
     // The seam gets upstream's real handshake; without it `PairingController` fails closed, which
     // is the state 03-03 shipped and the gap this wiring closes.
     m_pairingSeam->setHandshake(&runUpstreamPairingHandshake);
+    // ADR-0074 W03: the warm return. Tried only for a NEW session whose authorization says
+    // `warm_return`, and only with the host certificate this run itself pinned.
+    m_pairingSeam->setWarmReturnCheck(&runUpstreamWarmReturnCheck);
     m_pairing->setSeam(m_pairingSeam);
     m_pairing->setControlPlane(m_controlPlane);
     m_teardown->setControlPlane(m_controlPlane);
@@ -624,6 +668,10 @@ SeatHubClient::~SeatHubClient()
     LogTee::removeSink(m_statsSinkHandle);
     m_terminationSinkHandle = 0;
     m_statsSinkHandle = 0;
+    // ADR-0074 HI02: the stream-time clock's sink goes the same way, and its closed hook with it.
+    LogTee::removeSink(m_streamTimeSinkHandle);
+    m_streamTimeSinkHandle = 0;
+    m_streamTime->setSegmentClosedHook({});
 
     // Plan 21 (D-14, SEATHUB § E.3 step 6): "at quit" for this fork is this destructor - one
     // `SeatHubClient` for the life of the production app. Queues whatever is still in memory
@@ -767,6 +815,12 @@ void SeatHubClient::beginSession(const QString& sessionId)
 
     setAttachedSession(sessionId);
     setAttachedSessionEnded(false);
+    // ADR-0074 HI02/HI06: the delivered-time clock is bound to this app's own new session and the
+    // signed-in account (still empty on a customer's very first Play until `GET /api/me` answers;
+    // `setAccountId()` fills it then). Every report from here on goes to this session id only. The
+    // same session again (a reconnect never reaches here) would change nothing.
+    m_streamTimeOutbox->setDirectory(streamTimeOutboxDirectory());
+    m_streamTime->beginSession(sessionId, m_accountId);
     m_lastFailedStep.clear();
     // O01: whether the customer quit, and whether the engine named a failure, are facts about one
     // attempt. A quit or a failure of the attempt before this one never colours this one's end.
@@ -1444,6 +1498,9 @@ bool SeatHubClient::endAttachedSessionBeforePlay()
 
 void SeatHubClient::beginLocalAttempt()
 {
+    // ADR-0074 HI02: a local attempt has no control-plane session, so no delivered time is
+    // recorded for it - and none is added to a session attached earlier.
+    m_streamTime->endSession();
     m_samplerPlayId = randomTraceId();
     m_playSummaryPending = true;
     m_stepTimings.clear();
@@ -1499,7 +1556,9 @@ void SeatHubClient::beginPlayRequest()
     // epoch, like `requestSession()`'s own callback: applying a slightly stale handout after a
     // sign-out is harmless, D-18 F-1). No quality field is sent (A-68, D-06 reversal): the
     // customer's saved Settings are the only decider of stream quality.
-    m_controlPlane->requestSession([this](const ControlPlaneResult& result) {
+    // ADR-0074 X02: the body names the fingerprint of the client certificate this app pairs with,
+    // so the rig can find this customer's pairing and no other.
+    m_controlPlane->requestSession(ownClientCertificateFingerprint(), [this](const ControlPlaneResult& result) {
         onClientThread(this, [this, result]() {
             if (!result.ok) {
                 applyPlayFailure(result);
@@ -1817,6 +1876,10 @@ bool SeatHubClient::adoptSignIn(const AuthTokenPair& pair, const QString& identi
                 SeatHubTelemetry::setUser(account.id);
                 flushUntaggedQualityReports();
                 drainQualityOutbox();
+                // ADR-0074 HI06: the stream-time records an earlier run left are sent again now
+                // that the account is known - to their own session ids and this account only.
+                m_streamTime->setAccountId(m_accountId);
+                drainStreamTimeOutbox();
             }
         });
     });
@@ -1943,6 +2006,14 @@ void SeatHubClient::signOut()
     // for it any more, and never left to be posted after `m_accountId` and the access token are
     // gone.
     storeQualityReportToOutbox();
+
+    // ADR-0074 W03/HI06: nothing of this customer's survives a sign-out in memory either. The host
+    // certificate this run pinned is forgotten, so the next Play pairs normally ("a sign-out"
+    // runs the normal pairing); a stream-time drain in flight for this account stops, and the clock
+    // forgets its session (its unsent time is in the record, tagged with this account).
+    HeldRigTrust::clear();
+    m_streamTimeOutbox->cancel();
+    m_streamTime->endSession();
 
     // WR-06: an untagged report (parsed before `m_accountId` was ever resolved this epoch) can
     // never be tagged now - the epoch it was held for is about to be over, and dropping it here,
@@ -2142,6 +2213,10 @@ void SeatHubClient::applyRestoreResult(const ControlPlaneResult& result)
         // CR-03: a `drainQualityOutbox()` call this credential started must not still be running
         // once it has been refused - see `QualityOutbox::cancel()`'s own comment.
         m_qualityOutbox.cancel();
+        // ADR-0074: the same for the stream-time drain, and no held pairing trust outlives the
+        // credential that earned it.
+        m_streamTimeOutbox->cancel();
+        HeldRigTrust::clear();
         setAppState(QString::fromLatin1(kStateSignedOut));
         return;
     }
@@ -2187,11 +2262,63 @@ void SeatHubClient::setAccount(const AccountInfo& account)
     // earlier one this process never got a chance to tag) is tagged and stored now.
     flushUntaggedQualityReports();
     drainQualityOutbox();
+    // ADR-0074 HI06: as in `adoptSignIn()`'s own `fetchMe` callback - records a killed run left are
+    // replayed after the relaunch, to the same session and the same account only.
+    m_streamTime->setAccountId(m_accountId);
+    drainStreamTimeOutbox();
 }
 
 QString SeatHubClient::qualityOutboxDirectory() const
 {
     return QDir(m_tokenStore->directory()).filePath(QStringLiteral("quality-outbox"));
+}
+
+QString SeatHubClient::streamTimeOutboxDirectory() const
+{
+    return QDir(m_tokenStore->directory()).filePath(QStringLiteral("stream-time-outbox"));
+}
+
+void SeatHubClient::flushStreamTime()
+{
+    m_streamTimeOutbox->setDirectory(streamTimeOutboxDirectory());
+    makeStreamTimeCheckpoint(m_streamTime, m_streamTimeOutbox, m_controlPlane)();
+}
+
+void SeatHubClient::drainStreamTimeOutbox()
+{
+    if (m_accountId.isEmpty() || !m_controlPlane->hasAccessToken()) {
+        return;
+    }
+
+    m_streamTimeOutbox->setDirectory(streamTimeOutboxDirectory());
+
+    // The same discipline as `drainQualityOutbox()`: the real bearer token never leaves
+    // `ControlPlaneClient`, `m_authEpoch` names which sign-in is current, and the account is
+    // captured now and checked again before every send and every reply, so a sign-out (or a
+    // sign-in as someone else) mid-drain stops the loop instead of sending one account's records
+    // under another's token.
+    const QString tokenGeneration = QString::number(m_authEpoch);
+    const quint64 epoch = m_authEpoch;
+
+    // The live session's own record belongs to the beat, not to this pass.
+    m_streamTimeOutbox->drain(
+        tokenGeneration, m_accountId, m_streamTime->sessionId(),
+        [this, epoch](const QString& sessionId, const StreamSegmentReport& segment,
+                      ControlPlaneClient::Callback callback) {
+            if (epoch != m_authEpoch) {
+                callback(ControlPlaneResult::aborted());
+                return;
+            }
+            m_controlPlane->postStreamTime(
+                sessionId, segment.segmentNo, segment.deliveredMs, segment.closed,
+                [this, epoch, callback](const ControlPlaneResult& result) {
+                    // The reply lands on the network thread; the outbox's own state is the
+                    // facade thread's, so the continuation is marshalled back first.
+                    onClientThread(this, [this, epoch, callback, result]() {
+                        callback(epoch == m_authEpoch ? result : ControlPlaneResult::aborted());
+                    });
+                });
+        });
 }
 
 void SeatHubClient::drainQualityOutbox()
@@ -2415,6 +2542,14 @@ void SeatHubClient::handleStageFailed(const QString& stage, int errorCode, const
 
 void SeatHubClient::handleConnectionStarted()
 {
+    // ADR-0074 HI02: a segment of delivered stream time starts here, the instant the engine says
+    // its connection started - before anything else in this handler (the HUD, the stage, the
+    // sampler) takes any of the time. Only for the control-plane session the clock is bound to:
+    // a local attempt, or a session that is no longer the attached one, records nothing.
+    if (inControlPlaneSession() && m_streamTime->sessionId() == m_sessionId) {
+        m_streamTime->connectionStarted();
+    }
+
     const bool firstConnection = m_streamStartMs < 0;
     if (firstConnection) m_streamStartMs = m_playElapsed.elapsed();
     const auto generation = m_playGeneration.load();
@@ -2563,13 +2698,23 @@ void SeatHubClient::handleDisplayLaunchWarning(const QString& text)
 
 void SeatHubClient::handleQuitStarting()
 {
-    // Deliberately inert. `quitStarting` fires before deferred engine cleanup and before
-    // SDL destroys its window, so restoring the Qt window here would put two windows on
+    // ADR-0074 HI02: the engine's quit has begun, so no stream is running. The segment normally
+    // ended already, on the engine's own `Quit event received` / `Connection terminated` /
+    // unexpected-disconnect line, which this signal follows; this closes one whose line was not
+    // seen, unreduced, and does nothing otherwise.
+    m_streamTime->closeOpenSegment();
+
+    // Otherwise deliberately inert. `quitStarting` fires before deferred engine cleanup and
+    // before SDL destroys its window, so restoring the Qt window here would put two windows on
     // screen at once (Pitfall 1). The restore happens on `readyForDeletion`.
 }
 
 void SeatHubClient::handleSessionFinished(int portTestResult)
 {
+    // ADR-0074 HI02: the other end of the engine's cleanup (`quitStarting` is emitted only when
+    // the app is quit after the session) - same fallback, same unreduced close, no-op normally.
+    m_streamTime->closeOpenSegment();
+
     m_hud.compositor().setStatsTap(nullptr);
     m_sampler->finish();
     // D-56: the duration timer stops here, which is the interval the plan specifies.
@@ -3671,12 +3816,17 @@ void SeatHubClient::handleVideoStatsParsed(VideoStats stats)
     m_hasPendingQualityReport = true;
 }
 
-void SeatHubClient::postOrStoreQualityReport()
+void SeatHubClient::postOrStoreQualityReport(const QString& onlyForSession)
 {
     // D-17/CR-02: post the held stats block once, for the session it was bound to. Cleared
     // immediately after so a second call - a later session's teardown, or one with no stats block
     // at all - never re-sends an earlier session's numbers.
     if (!m_hasPendingQualityReport) {
+        return;
+    }
+    // R06: a late step of an ended session posts that session's own report and nothing else. A
+    // report that belongs to the newer attempt stays held for its own teardown.
+    if (!onlyForSession.isEmpty() && m_pendingQualitySessionId != onlyForSession) {
         return;
     }
     const QString sessionId = m_pendingQualitySessionId;
@@ -3739,13 +3889,17 @@ void SeatHubClient::postOrStoreQualityReport()
         });
 }
 
-void SeatHubClient::storeQualityReportToOutbox()
+void SeatHubClient::storeQualityReportToOutbox(const QString& onlyForSession)
 {
     // CR-02: the teardown POST that would have carried this report already failed to reach the
     // control plane, so this stores it straight into the outbox rather than attempting a second
     // network call that is very likely to fail the same way. Cleared either way, so a later
     // session never inherits a stale pending report.
     if (!m_hasPendingQualityReport) {
+        return;
+    }
+    // R06: the same fence as `postOrStoreQualityReport()`.
+    if (!onlyForSession.isEmpty() && m_pendingQualitySessionId != onlyForSession) {
         return;
     }
     const QString sessionId = m_pendingQualitySessionId;
@@ -3793,13 +3947,19 @@ void SeatHubClient::handleTeardownCompleted(const SessionInfo& finalSession,
     if (isLateStepOfEndedSession(sessionId)) {
         qCInfo(seathubClient) << "dropping the teardown result of a session that is no longer attached:"
                               << sessionId;
-        postOrStoreQualityReport();
+        // Fenced to the teardown's own session: a report that belongs to the attempt now attached
+        // is that attempt's to post, not this late step's.
+        postOrStoreQualityReport(sessionId);
         return;
     }
 
     noteStepOutcome(QStringLiteral("teardown"), QStringLiteral("ok"), QStringLiteral("ok"),
                     m_playElapsed.isValid() ? m_playElapsed.elapsed() : -1);
     postOrStoreQualityReport();
+    // ADR-0074 HI06: the last checkpoint of this session's delivered stream time ("at teardown"),
+    // and a retry of any record an earlier run or session could not deliver.
+    flushStreamTime();
+    drainStreamTimeOutbox();
 
     // Home says why the session ended, read from the session itself now that teardown has confirmed it
     // is over (CUST-15, D-21). The minute count is the server's own `minutes_billed`. A session the
@@ -3843,6 +4003,9 @@ void SeatHubClient::handleTeardownCompleted(const SessionInfo& finalSession,
     SeatHubTelemetry::clearSession();
 
     setAttachedSession(QString());
+    // ADR-0074 HI06: the clock's session goes with the attachment. What it had not yet delivered
+    // is in the record (written before each send) and is sent again at the next launch's drain.
+    m_streamTime->endSession();
     m_clientUuid.clear();
     // The session's teardown claim goes with its id. The next `beginSession()` resets it anyway;
     // clearing it here keeps "no session" and "no claim" the same state, which is what the guard
@@ -3881,7 +4044,8 @@ void SeatHubClient::handleTeardownFailed(const SeatHubFailure& failure, const QS
     if (isLateStepOfEndedSession(sessionId)) {
         qCInfo(seathubClient) << "dropping the teardown failure of a session that is no longer attached:"
                               << sessionId;
-        storeQualityReportToOutbox();
+        // R06 fence, as in `handleTeardownCompleted()`: only this teardown's own session's report.
+        storeQualityReportToOutbox(sessionId);
         return;
     }
 
@@ -3910,6 +4074,10 @@ void SeatHubClient::handleTeardownFailed(const SeatHubFailure& failure, const QS
     // would have carried it already failed to reach the control plane); the report is written
     // straight to the outbox and picked up at the next sign-in or launch.
     storeQualityReportToOutbox();
+    // ADR-0074 HI06: the delivered stream time is checkpointed at this teardown too, whatever its
+    // outcome - it is the app's own measure of a stream that happened, and the record keeps what
+    // the network does not take.
+    flushStreamTime();
 
     // WR-01: the Play this trace id covered ended here, at a teardown failure - the next one
     // (`beginPlayRequest`) mints its own. Before this fix only `handleTeardownCompleted()` cleared

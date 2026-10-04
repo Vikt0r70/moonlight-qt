@@ -38,3 +38,26 @@
 /// On any failure `ok` is false, `clientIdentity` is empty, and `engineError` carries upstream's
 /// own text for the log only - it is never rendered (D-51) and never contains the PIN.
 PairingHandshakeResult runUpstreamPairingHandshake(const PairingTarget& target);
+
+/// The warm-return check (ADR-0074 W03, `docs/spec/client.md` "Warm return"): with the host
+/// certificate this app run pinned when it paired earlier (`heldHostCertificatePem`), reads the
+/// rig's HTTPS `serverinfo` through upstream's own `NvHTTP` - which authenticates the host against
+/// that pin and presents this client's certificate - and succeeds only when the answer says this
+/// client is paired. `ok` is then true with the client identity and a host record built the way a
+/// full pairing builds it (the pin, the application list), so the engine streams from it exactly as
+/// after a handshake.
+///
+/// Every other outcome is `ok` false and runs the normal pairing: no HTTPS port to ask, a pin the
+/// rig refuses (the TLS check fails or the answer falls back to plain HTTP, which never reports
+/// paired), an unreachable rig, a not-paired answer, or any exception. Nothing is persisted, no PIN
+/// is used, no pairing request is sent, and the rig is only asked a question it answers to anyone
+/// (`serverinfo`). Blocks its caller (a worker thread) and never throws.
+PairingHandshakeResult runUpstreamWarmReturnCheck(const PairingTarget& target,
+                                                  const QByteArray& heldHostCertificatePem);
+
+/// The SHA-256 fingerprint (64 lowercase hex characters) of this client's own certificate - the
+/// identity the app names to the control plane at Play (`client_cert_sha256`, ADR-0074 X02) and
+/// that the rig uses to find this customer's pairing and no other. Empty when the certificate
+/// cannot be read. Must be called after the engine's `IdentityManager` exists (the app creates it at
+/// start-up, on the main thread).
+QString ownClientCertificateFingerprint();

@@ -14,9 +14,12 @@
 
 #include <QElapsedTimer>
 #include <QJsonObject>
+#include <QMutex>
 #include <QObject>
 #include <QString>
+#include <QVector>
 
+#include <functional>
 #include <vector>
 
 #include "log_tee.h"
@@ -211,4 +214,158 @@ public:
 private:
     QElapsedTimer m_timer;
     std::vector<Segment> m_segments;
+};
+
+// ---------------------------------------------------------------- delivered stream time (HI02)
+
+/// One stream segment as the reporter sends it (`StreamTimeReport`, ADR-0074 W04): the key
+/// `segmentNo` (the first segment of a Play is 1, each reconnect starts the next number), the
+/// milliseconds the app measured for it so far, and whether it has ended.
+struct StreamSegmentReport
+{
+    int segmentNo = 0;
+    qint64 deliveredMs = 0;
+    bool closed = false;
+};
+
+/// What `DeliveredStreamTime::pending()` hands the reporter: the session and account the clock is
+/// bound to, and every segment whose last state the server has not yet confirmed - an open one at
+/// its running time, a closed one at its final value.
+struct StreamTimeSnapshot
+{
+    QString sessionId;
+    QString accountId;
+    QVector<StreamSegmentReport> segments;
+};
+
+/// The delivered-stream-time clock (ADR-0074 item 6, `docs/spec/client.md` § Stream Liveness and
+/// Reconnect, "Delivered stream time", HI02).
+///
+/// For the history rule only (distinct-rig history qualifies on streamed time strictly greater
+/// than 30 minutes), the app measures the time its own stream actually ran. It reads no stats
+/// overlay and no statistics value - there is no member here that takes a `VideoStats` - so showing
+/// or hiding the overlay (Moonlight's stats hotkey) cannot change it, and it never uses billed
+/// minutes, the wall-clock `stream_s` or the Node Agent's Busy minutes.
+///
+/// A segment starts when the engine reports its connection started (`connectionStarted()`) and ends
+/// at the first of three engine log lines, which `sink()` reads from the one `LogTee`:
+///
+///   * `Quit event received` (`app/streaming/session.cpp`, the customer quitting or the end of any
+///     stream),
+///   * `Connection terminated: <code>` (`Session::clConnectionTerminated`), or
+///   * `Control stream received unexpected disconnect event` (`moonlight-common-c`
+///     `ControlStream.c`, after which the library reports a termination of -1).
+///
+/// When the segment ends on either of the last two with a termination code other than 0, the
+/// engine's 10-second control-stream wait (`enet_peer_timeout(peer, 2, 10000, 10000)` in
+/// `ControlStream.c`) is taken off the end - the connection was already gone that long ago - but a
+/// segment never ends before its own start. A graceful engine end (code 0) and the customer's own
+/// quit are not reduced. The first line closes the segment; the lines that follow it (the engine
+/// reports one loss as a disconnect line, then a termination line, then the quit event) find no open
+/// segment and change nothing.
+///
+/// Each segment is timed on the monotonic clock in whole milliseconds. A reconnect starts a new
+/// segment with the next number; the seconds between segments (noticing the loss, reconnect
+/// attempts, grace, pairing) belong to no segment. Everything is read from signals and log lines
+/// SeatHub already receives; no engine file changes.
+///
+/// Thread safety: `sink()` runs on whichever thread logs (the engine's connection and control
+/// threads, the SDL main thread), `pending()` and `settle()` on the network thread, and
+/// `connectionStarted()` on the facade's. One mutex guards the state; the segment-closed hook is
+/// called with it released.
+class DeliveredStreamTime
+{
+public:
+    /// `moonlight-common-c` `ControlStream.c`: `enet_peer_timeout(peer, 2, 10000, 10000)`.
+    static constexpr qint64 kControlStreamWaitMs = 10000;
+
+    /// A monotonic millisecond clock. The default is `QElapsedTimer`; a test supplies its own.
+    using Clock = std::function<qint64()>;
+
+    /// How a recognised engine line ends a segment (`classifyEngineLine()`).
+    enum class EngineLine
+    {
+        None,
+        QuitEvent,
+        UnexpectedDisconnect,
+        ConnectionTerminated,
+    };
+
+    explicit DeliveredStreamTime(Clock clock = {});
+
+    /// Binds the clock to the app's own current session and the signed-in account. The same
+    /// session again changes nothing (segment numbers keep counting); a different one starts a
+    /// fresh count and forgets the previous session's segments (they were persisted when they were
+    /// written, `StreamTimeOutbox`). An empty `accountId` is filled in later by `setAccountId()`.
+    void beginSession(const QString& sessionId, const QString& accountId);
+    /// Fills the account only when none is set yet; never replaces one.
+    void setAccountId(const QString& accountId);
+    /// Forgets the session and its segments (sign-out, or the session being detached).
+    void endSession();
+    QString sessionId() const;
+    QString accountId() const;
+
+    /// The engine reported its connection started: opens the next segment and returns its number.
+    /// A segment still open (its end line was missed) is closed first, at this instant and
+    /// unreduced. Returns 0 and records nothing when no session is bound (a local attempt).
+    int connectionStarted();
+
+    /// Closes the open segment at this instant, reduced by the control-stream wait when
+    /// `connectionLost` is true. Returns whether a segment was open.
+    bool closeOpenSegment(bool connectionLost = false);
+    bool hasOpenSegment() const;
+
+    /// What one engine line means for a segment, or `None`. `code` receives the termination code
+    /// for `ConnectionTerminated`. Trailing line breaks are ignored.
+    static EngineLine classifyEngineLine(int category, int priority, const QString& text, int* code);
+
+    /// The `LogTee::Sink` to register (`LogTee::addSink`); the caller must `LogTee::removeSink()`
+    /// before this object is destroyed.
+    LogTee::Sink sink();
+
+    /// Called (on the thread that closed the segment, with no lock held) after a segment closes, so
+    /// the owner can send its final value at once instead of waiting for the next beat. Must not
+    /// block.
+    void setSegmentClosedHook(std::function<void()> hook);
+
+    /// Every segment the server has not yet confirmed (see `StreamTimeSnapshot`). Empty after
+    /// `refuse()`.
+    StreamTimeSnapshot pending() const;
+    /// A closed segment's final value reached the server (or was refused for good): it is not sent
+    /// again. Ignored for a different session than the one bound now, for an open segment, and for
+    /// a value that is not the segment's final one.
+    void settle(const QString& sessionId, int segmentNo, qint64 deliveredMs);
+    /// The server refused this session's reports for good (404 or 422): nothing more is reported
+    /// for it. Ignored for a different session than the one bound now.
+    void refuse(const QString& sessionId);
+
+    /// The sum of every segment of the bound session, an open one at its running time. For tests
+    /// and diagnostics; the server computes its own total from the reports.
+    qint64 totalMs() const;
+
+private:
+    struct Segment
+    {
+        int no = 0;
+        qint64 startMs = 0;
+        qint64 deliveredMs = 0;
+        bool closed = false;
+        bool settled = false;
+    };
+
+    qint64 nowMs() const;
+    bool closeLocked(qint64 reduceMs);
+    void fireClosed();
+    bool handleEngineLine(int category, int priority, const QString& text);
+
+    Clock m_clock;
+    QElapsedTimer m_origin;
+    mutable QMutex m_mutex;
+    QString m_sessionId;
+    QString m_accountId;
+    QVector<Segment> m_segments;
+    int m_open = -1;
+    int m_nextNo = 1;
+    bool m_refused = false;
+    std::function<void()> m_closedHook;
 };

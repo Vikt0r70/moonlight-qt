@@ -3,12 +3,17 @@
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
+#include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonParseError>
 #include <QLoggingCategory>
+#include <QMutex>
+#include <QMutexLocker>
 #include <QRegularExpression>
 #include <QSaveFile>
 #include <QStandardPaths>
+
+#include <algorithm>
 
 Q_LOGGING_CATEGORY(seathubQualityOutbox, "seathub.quality_outbox")
 
@@ -240,4 +245,414 @@ void QualityOutbox::drainFiles(const QStringList& files, int index, const QStrin
                }
                drainFiles(files, index + 1, tokenGeneration, accountId, postFn, generation);
            });
+}
+
+// ---------------------------------------------------------------- StreamTimeOutbox (HI06)
+
+namespace {
+
+// One lock for every record file and for each outbox's directory string. The beat and the
+// segment-closed hook write from the network thread, teardown and the launch drain from the
+// facade's, and a relaunch reads what a killed process left. Held for a few small file operations
+// only, never across a network call.
+QMutex& streamTimeFileMutex()
+{
+    static QMutex mutex;
+    return mutex;
+}
+
+const char* kStreamAccountKey = "account_id";
+const char* kStreamSegmentsKey = "segments";
+const char* kStreamSegmentNoKey = "segment_no";
+const char* kStreamDeliveredKey = "delivered_ms";
+const char* kStreamClosedKey = "closed";
+
+// The largest value the server can store for `delivered_ms` (W04: a 32-bit `integer`).
+constexpr qint64 kStreamMaxDeliveredMs = 2147483647;
+
+struct StreamTimeFile
+{
+    QString accountId;
+    QVector<StreamSegmentReport> segments;
+};
+
+QString streamTimePath(const QString& directory, const QString& sessionId)
+{
+    return QDir(directory).filePath(sessionId + QStringLiteral(".json"));
+}
+
+// Reads one record file. False for a file that is not a record this outbox wrote.
+bool readStreamTimeFile(const QString& path, StreamTimeFile* out)
+{
+    QFile file(path);
+    if (!file.open(QIODevice::ReadOnly)) {
+        return false;
+    }
+    QJsonParseError parseError{};
+    const QJsonDocument doc = QJsonDocument::fromJson(file.readAll(), &parseError);
+    file.close();
+    if (parseError.error != QJsonParseError::NoError || !doc.isObject()) {
+        return false;
+    }
+    const QJsonObject envelope = doc.object();
+    const QJsonValue segments = envelope.value(QLatin1String(kStreamSegmentsKey));
+    if (!segments.isArray() || !envelope.value(QLatin1String(kStreamAccountKey)).isString()) {
+        return false;
+    }
+    StreamTimeFile record;
+    record.accountId = envelope.value(QLatin1String(kStreamAccountKey)).toString();
+    for (const QJsonValue& value : segments.toArray()) {
+        const QJsonObject entry = value.toObject();
+        const int number = entry.value(QLatin1String(kStreamSegmentNoKey)).toInt();
+        const qint64 delivered =
+            static_cast<qint64>(entry.value(QLatin1String(kStreamDeliveredKey)).toDouble(-1));
+        if (number < 1 || delivered < 0) {
+            // Not an entry this outbox wrote: never trusted, never sent.
+            continue;
+        }
+        StreamSegmentReport segment;
+        segment.segmentNo = number;
+        segment.deliveredMs = qMin(delivered, kStreamMaxDeliveredMs);
+        segment.closed = entry.value(QLatin1String(kStreamClosedKey)).toBool(false);
+        record.segments.push_back(segment);
+    }
+    std::sort(record.segments.begin(), record.segments.end(),
+              [](const StreamSegmentReport& a, const StreamSegmentReport& b) {
+                  return a.segmentNo < b.segmentNo;
+              });
+    *out = record;
+    return true;
+}
+
+bool writeStreamTimeFile(const QString& directory, const QString& path, const StreamTimeFile& record)
+{
+    QJsonArray segments;
+    for (const StreamSegmentReport& segment : record.segments) {
+        QJsonObject entry;
+        entry.insert(QLatin1String(kStreamSegmentNoKey), segment.segmentNo);
+        entry.insert(QLatin1String(kStreamDeliveredKey), QJsonValue(segment.deliveredMs));
+        entry.insert(QLatin1String(kStreamClosedKey), segment.closed);
+        segments.append(entry);
+    }
+    QJsonObject envelope;
+    envelope.insert(QLatin1String(kStreamAccountKey), record.accountId);
+    envelope.insert(QLatin1String(kStreamSegmentsKey), segments);
+    const QByteArray bytes = QJsonDocument(envelope).toJson(QJsonDocument::Compact);
+
+    QDir().mkpath(directory);
+    // QSaveFile: a kill mid-write leaves the previous copy (or nothing), never a truncated record.
+    QSaveFile file(path);
+    return file.open(QIODevice::WriteOnly) && file.write(bytes) == bytes.size() && file.commit();
+}
+
+} // namespace
+
+StreamTimeOutbox::Outcome StreamTimeOutbox::classify(const ControlPlaneResult& result)
+{
+    if (result.wasAborted) {
+        return Outcome::Aborted;
+    }
+    if (result.ok) {
+        return Outcome::Delivered;
+    }
+    if (result.statusCode == 401 || result.statusCode == 403) {
+        return Outcome::AuthFailed;
+    }
+    // The W04 route documents 404, 409 and 422 as its refusals (docs/spec openapi.yaml); those are
+    // what is dropped. Any other status is not one the route promises, so it is kept and tried again.
+    switch (result.statusCode) {
+    case 404: // another account's session, or none by that id
+    case 409: // this session never streamed (stream_started_at is null)
+    case 422: // a malformed body
+        return Outcome::Refused;
+    default:
+        // 0 (no answer), 5xx, 408, 429, or any other status this route does not document.
+        return Outcome::Retryable;
+    }
+}
+
+QString StreamTimeOutbox::defaultDirectory()
+{
+    return QDir(QStandardPaths::writableLocation(QStandardPaths::AppDataLocation))
+        .filePath(QStringLiteral("stream-time-outbox"));
+}
+
+StreamTimeOutbox::StreamTimeOutbox(const QString& directory)
+    : m_directory(directory.isEmpty() ? defaultDirectory() : directory)
+{
+}
+
+void StreamTimeOutbox::setDirectory(const QString& directory)
+{
+    QMutexLocker locker(&streamTimeFileMutex());
+    m_directory = directory;
+}
+
+QString StreamTimeOutbox::directory() const
+{
+    QMutexLocker locker(&streamTimeFileMutex());
+    return m_directory;
+}
+
+void StreamTimeOutbox::put(const QString& sessionId, const QString& accountId,
+                           const StreamSegmentReport& segment)
+{
+    if (!isUuidShaped(sessionId)) {
+        qCWarning(seathubQualityOutbox) << "refusing to store stream time for a session id "
+                                           "that is not a UUID";
+        return;
+    }
+    if (accountId.isEmpty() || segment.segmentNo < 1 || segment.deliveredMs < 0) {
+        return;
+    }
+
+    QMutexLocker locker(&streamTimeFileMutex());
+    const QString path = streamTimePath(m_directory, sessionId);
+
+    StreamTimeFile record;
+    StreamTimeFile existing;
+    if (readStreamTimeFile(path, &existing) && existing.accountId == accountId) {
+        record = existing;
+    }
+    record.accountId = accountId;
+
+    StreamSegmentReport incoming = segment;
+    incoming.deliveredMs = qMin(incoming.deliveredMs, kStreamMaxDeliveredMs);
+
+    bool merged = false;
+    for (StreamSegmentReport& stored : record.segments) {
+        if (stored.segmentNo != incoming.segmentNo) {
+            continue;
+        }
+        merged = true;
+        if (stored.closed && !incoming.closed) {
+            // A closed segment never reopens: a late checkpoint of it changes nothing.
+        }
+        else if (incoming.closed && !stored.closed) {
+            // The end of the segment is authoritative, even when it is smaller than the last
+            // checkpoint (the reduction for a lost connection can make it so).
+            stored = incoming;
+        }
+        else {
+            // Open over open, or closed over closed: the larger, as the server keeps.
+            stored.deliveredMs = qMax(stored.deliveredMs, incoming.deliveredMs);
+        }
+        break;
+    }
+    if (!merged) {
+        record.segments.push_back(incoming);
+        std::sort(record.segments.begin(), record.segments.end(),
+                  [](const StreamSegmentReport& a, const StreamSegmentReport& b) {
+                      return a.segmentNo < b.segmentNo;
+                  });
+    }
+
+    if (!writeStreamTimeFile(m_directory, path, record)) {
+        qCWarning(seathubQualityOutbox) << "could not write the stream-time record for" << sessionId;
+    }
+}
+
+QVector<StreamSegmentReport> StreamTimeOutbox::entries(const QString& sessionId,
+                                                      const QString& accountId) const
+{
+    if (!isUuidShaped(sessionId)) {
+        return {};
+    }
+    QMutexLocker locker(&streamTimeFileMutex());
+    StreamTimeFile record;
+    if (!readStreamTimeFile(streamTimePath(m_directory, sessionId), &record)
+        || record.accountId != accountId) {
+        return {};
+    }
+    return record.segments;
+}
+
+void StreamTimeOutbox::removeIfUnchanged(const QString& sessionId, const StreamSegmentReport& segment)
+{
+    if (!isUuidShaped(sessionId)) {
+        return;
+    }
+    QMutexLocker locker(&streamTimeFileMutex());
+    const QString path = streamTimePath(m_directory, sessionId);
+    StreamTimeFile record;
+    if (!readStreamTimeFile(path, &record)) {
+        return;
+    }
+    bool removed = false;
+    for (int i = 0; i < record.segments.size(); ++i) {
+        const StreamSegmentReport& stored = record.segments.at(i);
+        if (stored.segmentNo == segment.segmentNo && stored.deliveredMs == segment.deliveredMs
+            && stored.closed == segment.closed) {
+            record.segments.remove(i);
+            removed = true;
+            break;
+        }
+    }
+    if (!removed) {
+        return;
+    }
+    if (record.segments.isEmpty()) {
+        QFile::remove(path);
+    }
+    else if (!writeStreamTimeFile(m_directory, path, record)) {
+        qCWarning(seathubQualityOutbox) << "could not rewrite the stream-time record for" << sessionId;
+    }
+}
+
+bool StreamTimeOutbox::hasRecords() const
+{
+    QMutexLocker locker(&streamTimeFileMutex());
+    return !QDir(m_directory).entryList({ QStringLiteral("*.json") }, QDir::Files).isEmpty();
+}
+
+void StreamTimeOutbox::drain(const QString& tokenGeneration, const QString& accountId,
+                             const QString& skipSessionId, PostFn postFn)
+{
+    // Nothing is sent before both a token and the signed-in account id are known (D-17).
+    if (tokenGeneration.isEmpty() || accountId.isEmpty() || !postFn) {
+        return;
+    }
+    if (!m_blockedTokenGeneration.isEmpty() && m_blockedTokenGeneration == tokenGeneration) {
+        return;
+    }
+    if (m_draining) {
+        return;
+    }
+
+    QVector<Task> tasks;
+    {
+        QMutexLocker locker(&streamTimeFileMutex());
+        const QDir dir(m_directory);
+        const QStringList files = dir.entryList({ QStringLiteral("*.json") }, QDir::Files, QDir::Name);
+        for (const QString& fileName : files) {
+            const QString sessionId = QFileInfo(fileName).completeBaseName();
+            if (sessionId == skipSessionId) {
+                continue;
+            }
+            const QString path = dir.filePath(fileName);
+            StreamTimeFile record;
+            if (!isUuidShaped(sessionId) || !readStreamTimeFile(path, &record)) {
+                // Not a record this outbox wrote - never trusted, never sent.
+                QFile::remove(path);
+                continue;
+            }
+            if (record.accountId != accountId) {
+                // Another account's record: not this token's to send, and not this call's to
+                // delete. It waits for its own account to sign in again.
+                continue;
+            }
+            for (const StreamSegmentReport& segment : record.segments) {
+                tasks.push_back(Task{ sessionId, segment });
+            }
+        }
+    }
+    if (tasks.isEmpty()) {
+        return;
+    }
+
+    m_draining = true;
+    const quint64 generation = ++m_drainGeneration;
+    drainTasks(tasks, 0, tokenGeneration, postFn, generation);
+}
+
+void StreamTimeOutbox::cancel()
+{
+    ++m_drainGeneration;
+    m_draining = false;
+}
+
+void StreamTimeOutbox::drainTasks(const QVector<Task>& tasks, int index,
+                                  const QString& tokenGeneration, const PostFn& postFn,
+                                  quint64 generation)
+{
+    if (index >= tasks.size()) {
+        if (generation == m_drainGeneration) {
+            m_draining = false;
+        }
+        return;
+    }
+
+    const Task task = tasks.at(index);
+    postFn(task.sessionId, task.segment,
+           [this, tasks, index, tokenGeneration, postFn, generation,
+            task](const ControlPlaneResult& result) {
+               const Outcome outcome = classify(result);
+               // File effects reflect real server truth whichever drain asked for them, so they
+               // always run; only this call's own loop and bookkeeping are gated on its generation.
+               switch (outcome) {
+               case Outcome::Delivered:
+                   removeIfUnchanged(task.sessionId, task.segment);
+                   break;
+               case Outcome::Refused:
+                   qCWarning(seathubQualityOutbox) << "stream time for" << task.sessionId
+                                                    << "refused" << result.statusCode;
+                   removeIfUnchanged(task.sessionId, task.segment);
+                   break;
+               case Outcome::AuthFailed:
+                   if (generation == m_drainGeneration) {
+                       m_blockedTokenGeneration = tokenGeneration;
+                   }
+                   break;
+               case Outcome::Retryable:
+               case Outcome::Aborted:
+                   break;
+               }
+
+               if (generation != m_drainGeneration) {
+                   return;
+               }
+               if (outcome == Outcome::AuthFailed || outcome == Outcome::Aborted) {
+                   m_draining = false;
+                   return;
+               }
+               drainTasks(tasks, index + 1, tokenGeneration, postFn, generation);
+           });
+}
+
+void checkpointStreamTime(const std::shared_ptr<DeliveredStreamTime>& clock,
+                          const std::shared_ptr<StreamTimeOutbox>& outbox,
+                          StreamTimeOutbox::PostFn post)
+{
+    if (!clock || !outbox || !post) {
+        return;
+    }
+    const StreamTimeSnapshot snapshot = clock->pending();
+    if (snapshot.sessionId.isEmpty() || snapshot.segments.isEmpty()) {
+        return;
+    }
+
+    for (const StreamSegmentReport& segment : snapshot.segments) {
+        // Written before it is sent: a kill between the two loses nothing the record holds. With
+        // no account known yet nothing is written (an untagged record could not be proven to
+        // belong to anyone), and the send below still happens.
+        if (!snapshot.accountId.isEmpty()) {
+            outbox->put(snapshot.sessionId, snapshot.accountId, segment);
+        }
+        const QString sessionId = snapshot.sessionId;
+        post(sessionId, segment,
+             [clock, outbox, sessionId, segment](const ControlPlaneResult& result) {
+                 switch (StreamTimeOutbox::classify(result)) {
+                 case StreamTimeOutbox::Outcome::Delivered:
+                     outbox->removeIfUnchanged(sessionId, segment);
+                     clock->settle(sessionId, segment.segmentNo, segment.deliveredMs);
+                     break;
+                 case StreamTimeOutbox::Outcome::Refused:
+                     outbox->removeIfUnchanged(sessionId, segment);
+                     if (result.statusCode == 409) {
+                         // The session has not reached ACTIVE (or never will): a closed segment
+                         // records nothing and is let go; an open one is tried again at the next
+                         // checkpoint, by which time the server may have started it.
+                         clock->settle(sessionId, segment.segmentNo, segment.deliveredMs);
+                     }
+                     else {
+                         clock->refuse(sessionId);
+                     }
+                     break;
+                 case StreamTimeOutbox::Outcome::AuthFailed:
+                 case StreamTimeOutbox::Outcome::Retryable:
+                 case StreamTimeOutbox::Outcome::Aborted:
+                     break;
+                 }
+             });
+    }
 }

@@ -39,10 +39,13 @@
 
 #include <QJsonObject>
 #include <QString>
+#include <QVector>
 
 #include <functional>
+#include <memory>
 
 #include "control_plane_client.h"
+#include "stream_stats.h"
 
 class QualityOutbox
 {
@@ -147,3 +150,121 @@ private:
     /// exactly "the next token" (D-17).
     QString m_blockedTokenGeneration;
 };
+
+// ---------------------------------------------------------------- StreamTimeOutbox (HI06)
+
+/// ADR-0074 HI06 (`docs/spec/client.md` § Reporting delivered stream time, and what a kill may
+/// lose): the local record of the stream time the app measured (`DeliveredStreamTime`), kept so
+/// that a kill loses at most the part of the open segment after its last checkpoint and so that a
+/// report the control plane did not accept is sent again.
+///
+/// Where the file lives: `<directory>/<session_id>.json`, one per session, in a subfolder of
+/// whatever `TokenStore` is currently pointed at (`SeatHubClient` sets it, exactly like the
+/// quality outbox above, so a test that isolates the token store isolates this too). The file holds
+/// the signed-in account's id and one entry per segment: `{segment_no, delivered_ms, closed}`.
+///
+/// A record is only ever sent to the session id it is named for and under the account it is tagged
+/// with: `drain()` sends a file only when its tag equals the signed-in account, and leaves another
+/// account's file exactly where it is (a shared PC's other customer keeps their record; it is
+/// neither sent under this token nor deleted). Time is never added to a different session or
+/// account, and a replayed entry adds nothing: the server stores the larger of the stored and the
+/// reported `delivered_ms` for its (session, segment) key (W04), and this file never sums anything.
+///
+/// What each answer does to an entry (`classify()`):
+///   * 200 - `Delivered`: the entry is on the server; it is removed (only while it still holds
+///     what was sent, so a newer checkpoint written meanwhile survives).
+///   * 404, 409, 422 - `Refused` (the three refusals W04 documents): the server will not take it (404
+///     another account's or no such session, 409 the session never streamed, 422 a malformed body);
+///     dropped.
+///   * 401, 403 - `AuthFailed`: kept; `drain()` stops and does not retry the same token generation.
+///   * anything else (no answer, 5xx, 408, 429) - `Retryable`: kept for the next beat, the next
+///     teardown or the next launch.
+class StreamTimeOutbox
+{
+public:
+    enum class Outcome
+    {
+        Delivered,
+        Refused,
+        AuthFailed,
+        Retryable,
+        /// The caller abandoned the attempt before or after issuing it because the account it
+        /// would have gone out under is no longer the signed-in one. Kept, and stops the drain.
+        Aborted,
+    };
+
+    static Outcome classify(const ControlPlaneResult& result);
+
+    explicit StreamTimeOutbox(const QString& directory = QString());
+
+    /// `<AppDataLocation>/stream-time-outbox`, beside the quality outbox's own folder.
+    static QString defaultDirectory();
+    void setDirectory(const QString& directory);
+    QString directory() const;
+
+    /// Writes the segment into `<sessionId>.json`, tagged `accountId`. A no-op for a session id
+    /// that is not a UUID or an empty account (an untagged record could never be proven to belong
+    /// to anyone). An entry for the same segment number is merged, never added to: an open entry
+    /// takes the larger of the two values; a closed value replaces an open one, even a smaller
+    /// one (the end of the segment is authoritative, and the reduction for a lost connection can
+    /// make it smaller than the last checkpoint); a closed entry stays closed.
+    void put(const QString& sessionId, const QString& accountId, const StreamSegmentReport& segment);
+
+    /// The entries of `sessionId`'s file when it is tagged `accountId`, ordered by segment number;
+    /// empty otherwise.
+    QVector<StreamSegmentReport> entries(const QString& sessionId, const QString& accountId) const;
+
+    /// Removes the entry for `segment.segmentNo` only if it still holds exactly the value and the
+    /// closed flag that were sent, and the file when it was the last entry.
+    void removeIfUnchanged(const QString& sessionId, const StreamSegmentReport& segment);
+
+    /// True when at least one record file exists, whichever account it is tagged for.
+    bool hasRecords() const;
+
+    /// Mirrors `ControlPlaneClient::postStreamTime`'s shape, so a bound call is a valid argument
+    /// with no adapter; a test supplies a fake instead.
+    using PostFn = std::function<void(const QString& sessionId, const StreamSegmentReport& segment,
+                                      ControlPlaneClient::Callback callback)>;
+
+    /// Sends every entry of every file tagged `accountId`, one at a time, name-sorted, skipping the
+    /// file named `skipSessionId` (the live session's own file belongs to the beat, not to this
+    /// pass). A no-op when `tokenGeneration` or `accountId` is empty, when a drain is already in
+    /// flight, or when `tokenGeneration` is the one an earlier call's `AuthFailed` was refused
+    /// under. A file that is not a record this outbox wrote is deleted.
+    void drain(const QString& tokenGeneration, const QString& accountId,
+               const QString& skipSessionId, PostFn postFn);
+
+    /// Aborts whatever `drain()` is in flight (a sign-out, or a sign-in as someone else), the same
+    /// way `QualityOutbox::cancel()` does.
+    void cancel();
+
+private:
+    struct Task
+    {
+        QString sessionId;
+        StreamSegmentReport segment;
+    };
+
+    void drainTasks(const QVector<Task>& tasks, int index, const QString& tokenGeneration,
+                    const PostFn& postFn, quint64 generation);
+
+    QString m_directory;
+    bool m_draining = false;
+    quint64 m_drainGeneration = 0;
+    QString m_blockedTokenGeneration;
+};
+
+/// One checkpoint of the delivered stream time (ADR-0074 HI06): for the segments `clock` has not
+/// yet settled - an open one at its running time, a closed one at its final value - writes the
+/// local record (when the account is known) and then sends each through `post`. Called at every
+/// client liveness beat, when a segment closes and at teardown; calling it more often only repeats
+/// reports the server stores once.
+///
+/// A reply is judged against the session it was sent for, never against whichever one is current
+/// when it lands: a delivered or refused entry leaves the record (only while it still holds what
+/// was sent), a closed segment that was delivered or refused is settled and not sent again, a 409
+/// ("this session never streamed", still in its first seconds) on an open segment is retried at the
+/// next checkpoint, and a refusal of the session itself (404, 422) stops the reports for it.
+void checkpointStreamTime(const std::shared_ptr<DeliveredStreamTime>& clock,
+                          const std::shared_ptr<StreamTimeOutbox>& outbox,
+                          StreamTimeOutbox::PostFn post);

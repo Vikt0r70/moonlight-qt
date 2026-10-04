@@ -1,5 +1,6 @@
 #include "stream_stats.h"
 
+#include <QMutexLocker>
 #include <QRegularExpression>
 #include <QRegularExpressionMatch>
 
@@ -418,4 +419,296 @@ VideoStats VideoStatsAggregator::aggregate() const
     }
 
     return out;
+}
+
+// ---------------------------------------------------------------- DeliveredStreamTime (HI02)
+
+namespace {
+
+// The three engine lines that end a segment. Each is the exact text its source writes, up to the
+// format argument: `app/streaming/session.cpp:2003` (`SDL_LogInfo ... "Quit event received"`),
+// `session.cpp:144-146` (`SDL_LogError ... "Connection terminated: %d"`) and
+// `moonlight-common-c/src/ControlStream.c:1302`
+// (`Limelog("Control stream received unexpected disconnect event\n")`, which `Session::clLogMessage`
+// forwards as `SDL_LOG_PRIORITY_INFO`; SDL chops the final line break, and a trailing one is ignored
+// here in case a build keeps it). All three are read-only upstream text.
+const QLatin1String kQuitEventLine("Quit event received");
+const QLatin1String kUnexpectedDisconnectLine("Control stream received unexpected disconnect event");
+const QLatin1String kTerminatedPrefix("Connection terminated: ");
+
+QString withoutTrailingLineBreaks(const QString& text)
+{
+    int end = text.size();
+    while (end > 0 && (text.at(end - 1) == QLatin1Char('\n') || text.at(end - 1) == QLatin1Char('\r'))) {
+        --end;
+    }
+    return text.left(end);
+}
+
+constexpr qint64 kMaxSegmentMs = 2147483647;
+
+} // namespace
+
+DeliveredStreamTime::DeliveredStreamTime(Clock clock) : m_clock(std::move(clock))
+{
+    m_origin.start();
+}
+
+qint64 DeliveredStreamTime::nowMs() const
+{
+    if (m_clock) {
+        return m_clock();
+    }
+    // Whole milliseconds on the monotonic clock, truncated from nanoseconds so the measure is
+    // exact to the millisecond and never rounds a segment up.
+    return m_origin.nsecsElapsed() / 1000000;
+}
+
+void DeliveredStreamTime::beginSession(const QString& sessionId, const QString& accountId)
+{
+    QMutexLocker locker(&m_mutex);
+    if (sessionId == m_sessionId) {
+        // The same session again (a repeated begin): segment numbering keeps counting, so a
+        // replayed call can never reuse a number for different time.
+        if (m_accountId.isEmpty()) {
+            m_accountId = accountId;
+        }
+        return;
+    }
+    m_sessionId = sessionId;
+    m_accountId = accountId;
+    m_segments.clear();
+    m_open = -1;
+    m_nextNo = 1;
+    m_refused = false;
+}
+
+void DeliveredStreamTime::setAccountId(const QString& accountId)
+{
+    QMutexLocker locker(&m_mutex);
+    if (m_accountId.isEmpty()) {
+        m_accountId = accountId;
+    }
+}
+
+void DeliveredStreamTime::endSession()
+{
+    QMutexLocker locker(&m_mutex);
+    m_sessionId.clear();
+    m_accountId.clear();
+    m_segments.clear();
+    m_open = -1;
+    m_nextNo = 1;
+    m_refused = false;
+}
+
+QString DeliveredStreamTime::sessionId() const
+{
+    QMutexLocker locker(&m_mutex);
+    return m_sessionId;
+}
+
+QString DeliveredStreamTime::accountId() const
+{
+    QMutexLocker locker(&m_mutex);
+    return m_accountId;
+}
+
+void DeliveredStreamTime::setSegmentClosedHook(std::function<void()> hook)
+{
+    QMutexLocker locker(&m_mutex);
+    m_closedHook = std::move(hook);
+}
+
+void DeliveredStreamTime::fireClosed()
+{
+    std::function<void()> hook;
+    {
+        QMutexLocker locker(&m_mutex);
+        hook = m_closedHook;
+    }
+    if (hook) {
+        hook();
+    }
+}
+
+int DeliveredStreamTime::connectionStarted()
+{
+    bool closedPrevious = false;
+    int number = 0;
+    {
+        QMutexLocker locker(&m_mutex);
+        if (m_sessionId.isEmpty()) {
+            return 0;
+        }
+        // A segment still open means its end line never arrived. The new connection proves it
+        // ended; it is closed at this instant and not reduced (nothing says it was lost).
+        closedPrevious = closeLocked(0);
+        Segment segment;
+        segment.no = m_nextNo++;
+        segment.startMs = nowMs();
+        m_segments.push_back(segment);
+        m_open = m_segments.size() - 1;
+        number = segment.no;
+    }
+    if (closedPrevious) {
+        fireClosed();
+    }
+    return number;
+}
+
+bool DeliveredStreamTime::closeLocked(qint64 reduceMs)
+{
+    if (m_open < 0) {
+        return false;
+    }
+    Segment& segment = m_segments[m_open];
+    // The reduction can never take a segment to before its own start.
+    const qint64 ran = qMax<qint64>(0, nowMs() - segment.startMs - reduceMs);
+    segment.deliveredMs = qMin(ran, kMaxSegmentMs);
+    segment.closed = true;
+    m_open = -1;
+    return true;
+}
+
+bool DeliveredStreamTime::closeOpenSegment(bool connectionLost)
+{
+    bool closed = false;
+    {
+        QMutexLocker locker(&m_mutex);
+        closed = closeLocked(connectionLost ? kControlStreamWaitMs : 0);
+    }
+    if (closed) {
+        fireClosed();
+    }
+    return closed;
+}
+
+bool DeliveredStreamTime::hasOpenSegment() const
+{
+    QMutexLocker locker(&m_mutex);
+    return m_open >= 0;
+}
+
+DeliveredStreamTime::EngineLine DeliveredStreamTime::classifyEngineLine(int category, int priority,
+                                                                        const QString& text,
+                                                                        int* code)
+{
+    if (category != SDL_LOG_CATEGORY_APPLICATION) {
+        return EngineLine::None;
+    }
+    const QString line = withoutTrailingLineBreaks(text);
+
+    if (priority == SDL_LOG_PRIORITY_INFO) {
+        if (line == kQuitEventLine) {
+            return EngineLine::QuitEvent;
+        }
+        if (line == kUnexpectedDisconnectLine) {
+            return EngineLine::UnexpectedDisconnect;
+        }
+        return EngineLine::None;
+    }
+
+    if (priority == SDL_LOG_PRIORITY_ERROR && line.startsWith(kTerminatedPrefix)) {
+        // `%d`: an optional minus sign and decimal digits, to the end of the line, in `int`.
+        static const QRegularExpression number(QStringLiteral("\\A-?[0-9]+\\z"));
+        const QString digits = line.mid(kTerminatedPrefix.size());
+        bool ok = false;
+        const int value = digits.toInt(&ok);
+        if (ok && number.match(digits).hasMatch()) {
+            if (code != nullptr) {
+                *code = value;
+            }
+            return EngineLine::ConnectionTerminated;
+        }
+    }
+    return EngineLine::None;
+}
+
+bool DeliveredStreamTime::handleEngineLine(int category, int priority, const QString& text)
+{
+    int code = 0;
+    switch (classifyEngineLine(category, priority, text, &code)) {
+    case EngineLine::None:
+        return false;
+    case EngineLine::QuitEvent:
+        // The customer quitting, or the end of any stream: the stream ran until now.
+        return closeOpenSegment(false);
+    case EngineLine::UnexpectedDisconnect:
+        // The library reports this loss as a termination of -1 right after: a lost connection.
+        return closeOpenSegment(true);
+    case EngineLine::ConnectionTerminated:
+        // 0 is `ML_ERROR_GRACEFUL_TERMINATION`, a real code and a clean end: not reduced.
+        return closeOpenSegment(code != 0);
+    }
+    return false;
+}
+
+LogTee::Sink DeliveredStreamTime::sink()
+{
+    // A sink never adds or removes sinks, never blocks and never logs (`log_tee.h`): this only
+    // classifies the line and, for a match, takes the segment's end under the mutex.
+    return [this](LogLevel level, int category, int priority, const QString& text) {
+        Q_UNUSED(level);
+        handleEngineLine(category, priority, text);
+    };
+}
+
+StreamTimeSnapshot DeliveredStreamTime::pending() const
+{
+    QMutexLocker locker(&m_mutex);
+    StreamTimeSnapshot snapshot;
+    snapshot.sessionId = m_sessionId;
+    snapshot.accountId = m_accountId;
+    if (m_sessionId.isEmpty() || m_refused) {
+        return snapshot;
+    }
+    const qint64 now = nowMs();
+    for (int i = 0; i < m_segments.size(); ++i) {
+        const Segment& segment = m_segments.at(i);
+        if (segment.settled) {
+            continue;
+        }
+        StreamSegmentReport report;
+        report.segmentNo = segment.no;
+        report.closed = segment.closed;
+        report.deliveredMs = segment.closed
+            ? segment.deliveredMs
+            : qMin(qMax<qint64>(0, now - segment.startMs), kMaxSegmentMs);
+        snapshot.segments.push_back(report);
+    }
+    return snapshot;
+}
+
+void DeliveredStreamTime::settle(const QString& sessionId, int segmentNo, qint64 deliveredMs)
+{
+    QMutexLocker locker(&m_mutex);
+    if (sessionId.isEmpty() || sessionId != m_sessionId) {
+        return;
+    }
+    for (Segment& segment : m_segments) {
+        if (segment.no == segmentNo && segment.closed && segment.deliveredMs == deliveredMs) {
+            segment.settled = true;
+            return;
+        }
+    }
+}
+
+void DeliveredStreamTime::refuse(const QString& sessionId)
+{
+    QMutexLocker locker(&m_mutex);
+    if (!sessionId.isEmpty() && sessionId == m_sessionId) {
+        m_refused = true;
+    }
+}
+
+qint64 DeliveredStreamTime::totalMs() const
+{
+    QMutexLocker locker(&m_mutex);
+    const qint64 now = nowMs();
+    qint64 total = 0;
+    for (const Segment& segment : m_segments) {
+        total += segment.closed ? segment.deliveredMs : qMax<qint64>(0, now - segment.startMs);
+    }
+    return total;
 }

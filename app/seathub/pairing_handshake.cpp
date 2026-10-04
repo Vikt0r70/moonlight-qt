@@ -111,6 +111,10 @@ PairingHandshakeResult runUpstreamPairingHandshake(const PairingTarget& target)
         if (state == NvPairingManager::PAIRED) {
             host->pinCertificate(pinnedCertificate.toPem());
 
+            // ADR-0074 W03: remembered in this process's memory for the warm return - the app run's
+            // own pin, never written anywhere (STREAM-10), forgotten at sign-out and by a restart.
+            HeldRigTrust::remember(pinnedCertificate.toPem());
+
             // The rig's own application list, read here on the pool thread so no frame of the Qt
             // main thread's work waits on it. A failure is recorded rather than raised: pairing
             // succeeded, and the caller fails closed at `launchApp()` instead of streaming an
@@ -211,4 +215,67 @@ PairingHandshakeResult runUpstreamPairingHandshake(const PairingTarget& target)
     // the one retry.
     qCWarning(seathubPairingHandshake) << "upstream pairing handshake did not complete";
     return result;
+}
+
+PairingHandshakeResult runUpstreamWarmReturnCheck(const PairingTarget& target,
+                                                  const QByteArray& heldHostCertificatePem)
+{
+    // `ok` stays false on every path that does not end in a confirmed "paired" answer: the caller
+    // then runs the normal pairing, which is always possible because a PIN is always issued.
+    PairingHandshakeResult result;
+
+    if (target.hostAddress.isEmpty() || heldHostCertificatePem.isEmpty()
+        || target.httpsPort <= 0 || target.httpsPort > 0xFFFF) {
+        // Pairing status is only reported over HTTPS (`NvHTTP::getServerInfo()`), which needs both
+        // the pin and the port; without either there is nothing to ask.
+        return result;
+    }
+
+    try {
+        const QSslCertificate pinned(heldHostCertificatePem, QSsl::Pem);
+        if (pinned.isNull()) {
+            return result;
+        }
+
+        // The same constructor the normal handshake uses, but with the pin it already holds. With a
+        // pin and a port `getServerInfo()` asks over HTTPS first - authenticating the host against
+        // that pin and presenting this client's certificate - and falls back to plain HTTP only on
+        // a certificate refusal, whose answer never says paired. NVLL_NONE for the same reason as
+        // above: the log must never carry the rig's address.
+        NvHTTP http(NvAddress(target.hostAddress, DEFAULT_HTTP_PORT),
+                    static_cast<uint16_t>(target.httpsPort), pinned);
+        const QString serverInfo = http.getServerInfo(NvHTTP::NVLL_NONE);
+
+        std::shared_ptr<MoonlightPairedHost> host =
+            std::make_shared<MoonlightPairedHost>(http, serverInfo);
+        if (host->computer()->pairState != NvComputer::PS_PAIRED) {
+            return result;
+        }
+
+        // Paired, under the pin this run already held: the host record is completed the way a full
+        // pairing completes it, and the engine streams from it. Nothing is persisted.
+        host->pinCertificate(heldHostCertificatePem);
+        host->fetchAppList();
+
+        result.clientIdentity = ownClientCertificateFingerprint();
+        if (result.clientIdentity.isEmpty()) {
+            return result;
+        }
+        result.host = host;
+        result.ok = true;
+        return result;
+    }
+    catch (...) {
+        // A refused pin, an unreachable rig or an unreadable answer: the normal pairing decides.
+        result.ok = false;
+        result.clientIdentity.clear();
+        result.host.reset();
+        qCInfo(seathubPairingHandshake) << "the warm-return check did not confirm the pairing";
+        return result;
+    }
+}
+
+QString ownClientCertificateFingerprint()
+{
+    return clientCertificateFingerprint(IdentityManager::get()->getCertificate());
 }
