@@ -98,7 +98,8 @@ public:
 
     // Wired to the session lifecycle: `connectionStarted` starts the clock, `sessionFinished`
     // (and `readyForDeletion`, defensively) stops it. A new session starts with Time left hidden
-    // and no balance known.
+    // and no balance known; a warm-return session that begins below 10 or 5 minutes (ADR-0080)
+    // shows it from its first fresh in-stream read, under the same rule.
     void beginSession();
     void endSession();
 

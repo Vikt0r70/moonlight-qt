@@ -5935,6 +5935,43 @@ private slots:
         endStreaming(client, engine);
     }
 
+    // T057 / ADR-0080: a warm-return session may now start below the 15-minute Play floor, so the
+    // first in-stream read at 6-10 minutes must arm the white reminder at once - through the real
+    // client path (liveness report -> wallet read -> HUD), never from the pre-stream balance. The
+    // one-minute window and the red final run on the HUD's injected clock (`tst_hud_bitmap`).
+    void aWarmReturnThatBeginsBetweenSixAndTenShowsTheReminderAtOnce()
+    {
+        SeatHubClient client;
+        auto* engine = new FakeEngineSession;
+        WalletTicks ticks;
+        // Home showed forty minutes before the stream; the first in-stream read says eight.
+        beginStreaming(client, engine, &ticks, 40, 8);
+        QVERIFY(!QTest::currentTestFailed());
+        QVERIFY(settleIntoTheStream(client, &ticks));
+        QCOMPARE(client.hud()->creditMinutes(), qint64(8));
+
+        client.hud()->tick();
+        const QImage frame = client.hud()->compositor().composedBottom();
+        QVERIFY2(!frame.isNull(), "an eight-minute first read shows Time left at once");
+
+        int white = 0;
+        int red = 0;
+        for (int y = 0; y < frame.height(); ++y) {
+            for (int x = 0; x < frame.width(); ++x) {
+                const QRgb pixel = frame.pixel(x, y);
+                if (qAlpha(pixel) != 255) {
+                    continue;
+                }
+                white += (pixel == kOsdValue) ? 1 : 0;
+                red += (pixel == kOsdDestructive) ? 1 : 0;
+            }
+        }
+        QVERIFY2(white > 0, "the reminder is white (osdValueDefault)");
+        QCOMPARE(red, 0);   // not Critical: eight is above the five-minute final threshold
+
+        endStreaming(client, engine);
+    }
+
     void theFirstReadFailingLeavesTheSeedOnTheHudAndFiresNothing()
     {
         // Home said one minute a moment ago; the wallet cannot be reached now. A warning built on a

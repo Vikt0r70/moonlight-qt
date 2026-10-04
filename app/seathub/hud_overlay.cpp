@@ -132,9 +132,11 @@ void HudOverlay::beginSession()
         m_reminderStartedMs = 0;
         m_prevReading = -1;
     }
-    // A new session starts with Time left invisible too (D-11: the pre-stream floor is 15
-    // minutes, A-33 #24, so a real session never starts with it visible; reset defensively so a
-    // reused `HudOverlay` cannot carry a previous session's Time left into this one).
+    // A new session starts with Time left invisible too: nothing is shown for the pre-stream
+    // balance (D-16). A session normally starts at or above the 15-minute Play floor (A-33 #24),
+    // but a warm-return session may start below 10 or 5 minutes (ADR-0080); the first fresh
+    // in-stream read handles that under the same rule (`applyTimeLeftReading()`). Reset here so a
+    // reused `HudOverlay` cannot carry a previous session's Time left into this one.
     m_compositor.setTimeLeft({false, 0, false});
     m_sessionActive.store(true);
 

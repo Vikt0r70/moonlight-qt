@@ -690,6 +690,88 @@ private slots:
         harness.hud().endSession();
     }
 
+    // T057 / ADR-0080: a warm-return session may start below the 15-minute Play floor. A new
+    // session whose first fresh read is 8 shows the white reminder at once, hides it after
+    // `kReminderMs` on the injected clock (no real minute is waited), does not re-fire on a read
+    // that is still above five, and shows red from the first read at or below five to the end.
+    void aSessionThatBeginsBetweenSixAndTenShowsTheReminderThenRed()
+    {
+        HudHarness harness;
+        harness.hud().beginSession();
+
+        harness.hud().noteCreditMinutes(8);
+        harness.hud().tick();
+        QVERIFY2(!harness.hud().compositor().composedBottom().isNull(),
+                 "an eight-minute first read must show the reminder");
+        const QImage reminder = harness.frames().last();
+        QVERIFY2(countColour(reminder, kOsdValue, 0) > 0, "the reminder is white");
+        QCOMPARE(countColour(reminder, kOsdDestructive, 0), 0);
+
+        harness.advance(HudOverlay::kReminderMs - 1000);
+        harness.hud().tick();
+        QVERIFY2(!harness.hud().compositor().composedBottom().isNull(),
+                 "the reminder is still up one second before its minute is up");
+
+        harness.advance(1000);
+        harness.hud().tick();
+        QVERIFY2(harness.hud().compositor().composedBottom().isNull(),
+                 "the reminder hides once its one-minute window has passed");
+
+        // A later read that is still above five (a plain descent, no top-up) does not re-fire it.
+        harness.hud().noteCreditMinutes(7);
+        harness.hud().tick();
+        QVERIFY2(harness.hud().compositor().composedBottom().isNull(),
+                 "a read still above five stays hidden after the reminder was spent");
+
+        // The first read at five shows red and keeps it red until the session ends.
+        harness.hud().noteCreditMinutes(5);
+        harness.hud().tick();
+        QVERIFY2(countColour(harness.frames().last(), kOsdDestructive, 0) > 0,
+                 "five minutes shows red");
+        QCOMPARE(countColour(harness.frames().last(), kOsdValue, 0), 0);
+        harness.advance(HudOverlay::kReminderMs * 5);
+        harness.hud().tick();
+        QVERIFY2(countColour(harness.frames().last(), kOsdDestructive, 0) > 0,
+                 "red stays until the session ends, however much time passes");
+
+        harness.hud().endSession();
+    }
+
+    // T057 / ADR-0080: a session whose first fresh read is already below five shows red at once,
+    // never the white reminder first.
+    void aSessionThatBeginsBelowFiveShowsRedAtOnce()
+    {
+        HudHarness harness;
+        harness.hud().beginSession();
+
+        harness.hud().noteCreditMinutes(4);
+        harness.hud().tick();
+        const QImage frame = harness.frames().last();
+        QVERIFY2(!frame.isNull(), "a four-minute first read must be drawn");
+        QVERIFY2(countColour(frame, kOsdDestructive, 0) > 0, "a four-minute first read is red");
+        QCOMPARE(countColour(frame, kOsdValue, 0), 0);
+
+        harness.hud().endSession();
+    }
+
+    // T057 / ADR-0080: the pre-stream balance alone never shows Time left, however low it is and
+    // however long the session runs - only a fresh in-stream read does (D-16).
+    void aLowPreStreamSeedAloneNeverShows()
+    {
+        HudHarness harness;
+        harness.hud().beginSession();
+
+        harness.hud().seedCreditMinutes(4);
+        harness.hud().tick();
+        harness.advance(HudOverlay::kReminderMs * 2);
+        harness.hud().tick();
+        QVERIFY2(harness.hud().compositor().composedBottom().isNull(),
+                 "a low pre-stream seed alone must not show Time left");
+        QCOMPARE(harness.frames().size(), 0);
+
+        harness.hud().endSession();
+    }
+
     // D-21: a fresh read above the previous one is a top-up. Time left goes away and the rule
     // above runs again on the new balance: a genuine descent to ten still shows the reminder, a
     // top-up into 6-10 shows it again, and a top-up that itself lands at or below five shows red
