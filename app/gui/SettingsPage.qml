@@ -32,6 +32,23 @@ Item {
 
     readonly property var prefs: client ? client.settings : null
 
+    // Each row names its control for assistive technology (`ui.md` §9: programmatic labels). A row is
+    // the row's own title as a named group around its switch, dropdown or number field, so the
+    // control a screen reader lands on is announced under the setting it changes and not as a
+    // bare check box, a bare current value or an unlabelled number.
+    component NamedToggle: SeatHubToggle {
+        Accessible.role: Accessible.Grouping
+        Accessible.name: title
+    }
+    component NamedSelect: SeatHubSelect {
+        Accessible.role: Accessible.Grouping
+        Accessible.name: title
+    }
+    component NamedNumberField: SeatHubNumberField {
+        Accessible.role: Accessible.Grouping
+        Accessible.name: title
+    }
+
     // The custom width/height fields are the "Custom" state of the Resolution control (`width` +
     // `height`), so they appear when the pair is neither of the four upstream presets OR when the
     // user has explicitly asked for Custom from the dropdown (see requestedCustomResolution).
@@ -108,20 +125,11 @@ Item {
             }
 
             // D-14, ADR-0063, ADR-0070 item 9, ADR-0072: the one plain-text disclosure
-            // sentence under the page title. No switch, no link - the same tokens as the
-            // "Changes are saved immediately" line right below, no new component.
+            // sentence under the page title (`screens.md` §27 change 4). No switch, no link, and
+            // no second line: the page adds nothing else of its own under the title.
             Text {
                 width: parent.width
                 text: qsTr("SeatHub sends diagnostic logs, stream quality numbers and crash reports to SevenHills so we can fix problems.")
-                wrapMode: Text.Wrap
-                color: Tokens.foregroundMutedDefault
-                font.family: Tokens.fontSansDefault
-                font.pixelSize: Metrics.fontSm
-            }
-
-            Text {
-                width: parent.width
-                text: qsTr("Changes are saved immediately and apply to your next stream.")
                 wrapMode: Text.Wrap
                 color: Tokens.foregroundMutedDefault
                 font.family: Tokens.fontSansDefault
@@ -186,10 +194,10 @@ Item {
                         // SeatHub renders Resolution and Frame rate as two rows, each carrying
                         // its half of upstream's description (a SeatHub layout choice, not a
                         // different set of options - `settings-audit.md`).
-                        SeatHubSelect {
+                        NamedSelect {
                             bridge: page.prefs
                             title: qsTr("Resolution")
-                            description: qsTr("Half of upstream's \"Resolution and FPS\" row (merges \"width\" and \"height\"). Presets 720p, 1080p, 1440p and 4K, or Custom.")
+                            description: qsTr("Setting values too high for your PC or network connection may cause lag, stuttering, or errors.")
                             optionsOverride: page.prefs ? page.prefs.resolutionPresets() : []
                             // Display "Custom" whenever the fields are open (requested or derived),
                             // so the dropdown never snaps back to a preset name while a custom value
@@ -206,7 +214,7 @@ Item {
                             }
                         }
 
-                        SeatHubNumberField {
+                        NamedNumberField {
                             settingKey: "width"
                             bridge: page.prefs
                             visible: page.customResolution
@@ -216,7 +224,7 @@ Item {
                             maximum: 7680
                         }
 
-                        SeatHubNumberField {
+                        NamedNumberField {
                             settingKey: "height"
                             bridge: page.prefs
                             visible: page.customResolution
@@ -226,10 +234,9 @@ Item {
                             maximum: 4320
                         }
 
-                        SeatHubSelect {
+                        NamedSelect {
                             title: qsTr("Frame rate")
                             bridge: page.prefs
-                            description: qsTr("The other half of upstream's \"Resolution and FPS\" row (merges \"fps\"). 30 FPS, 60 FPS, or Custom.")
                             optionsOverride: page.prefs ? page.prefs.frameRatePresets() : []
                             valueProvider: function() { return page.customFrameRate ? "Custom" : (page.prefs ? page.prefs.frameRatePreset() : "") }
                             onEdited: function(value) {
@@ -239,7 +246,7 @@ Item {
                             }
                         }
 
-                        SeatHubNumberField {
+                        NamedNumberField {
                             settingKey: "fps"
                             bridge: page.prefs
                             visible: page.customFrameRate
@@ -252,7 +259,7 @@ Item {
 
                         // --bitrate . Upstream's slider goes 500-150000 Kbps, or 500-500000 while
                         // "Unlock bitrate limit" is on (Advanced Settings) - no new bound.
-                        SeatHubNumberField {
+                        NamedNumberField {
                             settingKey: "bitrate"
                             bridge: page.prefs
                             title: qsTr("Video bitrate")
@@ -266,23 +273,23 @@ Item {
 
                         // One control over `windowmode` and its legacy predecessor `fullscreen`;
                         // upstream resolves the legacy key into `windowmode` on load.
-                        SeatHubSelect {
+                        NamedSelect {
                             bridge: page.prefs
                             title: qsTr("Display mode")
-                            description: qsTr("Merges the upstream keys \"fullscreen\" and \"windowmode\" into one control.")
+                            description: qsTr("Fullscreen generally provides the best performance, but borderless windowed may work better with features like macOS Spaces, Alt+Tab, screenshot tools, on-screen overlays, etc.")
                             optionsOverride: page.prefs ? page.prefs.displayModes() : []
                             valueProvider: function() { return page.prefs ? page.prefs.displayMode() : "" }
                             onEdited: page.prefs.setDisplayMode(value)
                         }
 
-                        SeatHubToggle {
+                        NamedToggle {
                             settingKey: "vsync"
                             bridge: page.prefs
                             title: qsTr("V-Sync")
                             description: qsTr("Disabling allows sub-frame latency but can show tearing.")
                         }
 
-                        SeatHubToggle {
+                        NamedToggle {
                             settingKey: "framepacing"
                             bridge: page.prefs
                             title: qsTr("Frame pacing")
@@ -303,7 +310,7 @@ Item {
                             font.weight: Font.DemiBold
                         }
 
-                        SeatHubSelect {
+                        NamedSelect {
                             settingKey: "audiocfg"
                             bridge: page.prefs
                             title: qsTr("Audio configuration")
@@ -313,14 +320,14 @@ Item {
                         // D-25a: NOT removed. Stays visible with upstream's own default,
                         // checked (host muted) - a renter's game audio does not play out of the
                         // owner's speakers unless they untick it.
-                        SeatHubToggle {
+                        NamedToggle {
                             settingKey: "hostaudio"
                             bridge: page.prefs
                             title: qsTr("Mute host PC speakers while streaming")
                             description: qsTr("Restart a running game for this to take effect.")
                         }
 
-                        SeatHubToggle {
+                        NamedToggle {
                             settingKey: "muteonfocusloss"
                             bridge: page.prefs
                             title: qsTr("Mute audio stream when SeatHub is not the active window")
@@ -341,7 +348,7 @@ Item {
                             font.weight: Font.DemiBold
                         }
 
-                        SeatHubToggle {
+                        NamedToggle {
                             settingKey: "gameopts"
                             bridge: page.prefs
                             title: qsTr("Optimize game settings for streaming")
@@ -370,10 +377,9 @@ Item {
 
                         // One control over `uidisplaymode` and its legacy predecessor
                         // `startwindowed`.
-                        SeatHubSelect {
+                        NamedSelect {
                             bridge: page.prefs
                             title: qsTr("GUI display mode")
-                            description: qsTr("Merges the upstream keys \"startwindowed\" and \"uidisplaymode\" into one control.")
                             optionsOverride: page.prefs ? page.prefs.launchDisplayModes() : []
                             valueProvider: function() { return page.prefs ? page.prefs.launchDisplayMode() : "" }
                             onEdited: page.prefs.setLaunchDisplayMode(value)
@@ -382,17 +388,16 @@ Item {
                         // OD-05: stays visible with upstream's own default. SeatHub's overlay
                         // re-asserts itself after the engine writes status text, so a low-balance
                         // warning is never blanked (Plan 10).
-                        SeatHubToggle {
+                        NamedToggle {
                             settingKey: "connwarnings"
                             bridge: page.prefs
                             title: qsTr("Show connection quality warnings")
-                            description: qsTr("Warnings appear in SeatHub's own words, never the engine's.")
                         }
 
                         // "Discord Rich Presence integration" (D-25(b)) is not rendered: forced
                         // off on every load. SeatHub has no external presence surface.
 
-                        SeatHubToggle {
+                        NamedToggle {
                             settingKey: "keepawake"
                             bridge: page.prefs
                             title: qsTr("Keep the display awake while streaming")
@@ -420,7 +425,7 @@ Item {
                             font.weight: Font.DemiBold
                         }
 
-                        SeatHubToggle {
+                        NamedToggle {
                             settingKey: "mouseacceleration"
                             bridge: page.prefs
                             title: qsTr("Optimize mouse for remote desktop instead of games")
@@ -458,7 +463,8 @@ Item {
                                     Text {
                                         width: parent.width
                                         wrapMode: Text.Wrap
-                                        text: qsTr("Lets combinations like Ctrl+Alt+Del reach the host instead of this PC. Checkbox and dropdown together are the [streamsettings] capturesyskeys key.")
+                                        text: qsTr("This enables the capture of system-wide keyboard shortcuts like Alt+Tab that would normally be handled by the client OS while streaming.") + " " +
+                                              qsTr("NOTE: Certain keyboard shortcuts like Ctrl+Alt+Del on Windows cannot be intercepted by any application, including SeatHub.")
                                         color: Tokens.foregroundMutedDefault
                                         font.family: Tokens.fontSansDefault
                                         font.pixelSize: Metrics.fontSm
@@ -472,6 +478,7 @@ Item {
                                     height: Metrics.touchTarget
                                     enabled: page.prefs ? page.prefs.writable : false
                                     checked: page.captureChecked
+                                    Accessible.name: qsTr("Capture system keyboard shortcuts")
 
                                     indicator: Rectangle {
                                         x: (parent.width - width) / 2
@@ -490,6 +497,7 @@ Item {
                                             color: Tokens.primaryForegroundDefault
                                             font.family: Tokens.fontSansDefault
                                             font.pixelSize: Metrics.fontSm
+                                            Accessible.ignored: true
                                         }
                                     }
 
@@ -522,6 +530,7 @@ Item {
                                     enabled: page.prefs ? page.prefs.writable : false
                                     model: [qsTr("In fullscreen"), qsTr("Always")]
                                     currentIndex: page.captureWhen === "always" ? 1 : 0
+                                    Accessible.name: qsTr("Capture system keyboard shortcuts")
                                     font.family: Tokens.fontSansDefault
                                     font.pixelSize: Metrics.fontBody
 
@@ -592,20 +601,20 @@ Item {
                             }
                         }
 
-                        SeatHubToggle {
+                        NamedToggle {
                             settingKey: "abstouchmode"
                             bridge: page.prefs
                             title: qsTr("Use touchscreen as a virtual trackpad")
                             description: qsTr("Unchecked, the touchscreen drives the pointer directly.")
                         }
 
-                        SeatHubToggle {
+                        NamedToggle {
                             settingKey: "swapmousebuttons"
                             bridge: page.prefs
                             title: qsTr("Swap left and right mouse buttons")
                         }
 
-                        SeatHubToggle {
+                        NamedToggle {
                             settingKey: "reversescroll"
                             bridge: page.prefs
                             title: qsTr("Reverse mouse scrolling direction")
@@ -625,27 +634,27 @@ Item {
                             font.weight: Font.DemiBold
                         }
 
-                        SeatHubToggle {
+                        NamedToggle {
                             settingKey: "swapfacebuttons"
                             bridge: page.prefs
                             title: qsTr("Swap A/B and X/Y gamepad buttons")
                             description: qsTr("Nintendo-style button layout.")
                         }
 
-                        SeatHubToggle {
+                        NamedToggle {
                             settingKey: "multicontroller"
                             bridge: page.prefs
                             title: qsTr("Force gamepad #1 always connected")
                             description: qsTr("Keeps one gamepad connected to the host even with none attached here.")
                         }
 
-                        SeatHubToggle {
+                        NamedToggle {
                             settingKey: "gamepadmouse"
                             bridge: page.prefs
                             title: qsTr("Enable mouse control with gamepads by holding the 'Start' button")
                         }
 
-                        SeatHubToggle {
+                        NamedToggle {
                             settingKey: "backgroundgamepad"
                             bridge: page.prefs
                             title: qsTr("Process gamepad input when SeatHub is in the background")
@@ -666,35 +675,34 @@ Item {
                             font.weight: Font.DemiBold
                         }
 
-                        SeatHubSelect {
+                        NamedSelect {
                             settingKey: "videodec"
                             bridge: page.prefs
                             title: qsTr("Video decoder")
                             description: qsTr("Automatic picks the best decoder this PC supports.")
                         }
 
-                        SeatHubSelect {
+                        NamedSelect {
                             settingKey: "videocfg"
                             bridge: page.prefs
                             title: qsTr("Video codec")
-                            description: qsTr("Your saved choice is never rewritten; a fallback is shown beside it.")
                         }
 
-                        SeatHubToggle {
+                        NamedToggle {
                             settingKey: "hdr"
                             bridge: page.prefs
                             title: qsTr("Enable HDR (Experimental)")
                             description: qsTr("Needs host and graphics support.")
                         }
 
-                        SeatHubToggle {
+                        NamedToggle {
                             settingKey: "yuv444"
                             bridge: page.prefs
                             title: qsTr("Enable YUV 4:4:4 (Experimental)")
                             description: qsTr("Sharper text and colour; needs a strong connection.")
                         }
 
-                        SeatHubToggle {
+                        NamedToggle {
                             settingKey: "unlockbitrate"
                             bridge: page.prefs
                             title: qsTr("Unlock bitrate limit (Experimental)")
@@ -754,6 +762,7 @@ Item {
                                             height: Metrics.touchTarget
                                             enabled: page.prefs ? page.prefs.writable : false
                                             checked: page.prefs ? page.prefs.getStatsToggle(statRow.statKey) : false
+                                            Accessible.name: page.prefs ? page.prefs.statsToggleLabel(statRow.statKey) : ""
 
                                             indicator: Rectangle {
                                                 x: (parent.width - width) / 2
@@ -772,6 +781,7 @@ Item {
                                                     color: Tokens.primaryForegroundDefault
                                                     font.family: Tokens.fontSansDefault
                                                     font.pixelSize: Metrics.fontSm
+                                                    Accessible.ignored: true
                                                 }
                                             }
 

@@ -21,6 +21,7 @@
 
 #include <QtTest>
 #include <QAbstractListModel>
+#include <QAccessible>
 #include <QColor>
 #include <QDir>
 #include <QFile>
@@ -902,6 +903,19 @@ private slots:
     void aStalledConnectWrapsTheLongestSentenceAndNeverBreaksAReference();
     void theErrorViewShowsThreeKindsOfSentenceAsTheyAreAndDrawsNoBareReferenceLabel();
     void noScreenRendersAnInternalStateOrEndReasonKey();
+    void everyCustomerScreenHasSpecStates();
+
+private:
+    // The per-screen halves of `everyCustomerScreenHasSpecStates`, each run at both desktop sizes. A
+    // QVERIFY inside one returns from it only, so the slot checks `currentTestFailed()` after each.
+    void checkHomeAt(const QSize& size);
+    void checkErrorViewAt(const QSize& size);
+    void checkSignInAt(const QSize& size);
+    void checkRestoreSplashAt(const QSize& size);
+    void checkStartingAt(const QSize& size);
+    void checkHeaderAt(const QSize& size);
+    void checkProfileAt(const QSize& size);
+    void checkSettingsAt(const QSize& size);
 };
 
 void TstUiScreens::initTestCase()
@@ -5581,6 +5595,1166 @@ void TstUiScreens::theProfileFitsItsWindowAndKeepsTheListWideEnough()
         const bool scrolls = left->property("contentHeight").toReal() > left->property("height").toReal();
         QVERIFY(fits || scrolls);
         QVERIFY(fx.visible("signOutButton"));
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------
+// T028 / SC13: every customer screen of `docs/spec/screens.md` §22-27 in the states the spec names, at
+// the two source-specified desktop sizes (1100x720 fixed, 960x640 minimum), in a real window.
+//
+// What each screen is held to, besides its sentences:
+//   * accessible names: every control a customer can press, type into or toggle is named, by itself or
+//     by the named group around it (`ui.md` §9 "programmatic labels"), and a decorative mark is not read
+//     out beside the sentence it decorates;
+//   * keyboard focus order: the real Qt tab chain (`nextItemInFocusChain`) of the window, in reading
+//     order, with nothing disabled or hidden in it;
+//   * fit: no sentence runs outside the window at either size.
+// The native walkthrough on an installed build (title bar, a screen reader, a stall) is the reviewer's
+// and the live test's (T034); a sidecar cannot see a pixel or drive Narrator.
+// ---------------------------------------------------------------------------------------------------
+
+namespace {
+
+const QList<QSize>& customerDesktopSizes()
+{
+    // screens.md Common shell: "fixed window 1100x720 minimum 960x640".
+    static const QList<QSize> sizes = { QSize(1100, 720), QSize(960, 640) };
+    return sizes;
+}
+
+// The signed-in header is 64px (screens.md Common shell); a signed-in screen fills what is below it.
+const int kSignedInHeaderPx = 64;
+
+// The attached `Accessible` object of an item (`QQuickAccessibleAttached`) is a QObject child of it; its
+// properties are read through the meta-object so the test needs no private Qt header.
+QObject* accessibleOf(QObject* item)
+{
+    if (!item) {
+        return nullptr;
+    }
+    for (QObject* child : item->children()) {
+        if (qstrcmp(child->metaObject()->className(), "QQuickAccessibleAttached") == 0) {
+            return child;
+        }
+    }
+    return nullptr;
+}
+
+QString accessibleName(QObject* item)
+{
+    QObject* attached = accessibleOf(item);
+    return attached ? attached->property("name").toString() : QString();
+}
+
+QString accessibleDescription(QObject* item)
+{
+    QObject* attached = accessibleOf(item);
+    return attached ? attached->property("description").toString() : QString();
+}
+
+bool accessibleIgnored(QObject* item)
+{
+    QObject* attached = accessibleOf(item);
+    return attached && attached->property("ignored").toBool();
+}
+
+int accessibleRole(QObject* item)
+{
+    QObject* attached = accessibleOf(item);
+    return attached ? attached->property("role").toInt() : -1;
+}
+
+// What a screen reader is told for an item: its own `Accessible.name`, else the label Qt Quick Controls
+// take from a button's text.
+QString spokenName(QObject* item)
+{
+    const QString own = accessibleName(item);
+    if (!own.isEmpty()) {
+        return own;
+    }
+    if (item && item->inherits("QQuickAbstractButton")) {
+        return item->property("text").toString();
+    }
+    return QString();
+}
+
+// The name for a control: its own, or that of the nearest named group it sits in below `stopAt`.
+QString nameOrGroupName(QQuickItem* control, QQuickItem* stopAt)
+{
+    const QString own = spokenName(control);
+    if (!own.isEmpty()) {
+        return own;
+    }
+    for (QQuickItem* item = control->parentItem(); item; item = item->parentItem()) {
+        const QString group = accessibleName(item);
+        if (!group.isEmpty()) {
+            return group;
+        }
+        if (item == stopAt) {
+            break;
+        }
+    }
+    return QString();
+}
+
+bool isInteractiveControl(QObject* object)
+{
+    return object->inherits("QQuickAbstractButton") || object->inherits("QQuickTextInput")
+           || object->inherits("QQuickComboBox") || object->inherits("QQuickAbstractSlider")
+           || object->inherits("QQuickSpinBox");
+}
+
+// Every control under `root`; `onlyShown` keeps those a customer can see.
+QList<QQuickItem*> controlsUnder(QObject* root, bool onlyShown)
+{
+    QList<QQuickItem*> controls;
+    for (QObject* object : visualTree(root)) {
+        auto* item = qobject_cast<QQuickItem*>(object);
+        if (item && item != root && isInteractiveControl(item) && (!onlyShown || item->isVisible())) {
+            controls.append(item);
+        }
+    }
+    return controls;
+}
+
+// The controls with no name of their own and in no named group: what a screen reader would call
+// "button" or "edit" and nothing else.
+QStringList unnamedControls(QObject* root, bool onlyShown)
+{
+    QStringList unnamed;
+    for (QQuickItem* control : controlsUnder(root, onlyShown)) {
+        if (nameOrGroupName(control, qobject_cast<QQuickItem*>(root)).isEmpty()) {
+            unnamed.append(QString::fromLatin1(control->metaObject()->className())
+                           + QLatin1Char('#') + control->objectName());
+        }
+    }
+    return unnamed;
+}
+
+// A screen in a real window of a given size, below the header when the screen has one. The window is
+// shown and exposed so the Qt tab chain and the layout are the real ones.
+struct Hosted
+{
+    QQuickWindow window;
+    QQuickItem* item = nullptr;
+    QSize size;
+
+    bool show(QObject* root, const QSize& windowSize, int topInset, int fixedHeight = -1)
+    {
+        item = qobject_cast<QQuickItem*>(root);
+        if (!item) {
+            return false;
+        }
+        size = windowSize;
+        window.resize(windowSize);
+        item->setParentItem(window.contentItem());
+        item->setPosition(QPointF(0, topInset));
+        item->setSize(QSizeF(windowSize.width(),
+                             fixedHeight >= 0 ? fixedHeight : windowSize.height() - topInset));
+        window.show();
+        if (!QTest::qWaitForWindowExposed(&window)) {
+            return false;
+        }
+        window.requestActivate();
+        return true;
+    }
+
+    // The window's own tab chain, in order: the label of each stop.
+    QStringList tabOrder() const
+    {
+        QStringList stops;
+        QSet<QQuickItem*> seen;
+        QQuickItem* start = window.contentItem();
+        QQuickItem* current = start->nextItemInFocusChain(true);
+        // The chain wraps: the walk ends on the first item seen twice (or back at the window).
+        for (int guard = 0; current && current != start && !seen.contains(current) && guard < 400;
+             ++guard, current = current->nextItemInFocusChain(true)) {
+            seen.insert(current);
+            QString label = nameOrGroupName(current, item);
+            if (current->inherits("QQuickListView")) {
+                label = QStringLiteral("list:") + label;
+            }
+            stops.append(label.isEmpty() ? QStringLiteral("(unnamed ")
+                                               + QString::fromLatin1(current->metaObject()->className())
+                                               + QLatin1Char(')')
+                                         : label);
+        }
+        return stops;
+    }
+
+    // The sentences that run outside the window (left, right, or - when `checkBottom` - below it).
+    QStringList textsOutsideWindow(QObject* root, bool checkBottom) const
+    {
+        QStringList outside;
+        const QRectF bounds(0, 0, size.width(), size.height());
+        for (QObject* object : visualTree(root)) {
+            auto* text = qobject_cast<QQuickItem*>(object);
+            if (!text || text->metaObject()->indexOfProperty("font") < 0
+                || text->metaObject()->indexOfProperty("text") < 0 || !text->isVisible()
+                || text->property("text").toString().isEmpty() || text->width() <= 0) {
+                continue;
+            }
+            const QRectF where = text->mapRectToScene(QRectF(0, 0, text->width(), text->height()));
+            if (where.left() < -1 || where.right() > bounds.right() + 1 || where.top() < -1
+                || (checkBottom && where.bottom() > bounds.bottom() + 1)) {
+                outside.append(text->property("text").toString());
+            }
+        }
+        return outside;
+    }
+};
+
+// The window's tab chain is exactly `expected`, in order. Uses the `host` and `where` of the check that
+// calls it, and says what the chain really was when it differs.
+#define COMPARE_TABS(expected)                                                                          \
+    do {                                                                                                \
+        const QStringList actualTabs = host.tabOrder();                                                 \
+        const QStringList expectedTabs = (expected);                                                    \
+        QVERIFY2(actualTabs == expectedTabs,                                                            \
+                 qPrintable(where + QStringLiteral(": tab order is [") + actualTabs.join(" | ")         \
+                            + QStringLiteral("], expected [") + expectedTabs.join(" | ")                \
+                            + QStringLiteral("]")));                                                    \
+    } while (0)
+
+QString sizeLabel(const QSize& size)
+{
+    return QStringLiteral("%1x%2").arg(size.width()).arg(size.height());
+}
+
+// Words a stream-quality selector would carry. Settings alone determines stream quality (SC13): none of
+// them may be on any other customer screen.
+bool carriesAQualitySelectorWord(const QString& text)
+{
+    static const QRegularExpression words(
+        QStringLiteral("bitrate|resolution|frame rate|1080p|1440p|720p|quality"),
+        QRegularExpression::CaseInsensitiveOption);
+    return text.contains(words);
+}
+
+void expectNoQualitySelector(QObject* root, const QString& where)
+{
+    for (QObject* object : visualTree(root)) {
+        const QMetaObject* meta = object->metaObject();
+        if (meta->indexOfProperty("text") < 0 || meta->indexOfProperty("font") < 0 || !isShown(object)) {
+            continue;
+        }
+        const QString text = object->property("text").toString();
+        QVERIFY2(!carriesAQualitySelectorWord(text),
+                 qPrintable(where + QStringLiteral(": a stream quality control or word outside Settings: ")
+                            + text));
+    }
+}
+
+// A sentence's item, and whether it sits above another item on the screen (error text sits above the
+// field or the button it belongs to, screens.md §22).
+qreal sceneTop(QObject* object)
+{
+    auto* item = qobject_cast<QQuickItem*>(object);
+    return item ? item->mapToScene(QPointF(0, 0)).y() : 0;
+}
+
+QObject* hostedProfile(QQmlEngine* engine, FakeShellClient* client, const QSize& size, QString* error)
+{
+    QQmlComponent component(engine, QUrl::fromLocalFile(guiDir() + QStringLiteral("/ProfileScreen.qml")));
+    QObject* root = component.createWithInitialProperties(
+        { { QStringLiteral("client"), QVariant::fromValue(static_cast<QObject*>(client)) },
+          { QStringLiteral("width"), size.width() },
+          { QStringLiteral("height"), size.height() - kSignedInHeaderPx },
+          { QStringLiteral("loadingDelay"), 0 } });
+    if (!root && error) {
+        *error = component.errorString();
+    }
+    return root;
+}
+
+FakeList* profileListFor(FakeShellClient& client, int tab)
+{
+    return tab == 0 ? client.sessions() : (tab == 1 ? client.credit() : client.topups());
+}
+
+} // namespace
+
+void TstUiScreens::checkHomeAt(const QSize& size)
+{
+    const QString where = QStringLiteral("Home at ") + sizeLabel(size);
+    QQuickStyle::setStyle(QStringLiteral("Basic"));
+    QQmlEngine engine;
+    registerTokenSingletons(&engine);
+
+    FakeShellClient client;
+    Hosted host;
+    QString error;
+    QScopedPointer<QObject> screen(instantiate(&engine, QStringLiteral("HomeScreen.qml"), &error));
+    QVERIFY2(screen, qPrintable(error));
+    QVERIFY(screen->setProperty("client", QVariant::fromValue(static_cast<QObject*>(&client))));
+    QVERIFY2(host.show(screen.data(), size, kSignedInHeaderPx), qPrintable(where));
+
+    QObject* play = screen->findChild<QObject*>(QStringLiteral("playButton"));
+    QVERIFY(play);
+    QCOMPARE(spokenName(play), QStringLiteral("Play"));
+
+    // Populated: Play alone, and the last session's end reason above it when there is one.
+    client.setHomeStatus(QStringLiteral("ready"));
+    COMPARE_TABS( QStringList{ QStringLiteral("Play") });
+    client.setEndReasonText(QStringLiteral("You ended the session. Unused minutes stay in your account."));
+    QVERIFY2(seesText(screen.data(),
+                      QStringLiteral("You ended the session. Unused minutes stay in your account.")),
+             qPrintable(where));
+    QTRY_VERIFY2(sceneTop(screen->findChild<QObject*>(QStringLiteral("endReasonLine"))) < sceneTop(play),
+             qPrintable(where + QStringLiteral(": the end reason sits above Play")));
+    client.setEndReasonText(QString());
+
+    // Loading: the named line above Play, and Play busy with its name unchanged.
+    client.setHomeStatus(QStringLiteral("checking"));
+    QVERIFY2(seesText(screen.data(), QStringLiteral("Checking availability…")), qPrintable(where));
+    QVERIFY(play->property("busy").toBool());
+    QCOMPARE(spokenName(play), QStringLiteral("Play"));
+    QTRY_VERIFY2(sceneTop(screen->findChild<QObject*>(QStringLiteral("stateLine"))) < sceneTop(play),
+             qPrintable(where));
+
+    // Empty (no rig is free): one line, and Play stays the one action.
+    client.setHomeStatus(QStringLiteral("busy"));
+    QVERIFY2(seesText(screen.data(), QStringLiteral("None available right now.")), qPrintable(where));
+    COMPARE_TABS( QStringList{ QStringLiteral("Play") });
+
+    // Offline: the full sentence, Play still pressable.
+    client.setHomeStatus(QStringLiteral("offline"));
+    QVERIFY2(seesText(screen.data(),
+                      QStringLiteral("Can't reach SevenHills right now. Showing the last known balance.")),
+             qPrintable(where));
+    COMPARE_TABS( QStringList{ QStringLiteral("Play") });
+
+    // Refused: the server's sentence, the reference in mono, and a ghost Top up under Play. The mark
+    // beside the sentence is decoration and is not read out.
+    const QString sentence = QStringLiteral("You need at least 15 minutes of credit to start a session.");
+    client.setFailure(sentence, QStringLiteral("SH-4F7KQ2"));
+    client.setHomeStatus(QStringLiteral("refused"));
+    QVERIFY2(seesText(screen.data(), sentence), qPrintable(where));
+    QObject* reference = findVisibleTextItem(screen.data(), QStringLiteral("SH-4F7KQ2"));
+    QVERIFY2(reference, qPrintable(where));
+    QCOMPARE(reference->property("font").value<QFont>().family(), QString::fromLatin1(kMonoFamily));
+    QObject* mark = screen->findChild<QObject*>(QStringLiteral("refusalGlyph"));
+    QVERIFY(mark);
+    QVERIFY2(accessibleIgnored(mark), "the refusal mark is not read out");
+    COMPARE_TABS( (QStringList{ QStringLiteral("Play"), QStringLiteral("Top up") }));
+
+    QVERIFY2(unnamedControls(screen.data(), true).isEmpty(), qPrintable(where));
+    QVERIFY2(host.textsOutsideWindow(screen.data(), true).isEmpty(),
+             qPrintable(where + QStringLiteral(": ") + host.textsOutsideWindow(screen.data(), true).join(" | ")));
+    expectNoQualitySelector(screen.data(), where);
+}
+
+void TstUiScreens::checkErrorViewAt(const QSize& size)
+{
+    const QString where = QStringLiteral("Error view at ") + sizeLabel(size);
+    QQuickStyle::setStyle(QStringLiteral("Basic"));
+    QQmlEngine engine;
+    registerTokenSingletons(&engine);
+
+    // The server's sentence and its reference, then the way on.
+    {
+        FakeShellClient client;
+        client.setFailure(QStringLiteral("The rig is busy right now."), QStringLiteral("SH-4F7KQ2"));
+        Hosted host;
+        QString error;
+        QScopedPointer<QObject> screen(instantiate(&engine, QStringLiteral("ErrorScreen.qml"), &error));
+        QVERIFY2(screen, qPrintable(error));
+        QVERIFY(screen->setProperty("client", QVariant::fromValue(static_cast<QObject*>(&client))));
+        QVERIFY2(host.show(screen.data(), size, kSignedInHeaderPx), qPrintable(where));
+
+        QVERIFY2(seesText(screen.data(), QStringLiteral("The rig is busy right now.")), qPrintable(where));
+        QObject* reference = findVisibleTextItem(screen.data(), QStringLiteral("SH-4F7KQ2"));
+        QVERIFY2(reference, qPrintable(where));
+        QCOMPARE(reference->property("font").value<QFont>().family(), QString::fromLatin1(kMonoFamily));
+        COMPARE_TABS(
+                 (QStringList{ QStringLiteral("Try again"), QStringLiteral("Back to home") }));
+        QVERIFY2(unnamedControls(screen.data(), true).isEmpty(), qPrintable(where));
+        QVERIFY2(host.textsOutsideWindow(screen.data(), true).isEmpty(), qPrintable(where));
+    }
+
+    // A message with no mapping: the generic sentence and no reference row (the client never makes a
+    // code up, ADR-0008), and the same two actions.
+    {
+        FakeShellClient client;
+        Hosted host;
+        QString error;
+        QScopedPointer<QObject> screen(instantiate(&engine, QStringLiteral("ErrorScreen.qml"), &error));
+        QVERIFY2(screen, qPrintable(error));
+        QVERIFY(screen->setProperty("client", QVariant::fromValue(static_cast<QObject*>(&client))));
+        QVERIFY2(host.show(screen.data(), size, kSignedInHeaderPx), qPrintable(where));
+        QVERIFY2(seesText(screen.data(), QStringLiteral("Something went wrong on our side.")),
+                 qPrintable(where));
+        QObject* row = screen->findChild<QObject*>(QStringLiteral("referenceRow"));
+        QVERIFY(row);
+        QVERIFY2(!isShown(row), "no reference row rather than a label with nothing after it");
+        COMPARE_TABS(
+                 (QStringList{ QStringLiteral("Try again"), QStringLiteral("Back to home") }));
+    }
+}
+
+void TstUiScreens::checkSignInAt(const QSize& size)
+{
+    const QString where = QStringLiteral("Sign in at ") + sizeLabel(size);
+    QQuickStyle::setStyle(QStringLiteral("Basic"));
+    QQmlEngine engine;
+    registerTokenSingletons(&engine);
+
+    FakeShellClient client;
+    Hosted host;
+    QString error;
+    QScopedPointer<QObject> screen(instantiate(&engine, QStringLiteral("SignInScreen.qml"), &error));
+    QVERIFY2(screen, qPrintable(error));
+    QVERIFY(screen->setProperty("client", QVariant::fromValue(static_cast<QObject*>(&client))));
+    // Sign in carries no header, so it fills the window.
+    QVERIFY2(host.show(screen.data(), size, 0), qPrintable(where));
+
+    auto child = [&](const char* name) { return deepChild(screen.data(), QLatin1String(name)); };
+    auto sees = [&](const QString& text) { return seesText(screen.data(), text); };
+    auto call = [&](const char* method) { return QMetaObject::invokeMethod(screen.data(), method); };
+    auto type = [&](const QString& text) { child("identifierField")->setProperty("text", text); };
+    auto click = [&](const char* name) {
+        QObject* button = child(name);
+        return button && QMetaObject::invokeMethod(button, "clicked");
+    };
+    const QStringList identifierStops = { QStringLiteral("Email or phone"), QStringLiteral("Continue"),
+                                          QStringLiteral("New here? Create an account"),
+                                          QStringLiteral("Forgot password?") };
+
+    // Empty: label, helper and an enabled Continue; the input takes focus; the order is the field, the
+    // primary action, then the two links to the website. The input is named after the field's label.
+    QVERIFY2(sees(QStringLiteral("Email or phone")), qPrintable(where));
+    QVERIFY2(sees(QStringLiteral(
+                 "Enter an email address, or pick your country and enter your phone number.")),
+             qPrintable(where));
+    QObject* primary = child("primaryAction");
+    QVERIFY(primary);
+    QVERIFY(primary->property("enabled").toBool());
+    QVERIFY(!primary->property("busy").toBool());
+    COMPARE_TABS( identifierStops);
+    QObject* input = child("identifierInput");
+    QVERIFY(input);
+    QCOMPARE(accessibleName(input), QStringLiteral("Email or phone"));
+    QTRY_VERIFY2(input->property("activeFocus").toBool(),
+                 "the field starts focused so the customer can type at once");
+
+    // Error, before anything is sent: the message sits above the field and is the field's accessible
+    // description; the mark beside it is not read out.
+    QVERIFY(call("continueFromIdentifier"));
+    QVERIFY2(sees(QStringLiteral("Enter your email or phone number.")), qPrintable(where));
+    QCOMPARE(accessibleDescription(input), QStringLiteral("Enter your email or phone number."));
+    QTRY_VERIFY2(sceneTop(child("fieldErrorLine")) < sceneTop(child("identifierField")),
+             qPrintable(where + QStringLiteral(": the message sits above the field")));
+    QVERIFY(client.otpRequests().isEmpty());
+    for (QObject* glyph : deepChildren(screen.data(), QStringLiteral("errorGlyph"))) {
+        QVERIFY2(accessibleIgnored(glyph), "the error mark is not read out");
+    }
+
+    // Non-Jordan region: the tag starts on the machine's country (Jordan here), a country picked with
+    // the tag is believed, the digits stay, and the number goes out as E.164 for that country.
+    type(QStringLiteral("07911123456"));
+    QObject* field = child("identifierField");
+    QVERIFY(field->property("tagShown").toBool());
+    QCOMPARE(field->property("countryIso").toString(), QStringLiteral("JO"));
+    QVERIFY(QMetaObject::invokeMethod(field, "setCountry", Q_ARG(QVariant, QStringLiteral("GB"))));
+    QCOMPARE(field->property("countryIso").toString(), QStringLiteral("GB"));
+    QCOMPARE(field->property("countryDial").toString(), QStringLiteral("+44"));
+    QCOMPARE(field->property("text").toString(), QStringLiteral("07911123456"));
+    QObject* tagIso = child("tagIso");
+    QVERIFY(tagIso);
+    QCOMPARE(tagIso->property("text").toString(), QStringLiteral("GB"));
+    QObject* tag = child("countryTag");
+    QVERIFY(tag);
+    QCOMPARE(accessibleName(tag), QStringLiteral("Country code: United Kingdom"));
+    QObject* chevron = child("tagChevron");
+    QVERIFY(chevron);
+    QVERIFY2(accessibleIgnored(chevron), "the chevron is not read out beside the country");
+    COMPARE_TABS(
+             (QStringList{ QStringLiteral("Country code: United Kingdom"), QStringLiteral("Email or phone"),
+                           QStringLiteral("Continue"), QStringLiteral("New here? Create an account"),
+                           QStringLiteral("Forgot password?") }));
+
+    // Loading: the pressed control keeps its label and its width and is busy.
+    const qreal buttonWidth = qobject_cast<QQuickItem*>(primary)->width();
+    QVERIFY(call("continueFromIdentifier"));
+    QCOMPARE(client.otpRequests(), QStringList{ QStringLiteral("+447911123456") });
+    QVERIFY(primary->property("busy").toBool());
+    QCOMPARE(spokenName(primary), QStringLiteral("Continue"));
+    QCOMPARE(qobject_cast<QQuickItem*>(primary)->width(), buttonWidth);
+
+    // Error, a refusal that names no field: above the button, with the reference in mono.
+    client.deliverOtpRejected(QStringLiteral("That didn't work. Try again."), QStringLiteral("SH-4F7KQ2"));
+    QVERIFY(!primary->property("busy").toBool());
+    QVERIFY2(sees(QStringLiteral("That didn't work. Try again.")), qPrintable(where));
+    QObject* reference = findVisibleTextItem(screen.data(), QStringLiteral("SH-4F7KQ2"));
+    QVERIFY2(reference, qPrintable(where));
+    QCOMPARE(reference->property("font").value<QFont>().family(), QString::fromLatin1(kMonoFamily));
+    QTRY_VERIFY2(sceneTop(child("refusalLine")) < sceneTop(primary), qPrintable(where));
+
+    // Offline: the deck's sentence above the button, and no reference row (none exists for it).
+    client.deliverOtpRejected(QStringLiteral("We couldn't reach SevenHills. Try again in a moment."),
+                              QString());
+    QVERIFY2(sees(QStringLiteral("We couldn't reach SevenHills. Try again in a moment.")),
+             qPrintable(where));
+    QVERIFY2(!findVisibleTextItem(screen.data(), QStringLiteral("SH-4F7KQ2")), qPrintable(where));
+
+    // The code step: the six cells share the field's one name, and the actions follow in order.
+    client.deliverOtpRequested(QStringLiteral("+447911123456"));
+    QCOMPARE(screen->property("step").toString(), QStringLiteral("code"));
+    QVERIFY2(sees(QStringLiteral("Enter the 6-digit code")), qPrintable(where));
+    QVERIFY2(sees(QStringLiteral("Resend in 0:24")), qPrintable(where));
+    QObject* otp = child("otpField");
+    QVERIFY(otp);
+    QCOMPARE(accessibleName(otp), QStringLiteral("Enter the 6-digit code"));
+    QCOMPARE(accessibleRole(otp), int(QAccessible::Grouping));
+    // Focus lands in the first cell as the step shows (the customer types the six digits at once), and
+    // the Tab order that follows is the primary action then Back. The cells themselves are not tab
+    // stops - `SeatHubOTPField.qml` is outside this task's files, so that is recorded in the task Log.
+    {
+        QQuickItem* firstCell = nullptr;
+        for (QQuickItem* control : controlsUnder(otp, true)) {
+            if (control->inherits("QQuickTextInput")) {
+                firstCell = control;
+                break;
+            }
+        }
+        QVERIFY2(firstCell, qPrintable(where));
+        QTRY_VERIFY2(firstCell->hasActiveFocus(), qPrintable(where + QStringLiteral(": the code step focuses its first cell")));
+    }
+    COMPARE_TABS((QStringList{ QStringLiteral("Verify and continue"), QStringLiteral("Back") }));
+    QVERIFY2(unnamedControls(screen.data(), true).isEmpty(),
+             qPrintable(where + QStringLiteral(": ") + unnamedControls(screen.data(), true).join(", ")));
+
+    // Back keeps the number; the email path goes to the password step.
+    QVERIFY(click("backButton"));
+    QCOMPARE(screen->property("step").toString(), QStringLiteral("identifier"));
+    QCOMPARE(child("identifierField")->property("text").toString(), QStringLiteral("07911123456"));
+    type(QStringLiteral("lina@example.com"));
+    QVERIFY(call("continueFromIdentifier"));
+    QCOMPARE(screen->property("step").toString(), QStringLiteral("password"));
+    COMPARE_TABS(
+             (QStringList{ QStringLiteral("Password"), QStringLiteral("Show password"),
+                           QStringLiteral("Sign in"), QStringLiteral("Forgot password?"),
+                           QStringLiteral("Back") }));
+    QObject* password = child("passwordField");
+    QVERIFY(password);
+    QCOMPARE(accessibleName(password), QStringLiteral("Password"));
+    QVERIFY(call("signInWithPassword"));
+    QVERIFY2(sees(QStringLiteral("Enter your password.")), qPrintable(where));
+    QCOMPARE(accessibleDescription(password), QStringLiteral("Enter your password."));
+    QVERIFY(client.passwordAttempts().isEmpty());
+
+    QVERIFY2(unnamedControls(screen.data(), true).isEmpty(), qPrintable(where));
+    QVERIFY2(host.textsOutsideWindow(screen.data(), true).isEmpty(),
+             qPrintable(where + QStringLiteral(": ") + host.textsOutsideWindow(screen.data(), true).join(" | ")));
+    // Nothing on the sign-in screen is a stream quality control or a balance (no header before sign-in).
+    expectNoQualitySelector(screen.data(), where);
+    QVERIFY2(!screen->findChild<QObject*>(QStringLiteral("balancePill")), qPrintable(where));
+}
+
+void TstUiScreens::checkRestoreSplashAt(const QSize& size)
+{
+    const QString where = QStringLiteral("Restore splash at ") + sizeLabel(size);
+    QQuickStyle::setStyle(QStringLiteral("Basic"));
+    QQmlEngine engine;
+    registerTokenSingletons(&engine);
+
+    Hosted host;
+    QString error;
+    QScopedPointer<QObject> screen(instantiate(&engine, QStringLiteral("RestoreSplash.qml"), &error));
+    QVERIFY2(screen, qPrintable(error));
+    QVERIFY2(host.show(screen.data(), size, 0), qPrintable(where));
+
+    // The wordmark and `Signing you in…`: never the form, and nothing to press or tab to.
+    QVERIFY2(seesText(screen.data(), QStringLiteral("Signing you in…")), qPrintable(where));
+    QVERIFY2(seesText(screen.data(), QStringLiteral("SeatHub")), qPrintable(where));
+    QVERIFY2(!seesText(screen.data(), QStringLiteral("Sign in")), qPrintable(where));
+    QVERIFY2(!seesText(screen.data(), QStringLiteral("Continue")), qPrintable(where));
+    QVERIFY2(controlsUnder(screen.data(), false).isEmpty(), qPrintable(where));
+    QVERIFY2(host.tabOrder().isEmpty(), qPrintable(host.tabOrder().join(" | ")));
+    QVERIFY2(host.textsOutsideWindow(screen.data(), true).isEmpty(), qPrintable(where));
+}
+
+void TstUiScreens::checkStartingAt(const QSize& size)
+{
+    const QString where = QStringLiteral("Starting at ") + sizeLabel(size);
+    QQuickStyle::setStyle(QStringLiteral("Basic"));
+    QQmlEngine engine;
+    registerTokenSingletons(&engine);
+
+    FakeShellClient client;
+    Hosted host;
+    QString error;
+    QScopedPointer<QObject> screen(instantiate(&engine, QStringLiteral("ConnectingScreen.qml"), &error));
+    QVERIFY2(screen, qPrintable(error));
+    QVERIFY(screen->setProperty("client", QVariant::fromValue(static_cast<QObject*>(&client))));
+    QVERIFY2(host.show(screen.data(), size, kSignedInHeaderPx), qPrintable(where));
+
+    QObject* stepper = screen->findChild<QObject*>(QStringLiteral("stepper"));
+    QVERIFY(stepper);
+
+    // Loading is the screen itself: three stages, each in the deck's words, and the one that is active
+    // is the one the stepper names (one polite announcement), tied to the facade's real stage.
+    const QStringList stages = { QStringLiteral("Preparing the rig"), QStringLiteral("Preparing the stream"),
+                                 QStringLiteral("Streaming") };
+    for (const QString& stage : stages) {
+        QVERIFY2(seesText(screen.data(), stage), qPrintable(where + QStringLiteral(": ") + stage));
+    }
+    const QString rigSentence = QStringLiteral("Getting the rig ready. Usually a few seconds.");
+    const QString streamSentence = QStringLiteral("Pairing your client with the rig. Usually a few seconds.");
+    for (int reached = 0; reached <= 3; ++reached) {
+        client.setConnectStage(reached);
+        QCOMPARE(accessibleName(stepper), stages.at(std::max(reached, 1) - 1));
+        // The active stage carries its sentence (copy.md § Play flow); Streaming has none.
+        QCOMPARE(seesText(screen.data(), rigSentence), reached <= 1);
+        QCOMPARE(seesText(screen.data(), streamSentence), reached == 2);
+        COMPARE_TABS( QStringList{ QStringLiteral("Cancel") });
+    }
+    QVERIFY2(!isShown(screen->findChild<QObject*>(QStringLiteral("stalled"))), qPrintable(where));
+
+    // Error: where it stopped, the end-reason sentence, the reference (mono), and the two ways on.
+    client.setConnectStage(2);
+    client.setStalled(QStringLiteral("Stopped at: Preparing the stream"),
+                      QStringLiteral("The stream didn't start. You were not charged."),
+                      QStringLiteral("SH-4F7KQ2"));
+    QVERIFY2(seesText(screen.data(), QStringLiteral("Stopped at: Preparing the stream")), qPrintable(where));
+    QVERIFY2(seesText(screen.data(), QStringLiteral("The stream didn't start. You were not charged.")),
+             qPrintable(where));
+    QObject* reference = findVisibleTextItem(screen.data(), QStringLiteral("SH-4F7KQ2"));
+    QVERIFY2(reference, qPrintable(where));
+    QCOMPARE(reference->property("font").value<QFont>().family(), QString::fromLatin1(kMonoFamily));
+    QVERIFY2(accessibleIgnored(screen->findChild<QObject*>(QStringLiteral("stalledMark"))),
+             "the stage mark is not read out beside the stage");
+    COMPARE_TABS(
+             (QStringList{ QStringLiteral("Try again"), QStringLiteral("Back to home") }));
+    QVERIFY2(host.textsOutsideWindow(screen.data(), true).isEmpty(),
+             qPrintable(where + QStringLiteral(": ") + host.textsOutsideWindow(screen.data(), true).join(" | ")));
+    // Without a reference the row is gone, not an empty label.
+    client.setStalled(QStringLiteral("Stopped at: Preparing the rig"),
+                      QStringLiteral("You didn't start streaming in time, so the session was released."),
+                      QString());
+    QVERIFY2(!isShown(screen->findChild<QObject*>(QStringLiteral("stalledReferenceRow"))),
+             qPrintable(where));
+    client.clearStalled();
+
+    // Reconnecting: the first attempt's count, then the server's minutes, then `End session` always.
+    client.setReconnecting(0, false, -1);
+    QVERIFY2(seesText(screen.data(), QStringLiteral("Connection lost. Reconnecting… (1 of 5)")),
+             qPrintable(where));
+    COMPARE_TABS( QStringList{ QStringLiteral("End session") });
+    client.setReconnecting(0, true, 12);
+    QVERIFY2(seesText(screen.data(), QStringLiteral("Still trying. 12 minutes left to reconnect.")),
+             qPrintable(where));
+    COMPARE_TABS( QStringList{ QStringLiteral("End session") });
+
+    // Error, grace expired / reconnect limit: Back to home only - the session is over.
+    client.setStalled(QStringLiteral("Stopped at: Streaming"),
+                      QStringLiteral("We couldn't reconnect, so the session ended."), QString());
+    client.setReconnectEnded();
+    COMPARE_TABS( QStringList{ QStringLiteral("Back to home") });
+
+    QVERIFY2(unnamedControls(screen.data(), true).isEmpty(), qPrintable(where));
+    expectNoQualitySelector(screen.data(), where);
+}
+
+void TstUiScreens::checkHeaderAt(const QSize& size)
+{
+    const QString where = QStringLiteral("Header at ") + sizeLabel(size);
+    QQuickStyle::setStyle(QStringLiteral("Basic"));
+    QQmlEngine engine;
+    registerTokenSingletons(&engine);
+
+    FakeShellClient client;
+    Hosted host;
+    QString error;
+    QScopedPointer<QObject> header(instantiate(&engine, QStringLiteral("AppHeader.qml"), &error));
+    QVERIFY2(header, qPrintable(error));
+    QVERIFY(header->setProperty("client", QVariant::fromValue(static_cast<QObject*>(&client))));
+    QVERIFY2(host.show(header.data(), size, 0, kSignedInHeaderPx), qPrintable(where));
+
+    QObject* pill = header->findChild<QObject*>(QStringLiteral("balancePill"));
+    QVERIFY(pill);
+    QCOMPARE(qobject_cast<QQuickItem*>(pill)->height(), 32.0);
+
+    // The persistent balance in each of its states: always on screen, always named `Your credit`, and
+    // the state is in the words as well as the colour.
+    struct Case { qint64 minutes; const char* text; bool stale; const char* name; bool glyph; };
+    const Case cases[] = {
+        { -1, "", false, "Your credit: loading", false },
+        { 135, "2 h 15 min", false, "Your credit: 2 h 15 min", false },
+        { 10, "10 min", false, "Your credit: 10 min", true },
+        { 2, "2 min", false, "Your credit: 2 min", true },
+        { 45, "45 min", true, "Your credit: 45 min last known", false },
+        { -1, "", true, "Your credit: Unavailable", false },
+    };
+    for (const Case& c : cases) {
+        client.setBalance(c.minutes, QString::fromLatin1(c.text), c.stale);
+        QVERIFY2(isShown(pill), qPrintable(where + QStringLiteral(": the balance never disappears")));
+        QCOMPARE(accessibleName(pill), QString::fromLatin1(c.name));
+        QObject* glyph = pill->findChild<QObject*>(QStringLiteral("balanceGlyph"));
+        QVERIFY(glyph);
+        QCOMPARE(isShown(glyph), c.glyph);
+        if (c.glyph) {
+            // WINDOWS #25: the warn / danger mark at the 16px 05-UI-SPEC gives the balance element.
+            QCOMPARE(glyph->property("font").value<QFont>().pixelSize(), 16);
+            QVERIFY2(accessibleIgnored(glyph), "the pill's own name says it; the mark is not read twice");
+        }
+    }
+
+    // The menu: 40x40 trigger named `Menu`, the only tab stop in the header (the balance is data),
+    // three items in order named by their words; the external-link mark is not read out.
+    QObject* menu = header->findChild<QObject*>(QStringLiteral("seatHubMenu"));
+    QVERIFY(menu);
+    QObject* trigger = menu->property("trigger").value<QObject*>();
+    QVERIFY(trigger);
+    QCOMPARE(spokenName(trigger), QStringLiteral("Menu"));
+    QCOMPARE(qobject_cast<QQuickItem*>(trigger)->width(), 40.0);
+    QCOMPARE(qobject_cast<QQuickItem*>(trigger)->height(), 40.0);
+    COMPARE_TABS( QStringList{ QStringLiteral("Menu") });
+    // WINDOWS #28: the `menu` mark at the 20px 05-UI-SPEC gives the trigger.
+    QObject* menuGlyph = menu->findChild<QObject*>(QStringLiteral("menuGlyph"));
+    QVERIFY(menuGlyph);
+    QCOMPARE(menuGlyph->property("font").value<QFont>().pixelSize(), 20);
+    QVERIFY(accessibleIgnored(menuGlyph));
+    const QStringList items = { QStringLiteral("menuItemProfile"), QStringLiteral("menuItemTopUp"),
+                                QStringLiteral("menuItemSettings") };
+    const QStringList itemNames = { QStringLiteral("Profile"), QStringLiteral("Top up"),
+                                    QStringLiteral("Settings") };
+    for (int i = 0; i < items.size(); ++i) {
+        QObject* menuItem = menu->findChild<QObject*>(items.at(i));
+        QVERIFY2(menuItem, qPrintable(items.at(i)));
+        QCOMPARE(spokenName(menuItem), itemNames.at(i));
+        QCOMPARE(accessibleRole(menuItem), int(QAccessible::MenuItem));
+    }
+    QObject* topUpItem = menu->findChild<QObject*>(QStringLiteral("menuItemTopUp"));
+    for (QObject* glyph : deepChildren(topUpItem, QStringLiteral("rowGlyph"))) {
+        QVERIFY2(accessibleIgnored(glyph), "the external-link mark is decoration");
+    }
+
+    // Wordmark, balance and menu all fit the header at this width.
+    QVERIFY2(host.textsOutsideWindow(header.data(), true).isEmpty(), qPrintable(where));
+    QVERIFY2(unnamedControls(header.data(), true).isEmpty(), qPrintable(where));
+}
+
+void TstUiScreens::checkProfileAt(const QSize& size)
+{
+    const QString where = QStringLiteral("Profile at ") + sizeLabel(size);
+    QQuickStyle::setStyle(QStringLiteral("Basic"));
+    QQmlEngine engine;
+    registerTokenSingletons(&engine);
+
+    FakeShellClient client;
+    Hosted host;
+    QString error;
+    QScopedPointer<QObject> screen(hostedProfile(&engine, &client, size, &error));
+    QVERIFY2(screen, qPrintable(error));
+    QVERIFY2(host.show(screen.data(), size, kSignedInHeaderPx), qPrintable(where));
+    auto child = [&](const char* name) { return deepChild(screen.data(), QLatin1String(name)); };
+    auto sees = [&](const QString& text) { return seesText(screen.data(), text); };
+    auto shown = [&](const char* name) { QObject* o = child(name); return o && isShown(o); };
+
+    const QStringList titles = { QStringLiteral("Sessions"), QStringLiteral("Credit history"),
+                                 QStringLiteral("Top-ups") };
+    const QStringList loadingLines = { QStringLiteral("Loading your sessions…"),
+                                       QStringLiteral("Loading your credit history…"),
+                                       QStringLiteral("Loading your top-ups…") };
+    const QStringList emptyLines = { QStringLiteral("No sessions yet."), QStringLiteral("No credit history yet."),
+                                     QStringLiteral("No top-ups yet.") };
+    const QStringList emptyActions = { QStringLiteral("Back to home"), QStringLiteral("Top up"),
+                                       QStringLiteral("Top up") };
+    const QString sentence = QStringLiteral("We couldn't reach SevenHills. Try again in a moment.");
+
+    // Loading: every part loads on its own - skeletons and the named lines, the page not blank.
+    QVERIFY2(sees(QStringLiteral("Profile")), qPrintable(where));
+    QVERIFY2(shown("identityLoading"), qPrintable(where));
+    QVERIFY2(shown("totalsLoading"), qPrintable(where));
+    profileListFor(client, 0)->setState(QStringLiteral("loading"));
+    QVERIFY2(sees(loadingLines.at(0)), qPrintable(where));
+
+    // Error, each part on its own: the server's sentence, its reference and Try again in that part's
+    // region, and nothing else blanked. The mark before a sentence is not read out with it.
+    client.setAccountState(QStringLiteral("error"), sentence, QStringLiteral("SH-4F7KQ2"));
+    QVERIFY2(shown("identityError"), qPrintable(where));
+    QCOMPARE(accessibleName(child("identityErrorText")), sentence);
+    QCOMPARE(child("identityErrorReference")->property("text").toString(), QStringLiteral("SH-4F7KQ2"));
+    QVERIFY(shown("identityRetry"));
+    client.setTotals(QStringLiteral("ready"), QStringLiteral("2 h 15 min"), QStringLiteral("45 min"));
+    QVERIFY2(sees(QStringLiteral("Hours played")) && sees(QStringLiteral("Credit left")),
+             qPrintable(where + QStringLiteral(": one failing never blanks the others")));
+    client.setTotals(QStringLiteral("error"), QString(), QString(), sentence, QStringLiteral("SH-9K2XQ1"));
+    QVERIFY2(shown("totalsError"), qPrintable(where));
+    QCOMPARE(accessibleName(child("totalsErrorText")), sentence);
+    QVERIFY(shown("totalsRetry"));
+    client.setAccount(QStringLiteral("lina"), QStringLiteral("lina@example.com"),
+                      QStringLiteral("+962790000000"), true);
+    client.setTotals(QStringLiteral("ready"), QStringLiteral("2 h 15 min"), QStringLiteral("45 min"));
+    QVERIFY2(shown("identityRows") && sees(QStringLiteral("Verified")), qPrintable(where));
+    // A missing email or phone keeps its row and says so.
+    client.setAccount(QStringLiteral("lina"), QString(), QString(), false);
+    QCOMPARE(deepChild(child("rowEmail"), QStringLiteral("value"))->property("text").toString(),
+             QStringLiteral("Not added"));
+    QCOMPARE(deepChild(child("rowPhone"), QStringLiteral("value"))->property("text").toString(),
+             QStringLiteral("Not added"));
+    client.setAccount(QStringLiteral("lina"), QStringLiteral("lina@example.com"),
+                      QStringLiteral("+962790000000"), true);
+
+    // Each list in each state, on its own tab. The tabs name themselves; the region of rows is named
+    // after its tab and is one tab stop, so the keyboard reaches and scrolls it.
+    for (int tab = 0; tab < 3; ++tab) {
+        const QString which = where + QStringLiteral(", ") + titles.at(tab);
+        QVERIFY(QMetaObject::invokeMethod(child("tabsBar"), "select", Q_ARG(QVariant, tab)));
+        FakeList* list = profileListFor(client, tab);
+        const QString objectName = QStringLiteral("list_")
+                                   + (tab == 0 ? QStringLiteral("sessions")
+                                               : (tab == 1 ? QStringLiteral("credit") : QStringLiteral("topups")));
+        QObject* view = deepChild(screen.data(), objectName);
+        QVERIFY2(view, qPrintable(which));
+        QCOMPARE(view->property("title").toString(), titles.at(tab));
+
+        list->setRows({});
+        list->setState(QStringLiteral("loading"));
+        QVERIFY2(sees(loadingLines.at(tab)), qPrintable(which));
+        QVERIFY2(isShown(deepChild(view, QStringLiteral("loadingState"))), qPrintable(which));
+
+        list->setState(QStringLiteral("ready"));
+        QVERIFY2(sees(emptyLines.at(tab)), qPrintable(which));
+        QObject* action = deepChild(view, QStringLiteral("emptyAction"));
+        QVERIFY(action);
+        QCOMPARE(spokenName(action), emptyActions.at(tab));
+        const QStringList emptyStops = host.tabOrder();
+        QCOMPARE(emptyStops.last(), emptyActions.at(tab));
+
+        list->setState(QStringLiteral("error"), false, false, false, sentence, QStringLiteral("SH-4F7KQ2"));
+        QCOMPARE(accessibleName(deepChild(view, QStringLiteral("errorText"))), sentence);
+        QCOMPARE(deepChild(view, QStringLiteral("errorReference"))->property("text").toString(),
+                 QStringLiteral("SH-4F7KQ2"));
+        QCOMPARE(spokenName(deepChild(view, QStringLiteral("retryButton"))), QStringLiteral("Try again"));
+
+        list->setRows(FakeList::plainRows(15));
+        list->setState(QStringLiteral("ready"), true);
+        QVERIFY2(isShown(deepChild(view, QStringLiteral("rows"))), qPrintable(which));
+        // Next page loading: a footer row with the named line; the loaded rows stay.
+        list->setState(QStringLiteral("ready"), true, true);
+        QVERIFY2(isShown(deepChild(view, QStringLiteral("footerLoading"))), qPrintable(which));
+        QCOMPARE(view->property("rowCount").toInt(), 15);
+        // A later page failing keeps the loaded rows and offers Try again in the footer.
+        list->setState(QStringLiteral("ready"), true, false, true, sentence, QStringLiteral("SH-4F7KQ2"));
+        QVERIFY2(isShown(deepChild(view, QStringLiteral("footerError"))), qPrintable(which));
+        QCOMPARE(accessibleName(deepChild(view, QStringLiteral("footerErrorText"))), sentence);
+        QCOMPARE(view->property("rowCount").toInt(), 15);
+        // End of the feed.
+        list->setState(QStringLiteral("ready"), false);
+        QVERIFY2(sees(QStringLiteral("You've reached the end.")), qPrintable(which));
+        QVERIFY2(accessibleIgnored(deepChild(view, QStringLiteral("endOfFeedMark"))), qPrintable(which));
+
+        // The order is the left column's three actions, the tabs, and the region of rows last (named
+        // after its tab). The selected tab is always a stop; a tab selected earlier can remain one in a
+        // shown window (`SeatHubTabs.qml` is outside this task's files, noted in the task Log), so the
+        // tabs are held to being in order and including the selected one.
+        {
+            const QStringList stops = host.tabOrder();
+            const QString order = where + QStringLiteral(", ") + titles.at(tab) + QStringLiteral(": ")
+                                  + stops.join(" | ");
+            QVERIFY2(stops.size() >= 5, qPrintable(order));
+            QCOMPARE(stops.mid(0, 3), (QStringList{ QStringLiteral("Open the website"), QStringLiteral("Back"),
+                                                    QStringLiteral("Sign out") }));
+            QCOMPARE(stops.last(), QStringLiteral("list:") + titles.at(tab));
+            const QStringList tabStops = stops.mid(3, stops.size() - 4);
+            QVERIFY2(tabStops.contains(titles.at(tab)), qPrintable(order));
+            int previous = -1;
+            for (const QString& stop : tabStops) {
+                const int at = titles.indexOf(stop);
+                QVERIFY2(at > previous, qPrintable(order));
+                previous = at;
+            }
+        }
+    }
+
+    // Credit history with the ledger as the server sends it (C15-13): one `Played -1 min` row per
+    // billed minute stays one row per minute - paged 15 at a time, never collapsed or summed by the
+    // client - and each row is read out as its date, its plain kind and its signed amount.
+    {
+        QVERIFY(QMetaObject::invokeMethod(child("tabsBar"), "select", Q_ARG(QVariant, 1)));
+        FakeList* credit = profileListFor(client, 1);
+        QList<FakeList::Row> minuteRows;
+        for (int i = 0; i < 15; ++i) {
+            minuteRows.append({ QStringLiteral("Sat 12 Sep, 21:%1").arg(59 - i, 2, 10, QLatin1Char('0')),
+                                QStringLiteral("Played"), QStringLiteral("-1 min"), QString() });
+        }
+        credit->setRows(minuteRows);
+        credit->setState(QStringLiteral("ready"), true);
+        QObject* view = deepChild(screen.data(), QStringLiteral("list_credit"));
+        QCOMPARE(view->property("rowCount").toInt(), 15);
+        credit->appendRows(minuteRows);
+        QCOMPARE(view->property("rowCount").toInt(), 30);
+        credit->setState(QStringLiteral("ready"), false);
+        QObject* rows = deepChild(view, QStringLiteral("rows"));
+        QVERIFY(rows);
+        QCOMPARE(rows->property("count").toInt(), 30);
+        QList<QObject*> amounts = deepChildren(view, QStringLiteral("amountCell"));
+        QVERIFY(!amounts.isEmpty());
+        for (QObject* amount : amounts) {
+            QCOMPARE(amount->property("text").toString(), QStringLiteral("-1 min"));
+        }
+        for (QObject* kind : deepChildren(view, QStringLiteral("kindCell"))) {
+            QCOMPARE(kind->property("text").toString(), QStringLiteral("Played"));
+        }
+        // A row's accessible name reads its three parts, in order.
+        QQuickItem* firstRow = qobject_cast<QQuickItem*>(deepChildren(view, QStringLiteral("amountCell")).first())
+                                   ->parentItem()->parentItem();
+        QVERIFY(firstRow);
+        QCOMPARE(accessibleName(firstRow), QStringLiteral("Sat 12 Sep, 21:59, Played, -1 min"));
+    }
+
+    // Keyboard: the rows take focus with Tab and move with the arrow keys; focus is visible (a ring).
+    {
+        QVERIFY(QMetaObject::invokeMethod(child("tabsBar"), "select", Q_ARG(QVariant, 0)));
+        FakeList* sessions = profileListFor(client, 0);
+        sessions->setRows(FakeList::plainRows(15));
+        sessions->setState(QStringLiteral("ready"), false);
+        QObject* view = deepChild(screen.data(), QStringLiteral("list_sessions"));
+        QObject* rows = deepChild(view, QStringLiteral("rows"));
+        QVERIFY(rows);
+        QVERIFY2(rows->property("activeFocusOnTab").toBool(), "the list region is a tab stop");
+        QObject* ring = deepChild(view, QStringLiteral("listFocusRing"));
+        QVERIFY(ring);
+        QVERIFY2(!isShown(ring), "no ring until the list has focus");
+        host.window.requestActivate();
+        QVERIFY2(QTest::qWaitForWindowActive(&host.window), qPrintable(where));
+        QVERIFY(QMetaObject::invokeMethod(rows, "forceActiveFocus"));
+        QTRY_VERIFY2(rows->property("activeFocus").toBool(), qPrintable(where));
+        QVERIFY2(isShown(ring), "the focus ring shows while the list has focus");
+        QCOMPARE(rows->property("currentIndex").toInt(), 0);
+        QTest::keyClick(&host.window, Qt::Key_Down);
+        QCOMPARE(rows->property("currentIndex").toInt(), 1);
+        QTest::keyClick(&host.window, Qt::Key_Down);
+        QCOMPARE(rows->property("currentIndex").toInt(), 2);
+        QTest::keyClick(&host.window, Qt::Key_Up);
+        QCOMPARE(rows->property("currentIndex").toInt(), 1);
+    }
+
+    // Sign out and the website link are named; nothing on the page is unnamed; nothing runs outside the
+    // window sideways (the left column scrolls at the smallest size, so the bottom is not checked).
+    QVERIFY2(unnamedControls(screen.data(), true).isEmpty(),
+             qPrintable(where + QStringLiteral(": ") + unnamedControls(screen.data(), true).join(", ")));
+    QVERIFY2(host.textsOutsideWindow(screen.data(), false).isEmpty(),
+             qPrintable(where + QStringLiteral(": ") + host.textsOutsideWindow(screen.data(), false).join(" | ")));
+    expectNoQualitySelector(screen.data(), where);
+}
+
+void TstUiScreens::checkSettingsAt(const QSize& size)
+{
+    const QString where = QStringLiteral("Settings at ") + sizeLabel(size);
+    SettingsFixture fixture;
+    QQuickStyle::setStyle(QStringLiteral("Basic"));
+    QQmlEngine engine;
+    registerTokenSingletons(&engine);
+
+    Hosted host;
+    QString error;
+    QScopedPointer<QObject> screen(instantiateSettingsPage(&engine, fixture.client, &error));
+    QVERIFY2(screen, qPrintable(error));
+    QVERIFY2(host.show(screen.data(), size, kSignedInHeaderPx), qPrintable(where));
+
+    // The page is local preferences read synchronously: no empty, loading or error state arises, and
+    // the page says only what screens.md §27 allows under its title - the one disclosure sentence.
+    QVERIFY2(seesText(screen.data(), QStringLiteral("Settings")), qPrintable(where));
+    QVERIFY2(seesText(screen.data(),
+                      QStringLiteral("SeatHub sends diagnostic logs, stream quality numbers and crash reports "
+                                     "to SevenHills so we can fix problems.")),
+             qPrintable(where));
+    QVERIFY2(!seesText(screen.data(), QStringLiteral("Changes are saved immediately and apply to your next stream.")),
+             "§27 allows no line of the page's own under the title besides the disclosure");
+    // Nothing a developer wrote for a developer reaches a customer: every description is Moonlight's own
+    // line (with "Moonlight" read as "SeatHub"), a plain sentence.
+    static const QRegularExpression developerWords(
+        QStringLiteral("upstream|merges the|\\bkeys?\\b|capturesyskeys|streamsettings|engine's|\\bQSettings\\b"),
+        QRegularExpression::CaseInsensitiveOption);
+    for (QObject* object : visualTree(screen.data())) {
+        const QMetaObject* meta = object->metaObject();
+        if (meta->indexOfProperty("text") < 0 || meta->indexOfProperty("font") < 0) {
+            continue;
+        }
+        const QString text = object->property("text").toString();
+        QVERIFY2(!text.contains(developerWords),
+                 qPrintable(where + QStringLiteral(": developer wording on a customer screen: ") + text));
+    }
+
+    // Stream quality is chosen here and nowhere else: the resolution, frame rate and bitrate rows exist
+    // on this page (the other screens are held to the opposite in their own checks).
+    for (const QString& row : { QStringLiteral("Resolution"), QStringLiteral("Frame rate"),
+                                QStringLiteral("Video bitrate") }) {
+        QVERIFY2(itemByTitle(screen.data(), row), qPrintable(where + QStringLiteral(": ") + row));
+    }
+
+    // Accessible names: each row names its control as a group around it, and every control on the page
+    // - shown or reached by a Custom field - has a name of its own or from that group.
+    int namedRows = 0;
+    for (QObject* object : visualTree(screen.data())) {
+        const QMetaObject* meta = object->metaObject();
+        if (meta->indexOfProperty("title") < 0 || meta->indexOfProperty("bridge") < 0) {
+            continue;
+        }
+        ++namedRows;
+        const QString title = object->property("title").toString();
+        QVERIFY2(!title.isEmpty(), qPrintable(where));
+        QCOMPARE(accessibleName(object), title);
+        QCOMPARE(accessibleRole(object), int(QAccessible::Grouping));
+    }
+    QVERIFY2(namedRows >= 25, qPrintable(where + QStringLiteral(": rows found ") + QString::number(namedRows)));
+    QVERIFY2(unnamedControls(screen.data(), false).isEmpty(),
+             qPrintable(where + QStringLiteral(": ") + unnamedControls(screen.data(), false).join(", ")));
+    // The check in a box this page draws itself is the box's state, not a word. (The one inside a
+    // `SeatHubToggle` row belongs to that component, which is outside this task's files.)
+    int ownChecks = 0;
+    for (QObject* object : visualTree(screen.data())) {
+        auto* mark = qobject_cast<QQuickItem*>(object);
+        if (!mark || mark->metaObject()->indexOfProperty("text") < 0
+            || mark->property("text").toString() != QStringLiteral("✓")) {
+            continue;
+        }
+        bool insideARow = false;
+        for (QQuickItem* up = mark->parentItem(); up; up = up->parentItem()) {
+            insideARow = insideARow || up->metaObject()->indexOfProperty("settingKey") >= 0;
+        }
+        if (!insideARow) {
+            ++ownChecks;
+            QVERIFY2(accessibleIgnored(mark), "the check in a box is the box's state, not a word");
+        }
+    }
+    QVERIFY2(ownChecks >= 12, qPrintable(where + QStringLiteral(": own check marks ")
+                                         + QString::number(ownChecks)));
+
+    // Keyboard order: every stop is a real, named control, there are no duplicates, and the way back is
+    // the last stop. While a stream runs nothing is editable, so only the way back is left.
+    const QStringList stops = host.tabOrder();
+    QVERIFY2(stops.size() > 20, qPrintable(stops.join(" | ")));
+    QCOMPARE(stops.last(), QStringLiteral("Back"));
+    for (const QString& stop : stops) {
+        QVERIFY2(!stop.startsWith(QLatin1Char('(')), qPrintable(where + QStringLiteral(": ") + stop));
+    }
+    fixture.bridge->setStreamingActive(true);
+    QVERIFY2(seesText(screen.data(),
+                      QStringLiteral("You're streaming. These settings can't be changed until the session ends.")),
+             qPrintable(where));
+    COMPARE_TABS( QStringList{ QStringLiteral("Back") });
+    fixture.bridge->setStreamingActive(false);
+
+    // The page never runs sideways out of the window (it scrolls vertically).
+    QVERIFY2(host.textsOutsideWindow(screen.data(), false).isEmpty(),
+             qPrintable(where + QStringLiteral(": ") + host.textsOutsideWindow(screen.data(), false).join(" | ")));
+}
+
+void TstUiScreens::everyCustomerScreenHasSpecStates()
+{
+    // The screens, in the order screens.md §22-27 numbers them, plus the error view (§23 Error), at
+    // each source-specified desktop size.
+    for (const QSize& size : customerDesktopSizes()) {
+        checkSignInAt(size);
+        QVERIFY2(!QTest::currentTestFailed(), "§22 Sign in");
+        checkRestoreSplashAt(size);
+        QVERIFY2(!QTest::currentTestFailed(), "§22 Restore on launch");
+        checkHomeAt(size);
+        QVERIFY2(!QTest::currentTestFailed(), "§23 Home");
+        checkErrorViewAt(size);
+        QVERIFY2(!QTest::currentTestFailed(), "§23 Error");
+        checkStartingAt(size);
+        QVERIFY2(!QTest::currentTestFailed(), "§24 Starting");
+        checkHeaderAt(size);
+        QVERIFY2(!QTest::currentTestFailed(), "Common shell: the signed-in header");
+        checkProfileAt(size);
+        QVERIFY2(!QTest::currentTestFailed(), "§27 Profile");
+        checkSettingsAt(size);
+        QVERIFY2(!QTest::currentTestFailed(), "§27 Settings");
+    }
+
+    // The balance stays on every signed-in screen: Home, Starting and the Profile (a view inside Home)
+    // all carry the header, and sign-in and the splash do not. `main.qml` needs the real facade type, so
+    // the rule is read as source (the technique of `theShellGivesEverySignedInViewTheHeader...`).
+    const QString main = readSource(guiDir() + QStringLiteral("/main.qml"));
+    QVERIFY(!main.isEmpty());
+    const QRegularExpression rule(
+        QStringLiteral("function showsHeader\\(state, signedIn\\) \\{(.*?)\\n    \\}"),
+        QRegularExpression::DotMatchesEverythingOption);
+    const QRegularExpressionMatch match = rule.match(main);
+    QVERIFY2(match.hasMatch(), "main.qml must define showsHeader(state, signedIn)");
+    for (const char* state : { "home", "connecting" }) {
+        QVERIFY2(match.captured(1).contains(QStringLiteral("case \"%1\":").arg(QLatin1String(state))),
+                 state);
+    }
+    QVERIFY(!match.captured(1).contains(QStringLiteral("signed_out")));
+    QVERIFY(!match.captured(1).contains(QStringLiteral("restoring")));
+    QVERIFY2(main.contains(QStringLiteral("seatHub.inProfile ? profileComponent : homeComponent")),
+             "the profile is a view inside home, so it carries the header");
+
+    // The window title and size: `SeatHub` on a fixed 1100x720 window, 960x640 at the smallest; the
+    // stream window is `Playing - SeatHub` (copy.md C9, the fixed neutral word).
+    QVERIFY(main.contains(QStringLiteral("title: qsTr(\"SeatHub\")")));
+    QVERIFY(main.contains(QStringLiteral("width: 1100")));
+    QVERIFY(main.contains(QStringLiteral("height: 720")));
+    QVERIFY(main.contains(QStringLiteral("minimumWidth: 960")));
+    QVERIFY(main.contains(QStringLiteral("minimumHeight: 640")));
+    const QString streamName = readSource(guiDir() + QStringLiteral("/../seathub/stream_window_name.h"));
+    QVERIFY2(streamName.contains(QStringLiteral("QStringLiteral(\"Playing\")")),
+             "the stream window's name is the fixed word Playing");
+
+    // Sign-out shows the signed-out notice: window-level, announced when it appears, not focusable,
+    // and no control of its own.
+    {
+        QQuickStyle::setStyle(QStringLiteral("Basic"));
+        QQmlEngine engine;
+        registerTokenSingletons(&engine);
+        FakeShellClient client;
+        QString error;
+        QScopedPointer<QObject> notice(instantiate(&engine, QStringLiteral("SignedOutNotice.qml"), &error));
+        QVERIFY2(notice, qPrintable(error));
+        QVERIFY(notice->setProperty("client", QVariant::fromValue(static_cast<QObject*>(&client))));
+        QObject* panel = notice->findChild<QObject*>(QStringLiteral("signedOutPanel"));
+        QVERIFY(panel);
+        QVERIFY(!isShown(panel));
+        client.setSignedOutNotice(true);
+        QVERIFY(isShown(panel));
+        QCOMPARE(accessibleName(panel), QStringLiteral("You were signed out."));
+        QCOMPARE(accessibleRole(panel), int(QAccessible::AlertMessage));
+        QVERIFY(controlsUnder(notice.data(), false).isEmpty());
+    }
+
+    // WINDOWS 25, 26 and 28: the geometric characters that stand in for the spec's icons are the same
+    // six everywhere - the low / critical mark, the country chevron, the check, the external-link arrow
+    // and the menu mark - sized to the spec's figures (pill 16px, menu 20px, asserted above), with no
+    // image, icon font or new asset. A real Lucide set is a spec edit and an asset first, so it is not
+    // improvised here.
+    {
+        const QStringList files = {
+            QStringLiteral("BalancePill.qml"),    QStringLiteral("SeatHubIdentifierField.qml"),
+            QStringLiteral("SeatHubMenu.qml"),    QStringLiteral("HomeScreen.qml"),
+            QStringLiteral("SignInScreen.qml"),   QStringLiteral("ConnectingScreen.qml"),
+            QStringLiteral("ProfileScreen.qml"),  QStringLiteral("SeatHubListView.qml"),
+            QStringLiteral("SeatHubCountryPicker.qml"), QStringLiteral("SettingsPage.qml"),
+        };
+        const QSet<uint> allowed = { 0x25B2, 0x25C6, 0x25BE, 0x2713, 0x2197, 0x2630 };
+        static const QRegularExpression escape(QStringLiteral("\\\\u([0-9a-fA-F]{4})"));
+        for (const QString& name : files) {
+            QString source = readSource(guiDir() + QLatin1Char('/') + name);
+            QVERIFY2(!source.isEmpty(), qPrintable(name));
+            source.remove(QRegularExpression(QStringLiteral("//[^\\n]*")));
+            QVERIFY2(!source.contains(QRegularExpression(QStringLiteral("\\bImage\\s*\\{|\\.svg|icon\\.source|IconImage"))),
+                     qPrintable(name + QStringLiteral(" must not introduce an icon asset or system")));
+            for (const QChar ch : source) {
+                if (ch.unicode() >= 0x2190 && ch.unicode() <= 0x2BFF) {
+                    QVERIFY2(allowed.contains(ch.unicode()),
+                             qPrintable(name + QStringLiteral(": a new symbol character ")
+                                        + QString::number(ch.unicode(), 16)));
+                }
+            }
+            auto it = escape.globalMatch(source);
+            while (it.hasNext()) {
+                const uint code = it.next().captured(1).toUInt(nullptr, 16);
+                if (code >= 0x2190 && code <= 0x2BFF) {
+                    QVERIFY2(allowed.contains(code),
+                             qPrintable(name + QStringLiteral(": a new symbol escape ") + QString::number(code, 16)));
+                }
+            }
+        }
     }
 }
 

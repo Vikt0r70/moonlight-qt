@@ -389,6 +389,9 @@ Item {
                         width: parent.width
                         text: "◆ " + (root.client && root.client.accountError
                                        ? String(root.client.accountError) : "")
+                        // The sentence is read out; the decorative mark before it is not.
+                        Accessible.name: root.client && root.client.accountError
+                                         ? String(root.client.accountError) : ""
                         wrapMode: Text.Wrap
                         color: Tokens.destructiveDefault
                         font.family: Tokens.fontSansDefault
@@ -525,6 +528,9 @@ Item {
                             width: parent.width
                             text: "◆ " + (root.client && root.client.totalsError
                                            ? String(root.client.totalsError) : "")
+                            // The sentence is read out; the decorative mark before it is not.
+                            Accessible.name: root.client && root.client.totalsError
+                                             ? String(root.client.totalsError) : ""
                             wrapMode: Text.Wrap
                             color: Tokens.destructiveDefault
                             font.family: Tokens.fontSansDefault
@@ -619,6 +625,7 @@ Item {
                     anchors.fill: parent
                     visible: listView.index === root.currentTab
                     list: root.listFor(listView.index)
+                    title: listView.modelData.title
                     loadingText: listView.modelData.loading
                     emptyText: listView.modelData.empty
                     emptyActionText: listView.modelData.action

@@ -46,6 +46,11 @@ Item {
         border.width: 1
         border.color: Tokens.borderDefault
 
+        // `ui.md` §7 gives the notice `role="status"`: it is announced when it appears, but it is not
+        // focusable and takes no input, so it stays out of the tab order.
+        Accessible.role: Accessible.AlertMessage
+        Accessible.name: label.text
+
         Text {
             id: label
             anchors.centerIn: parent
@@ -53,6 +58,7 @@ Item {
             color: Tokens.foregroundDefault
             font.family: Tokens.fontSansDefault
             font.pixelSize: Metrics.fontBody
+            Accessible.ignored: true
         }
     }
 }

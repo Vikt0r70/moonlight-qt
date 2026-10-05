@@ -39,6 +39,10 @@ Item {
     /// `loadingMore`, `moreFailed`, `errorText`, `errorReference`, and the four row roles.
     property var list: null
 
+    /// The list's own name (`Sessions`, `Credit history`, `Top-ups`): what a screen reader calls the
+    /// region of rows when focus lands on it.
+    property string title: ""
+
     /// The named loading line for this list (copy.md § Menu and profile).
     property string loadingText: ""
 
@@ -119,6 +123,19 @@ Item {
         visible: !root.showEmpty
     }
 
+    // `ui.md` §9: the focus ring is always visible, 2px `--focus`. It sits above the rows and is a
+    // border only, so the box never changes size when the list takes focus.
+    Rectangle {
+        objectName: "listFocusRing"
+        anchors.fill: parent
+        z: 2
+        radius: Metrics.radiusMd
+        color: "transparent"
+        border.width: 2
+        border.color: Tokens.focusDefault
+        visible: rows.activeFocus
+    }
+
     // --- populated -------------------------------------------------------------------------------
 
     ListView {
@@ -131,6 +148,21 @@ Item {
         clip: true
         model: root.list
         boundsBehavior: Flickable.StopAtBounds
+
+        // `ui.md` §9: the keyboard reaches every action and scrolls every list. The region is one tab
+        // stop, and the Up and Down keys move through its rows (the view keeps the current row in
+        // sight, so reaching the last loaded row asks for the next page exactly as scrolling does).
+        // The current row is marked only while the list has focus.
+        activeFocusOnTab: root.showRows
+        keyNavigationEnabled: true
+        keyNavigationWraps: false
+        highlightMoveDuration: 0
+        Accessible.role: Accessible.List
+        Accessible.name: root.title
+
+        // A list reset behind the view leaves no current row; focus lands on the first one.
+        onActiveFocusChanged: if (rows.activeFocus && rows.count > 0 && rows.currentIndex < 0)
+                                  rows.currentIndex = 0
 
         // Shows while there is more than fits, and not otherwise.
         ScrollBar.vertical: ScrollBar {
@@ -153,7 +185,8 @@ Item {
 
             width: ListView.view ? ListView.view.width : 0
             height: Metrics.touchTarget
-            color: hover.hovered ? Tokens.surface3Default : "transparent"
+            color: hover.hovered || (row.ListView.isCurrentItem && rows.activeFocus)
+                   ? Tokens.surface3Default : "transparent"
 
             Accessible.role: Accessible.ListItem
             Accessible.name: [row.whenText, row.kindText, row.amountText]
@@ -295,6 +328,8 @@ Item {
                     objectName: "footerErrorText"
                     width: parent.width - Metrics.s4 * 2
                     text: "◆ " + root.errorText
+                    // The sentence is read out; the decorative mark before it is not.
+                    Accessible.name: root.errorText
                     wrapMode: Text.Wrap
                     color: Tokens.destructiveDefault
                     font.family: Tokens.fontSansDefault
@@ -341,11 +376,13 @@ Item {
                     spacing: Metrics.s2
 
                     Text {
+                        objectName: "endOfFeedMark"
                         anchors.verticalCenter: parent.verticalCenter
                         text: "✓"
                         color: Tokens.foregroundMutedDefault
                         font.family: Tokens.fontSansDefault
                         font.pixelSize: Metrics.fontSm
+                        Accessible.ignored: true
                     }
 
                     Text {
@@ -500,6 +537,8 @@ Item {
             width: parent.width
             horizontalAlignment: Text.AlignHCenter
             text: "◆ " + root.errorText
+            // The sentence is read out; the decorative mark before it is not.
+            Accessible.name: root.errorText
             wrapMode: Text.Wrap
             color: Tokens.destructiveDefault
             font.family: Tokens.fontSansDefault

@@ -181,6 +181,8 @@ Item {
                         color: Tokens.foregroundDefault
                         font.family: Tokens.fontSansDefault
                         font.pixelSize: Metrics.fontSm
+                        // The row's `Accessible.selected` already says it; the mark is not read.
+                        Accessible.ignored: true
                     }
 
                     Text {

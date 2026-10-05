@@ -48,13 +48,17 @@ Item {
         // Enter and Space both arrive here as `clicked`. A second press while it is open closes it.
         onClicked: menu.opened ? menu.close() : menu.open()
 
+        // The `menu` mark at the 20px 05-UI-SPEC gives the trigger (WINDOWS #28). The button's
+        // accessible name is `Menu`, so the character itself is not read out.
         contentItem: Text {
+            objectName: "menuGlyph"
             text: "☰"
             horizontalAlignment: Text.AlignHCenter
             verticalAlignment: Text.AlignVCenter
             color: Tokens.foregroundMutedDefault
             font.family: Tokens.fontSansDefault
             font.pixelSize: Metrics.s5
+            Accessible.ignored: true
         }
 
         background: Rectangle {
@@ -97,12 +101,14 @@ Item {
             }
 
             Text {
+                objectName: "rowGlyph"
                 visible: row.glyph.length > 0
                 anchors.verticalCenter: parent.verticalCenter
                 text: row.glyph
                 color: Tokens.foregroundMutedDefault
                 font.family: Tokens.fontSansDefault
                 font.pixelSize: Metrics.fontBody
+                Accessible.ignored: true
             }
         }
 

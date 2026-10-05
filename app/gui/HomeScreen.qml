@@ -107,10 +107,13 @@ Item {
 
                 Text {
                     id: refusalGlyph
+                    objectName: "refusalGlyph"
                     text: "◆"
                     color: Tokens.destructiveDefault
                     font.family: Tokens.fontSansDefault
                     font.pixelSize: Metrics.fontBody
+                    // Decoration beside the colour (WINDOWS #28): the sentence is what is read out.
+                    Accessible.ignored: true
                 }
 
                 Text {

@@ -218,10 +218,13 @@ Item {
 
             Text {
                 id: glyph
+                objectName: "errorGlyph"
                 text: "\u25c6"
                 color: Tokens.destructiveDefault
                 font.family: Tokens.fontSansDefault
                 font.pixelSize: Metrics.fontSm
+                // Decoration beside the colour (WINDOWS #26): the sentence is what is read out.
+                Accessible.ignored: true
             }
 
             Text {
@@ -341,6 +344,10 @@ Item {
 
                 SeatHubOTPField {
                     id: otpField
+                    objectName: "otpField"
+                    // The six cells share one label, the field's own (`copy.md` § Sign in).
+                    Accessible.role: Accessible.Grouping
+                    Accessible.name: qsTr("Enter the 6-digit code")
                     entryEnabled: !root.working
                     onCompleted: root.verify()
                 }

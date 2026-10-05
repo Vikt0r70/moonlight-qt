@@ -93,6 +93,9 @@ private slots:
     void ownSessionRefusal_showsTheServersSentenceVerbatim();
     void errorScreen_rendersReasonAndMonoReference();
     void mapEndBlame();
+    void searchableReference_isTheFormTheConsoleSearchResolves();
+    void everyFailureKindCarriesOnlyASearchableReference();
+    void errorScreen_neverDrawsAReferenceThatIsNotOne();
 };
 
 void TstErrorMap::initTestCase()
@@ -333,6 +336,116 @@ void TstErrorMap::mapEndBlame()
     const SeatHubFailure neither = ::mapEndBlame(QString(), QString());
     QCOMPARE(neither.error, QStringLiteral("The stream didn't start. You were not charged."));
     QVERIFY(neither.reference.isEmpty());
+}
+
+// SC13 "searchable plain-language errors" (screens.md §23 Error, the State coverage matrix's Error row,
+// ADR-0008 items 3 and 4). The operator finds a customer's failure by typing the code the customer
+// read out, so the code on screen must be exactly the form the console search resolves: `SH-` and six
+// characters of 0-9 A-Z without I, L, O and U, upper-case, no whitespace around it. The client cleans
+// up a code it was given; it never builds one, and anything that is not a reference is never drawn
+// as one (CUST-10: no enum or code ever appears bare).
+void TstErrorMap::searchableReference_isTheFormTheConsoleSearchResolves()
+{
+    // Already in form: unchanged. The deck's two sample codes, and the alphabet's edges.
+    QCOMPARE(SeatHubFailure::searchableReference(QStringLiteral("SH-4F7KQ2")), QStringLiteral("SH-4F7KQ2"));
+    QCOMPARE(SeatHubFailure::searchableReference(QStringLiteral("SH-9K2XQ1")), QStringLiteral("SH-9K2XQ1"));
+    QCOMPARE(SeatHubFailure::searchableReference(QStringLiteral("SH-000000")), QStringLiteral("SH-000000"));
+    QCOMPARE(SeatHubFailure::searchableReference(QStringLiteral("SH-ZZZZZZ")), QStringLiteral("SH-ZZZZZZ"));
+
+    // Padding and case are corrected, so what is read out is what is searched for.
+    QCOMPARE(SeatHubFailure::searchableReference(QStringLiteral("  SH-4F7KQ2\n")), QStringLiteral("SH-4F7KQ2"));
+    QCOMPARE(SeatHubFailure::searchableReference(QStringLiteral("sh-4f7kq2")), QStringLiteral("SH-4F7KQ2"));
+
+    // Not a reference, so not shown as one: a truncated or over-long code, a letter the alphabet
+    // leaves out (I, L, O, U), a code inside a sentence, an enum, a different prefix, nothing at all.
+    const QStringList notReferences = {
+        QStringLiteral("SH-4F7KQ"),   QStringLiteral("SH-4F7KQ22"), QStringLiteral("SH-4F7KQI"),
+        QStringLiteral("SH-4F7KQL"),  QStringLiteral("SH-4F7KQO"),  QStringLiteral("SH-4F7KQU"),
+        QStringLiteral("SH-4F 7KQ2"), QStringLiteral("SH4F7KQ2"),   QStringLiteral("XX-4F7KQ2"),
+        QStringLiteral("Reference SH-4F7KQ2"), QStringLiteral("NO_HOST_AVAILABLE"), QString(),
+        QStringLiteral("   "),
+    };
+    for (const QString& candidate : notReferences) {
+        QVERIFY2(SeatHubFailure::searchableReference(candidate).isEmpty(), qPrintable(candidate));
+    }
+}
+
+void TstErrorMap::everyFailureKindCarriesOnlyASearchableReference()
+{
+    // The control plane's own refusal: a padded, lower-case code is put in form; a bare enum in the
+    // reference slot is dropped, and the server's sentence is still shown as it came.
+    const SeatHubFailure padded = SeatHubFailure::api(
+        402, QStringLiteral("You need at least 15 minutes of credit to start a session."),
+        QStringLiteral(" sh-4f7kq2 "));
+    QCOMPARE(padded.reference, QStringLiteral("SH-4F7KQ2"));
+    QCOMPARE(padded.error, QStringLiteral("You need at least 15 minutes of credit to start a session."));
+    QCOMPARE(padded.toVariantMap().value(QStringLiteral("reference")).toString(),
+             QStringLiteral("SH-4F7KQ2"));
+
+    const SeatHubFailure bareEnum = SeatHubFailure::api(
+        409, QStringLiteral("You already have a session. Wait for it to finish."),
+        QStringLiteral("SESSION_ACTIVE"), QStringLiteral("SESSION_ACTIVE"));
+    QVERIFY2(bareEnum.reference.isEmpty(), "an enum is never drawn as the support reference");
+    QCOMPARE(bareEnum.error, QStringLiteral("You already have a session. Wait for it to finish."));
+    QCOMPARE(bareEnum.failure, QStringLiteral("SESSION_ACTIVE"));
+
+    // The engine-side constructor (the update window's failure) holds to the same rule.
+    QCOMPARE(SeatHubFailure::engine(QStringLiteral("The installer couldn't be started."),
+                                    QStringLiteral("sh-9k2xq1")).reference,
+             QStringLiteral("SH-9K2XQ1"));
+    QVERIFY(SeatHubFailure::engine(QStringLiteral("The installer couldn't be started."),
+                                   QStringLiteral("SUPPORT-REF")).reference.isEmpty());
+
+    // The terminal-session blame path: the server's `end_reference` is put in form too, and a value
+    // that is not a reference leaves the blame sentence with no code rather than a wrong one.
+    QCOMPARE(::mapEndBlame(QStringLiteral("rig"), QStringLiteral(" sh-4f7kq2")).reference,
+             QStringLiteral("SH-4F7KQ2"));
+    QVERIFY(::mapEndBlame(QStringLiteral("us"), QStringLiteral("whatever")).reference.isEmpty());
+    QVERIFY(::mapEndBlame(QStringLiteral("connection"), QStringLiteral("whatever")).error.contains(
+        QStringLiteral("You were not charged.")));
+
+    // Local failures have no code to clean up: the generic sentence stays, with none, and the deck's
+    // sample code is never taken for this incident's.
+    const SeatHubFailure generic = SeatHubFailure::generic();
+    QCOMPARE(generic.error, QStringLiteral("Something went wrong on our side."));
+    QVERIFY(generic.reference.isEmpty());
+    QVERIFY(SeatHubFailure::network(SeatHubFailure::offlineSentence()).reference.isEmpty());
+    QVERIFY(mapStageFailure(QStringLiteral("RTSP handshake"), -1, QString()).reference.isEmpty());
+}
+
+void TstErrorMap::errorScreen_neverDrawsAReferenceThatIsNotOne()
+{
+    // End to end through the view model ErrorScreen reads (D-35): a failure the control plane sent
+    // with a code in the wrong slot reaches the screen with the sentence and with no reference row.
+    QQuickStyle::setStyle(QStringLiteral("Basic"));
+    QQmlEngine engine;
+    qmlRegisterSingletonType(QUrl::fromLocalFile(guiDir() + QStringLiteral("/Tokens.qml")),
+                             "SeatHub.Tokens", 1, 0, "Tokens");
+    qmlRegisterSingletonType(QUrl::fromLocalFile(guiDir() + QStringLiteral("/Metrics.qml")),
+                             "SeatHub.Tokens", 1, 0, "Metrics");
+
+    const SeatHubFailure failure = SeatHubFailure::api(
+        500, QStringLiteral("Something went wrong on our side."), QStringLiteral("INTERNAL_ERROR"));
+    QVariantMap clientStub;
+    clientStub.insert(QStringLiteral("failure"), failure.toVariantMap());
+    clientStub.insert(QStringLiteral("reference"), failure.reference);
+
+    QQmlComponent component(&engine, QUrl::fromLocalFile(guiDir() + QStringLiteral("/ErrorScreen.qml")));
+    QScopedPointer<QObject> screen(component.createWithInitialProperties(
+        { { QStringLiteral("client"), clientStub } }));
+    QVERIFY2(screen, qPrintable(component.errorString()));
+
+    bool sawSentence = false;
+    for (QObject* item : textItems(screen.data())) {
+        const QString value = item->property("text").toString();
+        QVERIFY2(value != QStringLiteral("INTERNAL_ERROR"), "an enum is never drawn as a reference");
+        sawSentence = sawSentence || value == QStringLiteral("Something went wrong on our side.");
+    }
+    QVERIFY(sawSentence);
+    QObject* referenceRow = screen->findChild<QObject*>(QStringLiteral("referenceRow"));
+    QVERIFY(referenceRow);
+    QVERIFY2(!referenceRow->property("visible").toBool(),
+             "no reference row at all rather than a label with nothing after it");
 }
 
 QTEST_MAIN(TstErrorMap)

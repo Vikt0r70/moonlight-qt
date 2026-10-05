@@ -110,10 +110,13 @@ Item {
 
                 Text {
                     id: stalledMark
+                    objectName: "stalledMark"
                     text: "◆"
                     color: Tokens.destructiveDefault
                     font.family: Tokens.fontSansDefault
                     font.pixelSize: Metrics.fontBody
+                    // Decoration beside the colour: the stage and the sentence are what is read out.
+                    Accessible.ignored: true
                 }
 
                 Text {

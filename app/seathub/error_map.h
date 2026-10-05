@@ -78,6 +78,16 @@ struct SeatHubFailure
     /// Keys the customer-facing fields for QML. The `diagnostic` field is deliberately
     /// omitted - it must never cross into the view layer (D-51).
     QVariantMap toVariantMap() const;
+
+    /// A support reference in the one form the console search resolves (ADR-0008 item 3):
+    /// `SH-` and six characters of `0-9 A-Z` without `I`, `L`, `O` and `U`, upper-case, with no
+    /// whitespace around it. `raw` is whatever a response carried: surrounding whitespace and
+    /// lower-case letters are corrected, so the code a customer reads out is the code the operator
+    /// searches for. Anything that is still not a reference after that (an enum such as
+    /// `NO_HOST_AVAILABLE`, a sentence, a truncated code) returns empty: ADR-0008 holds that a code
+    /// the system cannot resolve is worse than none, and CUST-10 forbids a bare code on screen.
+    /// The client never builds a reference; this only cleans up one it was given.
+    static QString searchableReference(const QString& raw);
 };
 
 // Declared so a failure can cross a thread boundary. The control-plane callbacks run on the
@@ -93,7 +103,8 @@ SeatHubFailure mapStageFailure(const QString& stage, int errorCode, const QStrin
 /// `docs/spec/copy.md` §Session end reasons' `CONNECT_FAILED` row) to the sentence and reference
 /// the customer reads. `blame` is `rig` | `connection` | `us` | empty (`FailureBlame`, or absent
 /// on an older server / a non-failing end). `reference` - the server's own `end_reference` - is
-/// carried through verbatim and only when `blame` names one; this function never invents a code
+/// carried through (in its `searchableReference` form) and only when `blame` names one; this
+/// function never invents a code
 /// (ADR-0008). An empty `blame` returns today's plain `CONNECT_FAILED` sentence with no reference.
 SeatHubFailure mapEndBlame(const QString& blame, const QString& reference);
 

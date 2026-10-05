@@ -195,13 +195,16 @@ Item {
                     font.pixelSize: Metrics.fontSm
                 }
 
-                // The chevron: a glyph, the fork ships no icon set.
+                // The chevron: a glyph, the fork ships no icon set (WINDOWS #26). The tag's accessible
+                // name already says the country and that it is a button, so the mark is not read.
                 Text {
+                    objectName: "tagChevron"
                     anchors.verticalCenter: parent.verticalCenter
                     text: "\u25be"
                     color: Tokens.foregroundMutedDefault
                     font.family: Tokens.fontSansDefault
                     font.pixelSize: Metrics.fontSm
+                    Accessible.ignored: true
                 }
             }
 
@@ -228,6 +231,11 @@ Item {
             clip: true
             selectByMouse: true
             autoScroll: true
+            // A bare TextInput is not a tab stop (only the Controls' TextField is), so without this the
+            // keyboard could leave the field and never come back to it (`ui.md` §9, "every action
+            // reachable"). The country tag, when it shows, comes first in the order: it is to the
+            // left of the text.
+            activeFocusOnTab: true
             enabled: root.enabled
             color: Tokens.foregroundDefault
             selectionColor: Tokens.primaryDefault

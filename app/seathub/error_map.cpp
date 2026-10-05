@@ -1,6 +1,12 @@
 #include "error_map.h"
 
+#include <QRegularExpression>
+
 namespace {
+
+// ADR-0008 item 3: `SH-` and six characters of the alphabet without I, L, O and U. The same pattern
+// `ControlPlaneClient::isReferenceCode` checks before a liveness report carries a code.
+const char* kReferencePattern = "^SH-[0-9A-HJ-KM-NP-TV-Z]{6}$";
 
 // Customer-facing strings come from `docs/spec/copy.md`.
 //   §Support & errors  - "Generic error: `Something went wrong on our side. Reference SH-9K2XQ1.`"
@@ -57,12 +63,19 @@ SeatHubFailure SeatHubFailure::local(const QString& message)
     return f;
 }
 
+QString SeatHubFailure::searchableReference(const QString& raw)
+{
+    static const QRegularExpression pattern(QString::fromLatin1(kReferencePattern));
+    const QString canonical = raw.trimmed().toUpper();
+    return pattern.match(canonical).hasMatch() ? canonical : QString();
+}
+
 SeatHubFailure SeatHubFailure::engine(const QString& message, const QString& reference)
 {
     SeatHubFailure f;
     f.kind = FailureKind::Engine;
     f.error = message;
-    f.reference = reference;
+    f.reference = searchableReference(reference);
     return f;
 }
 
@@ -72,10 +85,11 @@ SeatHubFailure SeatHubFailure::api(int statusCode, const QString& error, const Q
     SeatHubFailure f;
     f.kind = FailureKind::Api;
     f.error = error;
-    // Whatever the control plane sent, verbatim - including nothing, if the response was
-    // malformed: an invented fallback would be a code support cannot resolve, which ADR-0008
-    // calls out as worse than showing none.
-    f.reference = reference;
+    // What the control plane sent, in the form the console search resolves - including nothing, if
+    // the response was malformed or carried something that is not a reference: an invented
+    // fallback would be a code support cannot resolve, which ADR-0008 calls out as worse than
+    // showing none.
+    f.reference = searchableReference(reference);
     f.statusCode = statusCode;
     f.failure = failure;
     return f;
@@ -174,15 +188,15 @@ SeatHubFailure mapEndBlame(const QString& blame, const QString& reference)
 
     if (blame == QLatin1String("rig")) {
         f.error = QString::fromLatin1(kBlameRig);
-        f.reference = reference;
+        f.reference = SeatHubFailure::searchableReference(reference);
     }
     else if (blame == QLatin1String("connection")) {
         f.error = QString::fromLatin1(kBlameConnection);
-        f.reference = reference;
+        f.reference = SeatHubFailure::searchableReference(reference);
     }
     else if (blame == QLatin1String("us")) {
         f.error = QString::fromLatin1(kBlameUs);
-        f.reference = reference;
+        f.reference = SeatHubFailure::searchableReference(reference);
     }
     else {
         // No blame: an older server that never named one, or a non-failing end. copy.md's plain
