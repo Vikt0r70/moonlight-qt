@@ -82,6 +82,11 @@ Item {
                         anchors.margins: 1
                         horizontalAlignment: TextInput.AlignHCenter
                         verticalAlignment: TextInput.AlignVCenter
+                        // A bare TextInput is not a tab stop (only the Controls' TextField is), so
+                        // without this a keyboard user who tabs out of the cells cannot return to
+                        // them (`ui.md` §9, "every action reachable"). Left/Right still move between
+                        // cells; each cell is named by the surrounding "Enter the 6-digit code" group.
+                        activeFocusOnTab: true
                         enabled: root.entryEnabled
                         inputMethodHints: Qt.ImhDigitsOnly
                         maximumLength: 1

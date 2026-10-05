@@ -222,8 +222,9 @@ Item {
                 text: "\u25c6"
                 color: Tokens.destructiveDefault
                 font.family: Tokens.fontSansDefault
-                font.pixelSize: Metrics.fontSm
-                // Decoration beside the colour (WINDOWS #26): the sentence is what is read out.
+                font.pixelSize: Metrics.s5
+                // Decoration beside the colour (WINDOWS #26), at the 20px inline icon size of
+                // `docs/spec/ui.md` §8: the sentence is what is read out.
                 Accessible.ignored: true
             }
 

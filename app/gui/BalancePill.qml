@@ -151,16 +151,16 @@ Rectangle {
             visible: !root.loading
 
             // Low and critical carry a glyph so colour is not the only signal. It is drawn at the
-            // 16px 05-UI-SPEC gives the balance element's `triangle-alert` / `octagon-alert` mark
-            // (WINDOWS #25), and the pill's own `Accessible.name` already says the value, so the
-            // decoration is not read out a second time.
+            // 20px inline icon size of `docs/spec/ui.md` §8 (WINDOWS #25), and the pill's own
+            // `Accessible.name` already says the value, so the decoration is not read out a second
+            // time.
             Text {
                 objectName: "balanceGlyph"
                 visible: root.level === "low" || root.level === "critical"
                 anchors.verticalCenter: parent.verticalCenter
                 text: root.level === "critical" ? "◆" : "▲"
                 color: root.level === "critical" ? Tokens.destructiveDefault : Tokens.warnDefault
-                font.pixelSize: Metrics.s4
+                font.pixelSize: Metrics.s5
                 Accessible.ignored: true
             }
 

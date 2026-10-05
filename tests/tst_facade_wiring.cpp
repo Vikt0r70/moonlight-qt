@@ -2954,8 +2954,16 @@ private slots:
         emit engine->readyForDeletion();
         QTRY_COMPARE_WITH_TIMEOUT(completed.count(), 1, 15000);
 
-        const QByteArray body =
-            m_fake->bodyFor(QStringLiteral("/api/sessions/aaaaaaaa-6666-6666-6666-666666666666/quality"));
+        // The quality report is its own request and may reach the fake after the teardown completes,
+        // so wait for a body that carries the measurement before reading it: read too early, the
+        // frame rate parses as 0 under load.
+        const QString qualityPath =
+            QStringLiteral("/api/sessions/aaaaaaaa-6666-6666-6666-666666666666/quality");
+        QTRY_VERIFY_WITH_TIMEOUT(
+            QJsonDocument::fromJson(m_fake->bodyFor(qualityPath)).object().contains(
+                QStringLiteral("rendered_fps")),
+            15000);
+        const QByteArray body = m_fake->bodyFor(qualityPath);
         const double renderedFps =
             QJsonDocument::fromJson(body).object().value(QStringLiteral("rendered_fps")).toDouble();
         QVERIFY2(renderedFps > 30.0 && renderedFps < 60.0,
@@ -5581,13 +5589,15 @@ private slots:
         QTest::newRow("HOST_LOST") << "HOST_LOST" << "Lost contact with the rig";
         QTest::newRow("CLIENT_SILENT") << "CLIENT_SILENT" << "Lost contact with your device";
         QTest::newRow("CONNECT_TIMEOUT") << "CONNECT_TIMEOUT" << "Not started in time, not charged";
-        QTest::newRow("READINESS_TIMEOUT") << "READINESS_TIMEOUT" << "Rig didn't come back, not charged";
+        QTest::newRow("READINESS_TIMEOUT") << "READINESS_TIMEOUT" << "Rig wasn't ready, not charged";
         QTest::newRow("MODE_BOOT_TIMEOUT") << "MODE_BOOT_TIMEOUT" << "Rig didn't come back, not charged";
         QTest::newRow("GRACE_EXPIRED") << "GRACE_EXPIRED" << "Couldn't reconnect";
+        QTest::newRow("RECONNECT_LIMIT") << "RECONNECT_LIMIT" << "Dropped too often";
+        QTest::newRow("CLIENT_ABSENT") << "CLIENT_ABSENT" << "Lost contact before start, not charged";
         QTest::newRow("OWNER_RESERVATION") << "OWNER_RESERVATION" << "Owner reserved the rig";
         QTest::newRow("TEARDOWN_TIMEOUT") << "TEARDOWN_TIMEOUT" << "Closed after a problem";
         QTest::newRow("OPERATOR_FORCED") << "OPERATOR_FORCED" << "Ended by support";
-        QTest::newRow("a reason the deck has no form for") << "RECONNECT_LIMIT" << "Ended";
+        QTest::newRow("a reason the deck has no form for") << "SESSION_LOST" << "Ended";
         QTest::newRow("no reason at all") << "" << "Ended";
     }
 

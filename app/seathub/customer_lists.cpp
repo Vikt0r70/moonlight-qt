@@ -10,7 +10,7 @@
 namespace {
 
 // `copy.md` § Session end reasons, short forms (C6d). Verbatim; the key is the server's and is never
-// drawn. Two keys share the rig-did-not-come-back form, as the deck's table has it.
+// drawn. Every key has its own form, as the deck's table has it.
 struct EndReasonForm
 {
     const char* key;
@@ -24,9 +24,11 @@ const EndReasonForm kEndReasonForms[] = {
     { "HOST_LOST", "Lost contact with the rig" },
     { "CLIENT_SILENT", "Lost contact with your device" },
     { "CONNECT_TIMEOUT", "Not started in time, not charged" },
-    { "READINESS_TIMEOUT", "Rig didn't come back, not charged" },
+    { "READINESS_TIMEOUT", "Rig wasn't ready, not charged" },
     { "MODE_BOOT_TIMEOUT", "Rig didn't come back, not charged" },
     { "GRACE_EXPIRED", "Couldn't reconnect" },
+    { "RECONNECT_LIMIT", "Dropped too often" },
+    { "CLIENT_ABSENT", "Lost contact before start, not charged" },
     { "OWNER_RESERVATION", "Owner reserved the rig" },
     { "TEARDOWN_TIMEOUT", "Closed after a problem" },
     { "OPERATOR_FORCED", "Ended by support" },

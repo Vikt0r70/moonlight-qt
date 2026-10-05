@@ -48,8 +48,8 @@ Item {
         // Enter and Space both arrive here as `clicked`. A second press while it is open closes it.
         onClicked: menu.opened ? menu.close() : menu.open()
 
-        // The `menu` mark at the 20px 05-UI-SPEC gives the trigger (WINDOWS #28). The button's
-        // accessible name is `Menu`, so the character itself is not read out.
+        // The `menu` mark at the 20px inline icon size of `docs/spec/ui.md` §8 (WINDOWS #28). The
+        // button's accessible name is `Menu`, so the character itself is not read out.
         contentItem: Text {
             objectName: "menuGlyph"
             text: "☰"
@@ -107,7 +107,7 @@ Item {
                 text: row.glyph
                 color: Tokens.foregroundMutedDefault
                 font.family: Tokens.fontSansDefault
-                font.pixelSize: Metrics.fontBody
+                font.pixelSize: Metrics.s5
                 Accessible.ignored: true
             }
         }

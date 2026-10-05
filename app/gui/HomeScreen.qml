@@ -111,8 +111,9 @@ Item {
                     text: "◆"
                     color: Tokens.destructiveDefault
                     font.family: Tokens.fontSansDefault
-                    font.pixelSize: Metrics.fontBody
-                    // Decoration beside the colour (WINDOWS #28): the sentence is what is read out.
+                    font.pixelSize: Metrics.s5
+                    // Decoration beside the colour (WINDOWS #28), at the 20px inline icon size of
+                    // `docs/spec/ui.md` §8: the sentence is what is read out.
                     Accessible.ignored: true
                 }
 

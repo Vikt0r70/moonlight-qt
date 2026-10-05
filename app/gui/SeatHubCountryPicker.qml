@@ -169,18 +169,19 @@ Item {
                         color: row.ListView.isCurrentItem ? Tokens.surface3Default : "transparent"
                     }
 
-                    // The selected row's mark. A glyph beside the colour: the fork ships no icon set.
+                    // The selected row's mark. A glyph beside the colour (the fork ships no icon set),
+                    // at the 20px inline icon size of `docs/spec/ui.md` §8; its slot is as wide.
                     Text {
                         id: mark
                         objectName: "selectedMark"
                         x: Metrics.s2
                         anchors.verticalCenter: parent.verticalCenter
-                        width: Metrics.s4
+                        width: Metrics.s5
                         visible: row.isSelected
                         text: "\u2713"
                         color: Tokens.foregroundDefault
                         font.family: Tokens.fontSansDefault
-                        font.pixelSize: Metrics.fontSm
+                        font.pixelSize: Metrics.s5
                         // The row's `Accessible.selected` already says it; the mark is not read.
                         Accessible.ignored: true
                     }

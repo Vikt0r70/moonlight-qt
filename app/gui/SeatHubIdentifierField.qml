@@ -195,15 +195,16 @@ Item {
                     font.pixelSize: Metrics.fontSm
                 }
 
-                // The chevron: a glyph, the fork ships no icon set (WINDOWS #26). The tag's accessible
-                // name already says the country and that it is a button, so the mark is not read.
+                // The chevron: a glyph, the fork ships no icon set (WINDOWS #26), at the 20px inline
+                // icon size of `docs/spec/ui.md` §8. The tag's accessible name already says the
+                // country and that it is a button, so the mark is not read.
                 Text {
                     objectName: "tagChevron"
                     anchors.verticalCenter: parent.verticalCenter
                     text: "\u25be"
                     color: Tokens.foregroundMutedDefault
                     font.family: Tokens.fontSansDefault
-                    font.pixelSize: Metrics.fontSm
+                    font.pixelSize: Metrics.s5
                     Accessible.ignored: true
                 }
             }

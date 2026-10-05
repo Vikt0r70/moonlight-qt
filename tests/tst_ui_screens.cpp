@@ -5853,6 +5853,22 @@ qreal sceneTop(QObject* object)
     return item ? item->mapToScene(QPointF(0, 0)).y() : 0;
 }
 
+// An inline icon glyph is drawn at the `ui.md` §8 size, 20px (`Metrics.s5`), and fits the container it
+// sits in (`containerHeight`, when given) without being squeezed or pushing its neighbours out.
+void expectInlineGlyph(QObject* glyph, const QString& what, qreal containerHeight = -1)
+{
+    QVERIFY2(glyph, qPrintable(what + QStringLiteral(": the glyph is missing")));
+    const int pixelSize = glyph->property("font").value<QFont>().pixelSize();
+    QVERIFY2(pixelSize == 20,
+             qPrintable(what + QStringLiteral(": glyph is %1px, ui.md §8 says 20px inline").arg(pixelSize)));
+    if (containerHeight >= 0) {
+        const qreal height = glyph->property("height").toReal();
+        QVERIFY2(height <= containerHeight + 0.5,
+                 qPrintable(what + QStringLiteral(": a %1px-tall glyph does not fit its %2px container")
+                                .arg(height).arg(containerHeight)));
+    }
+}
+
 QObject* hostedProfile(QQmlEngine* engine, FakeShellClient* client, const QSize& size, QString* error)
 {
     QQmlComponent component(engine, QUrl::fromLocalFile(guiDir() + QStringLiteral("/ProfileScreen.qml")));
@@ -5936,6 +5952,17 @@ void TstUiScreens::checkHomeAt(const QSize& size)
     QObject* mark = screen->findChild<QObject*>(QStringLiteral("refusalGlyph"));
     QVERIFY(mark);
     QVERIFY2(accessibleIgnored(mark), "the refusal mark is not read out");
+    // WINDOWS #28: the refusal mark and the top-up arrow at the ui.md §8 inline size.
+    expectInlineGlyph(mark, where + QStringLiteral(", refusal mark"));
+    {
+        QObject* topUp = screen->findChild<QObject*>(QStringLiteral("topUpButton"));
+        QVERIFY2(topUp, qPrintable(where));
+        QObject* arrow = deepChild(topUp, QStringLiteral("buttonGlyph"));
+        QVERIFY2(arrow && isShown(arrow), qPrintable(where + QStringLiteral(": the top-up link carries its arrow")));
+        expectInlineGlyph(arrow, where + QStringLiteral(", top-up arrow"),
+                          qobject_cast<QQuickItem*>(topUp)->height());
+    }
+    QVERIFY2(!QTest::currentTestFailed(), qPrintable(where));
     COMPARE_TABS( (QStringList{ QStringLiteral("Play"), QStringLiteral("Top up") }));
 
     QVERIFY2(unnamedControls(screen.data(), true).isEmpty(), qPrintable(where));
@@ -6031,6 +6058,19 @@ void TstUiScreens::checkSignInAt(const QSize& size)
     QVERIFY(primary->property("enabled").toBool());
     QVERIFY(!primary->property("busy").toBool());
     COMPARE_TABS( identifierStops);
+    // WINDOWS #26: the external-link arrow on the two website links, at the ui.md §8 inline size.
+    {
+        int shownArrows = 0;
+        for (QObject* glyph : deepChildren(screen.data(), QStringLiteral("buttonGlyph"))) {
+            if (isShown(glyph)) {
+                ++shownArrows;
+                expectInlineGlyph(glyph, where + QStringLiteral(", website link arrow"),
+                                  40.0);
+                QVERIFY2(!QTest::currentTestFailed(), qPrintable(where));
+            }
+        }
+        QVERIFY2(shownArrows == 2, qPrintable(where + QStringLiteral(": two website links carry the arrow")));
+    }
     QObject* input = child("identifierInput");
     QVERIFY(input);
     QCOMPARE(accessibleName(input), QStringLiteral("Email or phone"));
@@ -6045,8 +6085,15 @@ void TstUiScreens::checkSignInAt(const QSize& size)
     QTRY_VERIFY2(sceneTop(child("fieldErrorLine")) < sceneTop(child("identifierField")),
              qPrintable(where + QStringLiteral(": the message sits above the field")));
     QVERIFY(client.otpRequests().isEmpty());
-    for (QObject* glyph : deepChildren(screen.data(), QStringLiteral("errorGlyph"))) {
-        QVERIFY2(accessibleIgnored(glyph), "the error mark is not read out");
+    {
+        const QList<QObject*> errorGlyphs = deepChildren(screen.data(), QStringLiteral("errorGlyph"));
+        QVERIFY2(!errorGlyphs.isEmpty(), qPrintable(where));
+        for (QObject* glyph : errorGlyphs) {
+            QVERIFY2(accessibleIgnored(glyph), "the error mark is not read out");
+            if (isShown(glyph)) {
+                expectInlineGlyph(glyph, where + QStringLiteral(", error mark"));
+            }
+        }
     }
 
     // Non-Jordan region: the tag starts on the machine's country (Jordan here), a country picked with
@@ -6068,6 +6115,11 @@ void TstUiScreens::checkSignInAt(const QSize& size)
     QObject* chevron = child("tagChevron");
     QVERIFY(chevron);
     QVERIFY2(accessibleIgnored(chevron), "the chevron is not read out beside the country");
+    // WINDOWS #26: the chevron at the ui.md §8 inline size, inside the 28px country tag.
+    expectInlineGlyph(chevron, where + QStringLiteral(", country chevron"),
+                      qobject_cast<QQuickItem*>(tag)->height());
+    QVERIFY2(!QTest::currentTestFailed(), qPrintable(where));
+    QVERIFY2(!QTest::currentTestFailed(), qPrintable(where));
     COMPARE_TABS(
              (QStringList{ QStringLiteral("Country code: United Kingdom"), QStringLiteral("Email or phone"),
                            QStringLiteral("Continue"), QStringLiteral("New here? Create an account"),
@@ -6106,9 +6158,9 @@ void TstUiScreens::checkSignInAt(const QSize& size)
     QVERIFY(otp);
     QCOMPARE(accessibleName(otp), QStringLiteral("Enter the 6-digit code"));
     QCOMPARE(accessibleRole(otp), int(QAccessible::Grouping));
-    // Focus lands in the first cell as the step shows (the customer types the six digits at once), and
-    // the Tab order that follows is the primary action then Back. The cells themselves are not tab
-    // stops - `SeatHubOTPField.qml` is outside this task's files, so that is recorded in the task Log.
+    // Focus lands in the first cell as the step shows (the customer types the six digits at once). Every
+    // cell is a Tab stop (`ui.md` §9, every action reachable), each spoken as the field's one name, and
+    // the Tab order is the six cells, then the primary action, then Back.
     {
         QQuickItem* firstCell = nullptr;
         for (QQuickItem* control : controlsUnder(otp, true)) {
@@ -6120,7 +6172,11 @@ void TstUiScreens::checkSignInAt(const QSize& size)
         QVERIFY2(firstCell, qPrintable(where));
         QTRY_VERIFY2(firstCell->hasActiveFocus(), qPrintable(where + QStringLiteral(": the code step focuses its first cell")));
     }
-    COMPARE_TABS((QStringList{ QStringLiteral("Verify and continue"), QStringLiteral("Back") }));
+    {
+        const QString cellName = QStringLiteral("Enter the 6-digit code");
+        COMPARE_TABS((QStringList{ cellName, cellName, cellName, cellName, cellName, cellName,
+                                   QStringLiteral("Verify and continue"), QStringLiteral("Back") }));
+    }
     QVERIFY2(unnamedControls(screen.data(), true).isEmpty(),
              qPrintable(where + QStringLiteral(": ") + unnamedControls(screen.data(), true).join(", ")));
 
@@ -6149,6 +6205,32 @@ void TstUiScreens::checkSignInAt(const QSize& size)
     // Nothing on the sign-in screen is a stream quality control or a balance (no header before sign-in).
     expectNoQualitySelector(screen.data(), where);
     QVERIFY2(!screen->findChild<QObject*>(QStringLiteral("balancePill")), qPrintable(where));
+
+    // WINDOWS #26: the selected country's check in the picker, at the ui.md §8 inline size, in a slot
+    // as wide as the glyph and inside the 40px row.
+    {
+        QScopedPointer<QObject> picker(instantiate(&engine, QStringLiteral("SeatHubCountryPicker.qml"), &error));
+        QVERIFY2(picker, qPrintable(error));
+        picker->setProperty("model", QVariant::fromValue(bundledCountries()));
+        picker->setProperty("selectedIso", QStringLiteral("GB"));
+        picker->setProperty("query", QStringLiteral("kingdom"));
+        Hosted pickerHost;
+        QVERIFY2(pickerHost.show(picker.data(), QSize(288, 360), 0), qPrintable(where));
+        QObject* mark = nullptr;
+        QTRY_VERIFY2((mark = [&] {
+                          for (QObject* candidate : deepChildren(picker.data(), QStringLiteral("selectedMark"))) {
+                              if (isShown(candidate)) {
+                                  return candidate;
+                              }
+                          }
+                          return static_cast<QObject*>(nullptr);
+                      }()),
+                     qPrintable(where + QStringLiteral(": the selected country shows its check")));
+        expectInlineGlyph(mark, where + QStringLiteral(", selected country check"), 40.0);
+        QVERIFY2(mark->property("contentWidth").toReal() <= mark->property("width").toReal() + 0.5,
+                 qPrintable(where + QStringLiteral(": the check fits its slot")));
+        QVERIFY2(accessibleIgnored(mark), qPrintable(where));
+    }
 }
 
 void TstUiScreens::checkRestoreSplashAt(const QSize& size)
@@ -6294,8 +6376,10 @@ void TstUiScreens::checkHeaderAt(const QSize& size)
         QVERIFY(glyph);
         QCOMPARE(isShown(glyph), c.glyph);
         if (c.glyph) {
-            // WINDOWS #25: the warn / danger mark at the 16px 05-UI-SPEC gives the balance element.
-            QCOMPARE(glyph->property("font").value<QFont>().pixelSize(), 16);
+            // WINDOWS #25: the warn / danger mark at the ui.md §8 inline 20px, inside the 32px pill.
+            expectInlineGlyph(glyph, where + QStringLiteral(", balance mark"),
+                              qobject_cast<QQuickItem*>(pill)->height());
+            QVERIFY2(!QTest::currentTestFailed(), qPrintable(where));
             QVERIFY2(accessibleIgnored(glyph), "the pill's own name says it; the mark is not read twice");
         }
     }
@@ -6310,10 +6394,12 @@ void TstUiScreens::checkHeaderAt(const QSize& size)
     QCOMPARE(qobject_cast<QQuickItem*>(trigger)->width(), 40.0);
     QCOMPARE(qobject_cast<QQuickItem*>(trigger)->height(), 40.0);
     COMPARE_TABS( QStringList{ QStringLiteral("Menu") });
-    // WINDOWS #28: the `menu` mark at the 20px 05-UI-SPEC gives the trigger.
+    // WINDOWS #28: the `menu` mark at the ui.md §8 inline 20px, inside the 40x40 trigger.
     QObject* menuGlyph = menu->findChild<QObject*>(QStringLiteral("menuGlyph"));
     QVERIFY(menuGlyph);
-    QCOMPARE(menuGlyph->property("font").value<QFont>().pixelSize(), 20);
+    expectInlineGlyph(menuGlyph, where + QStringLiteral(", menu mark"),
+                      qobject_cast<QQuickItem*>(trigger)->height());
+    QVERIFY2(!QTest::currentTestFailed(), qPrintable(where));
     QVERIFY(accessibleIgnored(menuGlyph));
     const QStringList items = { QStringLiteral("menuItemProfile"), QStringLiteral("menuItemTopUp"),
                                 QStringLiteral("menuItemSettings") };
@@ -6326,8 +6412,15 @@ void TstUiScreens::checkHeaderAt(const QSize& size)
         QCOMPARE(accessibleRole(menuItem), int(QAccessible::MenuItem));
     }
     QObject* topUpItem = menu->findChild<QObject*>(QStringLiteral("menuItemTopUp"));
-    for (QObject* glyph : deepChildren(topUpItem, QStringLiteral("rowGlyph"))) {
-        QVERIFY2(accessibleIgnored(glyph), "the external-link mark is decoration");
+    {
+        // WINDOWS #28: the external-link mark on Top up at the ui.md §8 inline 20px, inside the 40px row.
+        const QList<QObject*> rowGlyphs = deepChildren(topUpItem, QStringLiteral("rowGlyph"));
+        QVERIFY2(!rowGlyphs.isEmpty(), qPrintable(where));
+        for (QObject* glyph : rowGlyphs) {
+            QVERIFY2(accessibleIgnored(glyph), "the external-link mark is decoration");
+            expectInlineGlyph(glyph, where + QStringLiteral(", menu row mark"), 40.0);
+        }
+        QVERIFY2(!QTest::currentTestFailed(), qPrintable(where));
     }
 
     // Wordmark, balance and menu all fit the header at this width.
@@ -6503,6 +6596,26 @@ void TstUiScreens::checkProfileAt(const QSize& size)
                                    ->parentItem()->parentItem();
         QVERIFY(firstRow);
         QCOMPARE(accessibleName(firstRow), QStringLiteral("Sat 12 Sep, 21:59, Played, -1 min"));
+    }
+
+    // Sessions list success state: a row shows how the session ended in its `copy.md` C6d short form
+    // (the facade turns the key into these words; the screen draws the kind text it is given).
+    {
+        QVERIFY(QMetaObject::invokeMethod(child("tabsBar"), "select", Q_ARG(QVariant, 0)));
+        FakeList* sessions = profileListFor(client, 0);
+        sessions->setRows({ { QStringLiteral("Sat 12 Sep, 21:59"), QStringLiteral("Dropped too often"),
+                              QStringLiteral("23 min"), QString() } });
+        sessions->setState(QStringLiteral("ready"), false);
+        QObject* view = deepChild(screen.data(), QStringLiteral("list_sessions"));
+        QVERIFY(view);
+        const QList<QObject*> kinds = deepChildren(view, QStringLiteral("kindCell"));
+        QVERIFY2(!kinds.isEmpty(), qPrintable(where));
+        QCOMPARE(kinds.first()->property("text").toString(), QStringLiteral("Dropped too often"));
+        QQuickItem* sessionRow = qobject_cast<QQuickItem*>(deepChildren(view, QStringLiteral("amountCell")).first())
+                                     ->parentItem()->parentItem();
+        QVERIFY(sessionRow);
+        QCOMPARE(accessibleName(sessionRow),
+                 QStringLiteral("Sat 12 Sep, 21:59, Dropped too often, 23 min"));
     }
 
     // Keyboard: the rows take focus with Tab and move with the arrow keys; focus is visible (a ring).

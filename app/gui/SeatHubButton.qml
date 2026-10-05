@@ -32,7 +32,8 @@ Button {
     property bool busy: false
 
     /// A trailing glyph after the label, for a control that leaves the app (the website links carry
-    /// the external-link arrow). Decoration only: the accessible name stays the label.
+    /// the external-link arrow), drawn at the 20px inline icon size of `docs/spec/ui.md` §8.
+    /// Decoration only: the accessible name stays the label.
     property string glyph: ""
 
     readonly property bool isGhost: root.variant === "ghost"
@@ -76,11 +77,12 @@ Button {
         }
 
         Text {
+            objectName: "buttonGlyph"
             visible: root.glyph.length > 0
             text: root.glyph
             color: Tokens.foregroundMutedDefault
             font.family: Tokens.fontSansDefault
-            font.pixelSize: root.isGhost ? Metrics.fontCaption : Metrics.fontBody
+            font.pixelSize: Metrics.s5
             anchors.verticalCenter: parent.verticalCenter
         }
     }
