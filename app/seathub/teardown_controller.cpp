@@ -20,9 +20,10 @@ Q_LOGGING_CATEGORY(seathubTeardown, "seathub.teardown")
 // (`POST /end`) and then waits until the session is terminal on the server, bounded by the
 // teardown grace. A terminal session is the SERVER's ending. It is not this client's proof that
 // the renter pairing was physically removed from the rig: that removal is the Node Agent's, it
-// removes only the renter's own entry and reads it back (`docs/spec/host.md` step 11), it can be
-// deliberately left in place when a free return hold keeps the pairing warm, and whether it was
-// removed is the rig side's to establish, not something this client reads off the session.
+// removes only the renter's own entry and reads it back
+// (`docs/spec/host.md` § Deterministic Session Teardown step 3), it can be deliberately left in
+// place when a free return hold keeps the pairing warm, and whether it was removed is the rig
+// side's to establish, not something this client reads off the session.
 // Nothing here reports a pairing as revoked.
 
 namespace {

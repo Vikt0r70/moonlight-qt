@@ -49,7 +49,8 @@ Q_DECLARE_METATYPE(TeardownStage)
 // `TEARDOWN_TIMEOUT` rather than a normal end. A terminal session is the server's ending, not
 // this client's proof that the renter pairing was physically removed: the Node Agent removes only
 // the renter's own entry and reads it back, or keeps it warm for a free return hold
-// (`docs/spec/host.md` step 11). The client never reports a revocation.
+// (`docs/spec/host.md` § Deterministic Session Teardown step 3). The client never reports a
+// revocation.
 //
 // Fencing (PF14-c, R06): every reply is judged against the teardown it was issued for, and a
 // result is reported with the session it ran for, so a late reply or result of an ended session
