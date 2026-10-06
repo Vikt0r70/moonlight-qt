@@ -574,8 +574,9 @@ SeatHubClient::SeatHubClient(QObject* parent)
     connect(m_sse, &SseClient::sessionState, this, &SeatHubClient::handleSseSessionState);
 
     // 06.4/ADR-0067, D-04/D-06 (L5): the fallback read starts and stops with the channel's own
-    // paused state.
+    // paused state. The indicator is separate (R7): it follows a missing `stream.hello`, not this.
     connect(m_sse, &SseClient::pausedChanged, this, &SeatHubClient::handleSsePaused);
+    connect(m_sse, &SseClient::liveUpdatesLostChanged, this, &SeatHubClient::handleSseLiveUpdatesLost);
 
     // 06.4/ADR-0067, D-07 (the owner's design A-87): a revoked stream starts the signed-out
     // sequence, deferred while the engine's stream is running (Phase 3 D-33).
@@ -2813,7 +2814,14 @@ void SeatHubClient::handleReadyForDeletion()
 
 void SeatHubClient::openSettings()
 {
+    // R6: Profile and Settings are views inside Home and only one shows at a time. Choosing Settings
+    // replaces an open Profile instead of stacking under it, so Back from Settings returns to Home.
+    // Settings is set first so the view switches once, straight to Settings.
     setInSettings(true);
+    if (m_inProfile) {
+        setInProfile(false);
+        resetProfileData();
+    }
 }
 
 void SeatHubClient::closeSettings()
@@ -2861,6 +2869,9 @@ void SeatHubClient::openProfile()
     // its way from that visit is dropped.
     resetProfileData();
     setInProfile(true);
+    // R6: choosing Profile replaces an open Settings (Profile is set first so the view switches once,
+    // straight to Profile), so Back from Profile returns to Home.
+    setInSettings(false);
 
     // The balance in the header and the `Credit left` tile are two reads of the same number; asking
     // for the header's again keeps them from disagreeing for the length of a visit.
@@ -3308,18 +3319,22 @@ void SeatHubClient::handleSseSessionState(const SessionInfo& session)
 
 void SeatHubClient::handleSsePaused(bool paused)
 {
-    if (m_liveUpdatesPaused == paused) {
-        return;
-    }
-    m_liveUpdatesPaused = paused;
-    emit liveUpdatesPausedChanged();
-
+    // The fallback read keeps its own trigger (L5) and runs without showing the indicator (R7).
     if (paused) {
         m_accountFallbackTimer->start(m_accountFallbackMs);
     }
     else {
         m_accountFallbackTimer->stop();
     }
+}
+
+void SeatHubClient::handleSseLiveUpdatesLost(bool lost)
+{
+    if (m_liveUpdatesPaused == lost) {
+        return;
+    }
+    m_liveUpdatesPaused = lost;
+    emit liveUpdatesPausedChanged();
 }
 
 void SeatHubClient::fetchAccountStateFallback()

@@ -93,8 +93,9 @@ public:
     /// L3: 45 000 ms by default (`docs/spec/timing.md` L3). Only enforced once a hello has named
     /// `alive_ms` - see `feed()`'s `hello` handling.
     void setDeadStreamTimeoutMs(int ms);
-    /// L5: 10 000 ms by default (`docs/spec/timing.md` L5) - not live this long shows the
-    /// fallback indicator.
+    /// L5: 10 000 ms by default (`docs/spec/timing.md` L5) - not live this long starts the fallback
+    /// read (`pausedChanged`); with no hello this long the live-updates indicator shows
+    /// (`liveUpdatesLostChanged`, R7).
     void setPausedDelayMs(int ms);
     /// L4's `replaced` case: 30 000 ms by default (`docs/spec/timing.md` L4) - waits the cap
     /// rather than the ordinary schedule, so as not to fight the connection that just replaced
@@ -113,10 +114,17 @@ public:
 
 signals:
     void stateChanged();
-    /// L5's fallback indicator (D-04): `true` on the paused-delay's expiry while not live,
+    /// L5's fallback-read trigger (D-04, D-06): `true` on the paused-delay's expiry while not live,
     /// `false` the moment the connection goes live again. Fires at most once per transition -
-    /// `pausedAfterTheFallbackDelay` checks this, not just `state()`.
+    /// `pausedAfterTheFallbackDelay` checks this, not just `state()`. It no longer drives the
+    /// indicator (R7): see `liveUpdatesLostChanged`.
     void pausedChanged(bool paused);
+    /// R7 (ADR-0067 amendment 2026-10-06): the live-updates indicator. `true` when no connection has
+    /// received `stream.hello` for L5's 10 s, counted from the close of the last connection that had
+    /// one, or from the first open; `false` the moment any connection receives `stream.hello` (or on
+    /// `stop()`/revocation). Distinct from `pausedChanged`, which keeps driving the L5 fallback read:
+    /// a routine reconnect whose hello arrives in time never raises this.
+    void liveUpdatesLostChanged(bool lost);
     /// `stream.closing {reason: "revoked"}`, or a 401/403 answer to the stream request itself
     /// (§2.3: the same `handleCredentialRefused()` path a REST 401 already takes). Requests no
     /// further stream.
@@ -149,6 +157,8 @@ private:
     void scheduleReconnect(int delayMs);
     void setState(const QString& state);
     void markLive();
+    /// Stops the R7 loss clock and, when the indicator was showing, hides it.
+    void clearLiveUpdatesLost();
     double jitterValue() const;
 
     void handleReadyRead();
@@ -173,6 +183,11 @@ private:
     /// True once the current attempt's `stream.hello` has named `alive_ms` - L3's dead-stream
     /// timeout is enforced only then, and clears at the start of every new attempt.
     bool m_helloNamedAliveMs = false;
+    /// R7: true once the current attempt has received any `stream.hello`; clears at the start of every
+    /// new attempt. A close of a connection with this set starts the loss clock.
+    bool m_connectionHelloed = false;
+    /// R7: the indicator is showing (`liveUpdatesLostChanged(true)` was the last one emitted).
+    bool m_updatesLost = false;
     /// The `reason` from the most recent `stream.closing` frame on the current attempt, consumed
     /// (and cleared) by `handleFinished()` once the reply the server closed actually completes.
     QString m_lastCloseReason;
@@ -182,6 +197,8 @@ private:
 
     QTimer* m_deadStreamTimer = nullptr;
     QTimer* m_pausedTimer = nullptr;
+    /// R7: single-shot, `m_pausedDelayMs` (L5's 10 s - the only duration); see `liveUpdatesLostChanged`.
+    QTimer* m_lostTimer = nullptr;
     QTimer* m_reconnectTimer = nullptr;
     /// Single-shot, armed on every `markLive()`: 60 s of continuous liveness resets `m_attempt`
     /// (L4: "back to 1 s after a connection that stayed live 60 s").

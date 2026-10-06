@@ -193,6 +193,7 @@ private slots:
     void aFailedLaunchIsShownAndTryAgainRetriesTheLaunch();
     void forcedUpdateModalOnlySaysStartingWhileTheInstallerIsLaunched();
     void latestReleaseIsMandatoryFloor();
+    void aNewerInstalledBuildIsCurrentAndGetsNoOffer();
     void additiveInstallerArgumentsAreExact();
     void persistentFailureReReadsTheFeedForReinstall();
     void tryAgainDownloadsTheRowJustRead();
@@ -236,10 +237,15 @@ void TstUpdateFeed::versionComparisonIsSemantic()
     QVERIFY(!UpdateFeedClient::isNewerVersion(QString(), QStringLiteral("0.1.0")));
     QVERIFY(!UpdateFeedClient::isNewerVersion(QStringLiteral("0.2.0"), QStringLiteral("not-a-version")));
 
-    // D-44: an operator rollback is a row pointing at an earlier version, and the client is
-    // expected to install it - so an offer is "different", and this only classifies it.
-    QVERIFY(UpdateFeedClient::isRollback(QStringLiteral("0.1.0"), QStringLiteral("0.2.0")));
-    QVERIFY(!UpdateFeedClient::isRollback(QStringLiteral("0.2.0"), QStringLiteral("0.1.0")));
+    // ADR-0077 Amendment R5: an install is current when it is equal to or newer than the release.
+    QVERIFY(UpdateFeedClient::isCurrentVersion(QStringLiteral("0.2.0"), QStringLiteral("0.2.0")));
+    QVERIFY(UpdateFeedClient::isCurrentVersion(QStringLiteral("0.1.28"), QStringLiteral("0.1.27")));
+    QVERIFY(UpdateFeedClient::isCurrentVersion(QStringLiteral("v0.10"), QStringLiteral("0.10.0")));
+    QVERIFY(!UpdateFeedClient::isCurrentVersion(QStringLiteral("0.1.26"), QStringLiteral("0.1.27")));
+    QVERIFY(!UpdateFeedClient::isCurrentVersion(QStringLiteral("0.9.9"), QStringLiteral("0.10.0")));
+    // Unparseable is never proven current.
+    QVERIFY(!UpdateFeedClient::isCurrentVersion(QStringLiteral("not-a-version"), QStringLiteral("0.1.0")));
+    QVERIFY(!UpdateFeedClient::isCurrentVersion(QStringLiteral("0.1.0"), QString()));
 }
 
 void TstUpdateFeed::checkForUpdatesOffersAnAvailableRelease()
@@ -255,13 +261,42 @@ void TstUpdateFeed::checkForUpdatesOffersAnAvailableRelease()
              QStringLiteral("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"));
     QCOMPARE(offer.value(QStringLiteral("notes")).toString(),
              QStringLiteral("Fixes the settings page."));
-    QCOMPARE(offer.value(QStringLiteral("rollback")).toBool(), false);
+    QVERIFY(!offer.contains(QStringLiteral("rollback")));
 
-    // An earlier row is an offer too (D-44), flagged so the modal can say so.
-    const QVariantMap rollback = UpdateFeedClient::parseRelease(feedRow(QStringLiteral("0.0.9")),
-                                                               QStringLiteral("0.1.0"), QString());
-    QCOMPARE(rollback.value(QStringLiteral("version")).toString(), QStringLiteral("0.0.9"));
-    QCOMPARE(rollback.value(QStringLiteral("rollback")).toBool(), true);
+    // An earlier row is no offer: a newer install is never moved down (ADR-0077 Amendment R5).
+    QVERIFY(UpdateFeedClient::parseRelease(feedRow(QStringLiteral("0.0.9")),
+                                           QStringLiteral("0.1.0"), QString()).isEmpty());
+}
+
+void TstUpdateFeed::aNewerInstalledBuildIsCurrentAndGetsNoOffer()
+{
+    // F-LIVE-1: installed 0.1.28 against a current release of 0.1.27 gets no offer and no window.
+    QVERIFY(UpdateFeedClient::parseRelease(feedRow("0.1.27"), "0.1.28", {}).isEmpty());
+    QVERIFY(UpdateFeedClient::parseRelease(feedRow("0.10.0"), "0.10.1", {}).isEmpty());
+    QVERIFY(UpdateFeedClient::parseRelease(feedRow("0.10.0"), "5.0.0", {}).isEmpty());
+    // An older install still gets the mandatory window, targeting the current release.
+    const auto older = UpdateFeedClient::parseRelease(feedRow("0.1.27"), "0.1.26", {});
+    QCOMPARE(older.value("version").toString(), QString("0.1.27"));
+    QVERIFY(older.value("mandatory").toBool());
+    QVERIFY(!older.contains("rollback"));
+
+    // The cached offer is judged the same way, in either order of loading it.
+    QTemporaryDir dir; QVERIFY(dir.isValid());
+    UpdateRetryState cached; cached.target = "0.1.27"; cached.lastClass = "installer.locked_file";
+    cached.lastOffer = QJsonDocument::fromJson(feedRow("0.1.27")).object().toVariantMap();
+    const auto path = dir.filePath("retry-state.json"); QVERIFY(cached.save(path));
+
+    UpdateFeedClient newer; newer.setInstalledVersion("0.1.28"); newer.setRetryStatePath(path);
+    QVERIFY(!newer.mandatory()); QVERIFY(newer.availableUpdate().isEmpty());
+    QCOMPARE(newer.state(), QString("idle"));
+
+    UpdateFeedClient upgraded; upgraded.setInstalledVersion("0.1.26"); upgraded.setRetryStatePath(path);
+    QVERIFY(upgraded.mandatory()); QCOMPARE(upgraded.state(), QString("failed"));
+    upgraded.setInstalledVersion("0.1.28");
+    QVERIFY(!upgraded.mandatory()); QVERIFY(upgraded.availableUpdate().isEmpty());
+
+    UpdateFeedClient older2; older2.setInstalledVersion("0.1.26"); older2.setRetryStatePath(path);
+    QVERIFY(older2.mandatory());
 }
 
 void TstUpdateFeed::checkForUpdatesStaysQuietWhenTheVersionMatches()
@@ -652,21 +687,22 @@ void TstUpdateFeed::latestReleaseIsMandatoryFloor()
                                    QJsonValue(QStringLiteral("99.0.0")), QJsonValue(QJsonValue::Null)};
     for (const QJsonValue& floor : floors) {
         row.insert("min_version", floor);
-        for (const char* installed : {"0.1.0", "0.9.0", "0.9.9", "0.10.1", "5.0.0"}) {
+        for (const char* installed : {"0.1.0", "0.9.0", "0.9.9"}) {
             const auto offer = UpdateFeedClient::parseRelease(QJsonDocument(row).toJson(), installed, {});
             QVERIFY2(offer.value("mandatory").toBool(), installed);
             QVERIFY2(!offer.contains("min_version"), "no independent floor is carried");
         }
+        // A newer install is current whatever the row's floor says (ADR-0077 Amendment R5).
+        for (const char* installed : {"0.10.1", "5.0.0"})
+            QVERIFY2(UpdateFeedClient::parseRelease(QJsonDocument(row).toJson(), installed, {}).isEmpty(), installed);
         // Equal means current, however the version is spelled: no window.
         QVERIFY(UpdateFeedClient::parseRelease(QJsonDocument(row).toJson(), "0.10.0", {}).isEmpty());
         QVERIFY(UpdateFeedClient::parseRelease(QJsonDocument(row).toJson(), "v0.10", {}).isEmpty());
     }
     row.remove("min_version");
     QVERIFY(UpdateFeedClient::parseRelease(QJsonDocument(row).toJson(), "0.9.9", {}).value("mandatory").toBool());
-    // The operator re-pinned the current row to an older release: the newer build converges to it too.
-    const auto rolledBack = UpdateFeedClient::parseRelease(QJsonDocument(row).toJson(), "0.11.0", {});
-    QVERIFY(rolledBack.value("mandatory").toBool());
-    QVERIFY(rolledBack.value("rollback").toBool());
+    // The operator re-pinned the current row to an older release: the newer build stays (roll forward).
+    QVERIFY(UpdateFeedClient::parseRelease(QJsonDocument(row).toJson(), "0.11.0", {}).isEmpty());
     QVERIFY(UpdateFeedClient::isSameVersion("0.10.0", "0.10"));
     QVERIFY(!UpdateFeedClient::isSameVersion("0.10.0", "0.10.1"));
 

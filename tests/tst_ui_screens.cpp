@@ -31,6 +31,7 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QRegularExpression>
+#include <QScopeGuard>
 #include <QQmlComponent>
 #include <QQmlContext>
 #include <QQmlEngine>
@@ -904,6 +905,7 @@ private slots:
     void theErrorViewShowsThreeKindsOfSentenceAsTheyAreAndDrawsNoBareReferenceLabel();
     void noScreenRendersAnInternalStateOrEndReasonKey();
     void everyCustomerScreenHasSpecStates();
+    void theSignInPasswordKeepsItsNameWhileAccessibilityIsActive();
 
 private:
     // The per-screen halves of `everyCustomerScreenHasSpecStates`, each run at both desktop sizes. A
@@ -5664,8 +5666,19 @@ int accessibleRole(QObject* item)
     return attached ? attached->property("role").toInt() : -1;
 }
 
+// The item an item's `Accessible.labelledBy` names. The Windows UI Automation bridge reports it as the
+// element's "labeled by" (QAccessibleQuickItem::relations answers it for QAccessible::Label), so it is
+// what a screen reader reads when the control's own name is empty.
+QQuickItem* accessibleLabelItem(QObject* item)
+{
+    QObject* attached = accessibleOf(item);
+    return attached ? qvariant_cast<QQuickItem*>(attached->property("labelledBy")) : nullptr;
+}
+
 // What a screen reader is told for an item: its own `Accessible.name`, else the label Qt Quick Controls
-// take from a button's text.
+// take from a button's text, else the label the item is `Accessible.labelledBy`. Qt reports an empty
+// own name for a password-echo field while accessibility is active, so the label relation is how that
+// field is named whether or not accessibility is active.
 QString spokenName(QObject* item)
 {
     const QString own = accessibleName(item);
@@ -5674,6 +5687,10 @@ QString spokenName(QObject* item)
     }
     if (item && item->inherits("QQuickAbstractButton")) {
         return item->property("text").toString();
+    }
+    if (QQuickItem* label = accessibleLabelItem(item)) {
+        const QString labelName = accessibleName(label);
+        return labelName.isEmpty() ? label->property("text").toString() : labelName;
     }
     return QString();
 }
@@ -6193,7 +6210,7 @@ void TstUiScreens::checkSignInAt(const QSize& size)
                            QStringLiteral("Back") }));
     QObject* password = child("passwordField");
     QVERIFY(password);
-    QCOMPARE(accessibleName(password), QStringLiteral("Password"));
+    QCOMPARE(spokenName(password), QStringLiteral("Password"));
     QVERIFY(call("signInWithPassword"));
     QVERIFY2(sees(QStringLiteral("Enter your password.")), qPrintable(where));
     QCOMPARE(accessibleDescription(password), QStringLiteral("Enter your password."));
@@ -6868,6 +6885,54 @@ void TstUiScreens::everyCustomerScreenHasSpecStates()
                 }
             }
         }
+    }
+}
+
+// Qt Quick marks a password-echo field as a password edit while accessibility is active and then reports
+// an empty own name for it (QQuickAccessibleAttached::name), so the Sign in password field is named for a
+// screen reader through its `Accessible.labelledBy` label. This runs the whole Sign in check with
+// accessibility switched on before the screen is built, as a UI Automation client does, and reads the
+// label back from the accessibility interface the Windows bridge reads.
+void TstUiScreens::theSignInPasswordKeepsItsNameWhileAccessibilityIsActive()
+{
+    const bool wasActive = QAccessible::isActive();
+    QAccessible::setActive(true);
+    const auto restore = qScopeGuard([wasActive] { QAccessible::setActive(wasActive); });
+    QVERIFY2(QAccessible::isActive(), "accessibility could not be switched on for this test");
+
+    {
+        QQuickStyle::setStyle(QStringLiteral("Basic"));
+        QQmlEngine engine;
+        registerTokenSingletons(&engine);
+        FakeShellClient client;
+        Hosted host;
+        QString error;
+        QScopedPointer<QObject> screen(instantiate(&engine, QStringLiteral("SignInScreen.qml"), &error));
+        QVERIFY2(screen, qPrintable(error));
+        QVERIFY(screen->setProperty("client", QVariant::fromValue(static_cast<QObject*>(&client))));
+        QVERIFY(host.show(screen.data(), QSize(1100, 720), 0));
+        deepChild(screen.data(), QLatin1String("identifierField"))
+            ->setProperty("text", QStringLiteral("lina@example.com"));
+        QVERIFY(QMetaObject::invokeMethod(screen.data(), "continueFromIdentifier"));
+        QCOMPARE(screen->property("step").toString(), QStringLiteral("password"));
+
+        QObject* password = deepChild(screen.data(), QLatin1String("passwordField"));
+        QVERIFY(password);
+        QAccessibleInterface* field = QAccessible::queryAccessibleInterface(password);
+        QVERIFY(field);
+        QVERIFY2(field->state().passwordEdit, "the password field is a password edit while accessibility is active");
+        // What the UI Automation bridge reports as the field's "labeled by".
+        const auto labels = field->relations(QAccessible::Label);
+        QCOMPARE(labels.size(), 1);
+        QVERIFY(labels.first().first);
+        QCOMPARE(labels.first().first->text(QAccessible::Name), QStringLiteral("Password"));
+        QCOMPARE(spokenName(password), QStringLiteral("Password"));
+    }
+
+    for (const QSize& size : customerDesktopSizes()) {
+        checkSignInAt(size);
+        QVERIFY2(!QTest::currentTestFailed(), qPrintable(QStringLiteral("§22 Sign in at ") + sizeLabel(size)
+                                                         + QStringLiteral(" with accessibility active")));
     }
 }
 

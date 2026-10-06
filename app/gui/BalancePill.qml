@@ -65,9 +65,9 @@ Rectangle {
                                     : root.level === "low" ? Tokens.warnDefault
                                     : Tokens.borderDefault
 
-    // D-04, ADR-0067: the live-updates indicator (`ui.md` §7), shown only while the account push
-    // channel is paused (`timing.md` L5) - independent of `loading`/`level`, which are about the
-    // balance itself.
+    // D-04, ADR-0067: the live-updates indicator (`ui.md` §7), shown only while live updates are
+    // actually lost (`timing.md` L5, R7: no `stream.hello` for 10 s from the last close or from
+    // start-up) - independent of `loading`/`level`, which are about the balance itself.
     readonly property bool paused: client ? client.liveUpdatesPaused === true : false
 
     // D-05, ADR-0067: one opacity pulse when a push changes the value already on screen - never on

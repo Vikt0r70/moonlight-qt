@@ -62,6 +62,19 @@ SseClient::SseClient(QObject* parent) : QObject(parent)
         setState(QStringLiteral("paused"));
     });
 
+    // R7 (ADR-0067 amendment 2026-10-06): the live-updates indicator's own clock. It is not the L5
+    // fallback timer above: it runs from the first open or from the close of a connection that had
+    // received `stream.hello`, and a hello stops it, so a routine reconnect never shows the indicator.
+    m_lostTimer = new QTimer(this);
+    m_lostTimer->setSingleShot(true);
+    connect(m_lostTimer, &QTimer::timeout, this, [this]() {
+        if (m_updatesLost) {
+            return;
+        }
+        m_updatesLost = true;
+        emit liveUpdatesLostChanged(true);
+    });
+
     m_reconnectTimer = new QTimer(this);
     m_reconnectTimer->setSingleShot(true);
     connect(m_reconnectTimer, &QTimer::timeout, this, &SseClient::beginConnection);
@@ -92,6 +105,8 @@ void SseClient::start()
     m_running = true;
     m_stopping = false;
     m_attempt = 0;
+    // R7: "from start-up" - no hello within L5's 10 s of the first open is a real loss.
+    m_lostTimer->start(m_pausedDelayMs);
     beginConnection();
 }
 
@@ -103,6 +118,7 @@ void SseClient::stop()
     m_pausedTimer->stop();
     m_reconnectTimer->stop();
     m_liveResetTimer->stop();
+    clearLiveUpdatesLost();
     if (m_reply) {
         QNetworkReply* reply = m_reply;
         m_reply = nullptr;
@@ -159,6 +175,7 @@ void SseClient::beginConnection()
         return;
     }
     m_helloNamedAliveMs = false;
+    m_connectionHelloed = false;
     m_live = false;
     m_lastCloseReason.clear();
     m_deadStreamTimer->stop();
@@ -196,6 +213,15 @@ void SseClient::setState(const QString& state)
     }
     m_state = state;
     emit stateChanged();
+}
+
+void SseClient::clearLiveUpdatesLost()
+{
+    m_lostTimer->stop();
+    if (m_updatesLost) {
+        m_updatesLost = false;
+        emit liveUpdatesLostChanged(false);
+    }
 }
 
 void SseClient::markLive()
@@ -251,6 +277,7 @@ void SseClient::handleFinished()
     // attempt opened). Both mean the same thing: stop for good (§2.3).
     if (reason == QStringLiteral("revoked") || status == 401 || status == 403) {
         m_pausedTimer->stop();
+        clearLiveUpdatesLost();
         m_live = false;
         if (m_paused) {
             m_paused = false;
@@ -262,6 +289,14 @@ void SseClient::handleFinished()
     }
 
     m_live = false;
+
+    // R7: the loss clock counts from the close of a connection that had received `stream.hello`. A
+    // connection that never got one adds nothing: the clock already running (from start-up or from the
+    // last such close) keeps counting, so repeated failed attempts cannot postpone a real loss forever.
+    if (m_connectionHelloed) {
+        m_connectionHelloed = false;
+        m_lostTimer->start(m_pausedDelayMs);
+    }
 
     if (reason == QStringLiteral("replaced")) {
         // §2.3: reconnecting immediately would fight the connection that just replaced this one.
@@ -277,6 +312,10 @@ void SseClient::handleFinished()
 
 void SseClient::onHello(int aliveMs)
 {
+    // R7: any hello proves a working stream - the indicator hides at once, whether or not the first
+    // `stream.alive` (which counts the connection live for L3/L5) has come yet.
+    m_connectionHelloed = true;
+    clearLiveUpdatesLost();
     if (aliveMs > 0) {
         m_helloNamedAliveMs = true;
         m_deadStreamTimer->start(m_deadStreamTimeoutMs);

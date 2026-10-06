@@ -188,9 +188,15 @@ bool UpdateFeedClient::isNewerVersion(const QString& candidate, const QString& c
     return false;
 }
 
-bool UpdateFeedClient::isRollback(const QString& candidate, const QString& current)
+bool UpdateFeedClient::isCurrentVersion(const QString& installed, const QString& release)
 {
-    return isNewerVersion(current, candidate);
+    QList<quint64> have;
+    QList<quint64> want;
+    if (!numericParts(installed, have) || !numericParts(release, want)) {
+        // Unparseable is never proven current; the caller decides what that means for an offer.
+        return false;
+    }
+    return !isNewerVersion(release, installed);
 }
 
 bool UpdateFeedClient::isSameVersion(const QString& left, const QString& right)
@@ -227,8 +233,10 @@ QVariantMap UpdateFeedClient::parseRelease(const QByteArray& json, const QString
     }
 
     if (normalizedVersion(version) == normalizedVersion(installedVersion)
-        || isSameVersion(version, installedVersion)) {
-        // Already on this build: the installed version equals the current release (ADR-0077 item 3).
+        || isCurrentVersion(installedVersion, version)) {
+        // ADR-0077 Amendment 2026-10-06 R5: an install equal to or newer than the current release is
+        // current. It gets no offer and is never moved down: a bad release is fixed by publishing a newer
+        // fixed build (roll forward).
         return {};
     }
 
@@ -247,12 +255,11 @@ QVariantMap UpdateFeedClient::parseRelease(const QByteArray& json, const QString
     offer.insert(QStringLiteral("url"), url);
     offer.insert(QStringLiteral("sha256"), sha256);
     offer.insert(QStringLiteral("notes"), release.value(QStringLiteral("notes")).toString());
-    offer.insert(QStringLiteral("rollback"), isRollback(version, installedVersion));
     QList<quint64> parts;
     if (!numericParts(version, parts) || !numericParts(installedVersion, parts)) return {};
     // ADR-0077: the current release IS the floor. The row's own `min_version` (still sent for installed
     // 0.1.16/0.1.27 readers) and any value cached by an older build are ignored, so an installed version
-    // that differs from the release, newer or older, is always required.
+    // older than the release is always required.
     offer.insert(QStringLiteral("mandatory"), true);
     return offer;
 }
@@ -926,8 +933,8 @@ void UpdateFeedClient::setInstalledVersion(const QString& version)
         return;
     }
     m_installedVersion = version;
-    // ADR-0077 item 2: only an installed version EQUAL to the target ends the attempt budget.
-    if (!m_retry.target.isEmpty() && isSameVersion(m_retry.target, version)) {
+    // ADR-0077 Amendment R5: an installed version equal to or newer than the target ends the attempt budget.
+    if (!m_retry.target.isEmpty() && isCurrentVersion(version, m_retry.target)) {
         m_retry.noteSuccess(); persistRetry(); clearOffer();
     }
     emit installedVersionChanged();

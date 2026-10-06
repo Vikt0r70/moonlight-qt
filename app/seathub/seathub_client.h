@@ -241,10 +241,12 @@ class SeatHubClient : public QObject
     /// while this holds: there is no balance before sign-in (CUST-06, `screens.md` Common shell).
     Q_PROPERTY(bool signedIn READ signedIn NOTIFY signedInChanged)
 
-    /// True while the account push channel has not been live for L5 (10 s, `timing.md`): SeatHub
-    /// reads `GET /api/account-state` every `kAccountFallbackMs` with `X-Stream-Fallback: seathub`
-    /// until it is live again (D-04, D-06, ADR-0067). The indicator (`ui.md` §7) shows while this
-    /// holds.
+    /// True only while live updates are actually lost (R7, ADR-0067 amendment 2026-10-06, `timing.md`
+    /// L5): no stream connection has received `stream.hello` for 10 s, counted from the close of the
+    /// last connection that had one, or from start-up. The indicator (`ui.md` §7) shows while this
+    /// holds, and a hello hides it at once. It is not the fallback read's state: SeatHub reads
+    /// `GET /api/account-state` every `kAccountFallbackMs` with `X-Stream-Fallback: seathub` while the
+    /// channel has not been live for L5 (D-04, D-06), whether or not this is true.
     Q_PROPERTY(bool liveUpdatesPaused READ liveUpdatesPaused NOTIFY liveUpdatesPausedChanged)
 
     /// True for `kSignedOutNoticeMs` (3 s, L9) on the screen already open after a revoked stream
@@ -592,6 +594,8 @@ private slots:
     void handleSseSessionState(const SessionInfo& session);
     /// `SseClient::pausedChanged` (D-04, D-06, L5): starts or stops the 10 s fallback read.
     void handleSsePaused(bool paused);
+    /// `SseClient::liveUpdatesLostChanged` (R7): shows or hides the live-updates indicator.
+    void handleSseLiveUpdatesLost(bool lost);
     /// `SseClient::revoked` (`stream.closing {reason: "revoked"}`, or a 401/403 on the stream
     /// request itself): the D-07 signed-out sequence, deferred while the stream is running.
     void handleSseRevoked();

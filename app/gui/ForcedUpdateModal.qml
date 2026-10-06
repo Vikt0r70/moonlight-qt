@@ -5,6 +5,7 @@ import SeatHub.Tokens 1.0
 // The forced-update modal (D-38, D-41, D-42, D-43).
 //
 // ADR-0077 / screens.md §49: the newest published release is the floor, so every offer is required.
+// Only an install older than that release is offered one; a newer install is current (R5).
 // There is no optional offer and no way to dismiss the window, and a failed update never hides it.
 //
 // It is never shown while a stream is running (Pitfall 8): `SeatHubClient` refuses to check,
@@ -126,8 +127,6 @@ Item {
                         return qsTr("SeatHub could not update itself. Download the new version and install it to keep playing.")
                     if (updates && updates.state === "failed")
                         return qsTr("SeatHub could not finish updating, so playing is paused until it does. It will try again %1.").arg(updates.nextAttemptText)
-                    if (modal.hasOffer && modal.offer.rollback === true)
-                        return qsTr("SevenHills has set version %1 for this app on your PC.").arg(modal.offeredVersion)
                     return qsTr("Version %1 is available. SeatHub has to restart to finish updating.").arg(modal.offeredVersion)
                 }
                 color: Tokens.foregroundMutedDefault

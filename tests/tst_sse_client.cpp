@@ -69,6 +69,26 @@ QByteArray sseFrameFromFixture(const QString& name)
                      fixture.value(QStringLiteral("data")).toObject());
 }
 
+// A `stream.hello` frame naming `alive_ms` (the first `stream.alive` then comes later), or none (0).
+QByteArray helloFrame(int aliveMs)
+{
+    QJsonObject data;
+    data.insert(QStringLiteral("connection_id"), QStringLiteral("c-test"));
+    data.insert(QStringLiteral("server_time"), QStringLiteral("2026-10-06T10:00:01.123Z"));
+    data.insert(QStringLiteral("topics"), QJsonArray());
+    data.insert(QStringLiteral("retry_ms"), 3000);
+    if (aliveMs > 0) {
+        data.insert(QStringLiteral("alive_ms"), aliveMs);
+    }
+    return sseFrame(QStringLiteral("stream.hello"), data);
+}
+
+QByteArray closingFrame(const QString& reason)
+{
+    return sseFrame(QStringLiteral("stream.closing"),
+                    QJsonObject{ { QStringLiteral("reason"), reason } });
+}
+
 // --- Task 2: a QNetworkReply that stays open, unlike tst_control_plane.cpp's FakeReply (which
 // --- always completes on the next event-loop turn - unsuitable for the "silence times out" and
 // --- "the server sent stream.closing, then closed the connection" tests below). ----------------
@@ -592,6 +612,125 @@ private slots:
         QCOMPARE(net.replies.count(), 1);
         QTest::qWait(150);
         QCOMPARE(net.replies.count(), 2);
+    }
+
+    // --- R7 (ADR-0067 amendment 2026-10-06): the live-updates indicator shows only on a real loss ------
+
+    void aRoutineReconnectWithAPromptHelloNeverShowsTheIndicator()
+    {
+        ControlPlaneClient controlPlane;
+        StreamNetworkAccessManager net;
+        controlPlane.setStreamNetworkAccessManager(&net);
+        controlPlane.setBaseUrl(QStringLiteral("https://example.test"));
+
+        SseClient client;
+        client.setControlPlane(&controlPlane);
+        client.setPausedDelayMs(500);       // stands for L5's 10 s
+        client.setReconnectCapMs(100);
+        client.setJitterProvider([]() { return 0.0; });
+        QSignalSpy lostSpy(&client, &SseClient::liveUpdatesLostChanged);
+        QSignalSpy pausedSpy(&client, &SseClient::pausedChanged);
+        client.start();
+
+        // The first connection gets its hello, then the server closes it (a routine reconnect).
+        net.replies.first()->pushBytes(helloFrame(20000));
+        net.replies.first()->pushBytes(closingFrame(QStringLiteral("replaced")));
+        net.replies.first()->finishStream();
+        QTRY_COMPARE_WITH_TIMEOUT(net.replies.count(), 2, 2000);
+
+        // The next connection gets its hello promptly, but its first `stream.alive` is held back for
+        // longer than the whole window: the indicator must never show.
+        net.replies.last()->pushBytes(helloFrame(20000));
+        QTest::qWait(800);
+        QCOMPARE(lostSpy.count(), 0);
+
+        // The L5 fallback read keeps its own trigger: the connection was not live for the delay.
+        QCOMPARE(pausedSpy.count(), 1);
+        QCOMPARE(pausedSpy.at(0).at(0).toBool(), true);
+
+        // The late alive then clears the fallback state, and the indicator was still never shown.
+        net.replies.last()->pushBytes(sseFrame(
+            QStringLiteral("stream.alive"),
+            QJsonObject{ { QStringLiteral("at"), QStringLiteral("2026-10-06T10:00:20.000Z") } }));
+        QCOMPARE(client.state(), QStringLiteral("live"));
+        QCOMPARE(pausedSpy.count(), 2);
+        QCOMPARE(lostSpy.count(), 0);
+    }
+
+    void aDeadStreamReconnectWithAPromptHelloNeverShowsTheIndicator()
+    {
+        ControlPlaneClient controlPlane;
+        StreamNetworkAccessManager net;
+        controlPlane.setStreamNetworkAccessManager(&net);
+        controlPlane.setBaseUrl(QStringLiteral("https://example.test"));
+
+        SseClient client;
+        client.setControlPlane(&controlPlane);
+        client.setPausedDelayMs(1600);      // stands for L5's 10 s; the ordinary schedule's floor is 1 s
+        client.setDeadStreamTimeoutMs(50);
+        client.setJitterProvider([]() { return 0.0; });
+        QSignalSpy lostSpy(&client, &SseClient::liveUpdatesLostChanged);
+        client.start();
+
+        net.replies.first()->pushBytes(helloFrame(20000));
+        // Silence past the bound aborts the connection; the ordinary 1 s schedule reconnects it.
+        QTRY_COMPARE_WITH_TIMEOUT(net.replies.count(), 2, 3000);
+        net.replies.last()->pushBytes(helloFrame(0));
+
+        // Past the window counted from the close: still never shown.
+        QTest::qWait(1900);
+        QCOMPARE(lostSpy.count(), 0);
+    }
+
+    void tenSecondsWithoutAnyHelloAfterALossShowsTheIndicator()
+    {
+        ControlPlaneClient controlPlane;
+        StreamNetworkAccessManager net;
+        controlPlane.setStreamNetworkAccessManager(&net);
+        controlPlane.setBaseUrl(QStringLiteral("https://example.test"));
+
+        SseClient client;
+        client.setControlPlane(&controlPlane);
+        client.setPausedDelayMs(200);       // stands for L5's 10 s
+        client.setReconnectCapMs(600);
+        client.setJitterProvider([]() { return 0.0; });
+        QSignalSpy lostSpy(&client, &SseClient::liveUpdatesLostChanged);
+        QSignalSpy pausedSpy(&client, &SseClient::pausedChanged);
+        client.start();
+
+        // From start-up: no hello within the window is a loss, and a hello hides it at once.
+        QTRY_COMPARE_WITH_TIMEOUT(lostSpy.count(), 1, 2000);
+        QCOMPARE(lostSpy.at(0).at(0).toBool(), true);
+        net.replies.first()->pushBytes(helloFrame(0));
+        QCOMPARE(lostSpy.count(), 2);
+        QCOMPARE(lostSpy.at(1).at(0).toBool(), false);
+
+        // A connection that had its hello closes; nothing is shown inside the window ...
+        net.replies.first()->pushBytes(closingFrame(QStringLiteral("replaced")));
+        net.replies.first()->finishStream();
+        QTest::qWait(100);
+        QCOMPARE(lostSpy.count(), 2);
+
+        // ... and with no hello for the whole window after that close, the indicator shows.
+        QTRY_COMPARE_WITH_TIMEOUT(lostSpy.count(), 3, 2000);
+        QCOMPARE(lostSpy.at(2).at(0).toBool(), true);
+
+        // The reconnect that follows without a hello changes nothing, and the L5 fallback trigger still
+        // fires for that connection on its own clock.
+        QTRY_COMPARE_WITH_TIMEOUT(net.replies.count(), 2, 2000);
+        const int pausedBefore = pausedSpy.count();
+        QTRY_VERIFY_WITH_TIMEOUT(pausedSpy.count() > pausedBefore, 2000);
+        QCOMPARE(pausedSpy.last().at(0).toBool(), true);
+        QCOMPARE(lostSpy.count(), 3);
+
+        // The next hello hides it at once.
+        net.replies.last()->pushBytes(helloFrame(20000));
+        QCOMPARE(lostSpy.count(), 4);
+        QCOMPARE(lostSpy.at(3).at(0).toBool(), false);
+
+        // A deliberate stop never leaves it showing.
+        client.stop();
+        QCOMPARE(lostSpy.count(), 4);
     }
 
     void theFallbackReadCarriesTheMarker()

@@ -4899,6 +4899,64 @@ private slots:
         QCOMPARE(client.sessionHistory()->status(), QStringLiteral("idle"));
     }
 
+    void settingsThenProfileFromTheMenuShowsProfileAtOnce()
+    {
+        // F-LIVE-2 / R6: Settings open, the menu's Profile replaces it instead of staying hidden under it.
+        SeatHubClient client;
+        reachHome(client, 45);
+        QVERIFY(!QTest::currentTestFailed());
+
+        client.openSettings();
+        QVERIFY(client.inSettings());
+        QVERIFY(!client.inProfile());
+
+        client.openProfile();
+        QVERIFY(client.inProfile());
+        QVERIFY(!client.inSettings());
+        QCOMPARE(client.appState(), QStringLiteral("home"));
+
+        // Back from Profile returns to Home, not to a Settings page left underneath.
+        client.closeProfile();
+        QVERIFY(!client.inProfile());
+        QVERIFY(!client.inSettings());
+        QCOMPARE(client.appState(), QStringLiteral("home"));
+    }
+
+    void profileThenSettingsFromTheMenuShowsSettingsAndBackReturnsHome()
+    {
+        // R6: Profile open, the menu's Settings replaces it, and Back from Settings is Home, not Profile.
+        SeatHubClient client;
+        reachHome(client, 45);
+        QVERIFY(!QTest::currentTestFailed());
+
+        client.openProfile();
+        QVERIFY(client.inProfile());
+        QVERIFY(!client.inSettings());
+
+        client.openSettings();
+        QVERIFY(client.inSettings());
+        QVERIFY(!client.inProfile());
+        QCOMPARE(client.appState(), QStringLiteral("home"));
+        // The Profile visit is over: nothing of it is left to show as current later.
+        QCOMPARE(client.totalsStatus(), QStringLiteral("idle"));
+
+        client.closeSettings();
+        QVERIFY(!client.inSettings());
+        QVERIFY(!client.inProfile());
+        QCOMPARE(client.appState(), QStringLiteral("home"));
+
+        // Alternating repeatedly never leaves both set.
+        for (int i = 0; i < 3; ++i) {
+            client.openSettings();
+            client.openProfile();
+            QVERIFY(client.inProfile() && !client.inSettings());
+            client.openSettings();
+            QVERIFY(client.inSettings() && !client.inProfile());
+        }
+        client.closeSettings();
+        QVERIFY(!client.inSettings() && !client.inProfile());
+    }
+
     void anUnknownListNameIsANoOp()
     {
         SeatHubClient client;
@@ -6935,20 +6993,27 @@ private slots:
             "\"account\":{\"wallet\":{\"balance_minutes\":77},\"live_session_id\":\"\","
             "\"open_topup_notice\":null,\"signup_stage\":\"complete\"}}"));
 
+        // The fallback read runs on the channel's L5 trigger without showing the indicator (R7).
         emit client.sse()->pausedChanged(true);
-        QCOMPARE(pausedSpy.count(), 1);
-        QVERIFY(client.liveUpdatesPaused());
+        QCOMPARE(pausedSpy.count(), 0);
+        QVERIFY(!client.liveUpdatesPaused());
 
         QTRY_COMPARE_WITH_TIMEOUT(client.balanceMinutes(), qint64(77), 15000);
         QCOMPARE(m_fake->streamFallbackHeaderFor(QStringLiteral("/api/account-state")),
                  QByteArrayLiteral("seathub"));
 
-        // Live again: the property clears and the reads stop.
+        // The indicator follows the channel's own "no hello" loss signal, not the fallback trigger.
+        emit client.sse()->liveUpdatesLostChanged(true);
+        QCOMPARE(pausedSpy.count(), 1);
+        QVERIFY(client.liveUpdatesPaused());
+        emit client.sse()->liveUpdatesLostChanged(false);
+        QCOMPARE(pausedSpy.count(), 2);
+        QVERIFY(!client.liveUpdatesPaused());
+
+        // Live again: the reads stop.
         const int readsBeforeLive =
             m_fake->countOfPathEndingWith(QStringLiteral("/api/account-state"));
         emit client.sse()->pausedChanged(false);
-        QCOMPARE(pausedSpy.count(), 2);
-        QVERIFY(!client.liveUpdatesPaused());
         QTest::qWait(150);
         QCOMPARE(m_fake->countOfPathEndingWith(QStringLiteral("/api/account-state")),
                  readsBeforeLive);

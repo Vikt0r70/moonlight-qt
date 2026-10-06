@@ -41,7 +41,7 @@ class UpdateFeedClient : public QObject
     /// `ready` is transient: a verified download moves on to `installing` by itself. `installing`
     /// is set only when the installer's launch is actually attempted.
     Q_PROPERTY(QString state READ state NOTIFY stateChanged)
-    /// version, url, sha256, notes, rollback. Empty when there is nothing to offer.
+    /// version, url, sha256, notes, mandatory. Empty when there is nothing to offer.
     Q_PROPERTY(QVariantMap availableUpdate READ availableUpdate NOTIFY availableUpdateChanged)
     Q_PROPERTY(int progress READ progress NOTIFY progressChanged)
     Q_PROPERTY(QVariantMap failure READ failure NOTIFY failureChanged)
@@ -51,7 +51,7 @@ class UpdateFeedClient : public QObject
     /// True once a verified package is on disk and waiting to be run.
     Q_PROPERTY(bool readyToInstall READ readyToInstall NOTIFY readyToInstallChanged)
     /// ADR-0077: the newest published release is the floor. Every offer is mandatory: an installed
-    /// version that differs from the current release, newer or older, is blocked by the update window.
+    /// version older than the current release is blocked by the update window. A newer one is current.
     Q_PROPERTY(bool mandatory READ mandatory NOTIFY availableUpdateChanged)
     Q_PROPERTY(bool exhausted READ exhausted NOTIFY retryChanged)
     Q_PROPERTY(QString nextAttemptText READ nextAttemptText NOTIFY retryChanged)
@@ -67,13 +67,13 @@ public:
     /// The app name this client tracks: the customer-facing client, `client`.
     static QString appName();
 
-    /// D-46/D-44: a candidate version counts as an offer when it differs from the installed one.
-    /// A rollback is an ordinary operator action - the client installs whatever the feed's
-    /// current row says, including an earlier version, once the checksum verifies.
+    /// A candidate version counts as an offer only when it is newer than the installed one
+    /// (ADR-0077 Amendment R5: a newer install is never moved down; roll forward instead).
     static bool isNewerVersion(const QString& candidate, const QString& current);
-    /// True when the feed's row is an earlier version than the one installed (a rollback).
-    static bool isRollback(const QString& candidate, const QString& current);
-    /// ADR-0077 item 2: a client is current only when its version equals the release's.
+    /// ADR-0077 Amendment R5: an install is current when its version is equal to or newer than the
+    /// release's (dotted numbers). An unparseable version is never proven current.
+    static bool isCurrentVersion(const QString& installed, const QString& release);
+    /// Two spellings of the same dotted version (`0.10` equals `0.10.0`).
     static bool isSameVersion(const QString& left, const QString& right);
 
     /// Parses a feed response into an offer, or an empty map when there is nothing to do.

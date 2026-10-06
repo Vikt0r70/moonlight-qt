@@ -386,7 +386,13 @@ Item {
                 spacing: Metrics.s2
                 visible: root.step === "password"
 
-                FieldLabel { text: qsTr("Password") }
+                FieldLabel {
+                    id: passwordLabel
+                    text: qsTr("Password")
+                    // `labelledBy` below gives this label an attached object, whose name is then
+                    // empty unless set, so the label's own text is named here.
+                    Accessible.name: text
+                }
 
                 ErrorLine {
                     objectName: "passwordErrorLine"
@@ -405,7 +411,11 @@ Item {
                     color: Tokens.foregroundDefault
                     font.family: Tokens.fontSansDefault
                     font.pixelSize: Metrics.fontBody
+                    // Qt reports an empty `Accessible.name` for a password-echo field while
+                    // accessibility is active (QQuickAccessibleAttached::name), so the label
+                    // relation is what tells a screen reader this field is "Password".
                     Accessible.name: qsTr("Password")
+                    Accessible.labelledBy: passwordLabel
                     Accessible.description: root.fieldError
                     background: Rectangle {
                         radius: Metrics.radiusSm

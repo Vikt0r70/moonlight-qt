@@ -199,9 +199,9 @@ bool UpdateRetryState::reset(const QString& nextTarget, const QString& installed
     while (current.startsWith('v')) current.remove(0, 1);
     const auto have = QVersionNumber::fromString(current).normalized();
     const auto want = QVersionNumber::fromString(nextTarget).normalized();
-    // ADR-0077 item 2: a client is current only when its version EQUALS the target. A newer one is a
-    // supported rollback and still has to converge, so it spends the same bounded budget.
-    const bool reached = !have.isNull() && !want.isNull() && QVersionNumber::compare(have, want) == 0;
+    // ADR-0077 Amendment 2026-10-06 R5: a client is current when its version is equal to or newer than the
+    // target. A newer client is never moved down; only an older one converges, under the bounded budget.
+    const bool reached = !have.isNull() && !want.isNull() && QVersionNumber::compare(have, want) >= 0;
     if (target == nextTarget && !reached) return false;
     target = nextTarget; noteSuccess();
     return true;

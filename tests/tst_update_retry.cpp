@@ -113,22 +113,26 @@ private slots:
         const auto empty = UpdateRetryState::load(path).trace;
         QCOMPARE(empty.pid, qint64(0)); QVERIFY(empty.pidCreated.isEmpty()); QCOMPARE(empty.launcherSession, qint64(-1));
     }
-    void aRollbackTargetConvergesAndSpendsTheSameBudget()
+    void aNewerInstalledBuildCountsAsReached()
     {
-        // ADR-0077 item 2: a client NEWER than the current release is not current; it converges to it
-        // under the same four attempts, and only an installed version EQUAL to the target ends them.
+        // ADR-0077 Amendment R5: an install equal to or newer than the target is current and is never moved
+        // down. Only an older install converges, under the same four attempts.
         UpdateRetryState state; state.setClock([this]{ return clock; });
-        QVERIFY(state.reset("0.1.27", "0.1.28"));            // the operator re-pinned the current row
+        QVERIFY(state.reset("0.1.27", "0.1.26"));            // older: the budget starts
         state.noteFailure("installer.locked_file"); QCOMPARE(state.attemptsFailed, 1);
-        QVERIFY(!state.reset("0.1.27", "0.1.28"));           // still above the target: nothing resets
+        QVERIFY(!state.reset("0.1.27", "0.1.26"));           // still older: nothing resets
         QCOMPARE(state.attemptsFailed, 1);
         state.noteFailure("installer.locked_file"); state.noteFailure("installer.locked_file");
         state.noteFailure("installer.locked_file");
         QVERIFY(state.exhausted());
-        QVERIFY(!state.reset("0.1.27", "0.1.30"));           // newer is never "reached"
-        QVERIFY(state.exhausted());
-        QVERIFY(state.reset("0.1.27", "0.1.27"));            // equal is
+        QVERIFY(state.reset("0.1.27", "0.1.30"));            // newer is reached
         QVERIFY(!state.exhausted()); QCOMPARE(state.attemptsFailed, 0);
+        state.noteFailure("installer.locked_file");
+        QVERIFY(state.reset("0.1.27", "0.1.28"));            // so is the install the live test uses
+        QCOMPARE(state.attemptsFailed, 0);
+        state.noteFailure("installer.locked_file");
+        QVERIFY(state.reset("0.1.27", "0.1.27"));            // and an equal one
+        QCOMPARE(state.attemptsFailed, 0);
     }
     void persistentFailureBlocksWithReinstall()
     {
