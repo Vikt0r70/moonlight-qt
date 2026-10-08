@@ -49,20 +49,17 @@ Item {
                                             ? Number(root.client.graceMinutesLeft) : -1
     readonly property bool reconnectStillTrying: root.client && root.client.reconnectStillTrying === true
 
-    // `Connection lost. Reconnecting… (n of 5)` until the first attempt has failed or timed out
-    // AND the server has returned `grace_deadline_at` for this interruption (the facade reports
-    // `graceMinutesLeft` as -1 until then), then `Still trying. {minutes} left to reconnect.` from
-    // that deadline - never a client-owned countdown, and never a figure of this screen's own
-    // while the server's is unknown (`{minutes}` uses `1 minute` in the singular, copy.md).
-    readonly property bool deadlineKnown: root.graceMinutesLeft >= 0
+    // C-RECONNECT (`screens.md` §24, `copy.md` §Reconnect, ADR-0083 decision 12): `Connection
+    // lost.` above an in-flight `Reconnecting…` or a waiting `Trying again in {n} s`. The countdown
+    // lost.` above an in-flight `Reconnecting…` or a waiting `Trying again in {n} s`. The countdown
+    // is the held session's own next attempt (V-COUNTDOWN), published by the client once a second -
+    // shown only while a retry is actually scheduled. No attempt count and no server minutes.
+    readonly property int retrySeconds: root.client ? root.client.reconnectRetrySeconds : -1
     readonly property string reconnectLineText: {
-        if (!root.reconnectStillTrying || !root.deadlineKnown) {
-            return qsTr("Connection lost. Reconnecting… (%1 of 5)").arg(root.reconnectCount + 1)
+        if (root.reconnectStillTrying && root.retrySeconds > 0) {
+            return qsTr("Trying again in %1 s").arg(root.retrySeconds)
         }
-        var minutes = root.graceMinutesLeft
-        return minutes === 1
-            ? qsTr("Still trying. 1 minute left to reconnect.")
-            : qsTr("Still trying. %1 minutes left to reconnect.").arg(minutes)
+        return qsTr("Reconnecting…")
     }
 
     Column {
@@ -81,9 +78,21 @@ Item {
             failed: root.failed
         }
 
-        // 06.1-19/J-07: shown while an automatic retry is in flight - the third stage's own
-        // breathing warn dot (`SeatHubStepper.qml`'s existing "active" look, unchanged) is the
-        // live signal; this line names the count or the time left, from the server.
+        // C-RECONNECT: `Connection lost.` sits above the reconnect lines (copy.md §Reconnect).
+        Text {
+            objectName: "connectionLostLine"
+            width: parent.width
+            wrapMode: Text.Wrap
+            visible: root.reconnecting
+            text: qsTr("Connection lost.")
+            color: Tokens.foregroundDefault
+            font.family: Tokens.fontSansDefault
+            font.pixelSize: Metrics.fontBody
+            lineHeight: 1.4
+        }
+
+        // C-RECONNECT: in-flight `Reconnecting…` or waiting `Trying again in {n} s`, from the
+        // app-scheduled retry only (V-COUNTDOWN).
         Text {
             objectName: "reconnectLine"
             width: parent.width
@@ -208,6 +217,18 @@ Item {
             text: qsTr("Cancel")
 
             onClicked: root.client.interrupt()
+        }
+
+        // C-RECONNECT: `Try now` starts the next attempt at once and shows `Reconnecting…` at once
+        // (copy.md §Reconnect). Offered only while a retry is actually waiting.
+        SeatHubButton {
+            id: tryNowButton
+            objectName: "tryNowButton"
+            width: parent.width
+            visible: root.reconnecting && root.reconnectStillTrying
+            text: qsTr("Try now")
+
+            onClicked: root.client.retryNow()
         }
 
         // 06.1-19/J-07: ends the held session at once, through the ordinary end - billing

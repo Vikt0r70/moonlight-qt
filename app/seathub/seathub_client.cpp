@@ -4,6 +4,7 @@
 #include <QDesktopServices>
 #include <QDir>
 #include <QLoggingCategory>
+#include <QNetworkInformation>
 #include <QRandomGenerator>
 #include <QSettings>
 #include <QStringList>
@@ -55,10 +56,15 @@ const char* kStateError = "error";
 // Widening the frozen wording requires an ADR-0070 amendment and a version bump.
 constexpr int kDiagnosticsNoticeVersion = 1;
 
-// 06.1-19/J-07: the reconnect backoff (D-01's own reference points - ENet's ~10 s connection
-// timeout, Sunshine's 10 s `ping_timeout` - not a multiple of them).
-const int kReconnectInitialBackoffMs = 2000;
-const int kReconnectMaxBackoffMs = 15000;
+// ADR-0066 decision 9 (amended 2026-10-07): the reconnect pace is a first attempt at once, then
+// 1 s growing x1.6 with up to 20% jitter to a 5 s cap. `timing.md` V9.
+const int kReconnectInitialBackoffMs = 1000;
+const int kReconnectMaxBackoffMs = 5000;
+
+// V-OUTBOX (`timing.md` V42): the saved End is re-sent at once, then 1 s doubling with up to 20%
+// jitter to a 10 s cap.
+const int kEndOutboxInitialBackoffMs = 1000;
+const int kEndOutboxMaxBackoffMs = 10000;
 
 // `docs/spec/copy.md` §Sign in, path B.
 const char* kOtpMismatch = "That code didn't match. Try again or resend.";
@@ -80,6 +86,7 @@ const char* kHomeReady = "ready";
 const char* kHomeChecking = "checking";
 const char* kHomeBusy = "busy";
 const char* kHomeOffline = "offline";
+const char* kHomeEnding = "ending";
 const char* kHomeRefused = "refused";
 
 // `docs/spec/copy.md` §Play flow: the three customer-visible stage lines (`screens.md` §24). The
@@ -430,6 +437,31 @@ SeatHubClient::SeatHubClient(QObject* parent)
     m_reconnectTimer = new QTimer(this);
     m_reconnectTimer->setSingleShot(true);
     connect(m_reconnectTimer, &QTimer::timeout, this, &SeatHubClient::resumeAfterReconnect);
+    // V-COUNTDOWN: one tick per second keeps the held-retry and live-retry countdowns moving while
+    // either is pending; it is stopped the moment neither is.
+    m_retryTickTimer = new QTimer(this);
+    connect(m_retryTickTimer, &QTimer::timeout, this, &SeatHubClient::recomputeRetrySeconds);
+
+    // V-OUTBOX (V42): the saved-End re-send pace - 1 s doubling with jitter to a 10 s cap, on the
+    // facade thread (no engine runs while an unconfirmed End waits).
+    m_endOutboxTimer = new QTimer(this);
+    m_endOutboxTimer->setSingleShot(true);
+    connect(m_endOutboxTimer, &QTimer::timeout, this, &SeatHubClient::drainEndOutbox);
+
+    // V-WAKE (ADR-0083 decision 3): a wake-up hint only - never a connectivity gate, never shown as
+    // "you are offline". `loadDefaultBackend()` returning false (no platform backend) is not an
+    // error: the ordinary retry schedule still runs.
+    if (QNetworkInformation::loadDefaultBackend()) {
+        if (QNetworkInformation* info = QNetworkInformation::instance()) {
+            connect(info, &QNetworkInformation::reachabilityChanged, this,
+                    [this](QNetworkInformation::Reachability reachability) {
+                        if (reachability == QNetworkInformation::Reachability::Online
+                                || reachability == QNetworkInformation::Reachability::Site) {
+                            onNetworkBack();
+                        }
+                    });
+        }
+    }
 
     // 06.4/ADR-0067, D-04/D-06: the paused-fallback read (L5). Repeating, parented to `this` for
     // the same reason `m_reconnectTimer` is (its class comment above).
@@ -581,11 +613,16 @@ SeatHubClient::SeatHubClient(QObject* parent)
     // 06.4/ADR-0067, D-07 (the owner's design A-87): a revoked stream starts the signed-out
     // sequence, deferred while the engine's stream is running (Phase 3 D-33).
     connect(m_sse, &SseClient::revoked, this, &SeatHubClient::handleSseRevoked);
+    // V-COUNTDOWN: the SSE client publishes its own reconnect wait on the network thread; here it
+    // is cached, never read across threads.
+    connect(m_sse, &SseClient::retrySecondsChanged, this, &SeatHubClient::handleSseRetrySeconds);
 
     connect(m_pairing, &PairingController::pairingCompleted,
             this, &SeatHubClient::handlePairingCompleted);
     connect(m_pairing, &PairingController::pairingFailed,
             this, &SeatHubClient::handlePairingFailed);
+    connect(m_pairing, &PairingController::pairingLimited,
+            this, &SeatHubClient::handlePairingLimited);
     connect(m_pairing, &PairingController::stepFailed, this,
             [this](const QString& step, const QString& failureClass, qint64 elapsedMs) {
                 if (m_reconnecting) {
@@ -624,6 +661,8 @@ SeatHubClient::SeatHubClient(QObject* parent)
             this, &SeatHubClient::handleTeardownCompleted);
     connect(m_teardown, &TeardownController::teardownFailed,
             this, &SeatHubClient::handleTeardownFailed);
+    connect(m_teardown, &TeardownController::endAnswered,
+            this, &SeatHubClient::handleTeardownEndAnswered);
 
     // D-33: the horizon is the only locally enforced end.
     connect(m_horizon, &AuthorizedThroughTimer::horizonReached,
@@ -1049,11 +1088,324 @@ void SeatHubClient::endAttachedSessionBeforeStream(bool failed)
     }
     setAttachedSessionEnded(true);
     if (m_teardownGuard.markStarted()) {
+        // V-OUTBOX (L06): the End is written to disk before the first POST, tagged to the account
+        // that pressed it, so a crash or restart mid-teardown still re-sends it until the server
+        // confirms. `put` never carries a credential - only the account id.
+        const bool durable = m_endOutbox.put(m_sessionId, m_accountId, failed, newEndReport());
+        if (!durable) {
+            // The record could not be written. The End is still attempted, but nothing durable
+            // backs it: a restart cannot re-send it and Home must not claim it was saved.
+            qCWarning(seathubClient)
+                << "end outbox write failed - this End has no durable record:" << m_sessionId;
+        }
+        // C-ENDING (screens.md §23): the End is unconfirmed either way, so Home shows the ending
+        // state and Play stays disabled until the server confirms it - never ready before then.
+        setHomeStatus(QString::fromLatin1(kHomeEnding));
         m_teardown->teardown(m_sessionId, m_clientUuid, failed);
     }
     // else: this session's teardown was already claimed - by `handleReadyForDeletion()` or by an
     // earlier call here for the same session - and is already running. A second failure while it
     // is in flight must not start a second one (T-06.6-50).
+}
+
+// ---------------------------------------------------------------------------
+// T089 V-OUTBOX / V-WAKE / V-COUNTDOWN helpers
+// ---------------------------------------------------------------------------
+
+void SeatHubClient::setReconnectJitterProvider(std::function<double()> provider)
+{
+    m_reconnectJitterProvider = std::move(provider);
+}
+
+double SeatHubClient::reconnectJitter() const
+{
+    if (m_reconnectJitterProvider) {
+        return m_reconnectJitterProvider();
+    }
+    return QRandomGenerator::global()->generateDouble() * 0.2;
+}
+
+int SeatHubClient::jitteredReconnectDelay(int baseMs) const
+{
+    // ADR-0066 decision 9 / V42: up to 20% jitter, never negative.
+    const double jitter = qBound(0.0, reconnectJitter(), 0.2);
+    return baseMs + int(baseMs * jitter);
+}
+
+void SeatHubClient::onNetworkBack()
+{
+    // V-WAKE (ADR-0083 decision 3): the network came back. This is a wake-up hint, never a
+    // connectivity gate and never shown as "you are offline" - if it never fires the ordinary
+    // retry schedule still runs. It starts the next attempt at once and resets the backoff.
+    if (m_reconnecting && m_reconnectTimer->isActive()) {
+        m_reconnectBackoffMs = kReconnectInitialBackoffMs;
+        m_reconnectTimer->start(0);
+        recomputeRetrySeconds();
+    }
+    if (m_sse) {
+        onClientThread(m_sse, [this]() { m_sse->wakeNow(); });
+    }
+    // V-OUTBOX (V42): a network return also re-sends an unconfirmed End at once and resets its pace.
+    if (!m_accountId.isEmpty()
+        && (m_endOutbox.hasQueuedForAccount(m_accountId) || hasUnconfirmedEndForAccount())) {
+        m_endOutboxTimer->stop();
+        m_endOutboxBackoffMs = kEndOutboxInitialBackoffMs;
+        drainEndOutbox();
+    }
+}
+
+void SeatHubClient::retryNow()
+{
+    // C-RECONNECT (copy.md §Reconnect): `Try now` starts the next attempt at once. On the reconnect
+    // screen that is the held session's own attempt; on Home/offline the same press wakes the
+    // live-updates stream, the fallback read and any unconfirmed End, which are what those surfaces
+    // are counting down.
+    if (m_reconnecting && m_reconnectTimer->isActive()) {
+        m_reconnectBackoffMs = kReconnectInitialBackoffMs;
+        m_reconnectTimer->start(0);
+        recomputeRetrySeconds();
+    }
+    if (m_sse) {
+        onClientThread(m_sse, [this]() { m_sse->wakeNow(); });
+    }
+    if (m_accountFallbackTimer->isActive()) {
+        m_accountFallbackTimer->stop();
+        fetchAccountStateFallback();
+    }
+    if (!m_accountId.isEmpty()
+        && (m_endOutbox.hasQueuedForAccount(m_accountId) || hasUnconfirmedEndForAccount())) {
+        m_endOutboxTimer->stop();
+        m_endOutboxBackoffMs = kEndOutboxInitialBackoffMs;
+        drainEndOutbox();
+    }
+}
+
+void SeatHubClient::handlePairingLimited()
+{
+    // V10 (ADR-0066 decision 8): the reconnect episode has spent its three PIN-bearing pairings
+    // (409 `session.pairing_limit`). Stop arming new attempts, but keep the reconnect screen and
+    // the held session until the server's grace ends (`handleReconnectEnded()`).
+    if (!m_reconnecting) {
+        return;
+    }
+    m_pairingLimited = true;
+    m_reconnectTimer->stop();
+    recomputeRetrySeconds();
+    if (!m_reconnectStillTrying) {
+        m_reconnectStillTrying = true;
+        emit reconnectStillTryingChanged();
+    }
+}
+
+void SeatHubClient::handleTeardownEndAnswered(const QString& sessionId, int statusCode)
+{
+    // V-OUTBOX (L06): a real answer to the End POST. 2xx confirms the end and 404 means the server
+    // holds no such session, so both finish the durable record. Any other answer (0, 401, 5xx)
+    // keeps it: the outbox re-sends it until one of those two arrives.
+    const bool answered = (statusCode >= 200 && statusCode < 300) || statusCode == 404;
+    if (!answered || sessionId.isEmpty()) {
+        return;
+    }
+    m_endOutbox.remove(sessionId);
+    // The in-memory intent (write failed) answers to the same two statuses and nothing else.
+    clearUnconfirmedEnd(sessionId);
+    // Home's own transition out of the ending state belongs to the paths that already own it: the
+    // terminal teardown result (`handleTeardownCompleted`) and an outbox drain's own answer. This
+    // acknowledgement only drops the durable record, so it can never race those writers.
+}
+
+void SeatHubClient::rememberUnconfirmedEnd(const QString& sessionId, bool failed,
+                                           const EndReport& report)
+{
+    // V-OUTBOX: the disk record could not be written. The End still has to hold Play back for this
+    // run - the server still holds the session - but it is not crash-durable, and nothing may tell
+    // the customer otherwise. The tag is this account, so a replaced sign-in cannot clear it.
+    m_unconfirmedEndSessionId = sessionId;
+    m_unconfirmedEndAccountId = m_accountId;
+    m_unconfirmedEndFailed = failed;
+    m_unconfirmedEndReport = report;
+}
+
+bool SeatHubClient::persistUnconfirmedEnd()
+{
+    if (m_unconfirmedEndSessionId.isEmpty() || m_unconfirmedEndAccountId != m_accountId) {
+        return false;
+    }
+    // A repaired directory (the customer freed space, a policy allowed the write) or a later launch
+    // can still make this End durable. Only then does it stop being an in-memory intent.
+    if (m_endOutbox.put(m_unconfirmedEndSessionId, m_unconfirmedEndAccountId,
+                        m_unconfirmedEndFailed, m_unconfirmedEndReport)) {
+        m_unconfirmedEndSessionId.clear();
+        m_unconfirmedEndAccountId.clear();
+        return true;
+    }
+    return false;
+}
+
+void SeatHubClient::clearUnconfirmedEnd(const QString& sessionId)
+{
+    if (!sessionId.isEmpty() && m_unconfirmedEndSessionId == sessionId) {
+        m_unconfirmedEndSessionId.clear();
+        m_unconfirmedEndAccountId.clear();
+    }
+}
+
+bool SeatHubClient::hasUnconfirmedEndForAccount() const
+{
+    return !m_unconfirmedEndSessionId.isEmpty() && !m_accountId.isEmpty()
+        && m_unconfirmedEndAccountId == m_accountId;
+}
+
+bool SeatHubClient::hasUnconfirmedEnd(const QString& sessionId) const
+{
+    return !sessionId.isEmpty() && m_unconfirmedEndSessionId == sessionId;
+}
+
+void SeatHubClient::updateHomeStatusForEndOutbox()
+{
+    if (!m_accountId.isEmpty()
+        && (m_endOutbox.hasQueuedForAccount(m_accountId) || hasUnconfirmedEndForAccount())) {
+        // C-ENDING (screens.md §23): Home shows the ending state, never ready, while an End is
+        // saved - or, when the write failed, still remembered for this run - but not confirmed.
+        setHomeStatus(QString::fromLatin1(kHomeEnding));
+    }
+}
+
+void SeatHubClient::scheduleEndOutboxRetry()
+{
+    // V-OUTBOX (V42): 1 s doubling with up to 20% jitter to a 10 s cap.
+    m_endOutboxTimer->start(jitteredReconnectDelay(m_endOutboxBackoffMs));
+    m_endOutboxBackoffMs = qMin(m_endOutboxBackoffMs * 2, kEndOutboxMaxBackoffMs);
+}
+
+void SeatHubClient::drainEndOutbox()
+{
+    // One drain at a time: launch, sign-in, network-back, before-Play and the retry timer can all
+    // ask at once, and a second concurrent drain would post every record twice.
+    if (m_endOutboxInFlight) {
+        return;
+    }
+    if (m_accountId.isEmpty()) {
+        return;
+    }
+    // Scoped to the account that started this drain: a late answer for a superseded sign-in must
+    // not clear - or set - the current account's Home state, and must not touch another account's
+    // record (that record is never this drain's to send or remove).
+    const QString accountId = m_accountId;
+    const quint64 epoch = m_authEpoch;
+    // V-OUTBOX: an intent whose write once failed gets another chance to become durable on every
+    // drain trigger, so a repaired destination is picked up without any new machinery.
+    persistUnconfirmedEnd();
+    QList<EndOutbox::Entry> entries = m_endOutbox.entriesForAccount(accountId);
+    if (hasUnconfirmedEndForAccount() && !m_endOutbox.hasQueued(m_unconfirmedEndSessionId)) {
+        // Still not on disk. It is sent anyway - the rule is that every End is saved before it is
+        // sent, not that an unwritable disk cancels the End - and it stays remembered until an
+        // answer confirms it.
+        EndOutbox::Entry entry;
+        entry.sessionId = m_unconfirmedEndSessionId;
+        entry.failed = m_unconfirmedEndFailed;
+        entry.report = m_unconfirmedEndReport;
+        entries.append(entry);
+    }
+    if (entries.isEmpty()) {
+        return;
+    }
+    // C-ENDING (screens.md §23): a record this drain is about to send is an End saved but not yet
+    // confirmed, so Home shows the ending state until an answer confirms it - including straight
+    // after a restart, when the record was written by an earlier run.
+    updateHomeStatusForEndOutbox();
+    m_endOutboxInFlight = true;
+    m_endOutboxPending = entries.size();
+    for (const EndOutbox::Entry& entry : entries) {
+        const QString sessionId = entry.sessionId;
+        m_controlPlane->endSession(sessionId, entry.failed, entry.report,
+                                   [this, sessionId, accountId, epoch](const ControlPlaneResult& result) {
+            onClientThread(this, [this, sessionId, accountId, epoch, result]() {
+                if (m_endOutboxPending > 0 && --m_endOutboxPending == 0) {
+                    m_endOutboxInFlight = false;
+                }
+                switch (EndOutbox::classify(result)) {
+                case EndOutbox::Delivered:
+                case EndOutbox::Refused:
+                    // 2xx confirms; 404 means the session is already gone - both drop the record.
+                    m_endOutbox.remove(sessionId);
+                    clearUnconfirmedEnd(sessionId);
+                    break;
+                case EndOutbox::AuthFailed:
+                case EndOutbox::Retryable:
+                case EndOutbox::Aborted:
+                    // Any other answer (0/5xx/401) keeps the record and re-sends later.
+                    scheduleEndOutboxRetry();
+                    break;
+                }
+                if (epoch == m_authEpoch) {
+                    if (!m_endOutbox.hasQueuedForAccount(accountId)
+                        && !hasUnconfirmedEndForAccount()
+                        && m_homeStatus == QLatin1String(kHomeEnding)) {
+                        setHomeStatus(QString::fromLatin1(kHomeReady));
+                    }
+                }
+            });
+        });
+    }
+}
+
+void SeatHubClient::setEndOutboxDirectory(const QString& directory)
+{
+    m_endOutbox.setDirectory(directory);
+}
+
+bool SeatHubClient::hasSavedEnd() const
+{
+    return !m_accountId.isEmpty() && m_endOutbox.hasQueuedForAccount(m_accountId);
+}
+
+void SeatHubClient::recomputeRetrySeconds()
+{
+    // V-COUNTDOWN (ADR-0083 decision 7): republish the two countdowns each second while one is
+    // pending. The held retry is the facade's own `m_reconnectTimer`; the live retry is the sooner
+    // of the SSE client's published wait and the 10 s fallback read.
+    int held = -1;
+    if (m_reconnecting && m_reconnectTimer->isActive()) {
+        const int remaining = m_reconnectTimer->remainingTime();
+        if (remaining >= 0) {
+            held = (remaining + 999) / 1000;
+        }
+    }
+    int live = m_liveSseRetrySeconds;
+    if (m_accountFallbackTimer->isActive()) {
+        const int remaining = m_accountFallbackTimer->remainingTime();
+        if (remaining >= 0) {
+            const int fallback = (remaining + 999) / 1000;
+            live = (live < 0) ? fallback : qMin(live, fallback);
+        }
+    }
+    if (held != m_heldRetrySeconds) {
+        m_heldRetrySeconds = held;
+        emit reconnectRetrySecondsChanged();
+    }
+    if (live != m_liveRetrySeconds) {
+        m_liveRetrySeconds = live;
+        emit liveRetrySecondsChanged();
+    }
+    // The tick runs only while something is genuinely pending - a new wait after a previous one
+    // ended starts it again, so a countdown is never left stale or invisible.
+    const bool pending = m_heldRetrySeconds > 0 || m_liveRetrySeconds > 0;
+    if (pending) {
+        if (!m_retryTickTimer->isActive()) {
+            m_retryTickTimer->start(1000);
+        }
+    } else if (m_retryTickTimer->isActive()) {
+        m_retryTickTimer->stop();
+    }
+}
+
+void SeatHubClient::handleSseRetrySeconds(int seconds)
+{
+    // V-COUNTDOWN: the SSE client published its own schedule from the network thread; cache it and
+    // republish the surfaces. This is the queued hand-off - the timer itself is never read here.
+    m_liveSseRetrySeconds = seconds;
+    recomputeRetrySeconds();
 }
 
 // ---------------------------------------------------------------------------
@@ -1083,10 +1435,13 @@ void SeatHubClient::enterReconnect()
 {
     m_reconnecting = true;
     m_reconnectBackoffMs = kReconnectInitialBackoffMs;
+    m_pairingLimited = false;
+    // V-COUNTDOWN: a new episode starts with no retry armed, so no stale countdown shows.
+    recomputeRetrySeconds();
     // WR-15: this is the header's own documented reset point ("Reset in `enterReconnect()`") -
     // without it, once any attempt in an earlier episode of this same session ever reached
     // `retryReconnectOrGiveUp()` once, every later episode's own first attempt would show "Still
-    // trying" instead of "Connection lost. Reconnecting... (n of 5)".
+    // trying" instead of the in-flight "Reconnecting…".
     if (m_reconnectStillTrying) {
         m_reconnectStillTrying = false;
         emit reconnectStillTryingChanged();
@@ -1134,11 +1489,19 @@ void SeatHubClient::retryReconnectOrGiveUp()
         m_reconnectStillTrying = true;
         emit reconnectStillTryingChanged();
     }
-    m_reconnectBackoffMs = qMin(m_reconnectBackoffMs * 2, kReconnectMaxBackoffMs);
+
+    // ADR-0066 decision 9: arm this retry at the current backoff (with up to 20% jitter), then
+    // grow the next one by x1.6 to the 5 s cap. The first attempt of the episode was already made
+    // at once (`handleReadyForDeletion()` arms 0), so this is the second attempt onwards.
+    m_reconnectTimer->start(jitteredReconnectDelay(m_reconnectBackoffMs));
+    recomputeRetrySeconds();
+    m_reconnectBackoffMs = qMin(int(m_reconnectBackoffMs * 1.6), kReconnectMaxBackoffMs);
 
     // No poll runs during the backoff gap between attempts (the pairing controller has already
     // failed or finished for this attempt): fetched once here so a server-side ending reached
-    // while nothing was polling is still caught before the next attempt starts.
+    // while nothing was polling is still caught before the next attempt starts. V9: the next
+    // attempt is armed above whether or not this read answers - and with the 8 s request limit
+    // (V-REQ) it always answers, so the retry cannot hang on a dead connection.
     const QString sessionId = m_sessionId;
     m_controlPlane->fetchSession(sessionId, [this, sessionId](const ControlPlaneResult& result) {
         onClientThread(this, [this, sessionId, result]() {
@@ -1154,7 +1517,6 @@ void SeatHubClient::retryReconnectOrGiveUp()
                 }
                 applyReconnectSessionFields(session);
             }
-            m_reconnectTimer->start(m_reconnectBackoffMs);
         });
     });
 }
@@ -1269,7 +1631,10 @@ void SeatHubClient::endHeldSession()
     endAttachedSessionBeforeStream(false);
     m_sessionChannel->close();
     resetConnecting();
-    setHomeStatus(QString::fromLatin1(kHomeReady));
+    // C-ENDING (screens.md §23): `endAttachedSessionBeforeStream()` above already saved the End and
+    // put Home into the ending state; it must stay there until the server confirms, so this must
+    // not force "ready" back over it.
+    updateHomeStatusForEndOutbox();
     setAppState(!m_signedIn ? QString::fromLatin1(kStateSignedOut)
                             : QString::fromLatin1(kStateHome));
 }
@@ -1470,6 +1835,15 @@ void SeatHubClient::start()
     // the server still considers it live). Idempotent with C2's own end attempt; the wait this
     // starts is what keeps the POST below from meeting the "one nonterminal session per
     // customer" refusal (409 `USER_HAS_NONTERMINAL_SESSION`, `openapi.yaml`).
+    // V-OUTBOX (L06): a saved End is re-sent before any Play, so the server sees the end before
+    // the new allocation.
+    drainEndOutbox();
+    if (hasSavedEnd() || hasUnconfirmedEndForAccount()) {
+        // C-ENDING (screens.md §23): an End for this account is still unconfirmed, so the server may
+        // still hold the session. Play must not start a new one until the server confirms the end.
+        updateHomeStatusForEndOutbox();
+        return;
+    }
     if (endAttachedSessionBeforePlay()) {
         return;
     }
@@ -1488,6 +1862,18 @@ bool SeatHubClient::endAttachedSessionBeforePlay()
     }
     setRetryBusy(true);
     if (m_teardownGuard.markStarted()) {
+        // V-OUTBOX (L06): every first End is saved before it is sent, this pre-Play one included,
+        // so a crash or restart between here and the server's answer still re-sends it.
+        const bool durable = m_endOutbox.put(m_sessionId, m_accountId, false, newEndReport());
+        if (!durable) {
+            // Nothing durable backs this End. It is still sent, but Home must not claim it was
+            // saved, and Play stays blocked: the ending state here, or the failure screen the
+            // teardown raises when the send fails, never a ready Home with this session un-ended.
+            rememberUnconfirmedEnd(m_sessionId, false, newEndReport());
+            qCWarning(seathubClient)
+                << "end outbox write failed - this End has no durable record:" << m_sessionId;
+        }
+        setHomeStatus(QString::fromLatin1(kHomeEnding));
         m_teardown->teardown(m_sessionId, m_clientUuid, false);
     }
     // else: this session's end was already claimed - C2's own pre-stream failure path, or an
@@ -1881,6 +2267,8 @@ bool SeatHubClient::adoptSignIn(const AuthTokenPair& pair, const QString& identi
                 // that the account is known - to their own session ids and this account only.
                 m_streamTime->setAccountId(m_accountId);
                 drainStreamTimeOutbox();
+                // V-OUTBOX (L06): the same for an End an earlier run could not confirm.
+                drainEndOutbox();
             }
         });
     });
@@ -2015,6 +2403,10 @@ void SeatHubClient::signOut()
     HeldRigTrust::clear();
     m_streamTimeOutbox->cancel();
     m_streamTime->endSession();
+    // V-OUTBOX: the in-memory End intent belongs to the account that is about to be cleared, so it
+    // goes with it (the on-disk record stays tagged and is re-sent if that account signs in again).
+    m_unconfirmedEndSessionId.clear();
+    m_unconfirmedEndAccountId.clear();
 
     // WR-06: an untagged report (parsed before `m_accountId` was ever resolved this epoch) can
     // never be tagged now - the epoch it was held for is about to be over, and dropping it here,
@@ -2169,6 +2561,8 @@ void SeatHubClient::applyRestoreResult(const ControlPlaneResult& result)
             setSignedIn(true);
             setAccount(account);
             setHomeStatus(QString::fromLatin1(kHomeReady));
+            // C-ENDING: a saved End from an earlier run still outranks ready.
+            updateHomeStatusForEndOutbox();
             setAppState(QString::fromLatin1(kStateHome));
 
             // 06.4/ADR-0067, D-01: opened the moment a restore is confirmed - the same channel
@@ -2230,6 +2624,8 @@ void SeatHubClient::applyRestoreResult(const ControlPlaneResult& result)
     ++m_authEpoch;
     setSignedIn(true);
     setHomeStatus(QString::fromLatin1(kHomeOffline));
+    // C-ENDING: a saved End outranks the offline notice.
+    updateHomeStatusForEndOutbox();
     setAppState(QString::fromLatin1(kStateHome));
 }
 
@@ -2267,6 +2663,8 @@ void SeatHubClient::setAccount(const AccountInfo& account)
     // replayed after the relaunch, to the same session and the same account only.
     m_streamTime->setAccountId(m_accountId);
     drainStreamTimeOutbox();
+    // V-OUTBOX (L06): an End an earlier run could not confirm is re-sent now the account is known.
+    drainEndOutbox();
 }
 
 QString SeatHubClient::qualityOutboxDirectory() const
@@ -2456,7 +2854,13 @@ void SeatHubClient::dismissError()
     clearFailure();
     setInSettings(false);
     setInProfile(false);
-    setHomeStatus(QString::fromLatin1(kHomeReady));
+    // C-ENDING: a saved End the server has not confirmed keeps Home in the ending state - dismissing
+    // an error must not make Play look ready over an unconfirmed End.
+    if (hasSavedEnd() || hasUnconfirmedEndForAccount()) {
+        updateHomeStatusForEndOutbox();
+    } else {
+        setHomeStatus(QString::fromLatin1(kHomeReady));
+    }
     setAppState(!m_signedIn ? QString::fromLatin1(kStateSignedOut)
                             : QString::fromLatin1(kStateHome));
 }
@@ -2741,7 +3145,11 @@ void SeatHubClient::handleReadyForDeletion()
         // Only the local engine object goes away, and the next attempt starts after the backoff.
         releaseEngineSession();
         m_settings->noteSessionFinished();
-        m_reconnectTimer->start(m_reconnectBackoffMs);
+        // ADR-0066 decision 9: the first attempt of a reconnect episode is made at once. The
+        // backoff applies to the attempts after it (`retryReconnectOrGiveUp()`).
+        m_reconnectBackoffMs = kReconnectInitialBackoffMs;
+        m_reconnectTimer->start(0);
+        recomputeRetrySeconds();
         return;
     }
 
@@ -2789,6 +3197,19 @@ void SeatHubClient::handleReadyForDeletion()
         EndReport report = newEndReport();
         report.attemptStep = m_lastFailedStep;
         const bool failed = !report.customerQuit && !report.attemptStep.isEmpty();
+        // V-OUTBOX (L06): every End caller saves the End to disk before the first POST, tagged to
+        // the account that pressed it. This is the ordinary in-stream quit path; the pre-engine
+        // path (`endAttachedSessionBeforeStream()`) saves the same record.
+        const bool durable = m_endOutbox.put(m_sessionId, m_accountId, failed, report);
+        if (!durable) {
+            // V-OUTBOX: the disk record failed, so this End is remembered for this run instead.
+            // Play stays blocked and Home keeps the ending state until an answer confirms it; it is
+            // never presented as crash-durable.
+            rememberUnconfirmedEnd(m_sessionId, failed, report);
+            qCWarning(seathubClient)
+                << "end outbox write failed - this End has no durable record:" << m_sessionId;
+        }
+        setHomeStatus(QString::fromLatin1(kHomeEnding));
         m_teardown->teardown(m_sessionId, m_clientUuid, failed, report);
     }
 
@@ -3326,6 +3747,8 @@ void SeatHubClient::handleSsePaused(bool paused)
     else {
         m_accountFallbackTimer->stop();
     }
+    // V-COUNTDOWN: the fallback read's own countdown just started or stopped.
+    recomputeRetrySeconds();
 }
 
 void SeatHubClient::handleSseLiveUpdatesLost(bool lost)
@@ -3710,6 +4133,12 @@ void SeatHubClient::handlePairingFailed(const SeatHubFailure& failure)
     m_pairingClassification = PairingHandshakeResult();
 
     if (m_reconnecting) {
+        if (m_pairingLimited) {
+            // V10 (ADR-0066 decision 8): this episode has spent its three PIN-bearing pairings
+            // (409 `session.pairing_limit`). Do not arm another attempt - keep the reconnect screen
+            // and the held session until the server's grace ends (`handleReconnectEnded()`).
+            return;
+        }
         // 06.1-19/J-07: a pairing failure during a reconnect attempt - nothing streams on this
         // attempt, but the session is still the server's to end, not this client's: schedule the
         // next attempt instead of the ordinary pre-stream teardown below, which would end a
@@ -4026,6 +4455,17 @@ void SeatHubClient::handleTeardownCompleted(const SessionInfo& finalSession,
     // clearing it here keeps "no session" and "no claim" the same state, which is what the guard
     // documents.
     m_teardownGuard.reset();
+    // V-OUTBOX (L06): the server confirmed the End - the durable record goes and Home may be ready
+    // again. Only the ending state this outbox wrote is cleared; a server refusal or an error screen
+    // is left exactly as that answer put it.
+    m_endOutbox.remove(sessionId);
+    // The in-memory intent ends the same way: this session's terminal result is proof enough.
+    clearUnconfirmedEnd(sessionId);
+    // C-ENDING: teardown completing is the server confirming this session is over, so Home is ready
+    // again here. The ending state itself is raised by `updateHomeStatusForEndOutbox()` wherever an
+    // unconfirmed End is found or sent, and this is the point that clears it once the session is
+    // proven over; a refusal or error screen raised by a later Play is untouched.
+    setHomeStatus(QString::fromLatin1(kHomeReady));
     m_billing.clear();
     m_sessionWarning.clear();
     emit billingChanged();
@@ -4111,6 +4551,23 @@ void SeatHubClient::handleTeardownFailed(const SeatHubFailure& failure, const QS
     // it, then a fresh Play" sequence C4 already describes.
     m_teardownGuard.reset();
     setRetryBusy(false);
+
+    // V-OUTBOX (V42/L06): what the End answered decides whether the record is done. A 404 is a
+    // confirmation (the session is already gone) and drops it; status 0, 5xx and 401 keep it, so
+    // Home shows the ending state and the outbox re-sends on its own pace instead of telling the
+    // customer the session is over. Anything else with no record is surfaced below.
+    const bool hasRecord = !m_accountId.isEmpty()
+        && m_endOutbox.hasQueuedForAccount(m_accountId);
+    if (failure.kind == FailureKind::Api && failure.statusCode == 404) {
+        m_endOutbox.remove(sessionId);
+        clearUnconfirmedEnd(sessionId);
+    } else if (hasRecord) {
+        updateHomeStatusForEndOutbox();
+        setAppState(!m_signedIn ? QString::fromLatin1(kStateSignedOut)
+                                : QString::fromLatin1(kStateHome));
+        scheduleEndOutboxRetry();
+        return;
+    }
 
     // STREAM-10: the rig-side disable/remove/verify did not complete, or something was left
     // stored on this PC. Reporting success would tell the customer the opposite of what is true,

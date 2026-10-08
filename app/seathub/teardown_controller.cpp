@@ -212,6 +212,12 @@ void TeardownController::handleEndResult(quint64 attempt, const ControlPlaneResu
         return;
     }
 
+    // V-OUTBOX (L06): the End POST itself has now been answered. The facade drops its durable
+    // record on 2xx (confirmed) or 404 (the session is already gone) and keeps it on 0/401/5xx.
+    // This is the acknowledgement of the HTTP call only - the teardown still observes the
+    // session's own progress below, and a terminal read is still the only proof the session ended.
+    emit endAnswered(m_sessionId, result.statusCode);
+
     if (!result.ok) {
         fail(result.toFailure());
         return;

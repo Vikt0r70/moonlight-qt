@@ -39,6 +39,7 @@
 #include "hud_overlay.h"
 #include "liveness_timer.h"
 #include "engine_status.h"
+#include "end_outbox.h"
 #include "stream_quality_sampler.h"
 #include "log_tee.h"
 #include "moonlight_engine_session.h"
@@ -176,7 +177,7 @@ class SeatHubClient : public QObject
     Q_PROPERTY(bool reconnecting READ reconnecting NOTIFY reconnectingChanged)
 
     /// The server's own `reconnect_count` from the last session read, cached at read time - the
-    /// count of reconnects already committed, so the screen's "(n of 5)" is `reconnectCount + 1`.
+    /// count of reconnects already committed. No screen shows this count any more (C-RECONNECT).
     Q_PROPERTY(int reconnectCount READ reconnectCount NOTIFY reconnectCountChanged)
 
     /// Whole minutes left in the server's grace, computed once at the moment each session read is
@@ -184,9 +185,11 @@ class SeatHubClient : public QObject
     /// `grace_deadline_at` against this client's clock. `-1` until a read has named one.
     Q_PROPERTY(int graceMinutesLeft READ graceMinutesLeft NOTIFY graceMinutesLeftChanged)
 
-    /// True once this reconnect episode's first attempt has failed or timed out - the screen's
-    /// "Still trying" line replaces "Reconnecting… (n of 5)" from here on.
+    /// True once this reconnect episode's first attempt has failed or timed out - the screen then
+    /// shows `Trying again in {n} s` rather than the in-flight `Reconnecting…`.
     Q_PROPERTY(bool reconnectStillTrying READ reconnectStillTrying NOTIFY reconnectStillTryingChanged)
+    Q_PROPERTY(int reconnectRetrySeconds READ reconnectRetrySeconds NOTIFY reconnectRetrySecondsChanged)
+    Q_PROPERTY(int liveRetrySeconds READ liveRetrySeconds NOTIFY liveRetrySecondsChanged)
 
     /// True once a held session's reconnect has been given up on (the server's grace expired, or
     /// the reconnect limit was reached) rather than succeeding or being ended by the customer -
@@ -359,6 +362,15 @@ public:
     int graceMinutesLeft() const { return m_graceMinutesLeft; }
     bool reconnectStillTrying() const { return m_reconnectStillTrying; }
     bool reconnectEnded() const { return m_reconnectEnded; }
+    /// V-COUNTDOWN (ADR-0083 decision 7): whole seconds until the held reconnect's next attempt,
+    /// or -1 when none is armed. This is the held `m_reconnectTimer`'s own schedule - the value the
+    /// reconnect screen counts down. The facade republishes it once a second (NOTIFY) instead of QML
+    /// polling, so a wait that begins after a previous one ended still appears.
+    int reconnectRetrySeconds() const { return m_heldRetrySeconds; }
+    /// V-COUNTDOWN: whole seconds to the sooner of the next live-updates retry and the next 10 s
+    /// fallback read (the Home-offline and balance-pill countdown), or -1 when neither is pending.
+    /// Published (NOTIFY) from the network thread's own schedule - never read across threads.
+    int liveRetrySeconds() const { return m_liveRetrySeconds; }
     bool inProfile() const { return m_inProfile; }
     SessionListModel* sessionHistory() const { return m_sessionHistory; }
     CreditHistoryModel* creditHistory() const { return m_creditHistory; }
@@ -390,6 +402,22 @@ public:
     /// the ordinary end (not `failed`), whether an attempt's own engine is currently running, mid
     /// re-pairing, or waiting out a backoff. A no-op unless `reconnecting`.
     Q_INVOKABLE void endHeldSession();
+
+    /// V-WAKE (ADR-0083 decision 3): the platform network came back. A wake-up hint only - never a
+    /// connectivity gate. Public so a test can drive it without a platform backend.
+    Q_INVOKABLE void onNetworkBack();
+
+    /// C-RECONNECT: the customer pressed `Try now` - start the next reconnect attempt at once.
+    Q_INVOKABLE void retryNow();
+
+    /// Test seam: the jitter source for the reconnect/outbox backoff (defaults to 0-20% random).
+    void setReconnectJitterProvider(std::function<double()> provider);
+
+    /// Test seam: point the durable End outbox at a temporary directory.
+    void setEndOutboxDirectory(const QString& directory);
+
+    /// C-ENDING: is an End saved on disk for the signed-in account?
+    bool hasSavedEnd() const;
 
     /// Sign-in step 1 (D-55 shell, stubbed in Plan 03-02).
     Q_INVOKABLE void requestOtp(const QString& phoneE164);
@@ -548,6 +576,8 @@ signals:
     void reconnectCountChanged();
     void graceMinutesLeftChanged();
     void reconnectStillTryingChanged();
+    void reconnectRetrySecondsChanged();
+    void liveRetrySecondsChanged();
     void inProfileChanged();
     void totalsChanged();
     void accountStatusChanged();
@@ -596,6 +626,9 @@ private slots:
     void handleSsePaused(bool paused);
     /// `SseClient::liveUpdatesLostChanged` (R7): shows or hides the live-updates indicator.
     void handleSseLiveUpdatesLost(bool lost);
+    /// V-COUNTDOWN: the SSE client's own reconnect schedule changed (published on the network
+    /// thread, delivered queued) - cache it and republish the surfaces' countdowns.
+    void handleSseRetrySeconds(int seconds);
     /// `SseClient::revoked` (`stream.closing {reason: "revoked"}`, or a 401/403 on the stream
     /// request itself): the D-07 signed-out sequence, deferred while the stream is running.
     void handleSseRevoked();
@@ -645,6 +678,11 @@ private slots:
     /// the server does.
     void handleCredentialRefused();
 
+    /// V10 (ADR-0066 decision 8): the episode's three PIN-bearing pairings are spent (409
+    /// `session.pairing_limit`). Stop arming new attempts; keep the reconnect screen until grace.
+    void handlePairingLimited();
+    void handleTeardownEndAnswered(const QString& sessionId, int statusCode);
+
 private:
     void setAppState(const QString& state);
     void setStageText(const QString& text);
@@ -668,6 +706,27 @@ private:
     /// only time a failure becomes a stall rather than the error view.
     bool connectingSession() const;
     void setHomeStatus(const QString& status);
+    /// V-OUTBOX (L06): show Home's ending state while an End is saved but unconfirmed.
+    void recomputeRetrySeconds();
+    void updateHomeStatusForEndOutbox();
+    /// V-OUTBOX: the End intent kept in memory when the disk record could not be written. It is not
+    /// crash-durable and is never presented as such; it only stops Play from allocating while the
+    /// server may still hold the session, and it is dropped by the same 2xx/404 answer that drops a
+    /// durable record (or by the session's own terminal teardown result).
+    void rememberUnconfirmedEnd(const QString& sessionId, bool failed, const EndReport& report);
+    /// Tries to make the in-memory intent durable again (a repaired directory or a network return).
+    /// Returns true once a record exists on disk.
+    bool persistUnconfirmedEnd();
+    void clearUnconfirmedEnd(const QString& sessionId);
+    bool hasUnconfirmedEndForAccount() const;
+    bool hasUnconfirmedEnd(const QString& sessionId) const;
+    /// V-OUTBOX (V42): re-send every saved End for the signed-in account; drop on 2xx/404.
+    void drainEndOutbox();
+    /// V-OUTBOX (V42): 1 s doubling with jitter to a 10 s cap.
+    void scheduleEndOutboxRetry();
+    /// ADR-0066 decision 9 / V42: the jittered delay for `baseMs` (up to 20%).
+    int jitteredReconnectDelay(int baseMs) const;
+    double reconnectJitter() const;
     void setEndReasonText(const QString& text);
     void raiseFailure(const SeatHubFailure& failure);
     void clearFailure();
@@ -1137,9 +1196,8 @@ private:
     /// True from `enterReconnect()` until the reconnect succeeds, is given up on, or the customer
     /// ends the held session (`endHeldSession()`).
     bool m_reconnecting = false;
-    /// The next attempt's delay: 2 s initially, doubling on every failed attempt, capped at 15 s
-    /// (D-01's own reference points - ENet's ~10 s connection timeout, Sunshine's 10 s
-    /// `ping_timeout` - not a multiple of them).
+    /// The next attempt's delay: 1 s initially, growing x1.6 with up to 20% jitter, capped at 5 s
+    /// (ADR-0066 decision 9, amended 2026-10-07).
     int m_reconnectBackoffMs = 0;
     /// Single-shot; its timeout re-enters `beginSession()`'s reconnect path for `m_sessionId`.
     /// Lives on the facade's own thread (never moved, unlike `m_liveness`/`m_pairing`): no engine
@@ -1157,6 +1215,35 @@ private:
     /// (`applyReconnectSessionFields()`) - `reconnectCount`/`graceMinutesLeft`'s backing state.
     int m_reconnectCount = 0;
     int m_graceMinutesLeft = -1;
+    /// V10 (ADR-0066 decision 8): set when the episode's three PIN-bearing pairings are spent
+    /// (409 `session.pairing_limit`); stops new attempts until the grace ends.
+    bool m_pairingLimited = false;
+    /// ADR-0066 decision 9: the jitter source for the reconnect/outbox backoff. Empty uses 0-20%
+    /// random; tests set it for deterministic delays.
+    std::function<double()> m_reconnectJitterProvider;
+    /// V-OUTBOX (L06): the durable End outbox, and its own re-send pace (V42).
+    EndOutbox m_endOutbox;
+    QTimer* m_endOutboxTimer = nullptr;
+    int m_endOutboxBackoffMs = 1000;
+    /// V-COUNTDOWN: the published countdowns and their sources. `m_heldRetrySeconds` mirrors the
+    /// held `m_reconnectTimer` (facade thread); `m_liveSseRetrySeconds` is the value the SSE client
+    /// publishes from the network thread, combined with the fallback timer into `m_liveRetrySeconds`.
+    int m_heldRetrySeconds = -1;
+    int m_liveRetrySeconds = -1;
+    int m_liveSseRetrySeconds = -1;
+    /// Repeating 1 s tick that keeps both countdowns moving; runs only while one is pending.
+    QTimer* m_retryTickTimer = nullptr;
+    /// V-OUTBOX: one drain at a time, and how many of its answers are still outstanding, so an
+    /// overlap of launch/sign-in/network/wake/before-Play cannot post the same record twice.
+    bool m_endOutboxInFlight = false;
+    int m_endOutboxPending = 0;
+    /// V-OUTBOX: an End whose disk record could not be written. The account tag scopes it exactly
+    /// like the on-disk record, so a replaced sign-in never blocks - or is blocked by - it, and it
+    /// is cleared by this End's own 2xx/404 answer or the session's terminal teardown result.
+    QString m_unconfirmedEndSessionId;
+    QString m_unconfirmedEndAccountId;
+    bool m_unconfirmedEndFailed = false;
+    EndReport m_unconfirmedEndReport;
     /// What pairing returned about this client: the SHA-256 fingerprint of its own certificate,
     /// which is the identity a host-side reader of Sunshine's client list can match to this
     /// client's record. It is the only thing that identifies this client - never the rig's name,

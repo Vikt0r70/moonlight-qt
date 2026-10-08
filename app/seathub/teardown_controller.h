@@ -125,6 +125,14 @@ signals:
     /// `failure = "TEARDOWN_TIMEOUT"` so support can tell it apart from a transport failure.
     /// `sessionId` is the session this teardown ran for (see `teardownCompleted`).
     void teardownFailed(const SeatHubFailure& failure, const QString& sessionId);
+
+    /// The End POST itself was answered (V-OUTBOX, L06). `statusCode` is the HTTP status, or 0
+    /// when the call never reached the server. 2xx confirms the end and 404 means the server holds
+    /// no such session, so the facade drops its durable record for both; any other answer keeps it
+    /// for the outbox to re-send. This is an acknowledgement of the HTTP call only - it is not the
+    /// terminal poll, and the teardown still observes the session's own progress.
+    void endAnswered(const QString& sessionId, int statusCode);
+
     /// Emitted once per stage entry, so the order is observable in a log and by a test.
     void stageEntered(TeardownStage stage);
 

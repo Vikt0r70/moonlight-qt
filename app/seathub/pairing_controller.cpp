@@ -45,6 +45,11 @@ PairingController::PairingController(QObject* parent)
 {
     m_pollTimer->setSingleShot(true);
     connect(m_pollTimer, &QTimer::timeout, this, &PairingController::pollAuthorization);
+    // V9: the deadline's own timer. Unlike the poll-entry check, this fires even when a poll reply
+    // never arrives (a stalled transport), which is exactly the case the own timer is for.
+    m_deadlineTimer = new QTimer(this);
+    m_deadlineTimer->setSingleShot(true);
+    connect(m_deadlineTimer, &QTimer::timeout, this, &PairingController::deadlineExpired);
     connect(this, &QObject::destroyed, []() { LogShipper::clearRedactions(); });
 }
 
@@ -66,6 +71,9 @@ void PairingController::setPollIntervalMs(int milliseconds)
 void PairingController::setDeadlineMs(int milliseconds)
 {
     m_deadlineMs = qMax(1, milliseconds);
+    if (m_deadlineTimer && m_deadlineTimer->isActive()) {
+        m_deadlineTimer->start(m_deadlineMs);
+    }
 }
 
 void PairingController::setState(const QString& state)
@@ -103,6 +111,8 @@ void PairingController::start(const QString& sessionId)
     m_handshakeInFlight = false;
     m_inFlightSessionId.clear();
     m_clock.start();
+    // V9: the deadline runs on its own timer from here, so a stalled poll cannot hide it.
+    m_deadlineTimer->start(m_deadlineMs);
 
     qCInfo(seathubPairing) << "silent pairing started for session" << sessionId;
 
@@ -118,6 +128,7 @@ void PairingController::cancel()
     // when it arrives, so it cannot finish, fail or pair a later attempt.
     ++m_attempt;
     m_pollTimer->stop();
+    m_deadlineTimer->stop();
     m_finished = true;
     m_clock.invalidate();
     m_sessionId.clear();
@@ -152,6 +163,18 @@ void PairingController::pollNow()
 void PairingController::scheduleNextPoll()
 {
     m_pollTimer->start(m_pollIntervalMs);
+}
+
+void PairingController::deadlineExpired()
+{
+    // V9: the deadline's own timer. Guarded the same way the poll-entry check is, so a timer that
+    // fires after the attempt already finished (or was cancelled) does nothing.
+    if (m_finished || m_sessionId.isEmpty()) {
+        return;
+    }
+    fail(SeatHubFailure::local(QString::fromLatin1(kTimedOut)),
+         m_transportFailureSeen ? QStringLiteral("unreachable_deadline")
+                                : QStringLiteral("deadline"));
 }
 
 void PairingController::pollAuthorization()
@@ -224,6 +247,21 @@ void PairingController::handleAuthorization(quint64 attempt, const ControlPlaneR
         }
 
         if (result.statusCode == kHttpConflict) {
+            // V10 / ADR-0066 decision 8: a fourth PIN request in one reconnect episode answers
+            // 409 `session.pairing_limit`. New PIN-bearing handshakes stop for this episode; the
+            // facade keeps the reconnect screen until the server ends the session at grace expiry.
+            if (result.kind == QStringLiteral("session.pairing_limit")
+                || result.failure == QStringLiteral("session.pairing_limit")) {
+                qCInfo(seathubPairing) << "pairing limit reached for this episode";
+                m_pollTimer->stop();
+                m_deadlineTimer->stop();
+                m_finished = true;
+                m_clock.invalidate();
+                emit pairingLimited();
+                LogShipper::clearRedactions();
+                return;
+            }
+
             // No pairing target yet. This is the expected state for the first polls while the
             // host is still being prepared, so it is not logged as a problem.
             //
@@ -235,6 +273,7 @@ void PairingController::handleAuthorization(quint64 attempt, const ControlPlaneR
             ++m_conflictPolls;
             m_transportFailureSeen = false;
             m_clock.restart();
+            m_deadlineTimer->start(m_deadlineMs);
             scheduleNextPoll();
             return;
         }
@@ -264,6 +303,7 @@ void PairingController::handleAuthorization(quint64 attempt, const ControlPlaneR
         ++m_conflictPolls;
         m_transportFailureSeen = false;
         m_clock.restart();
+        m_deadlineTimer->start(m_deadlineMs);
         scheduleNextPoll();
         return;
     }
@@ -302,6 +342,8 @@ void PairingController::handleAuthorization(quint64 attempt, const ControlPlaneR
     }
 
     setState(QString::fromLatin1(kStatePairing));
+    // The handshake now carries its own deadline; this controller's 30 s clock no longer applies.
+    m_deadlineTimer->stop();
 
     PairingTarget target;
     target.sessionId = authorization.sessionId.isEmpty() ? m_sessionId : authorization.sessionId;
@@ -340,6 +382,7 @@ void PairingController::handleSeamResult(quint64 attempt, bool ok, const QString
 
     m_handshakeInFlight = false;
     m_pollTimer->stop();
+    m_deadlineTimer->stop();
 
     if (!ok) {
         // The engine's own sentence is diagnostic only - it is never what the customer reads
@@ -369,6 +412,7 @@ void PairingController::handleSeamResult(quint64 attempt, bool ok, const QString
 void PairingController::fail(const SeatHubFailure& failure, const QString& attemptFailureClass)
 {
     m_pollTimer->stop();
+    m_deadlineTimer->stop();
     m_finished = true;
     setState(QString::fromLatin1(kStateFailed));
 

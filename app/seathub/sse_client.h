@@ -90,9 +90,23 @@ public:
 
     QString state() const { return m_state; }
 
+    /// V-COUNTDOWN (ADR-0083 decision 7): whole seconds until this client's own scheduled
+    /// reconnect fires, or -1 when no retry is armed (an attempt is in flight, or it is live or
+    /// stopped). The facade takes the sooner of this and its own 10 s fallback read.
+    int nextRetrySeconds() const;
+
+    /// V-WAKE (ADR-0083 decision 3): a network-back wake-up hint. If a reconnect is armed, start it
+    /// at once; otherwise nothing (an attempt in flight or a live stream is not interrupted).
+    void wakeNow();
+
     /// L3: 45 000 ms by default (`docs/spec/timing.md` L3). Only enforced once a hello has named
     /// `alive_ms` - see `feed()`'s `hello` handling.
     void setDeadStreamTimeoutMs(int ms);
+    /// V-L4 (ADR-0083 decision 4): 15 000 ms by default. A push-stream connection that has not
+    /// received `stream.hello` this long after it opened is closed and retried (15 s is HostHub's
+    /// existing connect timeout). `stream.alive` is not a substitute - only `stream.hello` stops
+    /// this timer.
+    void setHelloTimeoutMs(int ms);
     /// L5: 10 000 ms by default (`docs/spec/timing.md` L5) - not live this long starts the fallback
     /// read (`pausedChanged`); with no hello this long the live-updates indicator shows
     /// (`liveUpdatesLostChanged`, R7).
@@ -114,6 +128,12 @@ public:
 
 signals:
     void stateChanged();
+    /// V-COUNTDOWN (ADR-0083 decision 7): the whole seconds until this client's own scheduled
+    /// reconnect fires, emitted on the owning (network) thread whenever the schedule is armed, once
+    /// a second while it is pending, and with -1 when it is cleared (an attempt started, or
+    /// `stop()`). The facade caches this through a queued connection and never reads
+    /// `m_reconnectTimer` from another thread.
+    void retrySecondsChanged(int seconds);
     /// L5's fallback-read trigger (D-04, D-06): `true` on the paused-delay's expiry while not live,
     /// `false` the moment the connection goes live again. Fires at most once per transition -
     /// `pausedAfterTheFallbackDelay` checks this, not just `state()`. It no longer drives the
@@ -159,6 +179,9 @@ private:
     void markLive();
     /// Stops the R7 loss clock and, when the indicator was showing, hides it.
     void clearLiveUpdatesLost();
+    /// V-COUNTDOWN: emits `retrySecondsChanged` with the current whole-second wait and starts or
+    /// stops the 1 s tick that keeps it counting down while a retry is armed.
+    void publishRetrySeconds();
     double jitterValue() const;
 
     void handleReadyRead();
@@ -197,9 +220,15 @@ private:
 
     QTimer* m_deadStreamTimer = nullptr;
     QTimer* m_pausedTimer = nullptr;
+    /// V-L4: single-shot, `m_helloTimeoutMs`; armed on every attempt, stopped by `stream.hello`.
+    /// A connection that never hellos this long is aborted and retried.
+    QTimer* m_helloTimer = nullptr;
     /// R7: single-shot, `m_pausedDelayMs` (L5's 10 s - the only duration); see `liveUpdatesLostChanged`.
     QTimer* m_lostTimer = nullptr;
     QTimer* m_reconnectTimer = nullptr;
+    /// V-COUNTDOWN: repeating 1 s tick that re-publishes the reconnect wait while one is armed;
+    /// runs only while `m_reconnectTimer` is active (the genuine schedule, not a standing poll).
+    QTimer* m_retryTickTimer = nullptr;
     /// Single-shot, armed on every `markLive()`: 60 s of continuous liveness resets `m_attempt`
     /// (L4: "back to 1 s after a connection that stayed live 60 s").
     QTimer* m_liveResetTimer = nullptr;
@@ -207,6 +236,7 @@ private:
     int m_deadStreamTimeoutMs = 45000;
     int m_pausedDelayMs = 10000;
     int m_reconnectCapMs = 30000;
+    int m_helloTimeoutMs = 15000;
     std::function<double()> m_jitterProvider;
 
     static const int kLiveResetMs = 60000;

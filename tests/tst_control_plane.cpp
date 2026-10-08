@@ -17,7 +17,9 @@
 #include <QtTest>
 #include <QBuffer>
 #include <QDir>
+#include <QElapsedTimer>
 #include <QFile>
+#include <QHostAddress>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -25,6 +27,8 @@
 #include <QNetworkReply>
 #include <QNetworkRequest>
 #include <QRegularExpression>
+#include <QTcpServer>
+#include <QTcpSocket>
 #include <QTimer>
 #include <QUuid>
 
@@ -1923,6 +1927,132 @@ private slots:
         QCOMPARE(ControlPlaneClient::defaultBaseUrl(),
                  QStringLiteral("https://api-sevenhills.damra.co"));
         QCOMPARE(ControlPlaneClient::localBaseUrl(), QStringLiteral("http://127.0.0.1:8000"));
+    }
+
+    // V-REQ (ADR-0083 decision 1, AC1): every short control-plane request carries the 8 s
+    // inactivity limit, a stalled request fails and drops the pooled connection, and the next
+    // request goes out with the limit again. The push stream is deliberately excluded.
+    void aStalledRequestTimesOutAndTheNextOneUsesAFreshConnection()
+    {
+        auto* network = new FakeNetworkAccessManager;
+        ControlPlaneClient client;
+        client.setNetworkAccessManager(network);
+        client.setStreamNetworkAccessManager(network);
+        client.setBaseUrl(QStringLiteral("http://control-plane.test"));
+
+        QSignalSpy transportSpy(&client, &ControlPlaneClient::transportFailed);
+
+        // A dead connection: no route at all (status 0, a network error).
+        network->status = 0;
+        bool firstDone = false;
+        client.fetchMe([&firstDone](const ControlPlaneResult&) { firstDone = true; });
+        QTRY_VERIFY(firstDone);
+        QCOMPARE(client.connectionCacheClears(), 1);
+        QCOMPARE(transportSpy.count(), 1);
+
+        // The stalled request carried the 8 s inactivity limit.
+        QCOMPARE(network->lastRequest.transferTimeoutAsDuration().count(), qint64(8000));
+
+        // The next request goes out with the limit again, and no further drop on success.
+        network->status = 200;
+        network->body = QByteArrayLiteral("{\"id\":\"u-1\"}");
+        bool secondDone = false;
+        client.fetchMe([&secondDone](const ControlPlaneResult&) { secondDone = true; });
+        QTRY_VERIFY(secondDone);
+        QCOMPARE(network->lastRequest.transferTimeoutAsDuration().count(), qint64(8000));
+        QCOMPARE(client.connectionCacheClears(), 1);
+
+        // The push stream is excluded: it must not carry the inactivity limit.
+        network->status = 200;
+        network->body = QByteArrayLiteral("event: stream.hello\ndata: {}\n\n");
+        QNetworkReply* stream = client.openAccountStream();
+        QVERIFY(stream);
+        QCOMPARE(network->lastRequest.transferTimeoutAsDuration().count(), qint64(0));
+        stream->deleteLater();
+    }
+
+    // V-REQ (ADR-0083 decision 1, AC1): the 8 s limit is a real inactivity limit on a real socket,
+    // not a fake manager's attribute. A loopback server accepts the request and withholds the
+    // answer: the call fails at about 8 s, the pooled connection is dropped, and the next request
+    // opens a fresh connection (the second accept), which answers 200. The failure is logged with
+    // its route class and never the URL or the token.
+    void aRealStalledConnectionFailsAtTheInactivityLimitAndTheNextRequestUsesAFreshConnection()
+    {
+        QTcpServer server;
+        QVERIFY(server.listen(QHostAddress::LocalHost, 0));
+
+        int accepted = 0;
+        QObject::connect(&server, &QTcpServer::newConnection, [&server, &accepted]() {
+            while (QTcpSocket* socket = server.nextPendingConnection()) {
+                const int index = ++accepted;
+                if (index >= 2) {
+                    // The fresh connection answers as soon as the request arrives.
+                    auto answer = [socket]() {
+                        socket->readAll();
+                        const QByteArray body = QByteArrayLiteral("{\"id\":\"u-1\"}");
+                        socket->write("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                                      "Content-Length: "
+                                      + QByteArray::number(body.size())
+                                      + "\r\nConnection: close\r\n\r\n" + body);
+                        socket->flush();
+                    };
+                    QObject::connect(socket, &QTcpSocket::readyRead, socket, answer);
+                    if (socket->bytesAvailable() > 0) {
+                        answer();
+                    }
+                }
+                // The first connection is accepted and deliberately left unanswered: this is the
+                // stalled TCP connection the limit exists for.
+            }
+        });
+
+        static QString captured;   // A function-local static is reachable from a non-capturing lambda.
+        captured.clear();
+        const QtMessageHandler previous = qInstallMessageHandler(
+            [](QtMsgType, const QMessageLogContext&, const QString& message) {
+                if (message.contains(QStringLiteral("control-plane transport failure"))) {
+                    captured.append(message);
+                    captured.append(QLatin1Char('\n'));
+                }
+            });
+
+        ControlPlaneClient client;   // its own real QNetworkAccessManager
+        client.setBaseUrl(QStringLiteral("http://127.0.0.1:%1").arg(server.serverPort()));
+
+        QSignalSpy transportSpy(&client, &ControlPlaneClient::transportFailed);
+
+        QElapsedTimer elapsed;
+        elapsed.start();
+        bool firstDone = false;
+        client.fetchMe([&firstDone](const ControlPlaneResult&) { firstDone = true; });
+        QTRY_VERIFY_WITH_TIMEOUT(firstDone, 25000);
+        const qint64 stalledMs = elapsed.elapsed();
+        qInstallMessageHandler(previous);
+
+        // The approved 8 s inactivity limit, not an immediate failure.
+        QVERIFY2(stalledMs >= 7000, qPrintable(QStringLiteral("failed after %1 ms").arg(stalledMs)));
+        QVERIFY2(stalledMs <= 15000, qPrintable(QStringLiteral("failed after %1 ms").arg(stalledMs)));
+        QCOMPARE(transportSpy.count(), 1);
+        QCOMPARE(client.connectionCacheClears(), 1);
+
+        // The failure is logged with its route class, and never the URL, port or token.
+        QVERIFY2(!captured.isEmpty(), "the transport failure was not logged");
+        QVERIFY(captured.contains(QStringLiteral("route=")));
+        QVERIFY(!captured.contains(QStringLiteral("127.0.0.1")));
+        QVERIFY(!captured.contains(QString::number(server.serverPort())));
+
+        // The pooled connection was dropped: the next request opens a fresh TCP connection (the
+        // second accept) and succeeds.
+        bool secondDone = false;
+        bool secondOk = false;
+        client.fetchMe([&secondDone, &secondOk](const ControlPlaneResult& result) {
+            secondOk = result.ok;
+            secondDone = true;
+        });
+        QTRY_VERIFY_WITH_TIMEOUT(secondDone, 25000);
+        QVERIFY(secondOk);
+        QCOMPARE(accepted, 2);
+        QCOMPARE(client.connectionCacheClears(), 1);
     }
 };
 

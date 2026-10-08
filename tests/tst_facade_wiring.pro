@@ -81,6 +81,7 @@ SOURCES += \
     ../app/seathub/engine_termination.cpp \
     ../app/seathub/engine_status.cpp \
     ../app/seathub/quality_outbox.cpp \
+    ../app/seathub/end_outbox.cpp \
     ../app/seathub/hud_overlay.cpp \
     ../app/seathub/osd_compositor.cpp \
     ../app/seathub/osd_renderer.cpp \
@@ -124,6 +125,7 @@ HEADERS += \
     ../app/seathub/engine_termination.h \
     ../app/seathub/engine_status.h \
     ../app/seathub/quality_outbox.h \
+    ../app/seathub/end_outbox.h \
     ../app/seathub/hud_overlay.h \
     ../app/seathub/osd_compositor.h \
     ../app/seathub/osd_renderer.h \

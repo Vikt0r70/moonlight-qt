@@ -327,6 +327,8 @@ class FakeShellClient : public QObject
     Q_PROPERTY(int reconnectCount READ reconnectCount NOTIFY reconnectingChanged)
     Q_PROPERTY(int graceMinutesLeft READ graceMinutesLeft NOTIFY reconnectingChanged)
     Q_PROPERTY(bool reconnectStillTrying READ reconnectStillTrying NOTIFY reconnectingChanged)
+    Q_PROPERTY(int reconnectRetrySeconds READ reconnectRetrySeconds NOTIFY retrySecondsChanged)
+    Q_PROPERTY(int liveRetrySeconds READ liveRetrySeconds NOTIFY retrySecondsChanged)
     Q_PROPERTY(QVariantMap account READ account NOTIFY accountChanged)
     Q_PROPERTY(QString accountStatus READ accountStatus NOTIFY accountChanged)
     Q_PROPERTY(QString accountError READ accountError NOTIFY accountChanged)
@@ -433,6 +435,21 @@ public:
     int reconnectCount() const { return m_reconnectCount; }
     int graceMinutesLeft() const { return m_graceMinutesLeft; }
     bool reconnectStillTrying() const { return m_reconnectStillTrying; }
+    // C-RECONNECT / V-COUNTDOWN: the live retry countdown, and `Try now`.
+    Q_INVOKABLE int reconnectRetrySeconds() const { return m_reconnectRetrySeconds; }
+    int liveRetrySeconds() const { return m_liveRetrySeconds; }
+    void setReconnectRetrySeconds(int seconds)
+    {
+        m_reconnectRetrySeconds = seconds;
+        emit retrySecondsChanged();
+    }
+    void setLiveRetrySeconds(int seconds)
+    {
+        m_liveRetrySeconds = seconds;
+        emit retrySecondsChanged();
+    }
+    Q_INVOKABLE void retryNow() { ++m_retryNows; }
+    int retryNows() const { return m_retryNows; }
     void setReconnecting(int reconnectCount, bool stillTrying, int graceMinutesLeft)
     {
         m_reconnecting = true;
@@ -629,6 +646,7 @@ signals:
     void connectStageChanged();
     void connectFailedChanged();
     void reconnectingChanged();
+    void retrySecondsChanged();
     void liveSessionChanged();
     void homeStatusChanged();
     void endReasonTextChanged();
@@ -690,6 +708,9 @@ private:
     int m_graceMinutesLeft = -1;
     bool m_reconnectStillTrying = false;
     int m_endHeldSessions = 0;
+    int m_reconnectRetrySeconds = -1;
+    int m_liveRetrySeconds = -1;
+    int m_retryNows = 0;
 };
 
 class FakeUpdates : public QObject
@@ -821,7 +842,7 @@ private slots:
     void homeScreenRendersEachHomeState();
     void homePlayNeverReadsResumeSessionWhateverTheFacadeClaims();
     void noCustomerResumeAfterRestart();
-    void reconnectMinutesWaitForServerDeadline();
+    void theReconnectCountdownClearsWhenTheAttemptStarts();
     void homeShowsTheServersRefusalVerbatimWithAQuietTopUpBeneathPlay();
     void noHomeStateRendersACountAQueuePositionOrANotifyControl();
     void homeWrapsLongSentencesAndNeverBreaksAReference();
@@ -898,8 +919,8 @@ private slots:
     void theStepperDrawsThreeStagesFromTheFacadesStageAndNothingElse();
     void theStepperMarksTheStageThatWasActiveFailedWithAMarkOfItsOwn();
     void connectingShowsCancelWhileItGoesAndTheNamedStallWhenItStops();
-    void theReconnectingScreenShowsTheCount();
-    void stillTryingReadsTheServersDeadline();
+    void theReconnectingScreenShowsConnectionLostAndTryNow();
+    void theReconnectingScreenShowsTheRetryCountdown();
     void aStalledConnectOffersTryAgainAndBackToHomeAndNoOtherRig();
     void aStalledConnectWrapsTheLongestSentenceAndNeverBreaksAReference();
     void theErrorViewShowsThreeKindsOfSentenceAsTheyAreAndDrawsNoBareReferenceLabel();
@@ -1706,21 +1727,21 @@ void TstUiScreens::theBalancePillShowsTheLiveUpdatesIndicatorWhilePaused()
     client.setBalance(135, QStringLiteral("2 h 15 min"), false);
 
     QVERIFY2(!pill->property("paused").toBool(), "hidden by default");
-    QVERIFY(!findVisibleTextItem(pill.data(), QStringLiteral("Reconnecting to live updates…")));
+    QVERIFY(!findVisibleTextItem(pill.data(), QStringLiteral("Reconnecting to SevenHills…")));
     QObject* dot = pill->findChild<QObject*>(QStringLiteral("liveUpdatesDot"));
     QVERIFY(dot);
     QVERIFY2(!effectivelyVisible(dot), "the warn dot must be hidden by default too");
 
     client.setLiveUpdatesPaused(true);
     QVERIFY(pill->property("paused").toBool());
-    QVERIFY2(findVisibleTextItem(pill.data(), QStringLiteral("Reconnecting to live updates…")),
+    QVERIFY2(findVisibleTextItem(pill.data(), QStringLiteral("Reconnecting to SevenHills…")),
              "the indicator's own sentence must show while paused");
     QVERIFY2(effectivelyVisible(dot), "a warn dot must show beside it - colour is never alone (§9)");
     QCOMPARE(dot->property("color").value<QColor>(), QColor(QStringLiteral("#f59e0b")));
 
     client.setLiveUpdatesPaused(false);
     QVERIFY2(!pill->property("paused").toBool(), "gone the moment it is live again");
-    QVERIFY(!findVisibleTextItem(pill.data(), QStringLiteral("Reconnecting to live updates…")));
+    QVERIFY(!findVisibleTextItem(pill.data(), QStringLiteral("Reconnecting to SevenHills…")));
     QVERIFY(!effectivelyVisible(dot));
 }
 
@@ -4354,7 +4375,7 @@ void TstUiScreens::connectingShowsCancelWhileItGoesAndTheNamedStallWhenItStops()
     QVERIFY(!effectivelyVisible(itemNamed(screen.data(), QStringLiteral("stalled"))));
 }
 
-void TstUiScreens::theReconnectingScreenShowsTheCount()
+void TstUiScreens::theReconnectingScreenShowsConnectionLostAndTryNow()
 {
     QQuickStyle::setStyle(QStringLiteral("Basic"));
     QQmlEngine engine;
@@ -4369,9 +4390,13 @@ void TstUiScreens::theReconnectingScreenShowsTheCount()
     client.setConnectStage(3);
     client.setReconnecting(/*reconnectCount=*/1, /*stillTrying=*/false, /*graceMinutesLeft=*/-1);
 
+    // C-RECONNECT: `Connection lost.` above the in-flight `Reconnecting…`, and no attempt count.
+    QVERIFY(effectivelyVisible(itemNamed(screen.data(), QStringLiteral("connectionLostLine"))));
+    QCOMPARE(itemNamed(screen.data(), QStringLiteral("connectionLostLine"))->property("text").toString(),
+             QStringLiteral("Connection lost."));
     QVERIFY(effectivelyVisible(itemNamed(screen.data(), QStringLiteral("reconnectLine"))));
     QCOMPARE(itemNamed(screen.data(), QStringLiteral("reconnectLine"))->property("text").toString(),
-             QStringLiteral("Connection lost. Reconnecting… (2 of 5)"));
+             QStringLiteral("Reconnecting…"));
 
     // The third stage stays active (the breathing warn dot), not failed: this is not a failure.
     QObject* stepper = itemNamed(screen.data(), QStringLiteral("stepper"));
@@ -4389,7 +4414,7 @@ void TstUiScreens::theReconnectingScreenShowsTheCount()
     QCOMPARE(client.endHeldSessions(), 1);
 }
 
-void TstUiScreens::stillTryingReadsTheServersDeadline()
+void TstUiScreens::theReconnectingScreenShowsTheRetryCountdown()
 {
     QQuickStyle::setStyle(QStringLiteral("Basic"));
     QQmlEngine engine;
@@ -4401,21 +4426,25 @@ void TstUiScreens::stillTryingReadsTheServersDeadline()
     QVERIFY2(screen, qPrintable(error));
     client.setConnectStage(3);
 
-    // After the first attempt has not reconnected: 4 minutes 10 s left reads "4 minutes" (whole
-    // minutes, floored - never a client timer of its own).
-    client.setReconnecting(/*reconnectCount=*/1, /*stillTrying=*/true, /*graceMinutesLeft=*/4);
+    // V-COUNTDOWN: while a retry is scheduled the waiting line counts down, and `Try now` is
+    // offered (C-RECONNECT).
+    client.setReconnecting(/*reconnectCount=*/1, /*stillTrying=*/true, /*graceMinutesLeft=*/-1);
+    client.setReconnectRetrySeconds(4);
     QCOMPARE(itemNamed(screen.data(), QStringLiteral("reconnectLine"))->property("text").toString(),
-             QStringLiteral("Still trying. 4 minutes left to reconnect."));
+             QStringLiteral("Trying again in 4 s"));
+    QVERIFY(effectivelyVisible(buttonNamed(screen.data(), QStringLiteral("tryNowButton"))));
 
-    // 70 s left (1 minute 10 s) reads the singular.
-    client.setReconnecting(/*reconnectCount=*/2, /*stillTrying=*/true, /*graceMinutesLeft=*/1);
+    client.setReconnectRetrySeconds(2);
     QCOMPARE(itemNamed(screen.data(), QStringLiteral("reconnectLine"))->property("text").toString(),
-             QStringLiteral("Still trying. 1 minute left to reconnect."));
+             QStringLiteral("Trying again in 2 s"));
+
+    QMetaObject::invokeMethod(buttonNamed(screen.data(), QStringLiteral("tryNowButton")), "clicked");
+    QCOMPARE(client.retryNows(), 1);
 }
 
-// UD-04 O02: no minutes figure until the server has returned `grace_deadline_at` for THIS
-// interruption, and never one that disagrees with the server's own remaining time.
-void TstUiScreens::reconnectMinutesWaitForServerDeadline()
+// V-COUNTDOWN: the countdown is only for an app-scheduled retry - with none scheduled the line
+// falls back to the in-flight wording, and no attempt/minute counter is ever shown.
+void TstUiScreens::theReconnectCountdownClearsWhenTheAttemptStarts()
 {
     QQuickStyle::setStyle(QStringLiteral("Basic"));
     QQmlEngine engine;
@@ -4429,31 +4458,22 @@ void TstUiScreens::reconnectMinutesWaitForServerDeadline()
     QObject* line = itemNamed(screen.data(), QStringLiteral("reconnectLine"));
     QVERIFY(line);
 
-    const QString firstAttempt = QStringLiteral("Connection lost. Reconnecting… (2 of 5)");
-
-    // The first attempt has not reconnected, but the server has not returned a deadline yet: the
-    // screen keeps the first-attempt line and shows no minutes figure at all - not 0, not a guess.
+    // Waiting with a scheduled retry: the countdown.
     client.setReconnecting(/*reconnectCount=*/1, /*stillTrying=*/true, /*graceMinutesLeft=*/-1);
-    QCOMPARE(line->property("text").toString(), firstAttempt);
+    client.setReconnectRetrySeconds(5);
+    QCOMPARE(line->property("text").toString(), QStringLiteral("Trying again in 5 s"));
+
+    // The attempt started (no retry scheduled): in-flight wording at once.
+    client.setReconnectRetrySeconds(-1);
+    QCOMPARE(line->property("text").toString(), QStringLiteral("Reconnecting…"));
+
+    // No `of 5` and no server minutes anywhere.
+    QVERIFY(!line->property("text").toString().contains(QStringLiteral("of 5")));
     QVERIFY(!line->property("text").toString().contains(QStringLiteral("minute")));
 
-    // The server's deadline arrives: the figure is exactly its remaining whole minutes.
-    client.setReconnecting(/*reconnectCount=*/1, /*stillTrying=*/true, /*graceMinutesLeft=*/3);
-    QCOMPARE(line->property("text").toString(),
-             QStringLiteral("Still trying. 3 minutes left to reconnect."));
-
-    // Under a minute left is the server's 0, shown as it is.
-    client.setReconnecting(/*reconnectCount=*/1, /*stillTrying=*/true, /*graceMinutesLeft=*/0);
-    QCOMPARE(line->property("text").toString(),
-             QStringLiteral("Still trying. 0 minutes left to reconnect."));
-
-    // A new interruption: the previous one's deadline is gone, so the figure is gone with it.
+    // Not yet trying (first attempt in flight): in-flight wording too.
     client.setReconnecting(/*reconnectCount=*/0, /*stillTrying=*/false, /*graceMinutesLeft=*/-1);
-    QCOMPARE(line->property("text").toString(),
-             QStringLiteral("Connection lost. Reconnecting… (1 of 5)"));
-    client.setReconnecting(/*reconnectCount=*/0, /*stillTrying=*/true, /*graceMinutesLeft=*/-1);
-    QCOMPARE(line->property("text").toString(),
-             QStringLiteral("Connection lost. Reconnecting… (1 of 5)"));
+    QCOMPARE(line->property("text").toString(), QStringLiteral("Reconnecting…"));
 }
 
 void TstUiScreens::aStalledConnectOffersTryAgainAndBackToHomeAndNoOtherRig()
@@ -5955,7 +5975,8 @@ void TstUiScreens::checkHomeAt(const QSize& size)
     QVERIFY2(seesText(screen.data(),
                       QStringLiteral("Can't reach SevenHills right now. Showing the last known balance.")),
              qPrintable(where));
-    COMPARE_TABS( QStringList{ QStringLiteral("Play") });
+    // C-RECONNECT: the offline state carries `Try now` beside Play.
+    COMPARE_TABS( (QStringList{ QStringLiteral("Try now"), QStringLiteral("Play") }) );
 
     // Refused: the server's sentence, the reference in mono, and a ghost Top up under Play. The mark
     // beside the sentence is decoration and is not read out.
@@ -6335,15 +6356,16 @@ void TstUiScreens::checkStartingAt(const QSize& size)
              qPrintable(where));
     client.clearStalled();
 
-    // Reconnecting: the first attempt's count, then the server's minutes, then `End session` always.
+    // Reconnecting: `Connection lost.` above the in-flight line, then the countdown + `Try now`,
+    // and `End session` always.
     client.setReconnecting(0, false, -1);
-    QVERIFY2(seesText(screen.data(), QStringLiteral("Connection lost. Reconnecting… (1 of 5)")),
-             qPrintable(where));
+    QVERIFY2(seesText(screen.data(), QStringLiteral("Connection lost.")), qPrintable(where));
+    QVERIFY2(seesText(screen.data(), QStringLiteral("Reconnecting…")), qPrintable(where));
     COMPARE_TABS( QStringList{ QStringLiteral("End session") });
-    client.setReconnecting(0, true, 12);
-    QVERIFY2(seesText(screen.data(), QStringLiteral("Still trying. 12 minutes left to reconnect.")),
-             qPrintable(where));
-    COMPARE_TABS( QStringList{ QStringLiteral("End session") });
+    client.setReconnecting(0, true, -1);
+    client.setReconnectRetrySeconds(12);
+    QVERIFY2(seesText(screen.data(), QStringLiteral("Trying again in 12 s")), qPrintable(where));
+    COMPARE_TABS( (QStringList{ QStringLiteral("Try now"), QStringLiteral("End session") }) );
 
     // Error, grace expired / reconnect limit: Back to home only - the session is over.
     client.setStalled(QStringLiteral("Stopped at: Streaming"),

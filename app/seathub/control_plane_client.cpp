@@ -1,9 +1,11 @@
 #include "control_plane_client.h"
 #include "seathub_version.h"
 
+#include <QElapsedTimer>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonParseError>
+#include <QLoggingCategory>
 #include <QMutexLocker>
 #include <QNetworkAccessManager>
 #include <QNetworkReply>
@@ -14,7 +16,65 @@
 #include <QUrl>
 #include <QUuid>
 
+Q_LOGGING_CATEGORY(seathubControlPlane, "seathub.control_plane")
+
 namespace {
+
+// V-REQ (ADR-0083 decision 1): the inactivity limit for every short control-plane request.
+// `openAccountStream()` deliberately does not set it (its own comment explains why).
+const int kShortRequestTimeoutMs = 8000;
+
+// A short, stable class name for a route, for the transport-failure log: never the URL, the
+// session id, an address or a token (V-REQ, ADR-0083 decision 11).
+QString routeClassForPath(const QString& path)
+{
+    if (path.startsWith(QLatin1String("/api/auth/"))) {
+        return QStringLiteral("auth");
+    }
+    if (path == QLatin1String("/api/me")) {
+        return QStringLiteral("me");
+    }
+    if (path == QLatin1String("/api/me/telemetry")) {
+        return QStringLiteral("telemetry");
+    }
+    if (path == QLatin1String("/api/wallet")) {
+        return QStringLiteral("wallet");
+    }
+    if (path == QLatin1String("/api/wallet/history")) {
+        return QStringLiteral("wallet-history");
+    }
+    if (path == QLatin1String("/api/topup-notices")) {
+        return QStringLiteral("topup-notices");
+    }
+    if (path == QLatin1String("/api/usage")) {
+        return QStringLiteral("usage");
+    }
+    if (path == QLatin1String("/api/account-state")) {
+        return QStringLiteral("account-state");
+    }
+    if (path == QLatin1String("/api/sessions")) {
+        return QStringLiteral("sessions");
+    }
+    if (path.startsWith(QLatin1String("/api/sessions/"))) {
+        if (path.endsWith(QLatin1String("/pairing"))) {
+            return QStringLiteral("session-pairing");
+        }
+        if (path.endsWith(QLatin1String("/liveness"))) {
+            return QStringLiteral("session-liveness");
+        }
+        if (path.endsWith(QLatin1String("/end"))) {
+            return QStringLiteral("session-end");
+        }
+        if (path.endsWith(QLatin1String("/quality"))) {
+            return QStringLiteral("session-quality");
+        }
+        if (path.endsWith(QLatin1String("/stream-time"))) {
+            return QStringLiteral("session-stream-time");
+        }
+        return QStringLiteral("session-read");
+    }
+    return QStringLiteral("other");
+}
 
 // Where a call lands when nothing else is known. One place names the control plane.
 const char* kProductionBaseUrl = "https://api-sevenhills.damra.co";
@@ -585,6 +645,7 @@ ControlPlaneResult ControlPlaneClient::classify(int httpStatus, const QByteArray
             result.error = object.value(QStringLiteral("error")).toString();
             result.reference = object.value(QStringLiteral("reference")).toString();
             result.failure = object.value(QStringLiteral("failure")).toString();
+            result.kind = object.value(QStringLiteral("kind")).toString();
             if (result.error.isEmpty()) {
                 result.error = SeatHubFailure::generic().error;
             }
@@ -602,6 +663,7 @@ ControlPlaneResult ControlPlaneClient::classify(int httpStatus, const QByteArray
     result.error = object.value(QStringLiteral("error")).toString();
     result.reference = object.value(QStringLiteral("reference")).toString();
     result.failure = object.value(QStringLiteral("failure")).toString();
+    result.kind = object.value(QStringLiteral("kind")).toString();
     if (result.error.isEmpty()) {
         result.error = SeatHubFailure::generic().error;
     }
@@ -956,6 +1018,12 @@ void ControlPlaneClient::sendOnOwningThread(const QString& method, const QString
         request.setRawHeader(it.key(), it.value());
     }
 
+    // V-REQ (ADR-0083 decision 1): every short REST call is bounded by an 8 s inactivity limit,
+    // so a request on a connection that stopped answering fails instead of hanging. This is the
+    // one place every short call funnels through; `openAccountStream()` builds its own request on
+    // `m_streamNetwork` and deliberately leaves this unset.
+    request.setTransferTimeout(kShortRequestTimeoutMs);
+
     QNetworkReply* reply = nullptr;
     if (method == QLatin1String("GET")) {
         reply = m_network->get(request);
@@ -971,17 +1039,23 @@ void ControlPlaneClient::sendOnOwningThread(const QString& method, const QString
         }
     }
 
-    connect(reply, &QNetworkReply::finished, this, [this, reply, callback]() {
-        finishReply(reply, callback);
-    });
+    const QString routeClass = routeClassForPath(path);
+    QElapsedTimer elapsed;
+    elapsed.start();
+    connect(reply, &QNetworkReply::finished, this,
+            [this, reply, callback, routeClass, elapsed]() {
+                finishReply(reply, callback, routeClass, elapsed.elapsed());
+            });
 }
 
-void ControlPlaneClient::finishReply(QNetworkReply* reply, Callback callback)
+void ControlPlaneClient::finishReply(QNetworkReply* reply, Callback callback,
+                                     const QString& routeClass, qint64 elapsedMs)
 {
     const int status = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
     const QByteArray body = reply->readAll();
     const QNetworkReply::NetworkError networkError = reply->error();
     const QString networkErrorText = reply->errorString();
+    const bool http2Used = reply->attribute(QNetworkRequest::Http2WasUsedAttribute).toBool();
 
     reply->deleteLater();
 
@@ -997,7 +1071,30 @@ void ControlPlaneClient::finishReply(QNetworkReply* reply, Callback callback)
         result.error = networkErrorText;
         result.reference.clear();
         result.failure.clear();
+
+        // V-REQ: the connection that stopped answering may still sit in the pool; drop it so the
+        // next request opens a fresh connection instead of reusing the dead one.
+        if (m_network) {
+            m_network->clearConnectionCache();
+        }
+        m_connectionCacheClears.fetch_add(1);
+
+        // ADR-0083 decision 11: one line per outage episode - the NetworkError value, the route
+        // class (never a URL, an address, a session id or a token), the elapsed ms and whether
+        // HTTP/2 was used. Cleared by the next reply that got a status.
+        if (!m_transportFailureLoggedThisEpisode) {
+            m_transportFailureLoggedThisEpisode = true;
+            qCWarning(seathubControlPlane,
+                      "control-plane transport failure: error=%d route=%s elapsedMs=%lld http2=%s",
+                      int(networkError), qUtf8Printable(routeClass),
+                      static_cast<long long>(elapsedMs), http2Used ? "yes" : "no");
+        }
+
         emit transportFailed(networkErrorText);
+    }
+    else {
+        // A reply that produced a status means the transport worked: the outage episode is over.
+        m_transportFailureLoggedThisEpisode = false;
     }
 
     if (callback) {

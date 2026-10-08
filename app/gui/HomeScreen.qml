@@ -39,6 +39,11 @@ Item {
                                      ? String(client.homeStatus) : "ready"
     readonly property bool checking: root.status === "checking"
     readonly property bool refused: root.status === "refused"
+    readonly property bool ending: root.status === "ending"
+
+    // C-RECONNECT: the offline state's own scheduled wait (the live-updates retry or the 10 s
+    // fallback read), published by the client once a second - never a client-side timer.
+    readonly property int retrySeconds: root.client ? root.client.liveRetrySeconds : -1
 
     // The one line above Play for the states that have one. `copy.md` §Play flow gives the first two
     // and §Support & errors the third, each verbatim.
@@ -90,6 +95,49 @@ Item {
             color: Tokens.foregroundDefault
             font.family: Tokens.fontSansDefault
             font.pixelSize: Metrics.fontBody
+        }
+
+        // C-ENDING (screens.md §23): an End is saved but the server has not confirmed it - Home
+        // shows this and Play stays disabled until it clears.
+        Text {
+            id: endingLine
+            objectName: "endingLine"
+            width: parent.width
+            visible: root.ending
+            text: qsTr("Ending your session. It keeps running until SevenHills confirms the end.")
+            wrapMode: Text.Wrap
+            color: Tokens.foregroundDefault
+            font.family: Tokens.fontSansDefault
+            font.pixelSize: Metrics.fontBody
+        }
+
+        // C-RECONNECT: the offline line's own retry, with a live countdown and Try now.
+        Column {
+            objectName: "offlineRetry"
+            width: parent.width
+            spacing: Metrics.s1
+            visible: root.status === "offline"
+
+            Text {
+                objectName: "offlineRetryLine"
+                width: parent.width
+                text: root.retrySeconds > 0
+                    ? qsTr("Trying again in %1 s").arg(root.retrySeconds)
+                    : qsTr("Trying again soon")
+                wrapMode: Text.Wrap
+                color: Tokens.foregroundMutedDefault
+                font.family: Tokens.fontSansDefault
+                font.pixelSize: Metrics.fontBody
+            }
+
+            SeatHubButton {
+                objectName: "offlineTryNow"
+                width: parent.width
+                variant: "ghost"
+                text: qsTr("Try now")
+
+                onClicked: root.client.retryNow()
+            }
         }
 
         // A refusal: a glyph beside the colour (the fork ships no icon set), the server's sentence,
@@ -159,7 +207,7 @@ Item {
             width: parent.width
             implicitHeight: Metrics.s16
             text: qsTr("Play")
-            enabled: !root.checking
+            enabled: !root.checking && !root.ending
             busy: root.checking
 
             onClicked: root.client.start()

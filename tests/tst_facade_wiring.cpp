@@ -361,6 +361,23 @@ public:
         m_endBody = body;
     }
 
+    /// V-OUTBOX ordering probe: run as the next `/end` request arrives, before any answer, so a test
+    /// can prove the durable record already existed on disk before the first POST was sent.
+    /// Installing the probe resets the count, so `/end` traffic before it does not consume it.
+    void setEndProbe(std::function<bool()> probe)
+    {
+        QMutexLocker lock(&m_mutex);
+        m_endProbe = std::move(probe);
+        m_endRequests = 0;
+        m_endOutboxExistedAtFirstEnd = false;
+    }
+
+    bool endOutboxExistedAtFirstEnd() const
+    {
+        QMutexLocker lock(&m_mutex);
+        return m_endOutboxExistedAtFirstEnd;
+    }
+
     /// What `POST /api/sessions/{id}/quality` answers. The default (never called) is 200
     /// `{"status":true}`.
     void answerQuality(int status, const QByteArray& body = QByteArrayLiteral("{\"status\":true}"))
@@ -591,6 +608,12 @@ protected:
         }
 
         if (path.endsWith(QLatin1String("/end"))) {
+            {
+                QMutexLocker lock(&m_mutex);
+                if (++m_endRequests == 1 && m_endProbe) {
+                    m_endOutboxExistedAtFirstEnd = m_endProbe();
+                }
+            }
             return new FakeReply(endStatus, endBody, this);
         }
         if (path.endsWith(QLatin1String("/quality"))) {
@@ -660,6 +683,9 @@ private:
     QByteArray m_sessionBody;
     int m_endStatus = 200;
     QByteArray m_endBody = QByteArrayLiteral("{\"status\":true}");
+    std::function<bool()> m_endProbe;
+    bool m_endOutboxExistedAtFirstEnd = false;
+    int m_endRequests = 0;
     int m_qualityStatus = 200;
     QByteArray m_qualityBody = QByteArrayLiteral("{\"status\":true}");
     int m_qualityDelay = 0;
@@ -800,6 +826,7 @@ private:
     {
         client.credentialStore()->setDirectory(m_dir->path());
         client.credentialStore()->setBackupRoot(m_backupRoot->path());
+        client.setEndOutboxDirectory(m_dir->path() + QStringLiteral("/end-outbox"));
     }
 
     /// The account and wallet the control plane answers for a signed-in customer.
@@ -2218,6 +2245,12 @@ private slots:
         // carries the customer back to Home.
         emit engine->readyForDeletion();
         QTRY_COMPARE_WITH_TIMEOUT(client.appState(), QStringLiteral("home"), 15000);
+
+        // C-ENDING (screens.md §23): the End this session wrote is unconfirmed until the server
+        // answers, so Home is not ready to Play over it - the outbox re-sends it and the teardown's
+        // own terminal read confirms the session is over, at which point Home returns to ready.
+        QTRY_VERIFY_WITH_TIMEOUT(!client.hasSavedEnd(), 15000);
+        QTRY_COMPARE_WITH_TIMEOUT(client.homeStatus(), QStringLiteral("ready"), 15000);
 
         // So Play is Play again, and pressing it asks the server for a new session.
         m_fake->answerPlay(402, playRefusalBody(QStringLiteral("Not enough credit."),
@@ -4494,7 +4527,14 @@ private slots:
             QSignalSpy failed(client.teardown(), &TeardownController::teardownFailed);
             emit engine->readyForDeletion();
             QTRY_COMPARE_WITH_TIMEOUT(failed.count(), 1, 15000);
-            QTRY_COMPARE_WITH_TIMEOUT(client.appState(), QStringLiteral("error"), 15000);
+            QTRY_COMPARE_WITH_TIMEOUT(client.appState(), QStringLiteral("home"), 15000);
+            // C-ENDING: the End could not be confirmed, so the durable record stands and Home shows
+            // the ending state (Play not ready) instead of an error screen.
+            QCOMPARE(client.homeStatus(), QStringLiteral("ending"));
+            // C-ENDING: Play is not ready while the End is unconfirmed. Once the server confirms it,
+            // Play asks for a new session of its own.
+            m_fake->answerEnd(200);
+            QTRY_VERIFY_WITH_TIMEOUT(!client.hasSavedEnd(), 15000);
             client.dismissError();
             QCOMPARE(client.appState(), QStringLiteral("home"));
             QCOMPARE(client.attachedSessionId(), QStringLiteral("s-stages"));
@@ -6281,7 +6321,7 @@ private slots:
         QVERIFY(client.reconnecting());
 
         emit engine->readyForDeletion();
-        QTRY_COMPARE_WITH_TIMEOUT(client.reconnectTimer()->interval(), 2000, 15000);
+        QTRY_COMPARE_WITH_TIMEOUT(client.reconnectTimer()->interval(), 0, 15000);
         QVERIFY(client.reconnectTimer()->isActive());
 
         // The session stays held: no `/end` for this drop.
@@ -6327,6 +6367,318 @@ private slots:
         QCOMPARE(m_fake->requestPaths().count(QStringLiteral("/api/sessions/s-live/end")), 1);
     }
 
+    void anOfflineEndIsSavedAndResentUntilConfirmed()
+    {
+        FakeEngineSession engine;
+        WalletTicks ticks;
+        SeatHubClient client;
+        client.setReconnectJitterProvider([]() { return 0.0; });
+        beginStreaming(client, &engine, &ticks, 90, 80);
+        client.teardown()->setVerifyIntervalMs(1);
+
+        const QString outboxFile =
+            QDir(m_dir->path()).filePath(QStringLiteral("end-outbox/s-live.json"));
+        QVERIFY(!QFile::exists(outboxFile));
+
+        // The control plane is unreachable for this End.
+        m_fake->answerEnd(0);
+
+        emitConnectionTerminated(0);
+        emit engine.displayLaunchError(QStringLiteral("Connection terminated"));
+        emit engine.readyForDeletion();
+
+        // The End is on disk, tagged to the account, even though no POST could be answered.
+        QTRY_VERIFY_WITH_TIMEOUT(QFile::exists(outboxFile), 5000);
+        QVERIFY(client.hasSavedEnd());
+        QCOMPARE(client.homeStatus(), QStringLiteral("ending"));
+        {
+            QFile file(outboxFile);
+            QVERIFY(file.open(QIODevice::ReadOnly));
+            const QJsonObject entry = QJsonDocument::fromJson(file.readAll()).object();
+            QCOMPARE(entry.value(QStringLiteral("account_id")).toString(),
+                     QStringLiteral("6f1c6f5e-3a1e-4b1e-9f2e-0f1a2b3c4d5e"));
+            QCOMPARE(entry.value(QStringLiteral("session_id")).toString(), QStringLiteral("s-live"));
+        }
+
+        // The server answers 2xx; the next attempt drops the record and Home is ready again.
+        m_fake->answerEnd(200);
+        QTRY_VERIFY_WITH_TIMEOUT(!QFile::exists(outboxFile), 10000);
+        QVERIFY(!client.hasSavedEnd());
+        QCOMPARE(client.homeStatus(), QStringLiteral("ready"));
+    }
+
+    void aSavedEndSurvivesARestartAndIsSentBeforePlay()
+    {
+        // Exactly the record a crashed run leaves behind on disk - written before this run starts.
+        const QString outboxDir = QDir(m_dir->path()).filePath(QStringLiteral("end-outbox"));
+        const QString outboxFile = QDir(outboxDir).filePath(QStringLiteral("s-live.json"));
+        QVERIFY(QDir().mkpath(outboxDir));
+        {
+            QFile file(outboxFile);
+            QVERIFY(file.open(QIODevice::WriteOnly | QIODevice::Truncate));
+            file.write(QJsonDocument(QJsonObject{
+                { QStringLiteral("account_id"),
+                  QStringLiteral("6f1c6f5e-3a1e-4b1e-9f2e-0f1a2b3c4d5e") },
+                { QStringLiteral("session_id"), QStringLiteral("s-live") },
+                { QStringLiteral("failed"), false },
+            }).toJson(QJsonDocument::Compact));
+        }
+
+        // The restart: a fresh client signs in and finds the saved End on the way in.
+        SeatHubClient client;
+        client.setReconnectJitterProvider([]() { return 0.0; });
+        reachHome(client, 90);
+
+        // It was re-sent and confirmed as part of signing in, before any Play.
+        QTRY_VERIFY_WITH_TIMEOUT(!QFile::exists(outboxFile), 10000);
+        QVERIFY(!client.hasSavedEnd());
+        QVERIFY(m_fake->countOfPathEndingWith(QStringLiteral("/end")) >= 1);
+
+        // Nothing is re-sent at Play: the record was already confirmed before it.
+        const int endsBeforePlay = m_fake->countOfPathEndingWith(QStringLiteral("/end"));
+        client.start();
+        QTest::qWait(200);
+        QCOMPARE(m_fake->countOfPathEndingWith(QStringLiteral("/end")), endsBeforePlay);
+    }
+
+    void aRestoredEndBlocksPlayAndFollowsTheOutboxAnswers()
+    {
+        SeatHubClient client;
+        client.setReconnectJitterProvider([]() { return 0.0; });
+        reachHome(client, 90);
+
+        // A record a crashed run left behind, standing in for the restart (written after sign-in so
+        // the server can withhold its answer).
+        const QString outboxDir = QDir(m_dir->path()).filePath(QStringLiteral("end-outbox"));
+        const QString outboxFile = QDir(outboxDir).filePath(QStringLiteral("s-live.json"));
+        QVERIFY(QDir().mkpath(outboxDir));
+        {
+            QFile file(outboxFile);
+            QVERIFY(file.open(QIODevice::WriteOnly | QIODevice::Truncate));
+            file.write(QJsonDocument(QJsonObject{
+                { QStringLiteral("account_id"),
+                  QStringLiteral("6f1c6f5e-3a1e-4b1e-9f2e-0f1a2b3c4d5e") },
+                { QStringLiteral("session_id"), QStringLiteral("s-live") },
+                { QStringLiteral("failed"), false },
+            }).toJson(QJsonDocument::Compact));
+        }
+
+        // The server withholds its answer; a network return starts the send at once, not after the
+        // backoff the cadence would otherwise have reached.
+        m_fake->answerEnd(0);
+        QMetaObject::invokeMethod(&client, "onNetworkBack");
+        QTRY_VERIFY_WITH_TIMEOUT(client.hasSavedEnd(), 10000);
+        QTRY_COMPARE_WITH_TIMEOUT(client.homeStatus(), QStringLiteral("ending"), 10000);
+
+        // Play while the End is unconfirmed asks the server for nothing.
+        const int playsBefore = m_fake->countOfPathEndingWith(QStringLiteral("/api/sessions"));
+        client.start();
+        QTest::qWait(200);
+        QCOMPARE(m_fake->countOfPathEndingWith(QStringLiteral("/api/sessions")), playsBefore);
+        QCOMPARE(client.homeStatus(), QStringLiteral("ending"));
+
+        // 401 is not a confirmation: the record stays and Home stays ending.
+        m_fake->answerEnd(401);
+        QTest::qWait(1500);
+        QVERIFY(client.hasSavedEnd());
+        QCOMPARE(client.homeStatus(), QStringLiteral("ending"));
+
+        // 404 says the server holds no such session, so the record is done and Home is ready.
+        m_fake->answerEnd(404);
+        const int endsBefore = m_fake->countOfPathEndingWith(QStringLiteral("/end"));
+        QMetaObject::invokeMethod(&client, "onNetworkBack");
+        QTRY_VERIFY_WITH_TIMEOUT(
+            m_fake->countOfPathEndingWith(QStringLiteral("/end")) > endsBefore, 10000);
+        QTRY_VERIFY_WITH_TIMEOUT(!client.hasSavedEnd(), 15000);
+        QCOMPARE(client.homeStatus(), QStringLiteral("ready"));
+    }
+
+    void anEndIsOnDiskBeforeTheFirstEndRequestIsSent()
+    {
+        // V-OUTBOX: the durable record exists on disk before the first End POST leaves the machine.
+        // Play ends a never-streamed session before allocating, and that caller writes the record
+        // first too - the probe reads the disk as the request arrives, before any answer.
+        SeatHubClient client;
+        auto* engine = new FakeEngineSession;
+        client.session()->attachSession(engine);
+        client.setReconnectJitterProvider([]() { return 0.0; });
+        reachHome(client, 90);
+        QVERIFY(!QTest::currentTestFailed());
+
+        // Keep pairing from resolving, and let the pre-stream teardown time out, so the session stays
+        // attached on Home: the Play below is the caller that must end it before it allocates.
+        m_fake->answerPairing(409, playRefusalBody(QStringLiteral("The rig is not ready yet."),
+                                                   QStringLiteral("SH-2K2XQ1")));
+        m_fake->answerSession(QStringLiteral("s-stages"), QStringLiteral("ACTIVE"));
+        client.teardown()->setVerifyIntervalMs(1);
+        client.teardown()->setTeardownGraceMs(1);
+        client.beginSession(QStringLiteral("s-stages"));
+        emit engine->displayLaunchError(QStringLiteral("boom"));
+        QTRY_COMPARE_WITH_TIMEOUT(client.appState(), QStringLiteral("error"), 15000);
+        client.dismissError();
+        QTRY_COMPARE_WITH_TIMEOUT(client.appState(), QStringLiteral("home"), 15000);
+        QTRY_COMPARE_WITH_TIMEOUT(client.attachedSessionId(), QStringLiteral("s-stages"), 15000);
+
+        const QString outboxFile =
+            QDir(m_dir->path()).filePath(QStringLiteral("end-outbox/s-stages.json"));
+        m_fake->setEndProbe([outboxFile]() { return QFile::exists(outboxFile); });
+        m_fake->answerEnd(0);  // the server never answers; the probe is what this test reads
+
+        const int endsBefore = m_fake->countOfPathEndingWith(QStringLiteral("/end"));
+        client.start();
+        QTRY_VERIFY_WITH_TIMEOUT(
+            m_fake->countOfPathEndingWith(QStringLiteral("/end")) > endsBefore, 15000);
+        QVERIFY(m_fake->endOutboxExistedAtFirstEnd());
+        QVERIFY(QFile::exists(outboxFile));
+        QVERIFY(client.hasSavedEnd());
+        // Nothing was allocated while the End is unconfirmed.
+        QCOMPARE(client.homeStatus(), QStringLiteral("ending"));
+        QCOMPARE(m_fake->countOfPathEndingWith(QStringLiteral("/api/sessions")), 0);
+    }
+
+    void anUnwritableEndOutboxKeepsTheEndUnconfirmedAndBlocksPlay()
+    {
+        // If the End cannot be written to disk the app must not claim it saved, and Play must not
+        // allocate while the session is un-ended: the failure reaches the customer through the
+        // ordinary failure screen, never a ready Home.
+        SeatHubClient client;
+        auto* engine = new FakeEngineSession;
+        client.session()->attachSession(engine);
+        client.setReconnectJitterProvider([]() { return 0.0; });
+        reachHome(client, 90);
+        QVERIFY(!QTest::currentTestFailed());
+
+        m_fake->answerPairing(409, playRefusalBody(QStringLiteral("The rig is not ready yet."),
+                                                   QStringLiteral("SH-2K2XQ1")));
+        m_fake->answerSession(QStringLiteral("s-stages"), QStringLiteral("ACTIVE"));
+        client.teardown()->setVerifyIntervalMs(1);
+        client.teardown()->setTeardownGraceMs(1);
+        client.beginSession(QStringLiteral("s-stages"));
+        emit engine->displayLaunchError(QStringLiteral("boom"));
+        QTRY_COMPARE_WITH_TIMEOUT(client.appState(), QStringLiteral("error"), 15000);
+        client.dismissError();
+        QTRY_COMPARE_WITH_TIMEOUT(client.appState(), QStringLiteral("home"), 15000);
+        QTRY_COMPARE_WITH_TIMEOUT(client.attachedSessionId(), QStringLiteral("s-stages"), 15000);
+
+        // A regular file where the outbox directory should be: nothing can be written under it.
+        const QString blocker = QDir(m_dir->path()).filePath(QStringLiteral("blocked"));
+        {
+            QFile file(blocker);
+            QVERIFY(file.open(QIODevice::WriteOnly | QIODevice::Truncate));
+            file.write("not a directory");
+        }
+        client.setEndOutboxDirectory(QDir(blocker).filePath(QStringLiteral("end-outbox")));
+        m_fake->answerEnd(0);
+
+        const int playsBefore = m_fake->countOfPathEndingWith(QStringLiteral("/api/sessions"));
+        client.start();
+
+        // The teardown raises the failure the customer sees; Home is never ready.
+        QTRY_COMPARE_WITH_TIMEOUT(client.appState(), QStringLiteral("error"), 15000);
+        QVERIFY(!client.hasSavedEnd());
+        QVERIFY(client.homeStatus() != QStringLiteral("ready"));
+        QTest::qWait(200);
+        QCOMPARE(m_fake->countOfPathEndingWith(QStringLiteral("/api/sessions")), playsBefore);
+    }
+
+    void anEndAnswerOnlyClearsTheRecordItAnswers()
+    {
+        // The acknowledgement is scoped to the session it names: a late answer for another session
+        // (or another account's record) must not clear the End this account is still waiting on.
+        SeatHubClient client;
+        client.setReconnectJitterProvider([]() { return 0.0; });
+        reachHome(client, 90);
+        QVERIFY(!QTest::currentTestFailed());
+
+        const QString outboxDir = QDir(m_dir->path()).filePath(QStringLiteral("end-outbox"));
+        QVERIFY(QDir().mkpath(outboxDir));
+        {
+            QFile file(QDir(outboxDir).filePath(QStringLiteral("s-live.json")));
+            QVERIFY(file.open(QIODevice::WriteOnly | QIODevice::Truncate));
+            file.write(QJsonDocument(QJsonObject{
+                { QStringLiteral("account_id"),
+                  QStringLiteral("6f1c6f5e-3a1e-4b1e-9f2e-0f1a2b3c4d5e") },
+                { QStringLiteral("session_id"), QStringLiteral("s-live") },
+                { QStringLiteral("failed"), false },
+            }).toJson(QJsonDocument::Compact));
+        }
+
+        m_fake->answerEnd(0);
+        QMetaObject::invokeMethod(&client, "onNetworkBack");
+        QTRY_VERIFY_WITH_TIMEOUT(client.hasSavedEnd(), 10000);
+        QTRY_COMPARE_WITH_TIMEOUT(client.homeStatus(), QStringLiteral("ending"), 10000);
+
+        // An answer for a different session leaves this account's record and Home alone.
+        QMetaObject::invokeMethod(&client, "handleTeardownEndAnswered",
+                                  Q_ARG(QString, QStringLiteral("s-other")), Q_ARG(int, 200));
+        QVERIFY(client.hasSavedEnd());
+        QCOMPARE(client.homeStatus(), QStringLiteral("ending"));
+
+        // The answer for this session is the one that finishes it. Home's own return to ready is the
+        // teardown's confirmation of the session's end, which this direct ack does not stand in for.
+        QMetaObject::invokeMethod(&client, "handleTeardownEndAnswered",
+                                  Q_ARG(QString, QStringLiteral("s-live")), Q_ARG(int, 200));
+        QVERIFY(!client.hasSavedEnd());
+    }
+
+    void anUnwritableEndOutboxOnAStreamedSessionKeepsPlayBlocked()
+    {
+        // V-OUTBOX/C-ENDING (AC3): the ordinary streamed quit path. When the End cannot be written
+        // to disk it is remembered for this run only; the failed send surfaces the ordinary failure
+        // screen, and dismissing it must not make Play ready over a session the server may still
+        // hold. A repaired destination makes the End durable again and unblocks Home on the answer.
+        SeatHubClient client;
+        auto* engine = new FakeEngineSession;
+        client.setReconnectJitterProvider([]() { return 0.0; });
+        WalletTicks ticks;
+        beginStreaming(client, engine, &ticks, 90, 80);
+        QVERIFY(!QTest::currentTestFailed());
+        QCOMPARE(client.appState(), QStringLiteral("streaming"));
+
+        // A regular file where the outbox directory should be: nothing can be written under it.
+        const QString blocker = QDir(m_dir->path()).filePath(QStringLiteral("blocked-streamed"));
+        {
+            QFile file(blocker);
+            QVERIFY(file.open(QIODevice::WriteOnly | QIODevice::Truncate));
+            file.write("not a directory");
+        }
+        client.setEndOutboxDirectory(QDir(blocker).filePath(QStringLiteral("end-outbox")));
+        m_fake->answerEnd(0);
+
+        emitConnectionTerminated(0);
+        emit engine->displayLaunchError(QStringLiteral("Connection terminated"));
+        emit engine->readyForDeletion();
+
+        // The End never reached the server, so the teardown failed and the customer sees the ordinary
+        // failure screen - and no durable record exists, only the in-memory intent.
+        QTRY_COMPARE_WITH_TIMEOUT(client.appState(), QStringLiteral("error"), 15000);
+        QVERIFY(!client.hasSavedEnd());
+
+        client.dismissError();
+        QTRY_COMPARE_WITH_TIMEOUT(client.appState(), QStringLiteral("home"), 15000);
+        QCOMPARE(client.homeStatus(), QStringLiteral("ending"));
+
+        // Play is pressed over and over while the End is unconfirmed: no new session is allocated.
+        const int playsBefore = m_fake->countOfPathEndingWith(QStringLiteral("/api/sessions"));
+        client.start();
+        QTest::qWait(300);
+        client.start();
+        QTest::qWait(300);
+        QCOMPARE(m_fake->countOfPathEndingWith(QStringLiteral("/api/sessions")), playsBefore);
+        QVERIFY(client.appState() != QStringLiteral("connecting"));
+        QVERIFY(client.homeStatus() != QStringLiteral("ready"));
+
+        // The destination is repaired and the network returns: the intent becomes durable, is sent,
+        // and the server's 200 confirms it - only then is Home ready again.
+        client.setEndOutboxDirectory(QDir(m_dir->path()).filePath(QStringLiteral("end-outbox")));
+        const int endsBefore = m_fake->countOfPathEndingWith(QStringLiteral("/end"));
+        m_fake->answerEnd(200);
+        QMetaObject::invokeMethod(&client, "onNetworkBack");
+        QTRY_VERIFY_WITH_TIMEOUT(m_fake->countOfPathEndingWith(QStringLiteral("/end")) > endsBefore, 15000);
+        QTRY_VERIFY_WITH_TIMEOUT(!client.hasSavedEnd(), 15000);
+        QTRY_COMPARE_WITH_TIMEOUT(client.homeStatus(), QStringLiteral("ready"), 15000);
+    }
+
     void aHostSideCodeStillEnds()
     {
         auto* engine = new FakeEngineSession;
@@ -6349,10 +6701,12 @@ private slots:
         QCOMPARE(m_fake->requestPaths().count(QStringLiteral("/api/sessions/s-live/end")), 1);
     }
 
-    void aFailedAttemptTriesAgainWithBackoff()
+    void theReconnectPaceStartsAtOnceAndCapsAtFiveSeconds()
     {
         auto* engine = new FakeEngineSession;
         SeatHubClient client;
+        // Deterministic pace: no jitter, so the exact intervals can be compared.
+        client.setReconnectJitterProvider([] { return 0.0; });
         WalletTicks ticks;
         beginStreaming(client, engine, &ticks, 90, 80);
         QVERIFY(!QTest::currentTestFailed());
@@ -6361,25 +6715,91 @@ private slots:
         emitConnectionTerminated(-1);
         emit engine->displayLaunchError(QStringLiteral("Connection terminated"));
         emit engine->readyForDeletion();
-        QTRY_COMPARE_WITH_TIMEOUT(client.reconnectTimer()->interval(), 2000, 15000);
+
+        // V9/ADR-0066 decision 9: the first attempt starts at once (interval 0), not after a wait.
+        QTRY_COMPARE_WITH_TIMEOUT(client.reconnectTimer()->interval(), 0, 15000);
+        QVERIFY(client.reconnecting());
 
         const SeatHubFailure pairingFailure =
             SeatHubFailure::local(QStringLiteral("The rig didn't finish connecting. Try again."));
 
+        // Then 1 s growing x1.6 with jitter, capped at 5 s.
         emit client.pairing()->pairingFailed(pairingFailure);
-        QTRY_COMPARE_WITH_TIMEOUT(client.reconnectTimer()->interval(), 4000, 15000);
-        QVERIFY(client.reconnecting());
+        QTRY_COMPARE_WITH_TIMEOUT(client.reconnectTimer()->interval(), 1000, 15000);
 
         emit client.pairing()->pairingFailed(pairingFailure);
-        QTRY_COMPARE_WITH_TIMEOUT(client.reconnectTimer()->interval(), 8000, 15000);
+        QTRY_COMPARE_WITH_TIMEOUT(client.reconnectTimer()->interval(), 1600, 15000);
 
         emit client.pairing()->pairingFailed(pairingFailure);
-        QTRY_COMPARE_WITH_TIMEOUT(client.reconnectTimer()->interval(), 15000, 15000);
+        QTRY_COMPARE_WITH_TIMEOUT(client.reconnectTimer()->interval(), 2560, 15000);
 
         emit client.pairing()->pairingFailed(pairingFailure);
-        QTRY_COMPARE_WITH_TIMEOUT(client.reconnectTimer()->interval(), 15000, 15000);
+        QTRY_COMPARE_WITH_TIMEOUT(client.reconnectTimer()->interval(), 4096, 15000);
+
+        emit client.pairing()->pairingFailed(pairingFailure);
+        QTRY_COMPARE_WITH_TIMEOUT(client.reconnectTimer()->interval(), 5000, 15000);
+
+        emit client.pairing()->pairingFailed(pairingFailure);
+        QTRY_COMPARE_WITH_TIMEOUT(client.reconnectTimer()->interval(), 5000, 15000);
+
+        // V-COUNTDOWN: the held retry's own scheduled wait is published for the reconnect screen -
+        // read from the facade's held timer, never from the SSE client's (which lives on the
+        // network thread). `Try now` clears the countdown as the attempt starts.
+        QVERIFY(client.reconnectRetrySeconds() >= 1);
+        QMetaObject::invokeMethod(&client, "retryNow");
+        QVERIFY(client.reconnectRetrySeconds() <= 1);
 
         QVERIFY(!m_fake->requestPaths().contains(QStringLiteral("/api/sessions/s-live/end")));
+    }
+
+    // V9/ADR-0066 decision 9: the next attempt is armed even when the session read fails (or never
+    // resolves) - it is not held open by an unbounded `fetchSession`.
+    void aFailedSessionReadStillArmsTheNextAttempt()
+    {
+        auto* engine = new FakeEngineSession;
+        SeatHubClient client;
+        client.setReconnectJitterProvider([] { return 0.0; });
+        WalletTicks ticks;
+        beginStreaming(client, engine, &ticks, 90, 80);
+        QVERIFY(!QTest::currentTestFailed());
+
+        emitConnectionTerminated(-1);
+        emit engine->displayLaunchError(QStringLiteral("Connection terminated"));
+        emit engine->readyForDeletion();
+
+        // No usable session answer is configured: the read cannot resolve usefully.
+        emit client.pairing()->pairingFailed(
+            SeatHubFailure::local(QStringLiteral("The rig didn't finish connecting. Try again.")));
+        QTRY_COMPARE_WITH_TIMEOUT(client.reconnectTimer()->interval(), 1000, 15000);
+        QVERIFY(client.reconnecting());
+        QVERIFY(!client.reconnectEnded());
+    }
+
+    // V-WAKE: a network-back signal starts the next attempt at once and resets the backoff.
+    void aNetworkBackSignalStartsAnAttemptAtOnce()
+    {
+        auto* engine = new FakeEngineSession;
+        SeatHubClient client;
+        client.setReconnectJitterProvider([] { return 0.0; });
+        WalletTicks ticks;
+        beginStreaming(client, engine, &ticks, 90, 80);
+        QVERIFY(!QTest::currentTestFailed());
+        m_fake->answerSession(QStringLiteral("s-live"), QStringLiteral("ACTIVE"));
+
+        emitConnectionTerminated(-1);
+        emit engine->displayLaunchError(QStringLiteral("Connection terminated"));
+        emit engine->readyForDeletion();
+
+        // Let the first attempt fail so a paced retry is actually pending.
+        emit client.pairing()->pairingFailed(
+            SeatHubFailure::local(QStringLiteral("The rig didn't finish connecting. Try again.")));
+        QTRY_COMPARE_WITH_TIMEOUT(client.reconnectTimer()->interval(), 1000, 15000);
+
+        // `onNetworkBack()` is the reachability slot wired in the constructor; the wake-up is only
+        // a hint, never a gate, so the attempt starts at once and the backoff resets.
+        QMetaObject::invokeMethod(&client, "onNetworkBack");
+        QTRY_COMPARE_WITH_TIMEOUT(client.reconnectTimer()->interval(), 0, 15000);
+        QVERIFY(client.reconnecting());
     }
 
     void theServerEndingTheHeldSessionStopsTheAttempts()

@@ -62,6 +62,17 @@ SseClient::SseClient(QObject* parent) : QObject(parent)
         setState(QStringLiteral("paused"));
     });
 
+    // V-L4 (ADR-0083 decision 4): a connection that never sends `stream.hello` is closed and
+    // retried. Like the dead-stream timer, the abort's own `finished()` drives the reconnect
+    // through `handleFinished()`. `stream.alive` deliberately does not stop this.
+    m_helloTimer = new QTimer(this);
+    m_helloTimer->setSingleShot(true);
+    connect(m_helloTimer, &QTimer::timeout, this, [this]() {
+        if (m_reply) {
+            m_reply->abort();
+        }
+    });
+
     // R7 (ADR-0067 amendment 2026-10-06): the live-updates indicator's own clock. It is not the L5
     // fallback timer above: it runs from the first open or from the close of a connection that had
     // received `stream.hello`, and a hello stops it, so a routine reconnect never shows the indicator.
@@ -78,6 +89,9 @@ SseClient::SseClient(QObject* parent) : QObject(parent)
     m_reconnectTimer = new QTimer(this);
     m_reconnectTimer->setSingleShot(true);
     connect(m_reconnectTimer, &QTimer::timeout, this, &SseClient::beginConnection);
+    // V-COUNTDOWN: one tick per second while a reconnect is armed, re-publishing the wait.
+    m_retryTickTimer = new QTimer(this);
+    connect(m_retryTickTimer, &QTimer::timeout, this, &SseClient::publishRetrySeconds);
 
     m_liveResetTimer = new QTimer(this);
     m_liveResetTimer->setSingleShot(true);
@@ -115,8 +129,10 @@ void SseClient::stop()
     m_running = false;
     m_stopping = true;
     m_deadStreamTimer->stop();
+    m_helloTimer->stop();
     m_pausedTimer->stop();
     m_reconnectTimer->stop();
+    m_retryTickTimer->stop();
     m_liveResetTimer->stop();
     clearLiveUpdatesLost();
     if (m_reply) {
@@ -137,6 +153,48 @@ void SseClient::stop()
 void SseClient::setDeadStreamTimeoutMs(int ms)
 {
     m_deadStreamTimeoutMs = ms;
+}
+
+void SseClient::setHelloTimeoutMs(int ms)
+{
+    m_helloTimeoutMs = ms;
+}
+
+int SseClient::nextRetrySeconds() const
+{
+    if (!m_running || m_stopping || !m_reconnectTimer->isActive()) {
+        return -1;
+    }
+    const int remaining = m_reconnectTimer->remainingTime();
+    if (remaining < 0) {
+        return -1;
+    }
+    return (remaining + 999) / 1000;
+}
+
+void SseClient::publishRetrySeconds()
+{
+    // V-COUNTDOWN (ADR-0083 decision 7): publish the genuine wait on this object's own thread, so
+    // the facade never reads `m_reconnectTimer` across threads.
+    const int seconds = nextRetrySeconds();
+    emit retrySecondsChanged(seconds);
+    if (seconds > 0) {
+        if (!m_retryTickTimer->isActive()) {
+            m_retryTickTimer->start(1000);
+        }
+    } else {
+        m_retryTickTimer->stop();
+    }
+}
+
+void SseClient::wakeNow()
+{
+    // V-WAKE (ADR-0083 decision 3): a network-back wake-up hint. If a reconnect is armed, start it
+    // at once; otherwise nothing (an attempt in flight or a live stream is not interrupted).
+    if (m_running && !m_stopping && m_reconnectTimer->isActive()) {
+        m_reconnectTimer->start(0);
+        publishRetrySeconds();
+    }
 }
 
 void SseClient::setPausedDelayMs(int ms)
@@ -180,7 +238,11 @@ void SseClient::beginConnection()
     m_lastCloseReason.clear();
     m_deadStreamTimer->stop();
     setState(QStringLiteral("connecting"));
+    // V-COUNTDOWN: the attempt is starting, so no countdown is pending any more.
+    publishRetrySeconds();
     openStream();
+    // V-L4: arm the hello limit for this attempt; `stream.hello` stops it.
+    m_helloTimer->start(m_helloTimeoutMs);
     // L5: not live starts (or restarts, on reconnect) the fallback-indicator countdown.
     m_pausedTimer->start(m_pausedDelayMs);
 }
@@ -204,6 +266,7 @@ void SseClient::scheduleReconnect(int delayMs)
         return;
     }
     m_reconnectTimer->start(delayMs);
+    publishRetrySeconds();
 }
 
 void SseClient::setState(const QString& state)
@@ -254,6 +317,7 @@ void SseClient::handleFinished()
     QNetworkReply* reply = m_reply;
     m_reply = nullptr;
     m_deadStreamTimer->stop();
+    m_helloTimer->stop();
     m_liveResetTimer->stop();
 
     int status = 0;
@@ -312,6 +376,8 @@ void SseClient::handleFinished()
 
 void SseClient::onHello(int aliveMs)
 {
+    // V-L4: a hello proves the connection is alive; stop the hello limit for this attempt.
+    m_helloTimer->stop();
     // R7: any hello proves a working stream - the indicator hides at once, whether or not the first
     // `stream.alive` (which counts the connection live for L3/L5) has come yet.
     m_connectionHelloed = true;

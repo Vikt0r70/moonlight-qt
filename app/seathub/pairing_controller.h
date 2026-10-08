@@ -156,6 +156,11 @@ signals:
     void pairingCompleted(const QString& clientUuid);
     /// Pairing failed closed. Always a SeatHub failure, never engine text in `error`.
     void pairingFailed(const SeatHubFailure& failure);
+    /// V10 / ADR-0066 decision 8: this reconnect episode has issued its three PIN-bearing
+    /// pairings; the server answered 409 `session.pairing_limit` to a fourth. New PIN-bearing
+    /// handshakes stop for the episode, but this is not a `pairingFailed`: the facade keeps the
+    /// reconnect screen until the server ends the session at grace expiry.
+    void pairingLimited();
     /// Closed attempt classification for authorization failures; never carries response text.
     void stepFailed(const QString& step, const QString& failureClass, qint64 elapsedMs);
     /// The session exactly as `GET /api/sessions/{id}` reported it on one poll tick. It rides the
@@ -177,6 +182,10 @@ private slots:
     void handleSessionRead(quint64 attempt, const ControlPlaneResult& result);
     void handleSeamResult(quint64 attempt, bool ok, const QString& clientUuid,
                           const QString& engineError);
+    /// V9 (ADR-0066 decision 9): the deadline's own timer fired - a pairing that did not resolve
+    /// inside `m_deadlineMs`, even when no poll reply arrived. Fails closed the same way the
+    /// poll-entry check does.
+    void deadlineExpired();
 
 private:
     void setState(const QString& state);
@@ -196,6 +205,11 @@ private:
 
     QElapsedTimer m_clock;
     QTimer* m_pollTimer = nullptr;
+    /// V9: the deadline's own single-shot timer, kept in lockstep with `m_clock` (armed in
+    /// `start()` and on every not-ready answer, stopped once a handshake starts). Its whole reason
+    /// to exist is to fire when the poll itself is stalled - `deadlineExceeded()` is only checked
+    /// at poll entry, which never runs if no reply ever arrives.
+    QTimer* m_deadlineTimer = nullptr;
 
     int m_pollIntervalMs = kPollIntervalMs;
     int m_deadlineMs = kDeadlineMs;

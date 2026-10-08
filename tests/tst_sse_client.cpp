@@ -767,6 +767,100 @@ private slots:
         QVERIFY(plainOk);
         QVERIFY(!net.lastRequest.hasRawHeader("X-Stream-Fallback"));
     }
+
+    // --- V-L4 (ADR-0083 decision 4): a push-stream connection with no `stream.hello` within the
+    // --- hello time limit is closed and retried. `stream.alive` is deliberately not a substitute. --
+
+    void aHelloLessConnectionIsClosedAndRetried()
+    {
+        ControlPlaneClient controlPlane;
+        StreamNetworkAccessManager net;
+        controlPlane.setStreamNetworkAccessManager(&net);
+        controlPlane.setBaseUrl(QStringLiteral("https://example.test"));
+
+        SseClient client;
+        client.setControlPlane(&controlPlane);
+        client.setHelloTimeoutMs(50);        // stands for the 15 s hello time limit
+        client.setJitterProvider([]() { return 0.0; });
+        client.start();
+        QCOMPARE(net.replies.count(), 1);
+
+        auto* firstReply = net.replies.first();
+        bool firstWasAborted = false;
+        QObject abortObserver;
+        QVERIFY(QObject::connect(firstReply, &QNetworkReply::finished, &abortObserver,
+                                 [&firstWasAborted, firstReply]() {
+                                     firstWasAborted = firstReply->wasAborted();
+                                 }, Qt::DirectConnection));
+
+        // No `stream.hello` ever arrives: the hello time limit closes the connection and the
+        // ordinary reconnect opens a fresh one.
+        QTRY_VERIFY_WITH_TIMEOUT(firstWasAborted, 2000);
+        QTRY_COMPARE_WITH_TIMEOUT(net.replies.count(), 2, 2000);
+    }
+
+    void anAliveWithoutAHelloDoesNotStopTheHelloTimer()
+    {
+        ControlPlaneClient controlPlane;
+        StreamNetworkAccessManager net;
+        controlPlane.setStreamNetworkAccessManager(&net);
+        controlPlane.setBaseUrl(QStringLiteral("https://example.test"));
+
+        SseClient client;
+        client.setControlPlane(&controlPlane);
+        client.setHelloTimeoutMs(80);
+        client.setJitterProvider([]() { return 0.0; });
+        QSignalSpy helloSpy(&client, &SseClient::hello);
+        client.start();
+        QCOMPARE(net.replies.count(), 1);
+
+        // A bare `stream.alive` arrives, but never a `stream.hello`.
+        net.replies.first()->pushBytes(sseFrame(
+            QStringLiteral("stream.alive"),
+            QJsonObject{ { QStringLiteral("at"), QStringLiteral("2026-10-06T10:00:20.000Z") } }));
+        QCOMPARE(helloSpy.count(), 0);
+
+        // Alive is not a substitute for hello: the hello time limit still expires and retries.
+        QTRY_COMPARE_WITH_TIMEOUT(net.replies.count(), 2, 2000);
+        QCOMPARE(helloSpy.count(), 0);
+    }
+
+    // --- V-L5 (ADR-0083 decision 5): the loss clock runs from the close of the last connection
+    // --- that received `stream.hello`, or from start-up - not from every attempt's start. --------
+
+    void theLossClockRunsFromTheLastHelloedClose()
+    {
+        ControlPlaneClient controlPlane;
+        StreamNetworkAccessManager net;
+        controlPlane.setStreamNetworkAccessManager(&net);
+        controlPlane.setBaseUrl(QStringLiteral("https://example.test"));
+
+        SseClient client;
+        client.setControlPlane(&controlPlane);
+        client.setPausedDelayMs(400);        // stands for L5's 10 s
+        client.setReconnectCapMs(800);
+        client.setJitterProvider([]() { return 0.0; });
+        QSignalSpy lostSpy(&client, &SseClient::liveUpdatesLostChanged);
+        client.start();
+
+        // Start-up armed the clock. Hold the hello back so the close re-anchors it well after
+        // start-up, but still inside the first window so nothing fires early.
+        QTest::qWait(300);
+        QCOMPARE(lostSpy.count(), 0);
+
+        net.replies.first()->pushBytes(helloFrame(0));
+        net.replies.first()->pushBytes(closingFrame(QStringLiteral("replaced")));
+        net.replies.first()->finishStream();
+
+        // Past start-up's own window (~400 ms), but not the close's: nothing is shown yet. This is
+        // what tells the two anchors apart.
+        QTest::qWait(150);
+        QCOMPARE(lostSpy.count(), 0);
+
+        // The clock fires from the helloed close.
+        QTRY_COMPARE_WITH_TIMEOUT(lostSpy.count(), 1, 800);
+        QCOMPARE(lostSpy.at(0).at(0).toBool(), true);
+    }
 };
 
 QTEST_MAIN(TstSseClient)

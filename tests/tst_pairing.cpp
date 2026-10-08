@@ -312,6 +312,38 @@ private:
     bool m_open = false;
 };
 
+// A reply that never completes on its own - it stands for a request stalled on a dead connection,
+// where the ordinary `finished()`-driven poll never returns.
+class StallingReply : public QNetworkReply
+{
+    Q_OBJECT
+
+public:
+    explicit StallingReply(QObject* parent) : QNetworkReply(parent)
+    {
+        setAttribute(QNetworkRequest::HttpStatusCodeAttribute, 200);
+        open(QIODevice::ReadOnly);
+    }
+
+    void abort() override {}
+    qint64 readData(char*, qint64) override { return 0; }
+};
+
+class StallingNetworkAccessManager : public QNetworkAccessManager
+{
+    Q_OBJECT
+
+public:
+    int calls = 0;
+
+protected:
+    QNetworkReply* createRequest(Operation, const QNetworkRequest&, QIODevice*) override
+    {
+        ++calls;
+        return new StallingReply(this);
+    }
+};
+
 } // namespace
 
 class TstPairing : public QObject
@@ -2085,6 +2117,32 @@ private slots:
             ++checkedCalls;
         }
         QVERIFY(checkedCalls > 0);
+    }
+
+    void thePairingDeadlineFiresOnItsOwnTimer()
+    {
+        // V9 (ADR-0066 decision 9, ADR-0083 decision 8): the 30 s pairing deadline keeps its own
+        // timer. It must expire even when the request it is waiting on never answers - it is not a
+        // check that only runs when a poll tick returns.
+        PairingController controller;
+        auto* fake = new StallingNetworkAccessManager;
+        auto* seam = new RecordingSeam;
+        wire(controller, fake);
+        controller.setSeam(seam);
+        // A poll interval far longer than the deadline: no second poll tick can arrive first.
+        controller.setPollIntervalMs(60000);
+        controller.setDeadlineMs(60);
+
+        QSignalSpy failed(&controller, &PairingController::pairingFailed);
+        controller.start(QString::fromLatin1(kSessionId));
+
+        // The first poll went out and stalled; nothing else can happen unless the timer fires.
+        QVERIFY(fake->calls >= 1);
+        QCOMPARE(failed.count(), 0);
+
+        QTRY_COMPARE_WITH_TIMEOUT(failed.count(), 1, 2000);
+        QCOMPARE(controller.state(), QStringLiteral("failed"));
+        QCOMPARE(seam->calls, 0);
     }
 };
 

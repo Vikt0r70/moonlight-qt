@@ -51,6 +51,7 @@
 #include <QMutex>
 #include <QObject>
 #include <QString>
+#include <atomic>
 #include <functional>
 
 #include "error_map.h"
@@ -73,6 +74,9 @@ struct ControlPlaneResult
     QString reference;
     /// `AllocationRefused.failure`, e.g. `NO_HOST_AVAILABLE`. Empty when absent.
     QString failure;
+    /// `Error.kind`, when the control plane named one - e.g. the `session.pairing_limit` refusal a
+    /// reconnect episode's fourth PIN request gets (V10). Empty when absent.
+    QString kind;
     /// The parsed response object. Empty on failure.
     QJsonObject body;
 
@@ -459,6 +463,12 @@ public:
 
     QNetworkAccessManager* networkAccessManager() const { return m_network; }
 
+    /// Test seam (T089 AC1): how many times a transport failure has dropped the pooled
+    /// connections (`clearConnectionCache`, V-REQ). `clearConnectionCache` is a non-virtual slot,
+    /// so a fake `QNetworkAccessManager` cannot observe it; this counter is the observable proof
+    /// that the pool drop ran. Production never reads it.
+    int connectionCacheClears() const { return m_connectionCacheClears.load(); }
+
     /// Replaces the stream's own access manager (see `m_streamNetwork`'s comment). The same test
     /// seam `setNetworkAccessManager` is for the REST manager; production never calls it.
     void setStreamNetworkAccessManager(QNetworkAccessManager* manager);
@@ -636,7 +646,8 @@ private:
                             bool authenticated, const QString& accessToken, const QString& traceId,
                             Callback callback,
                             const QHash<QByteArray, QByteArray>& extraHeaders = {});
-    void finishReply(QNetworkReply* reply, Callback callback);
+    void finishReply(QNetworkReply* reply, Callback callback, const QString& routeClass,
+                     qint64 elapsedMs);
 
     QNetworkAccessManager* m_network = nullptr;
     bool m_ownsNetwork = false;
@@ -659,4 +670,10 @@ private:
     /// read where the liveness report is issued.
     QMutex m_beatObserverMutex;
     std::function<void()> m_beatObserver;
+
+    /// V-REQ (ADR-0083 decision 11): one transport-failure log line per outage episode - set when
+    /// the first failure of an episode is logged, cleared by the next reply that got a status.
+    bool m_transportFailureLoggedThisEpisode = false;
+    /// V-REQ (AC1 test seam): how many times a transport failure dropped the pooled connections.
+    std::atomic<int> m_connectionCacheClears{0};
 };

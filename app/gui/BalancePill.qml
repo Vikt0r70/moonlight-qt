@@ -70,6 +70,10 @@ Rectangle {
     // start-up) - independent of `loading`/`level`, which are about the balance itself.
     readonly property bool paused: client ? client.liveUpdatesPaused === true : false
 
+    // C-RECONNECT (ADR-0083 decision 12): the live-updates indicator's own scheduled wait,
+    // published by the client once a second - never a client-side timer.
+    readonly property int retrySeconds: root.client ? root.client.liveRetrySeconds : -1
+
     // D-05, ADR-0067: one opacity pulse when a push changes the value already on screen - never on
     // the first known value, and never for a read that answers with the same figure.
     property bool everKnownMinutes: false
@@ -209,7 +213,9 @@ Rectangle {
 
             Text {
                 anchors.verticalCenter: parent.verticalCenter
-                text: qsTr("Reconnecting to live updates…")
+                text: root.retrySeconds > 0
+                    ? qsTr("Reconnecting to SevenHills… trying again in %1 s").arg(root.retrySeconds)
+                    : qsTr("Reconnecting to SevenHills…")
                 color: Tokens.foregroundMutedDefault
                 font.family: Tokens.fontSansDefault
                 font.pixelSize: Metrics.fontCaption
