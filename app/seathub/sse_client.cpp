@@ -189,9 +189,13 @@ void SseClient::publishRetrySeconds()
 
 void SseClient::wakeNow()
 {
-    // V-WAKE (ADR-0083 decision 3): a network-back wake-up hint. If a reconnect is armed, start it
-    // at once; otherwise nothing (an attempt in flight or a live stream is not interrupted).
+    // V-WAKE (ADR-0083 decision 3): a network-back wake-up hint. If a reconnect is armed, reset
+    // the ordinary attempt count and start it at once; otherwise nothing (an attempt in flight or
+    // a live stream is not interrupted). The reset is what makes the wake a fresh start: an
+    // attempt started by the wake that then fails must wait the 1 s floor again, not the wait the
+    // old count had reached (wave 21 cycle 2, F3).
     if (m_running && !m_stopping && m_reconnectTimer->isActive()) {
+        m_attempt = 0;
         m_reconnectTimer->start(0);
         publishRetrySeconds();
     }

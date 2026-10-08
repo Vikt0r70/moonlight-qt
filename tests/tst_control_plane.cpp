@@ -2054,6 +2054,192 @@ private slots:
         QCOMPARE(accepted, 2);
         QCOMPARE(client.connectionCacheClears(), 1);
     }
+
+    // F2 repair (wave 21 cycle 2): Qt retains the HTTP status when the transfer dies after the
+    // headers, so a body that stalls must not be judged by the retained status. The real server
+    // here sends the headers and the first slice of a body that declares 4096 bytes, then sends
+    // nothing: the 8 s inactivity limit must fail the call, log it and clear the pool, and the
+    // next request must open a fresh TCP connection.
+    void aBodyStallAfterTheHeadersIsATransportFailure()
+    {
+        QTcpServer server;
+        QVERIFY(server.listen(QHostAddress::LocalHost, 0));
+
+        int accepted = 0;
+        QObject::connect(&server, &QTcpServer::newConnection, [&server, &accepted]() {
+            while (QTcpSocket* socket = server.nextPendingConnection()) {
+                const int index = ++accepted;
+                auto answer = [socket, index]() {
+                    socket->readAll();
+                    if (index == 1) {
+                        // Headers first, then a body that stalls short of its declared length.
+                        socket->write("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                                      "Content-Length: 4096\r\n\r\n{\"id\":\"u-");
+                        socket->flush();
+                    } else {
+                        const QByteArray body = QByteArrayLiteral("{\"id\":\"u-1\"}");
+                        socket->write("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                                      "Content-Length: "
+                                      + QByteArray::number(body.size())
+                                      + "\r\nConnection: close\r\n\r\n" + body);
+                        socket->flush();
+                    }
+                };
+                QObject::connect(socket, &QTcpSocket::readyRead, socket, answer);
+                if (socket->bytesAvailable() > 0) {
+                    answer();
+                }
+            }
+        });
+
+        static QString captured;   // A function-local static is reachable from a non-capturing lambda.
+        captured.clear();
+        const QtMessageHandler previous = qInstallMessageHandler(
+            [](QtMsgType, const QMessageLogContext&, const QString& message) {
+                if (message.contains(QStringLiteral("control-plane transport failure"))) {
+                    captured.append(message);
+                    captured.append(QLatin1Char('\n'));
+                }
+            });
+
+        ControlPlaneClient client;   // its own real QNetworkAccessManager
+        client.setBaseUrl(QStringLiteral("http://127.0.0.1:%1").arg(server.serverPort()));
+
+        QSignalSpy transportSpy(&client, &ControlPlaneClient::transportFailed);
+
+        QElapsedTimer elapsed;
+        elapsed.start();
+        bool firstDone = false;
+        ControlPlaneResult first;
+        client.fetchMe([&firstDone, &first](const ControlPlaneResult& result) {
+            first = result;
+            firstDone = true;
+        });
+        QTRY_VERIFY_WITH_TIMEOUT(firstDone, 25000);
+        const qint64 stalledMs = elapsed.elapsed();
+        qInstallMessageHandler(previous);
+
+        // The approved 8 s inactivity limit ended it, exactly like the header-less stall.
+        QVERIFY2(stalledMs >= 7000, qPrintable(QStringLiteral("failed after %1 ms").arg(stalledMs)));
+        QVERIFY2(stalledMs <= 15000, qPrintable(QStringLiteral("failed after %1 ms").arg(stalledMs)));
+        QVERIFY2(!first.ok, "a body that stalls is not a success, whatever status the headers carried");
+        QCOMPARE(first.statusCode, 0);
+        QCOMPARE(transportSpy.count(), 1);
+        QCOMPARE(client.connectionCacheClears(), 1);
+        QVERIFY2(!captured.isEmpty(), "the transport failure was not logged");
+        QVERIFY(captured.contains(QStringLiteral("route=")));
+        QVERIFY(!captured.contains(QStringLiteral("127.0.0.1")));
+        QVERIFY(!captured.contains(QString::number(server.serverPort())));
+
+        // The pool was cleared: the next request opens a fresh TCP connection (the second
+        // accept) and succeeds.
+        bool secondDone = false;
+        bool secondOk = false;
+        client.fetchMe([&secondDone, &secondOk](const ControlPlaneResult& result) {
+            secondOk = result.ok;
+            secondDone = true;
+        });
+        QTRY_VERIFY_WITH_TIMEOUT(secondDone, 25000);
+        QVERIFY(secondOk);
+        QCOMPARE(accepted, 2);
+        QCOMPARE(client.connectionCacheClears(), 1);
+    }
+
+    // F2 repair (wave 21 cycle 2): the bytes the peer sent parse as a complete JSON object, but
+    // the body declared 4096 bytes and the peer closed after ten. Qt keeps the 200 and reports
+    // the close as a transport error; the call must still be unsuccessful, logged and the pool
+    // dropped. The same test pins the preserved behaviour: a genuine HTTP content refusal on the
+    // fresh connection stays an HTTP failure, not a transport failure.
+    void aPrematureBodyCloseWithACompleteJsonPrefixIsATransportFailure()
+    {
+        QTcpServer server;
+        QVERIFY(server.listen(QHostAddress::LocalHost, 0));
+
+        int accepted = 0;
+        QObject::connect(&server, &QTcpServer::newConnection, [&server, &accepted]() {
+            while (QTcpSocket* socket = server.nextPendingConnection()) {
+                const int index = ++accepted;
+                auto answer = [socket, index]() {
+                    socket->readAll();
+                    if (index == 1) {
+                        socket->write("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                                      "Content-Length: 4096\r\n\r\n{\"id\":\"u-1\"}");
+                        socket->flush();
+                        socket->disconnectFromHost();
+                    } else {
+                        const QByteArray body = QByteArrayLiteral(
+                            "{\"error\":\"No such resource.\",\"reference\":\"SH-4F7KQ2\"}");
+                        socket->write("HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\n"
+                                      "Content-Length: "
+                                      + QByteArray::number(body.size())
+                                      + "\r\nConnection: close\r\n\r\n" + body);
+                        socket->flush();
+                        socket->disconnectFromHost();
+                    }
+                };
+                QObject::connect(socket, &QTcpSocket::readyRead, socket, answer);
+                if (socket->bytesAvailable() > 0) {
+                    answer();
+                }
+            }
+        });
+
+        static QString captured;   // A function-local static is reachable from a non-capturing lambda.
+        captured.clear();
+        const QtMessageHandler previous = qInstallMessageHandler(
+            [](QtMsgType, const QMessageLogContext&, const QString& message) {
+                if (message.contains(QStringLiteral("control-plane transport failure"))) {
+                    captured.append(message);
+                    captured.append(QLatin1Char('\n'));
+                }
+            });
+
+        ControlPlaneClient client;   // its own real QNetworkAccessManager
+        client.setBaseUrl(QStringLiteral("http://127.0.0.1:%1").arg(server.serverPort()));
+
+        QSignalSpy transportSpy(&client, &ControlPlaneClient::transportFailed);
+
+        QElapsedTimer elapsed;
+        elapsed.start();
+        bool firstDone = false;
+        ControlPlaneResult first;
+        client.fetchMe([&firstDone, &first](const ControlPlaneResult& result) {
+            first = result;
+            firstDone = true;
+        });
+        QTRY_VERIFY_WITH_TIMEOUT(firstDone, 25000);
+        const qint64 closeMs = elapsed.elapsed();
+        qInstallMessageHandler(previous);
+
+        // The peer closed; no inactivity wait was needed to catch it.
+        QVERIFY2(closeMs < 7000, qPrintable(QStringLiteral("failed after %1 ms").arg(closeMs)));
+        QVERIFY2(!first.ok,
+                 "a body shorter than its declared length is not a success, even when the bytes "
+                 "received parse as JSON");
+        QCOMPARE(first.statusCode, 0);
+        QCOMPARE(transportSpy.count(), 1);
+        QCOMPARE(client.connectionCacheClears(), 1);
+        QVERIFY2(!captured.isEmpty(), "the transport failure was not logged");
+        QVERIFY(captured.contains(QStringLiteral("route=")));
+        QVERIFY(!captured.contains(QStringLiteral("127.0.0.1")));
+        QVERIFY(!captured.contains(QString::number(server.serverPort())));
+
+        // Preserved: the next request (fresh connection) gets a genuine 404 from the control
+        // plane - unsuccessful with the status and error retained, and no transport treatment.
+        bool secondDone = false;
+        ControlPlaneResult second;
+        client.fetchMe([&secondDone, &second](const ControlPlaneResult& result) {
+            second = result;
+            secondDone = true;
+        });
+        QTRY_VERIFY_WITH_TIMEOUT(secondDone, 25000);
+        QVERIFY(!second.ok);
+        QCOMPARE(second.statusCode, 404);
+        QCOMPARE(second.error, QStringLiteral("No such resource."));
+        QCOMPARE(accepted, 2);
+        QCOMPARE(transportSpy.count(), 1);
+        QCOMPARE(client.connectionCacheClears(), 1);
+    }
 };
 
 QTEST_MAIN(TstControlPlane)

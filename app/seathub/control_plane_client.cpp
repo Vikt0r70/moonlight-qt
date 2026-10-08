@@ -1061,11 +1061,20 @@ void ControlPlaneClient::finishReply(QNetworkReply* reply, Callback callback,
 
     ControlPlaneResult result = classify(status, body);
 
-    // statusCode 0 means the transport never produced a response: an unreachable control
-    // plane, a DNS failure, a timeout. This is the D-33 case, and it is reported as a
-    // failure the caller can choose to treat as non-fatal - not as an exception and not as
-    // a silent no-op.
-    if (status == 0 && networkError != QNetworkReply::NoError) {
+    // The transport never completed. That is statusCode 0 (an unreachable control plane, a DNS
+    // failure, an inactivity timeout before any bytes), or a network-layer error (the 1-99 range)
+    // on a transfer whose headers were already parsed. Qt retains the HTTP status once the headers
+    // arrived, so a retained status says nothing about the body being complete: an inactivity
+    // timeout while the body stalls, or a premature close, must still be reported here. Content
+    // (201-299), protocol (301-399) and server (401-499) errors are the control plane's own
+    // answers and stay ordinary HTTP failures. This is the D-33 case: a failure the caller can
+    // choose to treat as non-fatal - not an exception and not a silent no-op.
+    const int networkErrorCode = int(networkError);
+    const bool transportFailure = networkError != QNetworkReply::NoError
+        && (status == 0
+            || (networkErrorCode >= int(QNetworkReply::ConnectionRefusedError)
+                && networkErrorCode <= int(QNetworkReply::UnknownNetworkError)));
+    if (transportFailure) {
         result.ok = false;
         result.statusCode = 0;
         result.error = networkErrorText;

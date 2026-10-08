@@ -614,6 +614,46 @@ private slots:
         QCOMPARE(net.replies.count(), 2);
     }
 
+    // F3 repair (wave 21 cycle 2): a network-back wake resets the ordinary attempt count before it
+    // arms the immediate attempt, so an attempt started by the wake that then fails must wait the
+    // 1 s floor again - even when the ordinary schedule had already reached its cap. Without the
+    // reset the woken attempt's failure re-arms the old capped wait.
+    void aWakeAtTheCapResetsTheNextOrdinaryWaitToTheFloor()
+    {
+        ControlPlaneClient controlPlane;
+        StreamNetworkAccessManager net;
+        controlPlane.setStreamNetworkAccessManager(&net);
+        controlPlane.setBaseUrl(QStringLiteral("https://example.test"));
+
+        SseClient client;
+        client.setControlPlane(&controlPlane);
+        client.setJitterProvider([]() { return 0.0; });
+        client.start();
+        QCOMPARE(net.replies.count(), 1);
+
+        // Ordinary failures walk the schedule: the 1 s floor, then doubling. Each armed wait
+        // elapsing opens the next attempt, which the test then fails again.
+        const int waitsMs[] = { 1000, 2000, 4000, 8000, 16000 };
+        for (int i = 0; i < 5; ++i) {
+            net.replies.last()->finishStream();
+            QTRY_COMPARE_WITH_TIMEOUT(client.nextRetrySeconds(), waitsMs[i] / 1000, 5000);
+            QTRY_COMPARE_WITH_TIMEOUT(net.replies.count(), i + 2, waitsMs[i] + 15000);
+        }
+
+        // The next failure reaches the cap: the deliberate 30 s wait.
+        net.replies.last()->finishStream();
+        QTRY_COMPARE_WITH_TIMEOUT(client.nextRetrySeconds(), 30, 5000);
+
+        // The network-back wake starts an attempt at once and resets the ordinary count.
+        client.wakeNow();
+        QVERIFY(client.nextRetrySeconds() <= 1);
+        QTRY_COMPARE_WITH_TIMEOUT(net.replies.count(), 7, 5000);
+
+        // The woken attempt fails: the next ordinary wait is the 1 s floor again, not the cap.
+        net.replies.last()->finishStream();
+        QTRY_COMPARE_WITH_TIMEOUT(client.nextRetrySeconds(), 1, 5000);
+    }
+
     // --- R7 (ADR-0067 amendment 2026-10-06): the live-updates indicator shows only on a real loss ------
 
     void aRoutineReconnectWithAPromptHelloNeverShowsTheIndicator()
