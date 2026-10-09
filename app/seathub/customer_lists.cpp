@@ -19,6 +19,7 @@ struct EndReasonForm
 
 const EndReasonForm kEndReasonForms[] = {
     { "CUSTOMER_ENDED", "You ended it" },
+    { "REPLACED_BY_PLAY", "Ended by your new Play" },
     { "CONNECT_FAILED", "Didn't start, not charged" },
     { "BALANCE_EXHAUSTED", "Balance ran out" },
     { "HOST_LOST", "Lost contact with the rig" },
@@ -42,6 +43,8 @@ const EndReasonForm kLedgerKinds[] = {
     { "refund", "Refund" },
     { "adjustment", "Adjustment by support" },
     { "shortfall", "Unpaid minutes" },
+    // C-SAMEPLAY / L11: the extra minutes a held rental returns when it ends, in one ledger entry.
+    { "held_return", "Minutes returned" },
 };
 
 // `copy.md` § Menu and profile: a top-up's status in a row.

@@ -66,11 +66,11 @@ const int kReconnectMaxBackoffMs = 5000;
 const int kEndOutboxInitialBackoffMs = 1000;
 const int kEndOutboxMaxBackoffMs = 10000;
 
-// `docs/spec/copy.md` §Sign in, path B.
-const char* kOtpMismatch = "That code didn't match. Try again or resend.";
-// `docs/spec/copy.md`, Sign-in Path B (phone): the string for a number that is not E.164 after
-// normalisation. Documented copy, not invented here.
-const char* kPhoneInvalid = "That doesn't look like a phone number.";
+// A-ID: the server answers a login that matches nobody with this sentence (`NO_ACCOUNT`,
+// `docs/spec/copy.md` § Sign in), as `kind` `account.login.no_account`. The screen offers `Create
+// an account on the website` for it (C-SIGNIN).
+const char* kNoAccountSentence = "No account uses that email or phone.";
+const char* kNoAccountKind = "account.login.no_account";
 // `docs/spec/copy.md` § Sign in: said before anything is sent. The screen checks both first; the
 // facade repeats them so no caller can spend a round trip on an empty field.
 const char* kIdentifierMissing = "Enter your email or phone number.";
@@ -87,6 +87,8 @@ const char* kHomeChecking = "checking";
 const char* kHomeBusy = "busy";
 const char* kHomeOffline = "offline";
 const char* kHomeEnding = "ending";
+// C-SAMEPLAY: a Play that answered `PREVIOUS_SESSION_ENDING` is being repeated.
+const char* kHomePreviousEnding = "previous_ending";
 const char* kHomeRefused = "refused";
 
 // `docs/spec/copy.md` §Play flow: the three customer-visible stage lines (`screens.md` §24). The
@@ -142,36 +144,44 @@ int connectStageForState(const QString& state)
 const char* kEndCustomerEnded = "You ended the session. Unused minutes stay in your account.";
 const char* kEndConnectFailed = "The stream didn't start. You were not charged.";
 const char* kEndHostLost =
-    "We lost contact with this rig, so the session ended. You were charged for %1 minutes.";
+    "We lost contact with this rig, so the session ended. You were charged for %1.";
 const char* kEndClientSilent =
-    "We lost contact with your device, so the session ended. You were charged for %1 minutes.";
+    "We lost contact with your device, so the session ended. You were charged for %1.";
 const char* kEndConnectTimeout =
     "You didn't start streaming in time, so the session was released. You were not charged.";
 const char* kEndReadinessTimeout = "This rig didn't come back in time. You were not charged.";
 const char* kEndGraceExpired =
-    "We couldn't reconnect, so the session ended. You were charged for %1 minutes.";
+    "We couldn't reconnect, so the session ended. You were charged for %1.";
 // 06.1's ADR (D-03/copy.md §Reconnect and §Session end reasons): the sixth disconnect after five
 // successful reconnects, and a client the server never heard from before the stream started.
 const char* kEndReconnectLimit =
-    "Your connection dropped too many times, so the session ended. You were charged for %1 "
-    "minutes.";
+    "Your connection dropped too many times, so the session ended. You were charged for %1.";
 const char* kEndClientAbsent =
     "We lost contact with your device before the stream started. You were not charged.";
 const char* kEndOwnerReservation =
-    "The rig's owner reserved it, so the session ended. You were charged for %1 minutes.";
+    "The rig's owner reserved it, so the session ended. You were charged for %1.";
 const char* kEndBalanceExhausted = "Your balance ran out, so the session ended.";
 const char* kEndTeardownTimeout =
     "Something went wrong ending this session, so we closed it. You were charged for the minutes "
     "you used.";
-const char* kEndOperatorForced = "Support ended this session. You were charged for %1 minutes.";
+const char* kEndOperatorForced = "Support ended this session. You were charged for %1.";
+// C-SAMEPLAY (`copy.md` §Session end reasons): the customer's own Play ended the held session.
+const char* kEndReplacedByPlay = "Ended by your new Play. You were charged for %1.";
 
 // Every number with a unit is mono (copy.md §5), and the end-reason sentences are rendered as
 // `Text.StyledText`, so the minute count is wrapped in the mono family. The family name is the
 // `fontMonoDefault` token; C++ cannot read `Tokens.qml`, and `hud_overlay.cpp` requests the same
 // family by name for the same reason.
-QString monoMinutes(int minutesBilled)
+//
+// The phrase is the whole `{minutes}` of `copy.md`: the count and its unit, `1 minute` in the
+// singular and `N minutes` otherwise (every `You were charged for {minutes}.` sentence).
+QString minutesPhrase(int minutesBilled, bool styled)
 {
-    return QStringLiteral("<font face=\"Geist Mono\">%1</font>").arg(minutesBilled);
+    const QString unit = minutesBilled == 1 ? QStringLiteral("minute") : QStringLiteral("minutes");
+    const QString count = styled
+        ? QStringLiteral("<font face=\"Geist Mono\">%1</font>").arg(minutesBilled)
+        : QString::number(minutesBilled);
+    return count + QLatin1Char(' ') + unit;
 }
 
 // `docs/spec/copy.md` §Session end reasons -> the sentence the customer reads. Returns an empty
@@ -200,14 +210,14 @@ QString endReasonSentence(const QString& endReason, int minutesBilled, bool styl
         { "BALANCE_EXHAUSTED", kEndBalanceExhausted },
         { "TEARDOWN_TIMEOUT", kEndTeardownTimeout },
         { "OPERATOR_FORCED", kEndOperatorForced },
+        { "REPLACED_BY_PLAY", kEndReplacedByPlay },
     };
 
     for (const ReasonLine& line : kLines) {
         if (endReason == QLatin1String(line.reason)) {
             QString sentence = QString::fromUtf8(line.sentence);
             if (sentence.contains(QLatin1String("%1"))) {
-                sentence = sentence.arg(styled ? monoMinutes(minutesBilled)
-                                               : QString::number(minutesBilled));
+                sentence = sentence.arg(minutesPhrase(minutesBilled, styled));
             }
             return sentence;
         }
@@ -655,6 +665,9 @@ SeatHubClient::SeatHubClient(QObject* parent)
     connect(m_pairingSeam, &ProductionPairingSeam::handshakeClassified, this,
             [this](const PairingHandshakeResult& result) {
                 m_pairingClassification = result;
+                // L07: whether the attempt that just paired skipped the PIN. Kept apart from the
+                // classification, which the completion handlers consume.
+                m_lastPairingWarm = result.ok && result.warm;
             });
 
     connect(m_teardown, &TeardownController::teardownCompleted,
@@ -987,6 +1000,18 @@ void SeatHubClient::setAppState(const QString& state)
         // running from is not something this client does (D-41).
         m_settings->setStreamingActive(isStreaming);
         m_updates->setStreamingActive(isStreaming);
+    }
+
+    // R6A: Profile and Settings open over Home, Connecting and Error. They are not views of the
+    // states below, so one left open does not survive into them: a stream hides this window, and a
+    // sign-in view or the restore splash has no menu to return from.
+    if (state == QLatin1String(kStateStreaming) || state == QLatin1String(kStateSignedOut)
+            || state == QLatin1String(kStateRestoring)) {
+        if (m_inProfile) {
+            setInProfile(false);
+            resetProfileData();
+        }
+        setInSettings(false);
     }
 
     emit appStateChanged();
@@ -1474,11 +1499,14 @@ void SeatHubClient::resumeAfterReconnect()
     // reads preferences.
     m_settings->prepareForSession();
     startNetworkThreads();
-    // STREAM-10: the client keeps no stored pairing of its own, so this is a full, fresh
-    // handshake against the same session id, which `beginSession()` also runs for a new session,
-    // just without resetting `appState`, the stepper or `m_liveness` (none of those stopped
-    // across the drop). This is the in-process recovery of an `ACTIVE` session only (UD-04 R14);
-    // nothing reattaches a session after a restart, close, crash or sign-in.
+    // STREAM-10: the client keeps no stored pairing of its own, so this is a fresh pairing against
+    // the same session id, which `beginSession()` also runs for a new session, just without
+    // resetting `appState`, the stepper or `m_liveness` (none of those stopped across the drop).
+    // When the authorization says `warm_return` (an ACTIVE session inside its grace, L07) the seam
+    // first tries the pin this app run already holds and skips the PIN if the rig confirms it;
+    // otherwise, or when that attempt fails, it runs the PIN handshake. This is the in-process
+    // recovery of an `ACTIVE` session only (UD-04 R14); nothing reattaches a session after a
+    // restart, close, crash or sign-in.
     const QString sessionId = m_sessionId;
     onClientThread(m_pairing, [this, sessionId]() { m_pairing->start(sessionId); });
 }
@@ -1819,6 +1847,12 @@ void SeatHubClient::start()
         return;
     }
 
+    // C-SAMEPLAY: the Play already in progress is repeating (the server is closing this account's
+    // previous session); a second press would only mint a second Idempotency-Key for the same Play.
+    if (m_homeStatus == QLatin1String(kHomePreviousEnding)) {
+        return;
+    }
+
     // Play is the control plane's allocation (`POST /api/sessions`, D-35). Without an access
     // token there is nothing to allocate with, so there is nothing to stream: a stream is always
     // the object of an allocated session. This used to run the Plan 03-02 tracer instead, which is
@@ -1938,20 +1972,55 @@ void SeatHubClient::beginPlayRequest()
     m_controlPlane->setTraceId(playTraceId);
     SeatHubTelemetry::setTrace(playTraceId);
 
+    // A-LC: one Idempotency-Key per press (ADR-0062 decision 11), kept for every repeat of this
+    // press that `PREVIOUS_SESSION_ENDING` asks for. The token names the press, so a repeat armed
+    // for an earlier press can never act on this one.
+    m_playIdempotencyKey = ControlPlaneClient::newIdempotencyKey();
+    ++m_playToken;
+    m_playRepeatBackoffMs = kReconnectInitialBackoffMs;
+
     // The session create goes out first - existing trace-id tests index requests relative to this
     // being the first one a Play makes - the telemetry refresh right after it (still unguarded by
     // epoch, like `requestSession()`'s own callback: applying a slightly stale handout after a
-    // sign-out is harmless, D-18 F-1). No quality field is sent (A-68, D-06 reversal): the
-    // customer's saved Settings are the only decider of stream quality.
+    // sign-out is harmless, D-18 F-1).
+    postPlayRequest();
+
+    // Plan 15 (D-01, D-18 SV-C3): one of the three moments SeatHub refreshes its DSN handout.
+    m_controlPlane->fetchTelemetry([this](const ControlPlaneResult& result) {
+        onClientThread(this, [this, result]() { applyTelemetryResult(result); adoptJournal(); });
+    });
+}
+
+void SeatHubClient::postPlayRequest()
+{
+    // No quality field is sent (A-68, D-06 reversal): the customer's saved Settings are the only
+    // decider of stream quality.
     // ADR-0074 X02: the body names the fingerprint of the client certificate this app pairs with,
     // so the rig can find this customer's pairing and no other.
-    m_controlPlane->requestSession(ownClientCertificateFingerprint(), [this](const ControlPlaneResult& result) {
-        onClientThread(this, [this, result]() {
+    const quint64 playToken = m_playToken;
+    m_controlPlane->requestSession(ownClientCertificateFingerprint(), m_playIdempotencyKey,
+                                   [this, playToken](const ControlPlaneResult& result) {
+        onClientThread(this, [this, playToken, result]() {
+            // The answer of a press that is no longer the current one (a sign-out, or a newer
+            // press) is not this Play's to act on.
+            if (playToken != m_playToken) {
+                return;
+            }
             if (!result.ok) {
+                // A-LC / C-SAMEPLAY: the server ended this account's own held session and the rig
+                // is still closing it. That is not an end of this Play: the busy Play stays and
+                // the same request is repeated with the same Idempotency-Key until a session or
+                // another answer arrives.
+                if (result.failure == QLatin1String("PREVIOUS_SESSION_ENDING")) {
+                    schedulePlayRepeat();
+                    return;
+                }
+                endPlayRepeat();
                 applyPlayFailure(result);
                 return;
             }
 
+            endPlayRepeat();
             const QString sessionId = result.body.value(QStringLiteral("id")).toString();
             if (sessionId.isEmpty()) {
                 noteStepOutcome(QStringLiteral("allocate"), QStringLiteral("failed"),
@@ -1969,11 +2038,44 @@ void SeatHubClient::beginPlayRequest()
             noteStepOutcome(QStringLiteral("allocate"), QStringLiteral("ok"), {}, m_playElapsed.elapsed());
         });
     });
+}
 
-    // Plan 15 (D-01, D-18 SV-C3): one of the three moments SeatHub refreshes its DSN handout.
-    m_controlPlane->fetchTelemetry([this](const ControlPlaneResult& result) {
-        onClientThread(this, [this, result]() { applyTelemetryResult(result); adoptJournal(); });
+void SeatHubClient::schedulePlayRepeat()
+{
+    // C-SAMEPLAY: Home keeps the busy Play and names what is happening.
+    setHomeStatus(QString::fromLatin1(kHomePreviousEnding));
+
+    // Spacing: the existing reconnect pace (V9 - 1 s growing x1.6 with up to 20% jitter to a 5 s
+    // cap), the one retry schedule the client already owns. `docs/spec` names no pace for this
+    // repeat and this adds no value of its own; the repeat ends with the first answer that is not
+    // `PREVIOUS_SESSION_ENDING`.
+    const int delayMs = jitteredReconnectDelay(m_playRepeatBackoffMs);
+    m_playRepeatBackoffMs = qMin(int(m_playRepeatBackoffMs * 1.6), kReconnectMaxBackoffMs);
+
+    const quint64 playToken = m_playToken;
+    const quint64 authEpoch = m_authEpoch;
+    QTimer::singleShot(delayMs, this, [this, playToken, authEpoch]() {
+        repeatPlayRequest(playToken, authEpoch);
     });
+}
+
+void SeatHubClient::repeatPlayRequest(quint64 playToken, quint64 authEpoch)
+{
+    // Only the press that armed this repeat, for the sign-in it was armed under, and only while
+    // Home is still showing the wait: a sign-out, a newer press or any other answer ended it.
+    if (playToken != m_playToken || authEpoch != m_authEpoch || !m_signedIn
+            || m_homeStatus != QLatin1String(kHomePreviousEnding)) {
+        return;
+    }
+    postPlayRequest();
+}
+
+void SeatHubClient::endPlayRepeat()
+{
+    // The press is answered (or abandoned): any repeat still armed finds the token moved on.
+    ++m_playToken;
+    m_playIdempotencyKey.clear();
+    m_playRepeatBackoffMs = 0;
 }
 
 void SeatHubClient::applyPlayFailure(const ControlPlaneResult& result)
@@ -2102,90 +2204,6 @@ void SeatHubClient::interrupt()
     m_session->interrupt();
 }
 
-void SeatHubClient::requestOtp(const QString& phoneE164)
-{
-    // ME-03: one normalisation rule, in `ControlPlaneClient`, applied here and in `verifyOtp`.
-    // Separators a person types are stripped, a leading `00` becomes `+`, and anything that is
-    // not then `^\+[1-9][0-9]{7,14}$` (`docs/spec/openapi.yaml` `phone_e164`) is rejected
-    // locally rather than spent as a round trip that can only come back refused.
-    const QString phone = ControlPlaneClient::normalisePhoneE164(phoneE164);
-    if (phone.isEmpty()) {
-        emit otpRejected(QString::fromLatin1(kPhoneInvalid), QString());
-        return;
-    }
-
-    startNetworkThreads();
-
-    m_controlPlane->requestOtp(phone, [this, phone](const ControlPlaneResult& result) {
-        onClientThread(this, [this, phone, result]() {
-            if (!result.ok) {
-                // This is where an HTTP 200 carrying `status:false` lands (Pitfall 4). The
-                // control plane's own sentence is what the customer reads, and its `SH-` code is
-                // what support searches on - the client does not substitute either. Only a request
-                // that never arrived says the offline sentence.
-                QString reference;
-                const QString message = signInFailureText(result, &reference);
-                emit otpRejected(message, reference);
-                return;
-            }
-            emit otpRequested(phone);
-        });
-    });
-}
-
-void SeatHubClient::verifyOtp(const QString& phoneE164, const QString& code)
-{
-    // Shape only, locally: the control plane is the authority on whether the code is right, and
-    // `OtpVerifyRequest.code` is documented as `^[0-9]{6}$`. A locally malformed code is not
-    // worth a round trip.
-    if (code.size() != 6) {
-        emit otpRejected(QString::fromLatin1(kOtpMismatch), QString());
-        return;
-    }
-
-    // ME-03: the same normalisation `requestOtp` applies, so the two calls cannot send two
-    // spellings of one number - the control plane keys the pending code on what it was sent.
-    const QString phone = ControlPlaneClient::normalisePhoneE164(phoneE164);
-    if (phone.isEmpty()) {
-        emit otpRejected(QString::fromLatin1(kPhoneInvalid), QString());
-        return;
-    }
-
-    startNetworkThreads();
-
-    m_controlPlane->verifyOtp(phone, code, [this, phone](const ControlPlaneResult& result) {
-        onClientThread(this, [this, phone, result]() {
-            if (!result.ok) {
-                QString reference;
-                const QString message = signInFailureText(result, &reference);
-                emit otpRejected(message, reference);
-                return;
-            }
-
-            AuthTokenPair pair;
-            if (!AuthTokenPair::parse(result.body, &pair)) {
-                const SeatHubFailure failure = SeatHubFailure::local(
-                    QStringLiteral("Sign-in didn't finish. Try again."));
-                emit otpRejected(failure.error, failure.reference);
-                return;
-            }
-
-            QString failureText;
-            if (!adoptSignIn(pair, phone, &failureText)) {
-                emit otpRejected(failureText, QString());
-                return;
-            }
-            emit otpAccepted();
-            setAppState(QString::fromLatin1(kStateHome));
-        });
-    });
-}
-
-QString SeatHubClient::toE164(const QString& typed, const QString& dialCode) const
-{
-    return ControlPlaneClient::normalisePhoneE164(typed, dialCode);
-}
-
 QString SeatHubClient::signInFailureText(const ControlPlaneResult& result, QString* reference)
 {
     // No HTTP status at all means the request never reached the control plane (`statusCode` is 0 on
@@ -2288,17 +2306,20 @@ bool SeatHubClient::adoptSignIn(const AuthTokenPair& pair, const QString& identi
     return true;
 }
 
-void SeatHubClient::signInWithPassword(const QString& identifier, const QString& password)
+void SeatHubClient::signInWithPassword(const QString& identifier, const QString& password,
+                                       const QString& region)
 {
-    // Nothing is normalised: the server decides whether this is an email or a phone number and
-    // which account it names. Surrounding space is not part of an identifier, so it is dropped.
+    // Nothing is normalised (A-ID): the server decides whether this is an email or a phone number,
+    // canonicalises a phone-shaped one with `region`, and says which account it names. This client
+    // never builds E.164 or a doubled dial code. Surrounding space is not part of an identifier, so
+    // it is dropped.
     const QString who = identifier.trimmed();
     if (who.isEmpty()) {
-        emit passwordSignInRejected(QString::fromLatin1(kIdentifierMissing), QString());
+        emit passwordSignInRejected(QString::fromLatin1(kIdentifierMissing), QString(), false);
         return;
     }
     if (password.isEmpty()) {
-        emit passwordSignInRejected(QString::fromLatin1(kPasswordMissing), QString());
+        emit passwordSignInRejected(QString::fromLatin1(kPasswordMissing), QString(), false);
         return;
     }
 
@@ -2306,7 +2327,8 @@ void SeatHubClient::signInWithPassword(const QString& identifier, const QString&
 
     // The callback captures the identifier only. The password is handed to the request and is in no
     // closure, member or log line here (T-05-27).
-    m_controlPlane->login(who, password, [this, who](const ControlPlaneResult& result) {
+    m_controlPlane->login(who, password, region.trimmed().toUpper(),
+                          [this, who](const ControlPlaneResult& result) {
         onClientThread(this, [this, who, result]() {
             if (!result.ok) {
                 // The server's own sentence, verbatim: the three refusals (`No account uses that
@@ -2314,7 +2336,11 @@ void SeatHubClient::signInWithPassword(const QString& identifier, const QString&
                 // contact support.`) are distinct on purpose (ADR-0050 accepted-risk register).
                 QString reference;
                 const QString message = signInFailureText(result, &reference);
-                emit passwordSignInRejected(message, reference);
+                // C-SIGNIN: a login that matches nobody also offers the website's sign-up page.
+                const bool noAccount = result.statusCode != 0
+                    && (result.kind == QLatin1String(kNoAccountKind)
+                        || message == QLatin1String(kNoAccountSentence));
+                emit passwordSignInRejected(message, reference, noAccount);
                 return;
             }
 
@@ -2322,13 +2348,13 @@ void SeatHubClient::signInWithPassword(const QString& identifier, const QString&
             if (!AuthTokenPair::parse(result.body, &pair)) {
                 const SeatHubFailure failure = SeatHubFailure::local(
                     QStringLiteral("Sign-in didn't finish. Try again."));
-                emit passwordSignInRejected(failure.error, failure.reference);
+                emit passwordSignInRejected(failure.error, failure.reference, false);
                 return;
             }
 
             QString failureText;
             if (!adoptSignIn(pair, who, &failureText)) {
-                emit passwordSignInRejected(failureText, QString());
+                emit passwordSignInRejected(failureText, QString(), false);
                 return;
             }
             emit passwordSignInAccepted();
@@ -2450,6 +2476,12 @@ void SeatHubClient::signOut()
     // leaving the NEXT, unrelated session's ordinary teardown to find the flag still set and fire
     // an unrequested `beginPlayRequest()` for a customer who is no longer signed in.
     setRetryBusy(false);
+    // C-SAMEPLAY: a Play that is waiting on its previous session's ending is abandoned with the
+    // sign-in that pressed it, and the next sign-in does not meet its wait on Home.
+    endPlayRepeat();
+    if (m_homeStatus == QLatin1String(kHomePreviousEnding)) {
+        setHomeStatus(QString::fromLatin1(kHomeReady));
+    }
     // WR-14: signing out mid-episode (e.g. during the backoff gap) stops and clears every other
     // piece of reconnect state above, but left `m_reconnectTimer`, `m_reconnecting` and the
     // Settings/updater lock stuck exactly as `enterReconnect()` set them - nobody signed in to
@@ -3046,6 +3078,14 @@ void SeatHubClient::handleDisplayLaunchError(const QString& text)
         noteStepOutcome(m_lastFailedStep, QStringLiteral("failed"),
                         QStringLiteral("attempt_engine_failed"),
                         m_playElapsed.isValid() ? m_playElapsed.elapsed() : -1, 1);
+        // L07: a warm attempt that failed - the rig answered paired to the held pin and the stream
+        // still did not come up - falls back to the PIN handshake: the held trust is forgotten, so
+        // the next attempt of this episode pairs with the PIN. An attempt that had paired with the
+        // PIN keeps its trust for the next one.
+        if (m_lastPairingWarm) {
+            HeldRigTrust::clear();
+            m_lastPairingWarm = false;
+        }
         retryReconnectOrGiveUp();
         return;
     }
@@ -3280,9 +3320,13 @@ CustomerListModel* SeatHubClient::listNamed(const QString& list) const
 
 void SeatHubClient::openProfile()
 {
-    // Only from Home: the menu is also on the connecting and error views, and a customer who is
-    // connecting is not looking at their history.
-    if (!m_signedIn || m_appState != QLatin1String(kStateHome)) {
+    // R6A: the menu is on Home, on the connecting view and on the error view, and Profile opens at
+    // once over any of them (`main.qml` routes it above the current view; `Back` returns to it).
+    // It does not open from the sign-in or restore views, or while a stream runs.
+    if (!m_signedIn
+            || (m_appState != QLatin1String(kStateHome)
+                && m_appState != QLatin1String(kStateConnecting)
+                && m_appState != QLatin1String(kStateError))) {
         return;
     }
 

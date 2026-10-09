@@ -13,6 +13,10 @@ import SeatHub.Tokens 1.0
 //             previous session ended, its end reason sits above Play as one quiet sentence.
 //   checking  `client.homeStatus` is "checking": Play has been pressed and the control plane is being
 //             asked for a rig. The line names the thing loading (copy.md §5) and Play is busy.
+//   previous_ending  C-SAMEPLAY: Play was pressed while this account's own old rental was still held;
+//             the server ended it at once and answered the retryable `PREVIOUS_SESSION_ENDING`, and
+//             the client repeats the same Play until the rig has finished closing it. Play stays
+//             busy and the line reads `Ending your previous session…`.
 //   busy      the control plane said nothing is free. The deck's one sentence and nothing more: no
 //             count, no position in a line, no rig detail and no offer of a notification (CUST-04,
 //             CUST-02, D-20). Play stays the one action: pressing it asks again.
@@ -38,6 +42,8 @@ Item {
     readonly property string status: client && client.homeStatus !== undefined
                                      ? String(client.homeStatus) : "ready"
     readonly property bool checking: root.status === "checking"
+    // C-SAMEPLAY: the Play that answered `PREVIOUS_SESSION_ENDING` is being repeated.
+    readonly property bool previousEnding: root.status === "previous_ending"
     readonly property bool refused: root.status === "refused"
     readonly property bool ending: root.status === "ending"
 
@@ -50,6 +56,8 @@ Item {
     readonly property string stateLine: {
         if (root.status === "checking")
             return qsTr("Checking availability…")
+        if (root.status === "previous_ending")
+            return qsTr("Ending your previous session…")
         if (root.status === "busy")
             return qsTr("None available right now.")
         if (root.status === "offline")
@@ -207,8 +215,8 @@ Item {
             width: parent.width
             implicitHeight: Metrics.s16
             text: qsTr("Play")
-            enabled: !root.checking && !root.ending
-            busy: root.checking
+            enabled: !root.checking && !root.previousEnding && !root.ending
+            busy: root.checking || root.previousEnding
 
             onClicked: root.client.start()
         }

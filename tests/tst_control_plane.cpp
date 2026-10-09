@@ -288,10 +288,10 @@ private slots:
         }
     }
 
-    void requestOtp_aCaptivePortalAnswering200_doesNotReportSuccess()
+    void login_aCaptivePortalAnswering200_doesNotReportSuccess()
     {
-        // The scenario the review named: a proxy answers the OTP request with a login page and
-        // HTTP 200. Nothing was sent, so nothing may be reported as sent.
+        // The scenario the review named: a proxy answers the sign-in with a login page and HTTP 200.
+        // Nothing was signed in, so nothing may be reported as signed in.
         ControlPlaneClient client;
         auto* fake = new FakeNetworkAccessManager;
         client.setNetworkAccessManager(fake);
@@ -300,115 +300,53 @@ private slots:
 
         ControlPlaneResult captured;
         bool called = false;
-        client.requestOtp(QStringLiteral("+962790000000"), [&](const ControlPlaneResult& result) {
-            captured = result;
-            called = true;
-        });
+        client.login(QStringLiteral("0790000000"), QStringLiteral("pw"), QStringLiteral("JO"),
+                     [&](const ControlPlaneResult& result) {
+                         captured = result;
+                         called = true;
+                     });
 
         QTRY_VERIFY(called);
-        QVERIFY2(!captured.ok, "an HTML 200 must not be read as 'code sent'");
+        QVERIFY2(!captured.ok, "an HTML 200 must not be read as a sign-in");
         QCOMPARE(captured.statusCode, 200);
         QVERIFY(!captured.error.isEmpty());
-        QCOMPARE(fake->lastPath, QStringLiteral("/api/auth/otp/request"));
+        QCOMPARE(fake->lastPath, QStringLiteral("/api/auth/login"));
     }
 
-    // --- ME-03: one phone normalisation rule ------------------------------------------------
-
-    void phoneNormalisation_data()
-    {
-        QTest::addColumn<QString>("raw");
-        QTest::addColumn<QString>("expected");
-
-        // Already E.164: unchanged.
-        QTest::newRow("e164") << QStringLiteral("+962790000000")
-                              << QStringLiteral("+962790000000");
-        // The separators people actually type: spaces, parentheses, dashes and dots. `+962 7 0000
-        // 0000` is the placeholder the sign-in screen shows, and it has to normalise to the same
-        // number as `+962700000000`.
-        QTest::newRow("spaces") << QStringLiteral("+962 7 0000 0000")
-                                << QStringLiteral("+962700000000");
-        QTest::newRow("parentheses-and-dashes") << QStringLiteral("+962 (79) 000-0000")
-                                                << QStringLiteral("+962790000000");
-        QTest::newRow("dots") << QStringLiteral("+962.79.000.0000")
-                              << QStringLiteral("+962790000000");
-        QTest::newRow("surrounding-space") << QStringLiteral("  +962790000000  ")
-                                           << QStringLiteral("+962790000000");
-        // The international prefix as people write it.
-        QTest::newRow("double-zero") << QStringLiteral("00962790000000")
-                                     << QStringLiteral("+962790000000");
-        QTest::newRow("double-zero-with-spaces") << QStringLiteral("00 962 79 000 0000")
-                                                 << QStringLiteral("+962790000000");
-        // Rejected: no country code is invented for these, because the spec defines none.
-        QTest::newRow("no-plus") << QStringLiteral("0962790000000") << QString();
-        QTest::newRow("national") << QStringLiteral("0790000000") << QString();
-        QTest::newRow("leading-zero-after-plus") << QStringLiteral("+0962790000000") << QString();
-        QTest::newRow("too-short") << QStringLiteral("+962790") << QString();
-        QTest::newRow("too-long") << QStringLiteral("+9627900000000000") << QString();
-        QTest::newRow("letters") << QStringLiteral("+96279ABC000") << QString();
-        QTest::newRow("empty") << QString() << QString();
-    }
-
-    void phoneNormalisation()
-    {
-        QFETCH(QString, raw);
-        QFETCH(QString, expected);
-
-        QCOMPARE(ControlPlaneClient::normalisePhoneE164(raw), expected);
-    }
-
-    // --- Phase 5 plan 06: a number typed the way its country writes it becomes E.164 -----------
+    // --- A-ID: this client never builds E.164 -------------------------------------------------
     //
-    // The chosen country's dial code is applied, one leading trunk zero is dropped, separators are
-    // ignored, and a number already written with a plus or a double zero is believed as it stands.
-    // These are the website's own rules (`auth-validation.ts` `toE164`). The six cases the plan
-    // names are the first rows; the rest are the edges around them.
+    // The sign-in sends the raw typed text and the picked ISO region; the server canonicalises a
+    // phone-shaped identifier. `ControlPlaneClient` no longer carries a phone normaliser at all
+    // (`normalisePhoneE164` and `isPhoneE164` are gone), so a doubled dial code cannot be built here.
 
-    void phoneNormalisationWithACountry_data()
+    void theClientHoldsNoPhoneNormaliser()
     {
-        QTest::addColumn<QString>("raw");
-        QTest::addColumn<QString>("dial");
-        QTest::addColumn<QString>("expected");
-
-        const QString jo = QStringLiteral("+962");
-        // 1. A local number with its trunk zero, the way a customer in Amman writes it.
-        QTest::newRow("local-with-trunk-zero") << QStringLiteral("0790000000") << jo
-                                               << QStringLiteral("+962790000000");
-        // 2. The same number without one.
-        QTest::newRow("local-without-trunk-zero") << QStringLiteral("790000000") << jo
-                                                  << QStringLiteral("+962790000000");
-        // 3. Already international: believed over the country the tag shows.
-        QTest::newRow("already-international-plus") << QStringLiteral("+447911123456") << jo
-                                                    << QStringLiteral("+447911123456");
-        QTest::newRow("already-international-double-zero") << QStringLiteral("00447911123456") << jo
-                                                           << QStringLiteral("+447911123456");
-        // 4. Written with separators.
-        QTest::newRow("separators") << QStringLiteral("(079) 000-00.00") << jo
-                                    << QStringLiteral("+962790000000");
-        // 5. Arabic-Indic and Persian digits are read as the Latin digits they are.
-        QTest::newRow("arabic-indic-digits")
-            << QString::fromUtf16(u"٠٧٩٠٠٠٠٠٠٠")
-            << jo << QStringLiteral("+962790000000");
-        QTest::newRow("persian-digits")
-            << QString::fromUtf16(u"۰۷۹۰۰۰۰۰۰۰")
-            << jo << QStringLiteral("+962790000000");
-        // 6. Too short after the country code is applied: refused, not sent.
-        QTest::newRow("too-short") << QStringLiteral("079") << jo << QString();
-        // Edges: a country whose dial code carries an area code; no dial code means nothing is
-        // guessed; letters are refused.
-        QTest::newRow("dial-with-area-code") << QStringLiteral("5550123") << QStringLiteral("+1876")
-                                             << QStringLiteral("+18765550123");
-        QTest::newRow("no-dial-code-no-guess") << QStringLiteral("0790000000") << QString()
-                                               << QString();
-        QTest::newRow("letters-are-refused") << QStringLiteral("07900abc00") << jo << QString();
-    }
-
-    void phoneNormalisationWithACountry()
-    {
-        QFETCH(QString, raw);
-        QFETCH(QString, dial);
-        QFETCH(QString, expected);
-
-        QCOMPARE(ControlPlaneClient::normalisePhoneE164(raw, dial), expected);
+        QDir dir(QCoreApplication::applicationDirPath());
+        QString sourceDir;
+        for (int depth = 0; depth < 8 && sourceDir.isEmpty(); ++depth) {
+            const QString candidate = dir.filePath(QStringLiteral("app/seathub"));
+            if (QFile::exists(candidate + QStringLiteral("/control_plane_client.h"))) {
+                sourceDir = candidate;
+            }
+            else if (!dir.cdUp()) {
+                break;
+            }
+        }
+        QVERIFY2(!sourceDir.isEmpty(), "app/seathub could not be located from the test binary");
+        for (const QString& name : { QStringLiteral("control_plane_client.h"),
+                                     QStringLiteral("control_plane_client.cpp"),
+                                     QStringLiteral("seathub_client.h"),
+                                     QStringLiteral("seathub_client.cpp") }) {
+            QFile file(sourceDir + QLatin1Char('/') + name);
+            QVERIFY2(file.open(QIODevice::ReadOnly), qPrintable(name));
+            const QString text = QString::fromUtf8(file.readAll());
+            for (const QString& retired : { QStringLiteral("normalisePhoneE164"),
+                                            QStringLiteral("requestOtp"), QStringLiteral("verifyOtp"),
+                                            QStringLiteral("buildOtp") }) {
+                QVERIFY2(!text.contains(retired),
+                         qPrintable(name + QStringLiteral(" still names ") + retired));
+            }
+        }
     }
 
     // --- Phase 5 plan 06: the bundled country list is the website's, and the default is Jordan ---
@@ -450,25 +388,16 @@ private slots:
 
     // --- Phase 5 plan 06: where the country tag starts -----------------------------------------
 
-    void region_machineThenLocaleThenTheDefault()
+    void region_jordanIsTheDefaultWhateverTheMachineSays()
     {
-        // The machine's own region wins.
-        QCOMPARE(SeatHubRegion::pick(QStringLiteral("GB"), QStringLiteral("US")), QStringLiteral("GB"));
-        // Case does not matter, and the answer is upper-case.
-        QCOMPARE(SeatHubRegion::pick(QStringLiteral("gb"), QString()), QStringLiteral("GB"));
-        // A machine answer that is not a country the list knows is no answer.
-        QCOMPARE(SeatHubRegion::pick(QStringLiteral("001"), QStringLiteral("US")), QStringLiteral("US"));
-        QCOMPARE(SeatHubRegion::pick(QStringLiteral("ZZ"), QStringLiteral("DE")), QStringLiteral("DE"));
-        // Neither: Jordan, the website's default.
-        QCOMPARE(SeatHubRegion::pick(QString(), QString()), QStringLiteral("JO"));
-        QCOMPARE(SeatHubRegion::pick(QStringLiteral("ZZ"), QStringLiteral("QQ")), QStringLiteral("JO"));
-    }
-
-    void region_theMachinesOwnAnswerIsAlwaysARowInTheList()
-    {
-        // Whatever this machine reports, the tag never starts on a country the picker lacks.
+        // C-SIGNIN: Jordan (+962) is the default for every sign-in, and the machine's own region or
+        // locale no longer decides it. It is a row in the bundled list, with the dial code +962.
         const QString initial = SeatHubRegion::initialCountryCode();
+        QCOMPARE(initial, QStringLiteral("JO"));
+        QCOMPARE(initial, SeatHubCountries::defaultIso());
         QVERIFY2(SeatHubCountries::contains(initial), qPrintable(initial));
+        QCOMPARE(SeatHubCountries::find(initial).value(QStringLiteral("dial")).toString(),
+                 QStringLiteral("+962"));
     }
 
     // --- Phase 5 plan 06: the website addresses are the spec's four strings --------------------
@@ -1075,15 +1004,6 @@ private slots:
 
     void builders_matchTheDocumentedRequestBodies()
     {
-        const QJsonObject otp = QJsonDocument::fromJson(
-            ControlPlaneClient::buildOtpRequest(QStringLiteral("+962790000000"))).object();
-        QCOMPARE(otp.value(QStringLiteral("phone_e164")).toString(), QStringLiteral("+962790000000"));
-
-        const QJsonObject verify = QJsonDocument::fromJson(
-            ControlPlaneClient::buildOtpVerify(QStringLiteral("+962790000000"),
-                                               QStringLiteral("123456"))).object();
-        QCOMPARE(verify.value(QStringLiteral("code")).toString(), QStringLiteral("123456"));
-
         const QJsonObject login = QJsonDocument::fromJson(
             ControlPlaneClient::buildLogin(QStringLiteral("someone@example.com"),
                                            QStringLiteral("a password"))).object();
@@ -1091,6 +1011,16 @@ private slots:
                  QStringLiteral("someone@example.com"));
         QCOMPARE(login.value(QStringLiteral("password")).toString(), QStringLiteral("a password"));
         QCOMPARE(login.size(), 2);
+
+        // A-ID: with a region named, the raw typed text goes out untouched beside the ISO code. The
+        // client sends exactly what was typed (separators, trunk zero and all) and no dial code.
+        const QJsonObject phone = QJsonDocument::fromJson(
+            ControlPlaneClient::buildLogin(QStringLiteral("(079) 000-0000"),
+                                           QStringLiteral("a password"), QStringLiteral("JO"))).object();
+        QCOMPARE(phone.value(QStringLiteral("identifier")).toString(), QStringLiteral("(079) 000-0000"));
+        QCOMPARE(phone.value(QStringLiteral("region")).toString(), QStringLiteral("JO"));
+        QCOMPARE(phone.size(), 3);
+        QVERIFY(!phone.contains(QStringLiteral("phone_e164")));
     }
 
     // A-68 / D-06 reversal, contract 3.3.0 (ADR-0064): `SessionCreateRequest` carries no quality
@@ -1528,6 +1458,62 @@ private slots:
         QVERIFY(pair.refreshToken.isEmpty());
     }
 
+    void login_postsTheRawTextAndTheRegionAndNothingElse()
+    {
+        ControlPlaneClient client;
+        auto* fake = new FakeNetworkAccessManager;
+        client.setNetworkAccessManager(fake);
+        fake->status = 200;
+        fake->body = QByteArrayLiteral("{\"access_token\":\"sb_at_permanent\"}");
+
+        bool called = false;
+        client.login(QStringLiteral("0790000000"), QStringLiteral("hunter2"), QStringLiteral("JO"),
+                     [&](const ControlPlaneResult&) { called = true; });
+        QTRY_VERIFY(called);
+
+        QCOMPARE(fake->lastPath, QStringLiteral("/api/auth/login"));
+        const QJsonObject sent = QJsonDocument::fromJson(fake->lastBody).object();
+        QCOMPARE(sent.value(QStringLiteral("identifier")).toString(), QStringLiteral("0790000000"));
+        QCOMPARE(sent.value(QStringLiteral("password")).toString(), QStringLiteral("hunter2"));
+        QCOMPARE(sent.value(QStringLiteral("region")).toString(), QStringLiteral("JO"));
+        QCOMPARE(sent.size(), 3);
+    }
+
+    void requestSession_aNamedKeyIsSentAsItIsAndAnEmptyOneIsMinted()
+    {
+        // A-LC: the repeat of a Play that answered `PREVIOUS_SESSION_ENDING` sends the SAME
+        // Idempotency-Key; a call that names none gets a fresh one each time.
+        ControlPlaneClient client;
+        auto* fake = new FakeNetworkAccessManager;
+        client.setNetworkAccessManager(fake);
+        client.setAccessToken(QStringLiteral("opaque-access-token"));
+        fake->status = 200;
+        fake->body = QByteArrayLiteral("{\"id\":\"s1\"}");
+
+        int completed = 0;
+        const ControlPlaneClient::Callback done = [&](const ControlPlaneResult&) { ++completed; };
+        const QString key = QStringLiteral("11111111-2222-3333-4444-555555555555");
+
+        client.requestSession(QString(), key, done);
+        QTRY_COMPARE(completed, 1);
+        QCOMPARE(fake->lastRequest.rawHeader("Idempotency-Key"), key.toUtf8());
+
+        client.requestSession(QString(), key, done);
+        QTRY_COMPARE(completed, 2);
+        QCOMPARE(fake->lastRequest.rawHeader("Idempotency-Key"), key.toUtf8());
+
+        client.requestSession(QString(), QString(), done);
+        QTRY_COMPARE(completed, 3);
+        const QByteArray minted = fake->lastRequest.rawHeader("Idempotency-Key");
+        QVERIFY(!minted.isEmpty());
+        QVERIFY(minted != key.toUtf8());
+        QVERIFY2(!QUuid(QString::fromLatin1(minted)).isNull(), "a minted key is a uuid");
+
+        client.requestSession(done);
+        QTRY_COMPARE(completed, 4);
+        QVERIFY(fake->lastRequest.rawHeader("Idempotency-Key") != minted);
+    }
+
     void login_aRefusalKeepsTheServersOwnSentence()
     {
         ControlPlaneClient client;
@@ -1588,8 +1574,6 @@ private slots:
 
         int completed = 0;
         const ControlPlaneClient::Callback done = [&](const ControlPlaneResult&) { ++completed; };
-        client.requestOtp(QStringLiteral("+962790000000"), done);
-        client.verifyOtp(QStringLiteral("+962790000000"), QStringLiteral("123456"), done);
         client.login(QStringLiteral("a@b.co"), QStringLiteral("pw"), done);
         client.logout(done);
         client.fetchMe(done);
@@ -1603,7 +1587,7 @@ private slots:
         client.fetchWalletHistory(QString(), 15, done);
         client.fetchTopupNotices(QString(), 15, done);
         client.fetchUsage(done);
-        QTRY_COMPARE(completed, 15);
+        QTRY_COMPARE(completed, 13);
 
         for (const QString& path : fake->paths) {
             QVERIFY2(!path.contains(QStringLiteral("refresh")),

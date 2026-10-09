@@ -2,30 +2,33 @@ import QtQuick
 import QtQuick.Controls
 import SeatHub.Tokens 1.0
 
-// Sign in (`docs/spec/screens.md` §22, Phase 5 D-01 to D-06).
+// Sign in (`docs/spec/screens.md` §22, C-SIGNIN, A-ID; Phase 5 D-01 to D-06).
 //
-// ONE field, "Email or phone", and then the step its content calls for:
+// ONE screen: one identifier field ("Email or phone"), one `Password` field with its reveal control,
+// and `Sign in`. A phone number and an email sign in through the same field and the same password
+// (`POST /api/auth/login`); there is no code step and no separate email/password step. The country
+// picker shows only while the field holds phone-shaped text (digits, spaces, `-`, `(`, `)`, `.` and one
+// optional leading `+`, at least three digits - `SeatHubIdentifierField.classify`), its default is
+// Jordan (`JO +962`) and any other country stays selectable.
 //
-//   identifier  the field, its helper, `Continue`, and two links that open the website
-//   code        (a phone number) the six-cell one-time code, resend, `Verify and continue`, `Back`
-//   password    (an email) the password with a reveal control, `Sign in`, `Forgot password?`, `Back`
+// What goes out is the raw typed text and the picked ISO region: this screen never builds E.164 and
+// never sends a doubled dial code. The server canonicalises a phone-shaped identifier with that
+// region and treats anything else as an email.
 //
-// Signup and password reset are the WEBSITE's, reached by a link (D-03, D-04): this client has no
-// screen for either, and no link carries a credential. The client never builds an address itself; it
-// asks the facade to open one (`openWebsite`), so the addresses live in `web_origin.h` and nowhere
-// in QML.
+// When the server answers `No account uses that email or phone.` the screen shows that sentence and
+// also offers `Create an account on the website`, which opens the website's sign-up page. SeatHub
+// never creates an account: signup and password reset are the WEBSITE's, reached by a link
+// (D-03, D-04), and no link carries a credential. The client never builds an address itself; it asks
+// the facade to open one (`openWebsite`), so the addresses live in `web_origin.h` and nowhere in QML.
 //
-// Every state `docs/spec/screens.md` requires is here: empty (label, helper, `Continue` enabled),
-// loading (the pressed control keeps its width and is busy), error (the message in the destructive
-// token above the field for a field-level mistake and above the control for a refusal, with the
-// ADR-0008 reference in mono) and offline (the deck's offline sentence, which the facade supplies as
-// the refusal). A field-level mistake is named before anything is sent.
+// Every state `docs/spec/screens.md` requires is here: empty (both labels, the helper, `Sign in`
+// enabled), loading (the pressed control keeps its width and is busy), error (the message in the
+// destructive token above the field for a field-level mistake and above the control for a refusal,
+// with the ADR-0008 reference in mono) and offline (the deck's offline sentence, which the facade
+// supplies as the refusal). A field-level mistake is named before anything is sent.
 //
 // The typed password lives in the field for the length of one attempt and is cleared after it. It is
 // never stored, never logged and never leaves this screen except as the argument of the sign-in call.
-//
-// The resend control (audit F6) is the deck's own sequence: `Resend in 0:24` while ADR-0022's
-// 24-second window runs, then the `Send code` action again.
 Item {
     id: root
 
@@ -36,161 +39,74 @@ Item {
     signal signedIn()
 
     // Local view state, not app state - it never leaves this screen.
-    /// "identifier" | "code" | "password"
-    property string step: "identifier"
-    readonly property bool codeSent: root.step === "code"
-
-    property bool requesting: false
-    property bool verifying: false
     property bool signingIn: false
-    readonly property bool working: root.requesting || root.verifying || root.signingIn
+    readonly property bool working: root.signingIn
 
-    /// A field-level mistake, named before anything is sent (shown above the field).
-    property string fieldError: ""
+    /// A field-level mistake, named before anything is sent (shown above its own field).
+    property string identifierError: ""
+    property string passwordError: ""
     /// A refusal that names no field (shown above the control), with its ADR-0008 reference.
     property string errorText: ""
     property string errorReference: ""
+    /// True after the server answered that no account uses that email or phone (C-SIGNIN): the
+    /// website's sign-up page is then offered beside the sentence.
+    property bool noAccount: false
 
     property bool showPassword: false
-    property int resendRemaining: 0
-    /// The E.164 number the code was asked for, so verify and resend use exactly it.
-    property string phoneE164: ""
-
-    // copy.md §5: countdowns are mono. ADR-0022 fixes the window at 24 seconds.
-    readonly property string countdownText: "0:" + (root.resendRemaining < 10 ? "0" : "")
-                                            + root.resendRemaining
 
     function clearErrors() {
-        fieldError = ""
+        identifierError = ""
+        passwordError = ""
         errorText = ""
         errorReference = ""
+        noAccount = false
     }
 
-    // Step one: work out what was typed and go where it says.
-    function continueFromIdentifier() {
-        clearErrors()
-        var typed = identifierField.typed
-        if (typed === "") {
-            fieldError = qsTr("Enter your email or phone number.")
-            return
-        }
-        if (identifierField.mode === "email") {
-            // An email goes to the password step without spending a request; the shape is checked
-            // first, the way the website checks it.
-            if (!identifierField.looksLikeEmail) {
-                fieldError = qsTr("Enter your email or phone number.")
-                return
-            }
-            root.step = "password"
-            return
-        }
-        // A phone number: build E.164 from the chosen country and what was typed, and refuse a
-        // mistake here instead of spending a round trip on it.
-        var e164 = client.toE164(typed, identifierField.selectedDial)
-        if (e164 === "") {
-            fieldError = qsTr("That doesn't look like a phone number.")
-            return
-        }
-        root.phoneE164 = e164
-        sendCode()
-    }
-
-    function sendCode() {
-        errorText = ""
-        errorReference = ""
-        requesting = true
-        client.requestOtp(root.phoneE164)
-    }
-
-    function verify() {
-        errorText = ""
-        errorReference = ""
-        verifying = true
-        client.verifyOtp(root.phoneE164, otpField.code)
-    }
-
+    // The one action. A mistake the screen can see is named on its field and nothing is sent.
     function signInWithPassword() {
         clearErrors()
+        var typed = identifierField.typed
+        // An empty field, or text that is neither phone-shaped (three digits or more) nor shaped like
+        // an email address, is named before a round trip is spent on it.
+        if (typed === "" || identifierField.mode === "partial"
+                || (identifierField.mode === "email" && !identifierField.looksLikeEmail)) {
+            identifierError = qsTr("Enter your email or phone number.")
+        }
         if (passwordField.text === "") {
-            fieldError = qsTr("Enter your password.")
+            passwordError = qsTr("Enter your password.")
+        }
+        if (identifierError.length > 0) {
+            identifierField.focusInput()
+            return
+        }
+        if (passwordError.length > 0) {
+            passwordField.forceActiveFocus()
             return
         }
         signingIn = true
-        client.signInWithPassword(identifierField.typed, passwordField.text)
-    }
-
-    // Back keeps what was typed in the field and drops everything else.
-    function back() {
-        clearErrors()
-        passwordField.text = ""
-        showPassword = false
-        resendRemaining = 0
-        requesting = false
-        verifying = false
-        signingIn = false
-        root.step = "identifier"
-    }
-
-    function primaryAction() {
-        if (root.step === "code")
-            root.verify()
-        else if (root.step === "password")
-            root.signInWithPassword()
-        else
-            root.continueFromIdentifier()
+        // The raw typed text and the picked region (the country in force: a number written with `+`
+        // or `00` names its own). An email carries no region.
+        client.signInWithPassword(typed, passwordField.text,
+                                  identifierField.mode === "email" ? "" : identifierField.countryIso)
     }
 
     Component.onCompleted: identifierField.focusInput()
 
-    onStepChanged: {
-        if (root.step === "identifier")
-            identifierField.focusInput()
-        else if (root.step === "password")
-            passwordField.forceActiveFocus()
-    }
-
-    Timer {
-        id: resendTimer
-        interval: 1000
-        repeat: true
-        running: root.codeSent && root.resendRemaining > 0
-        onTriggered: root.resendRemaining = Math.max(0, root.resendRemaining - 1)
-    }
-
     Connections {
         target: root.client
 
-        function onOtpRequested(phoneE164) {
-            root.requesting = false
-            root.verifying = false
-            root.phoneE164 = phoneE164
-            root.step = "code"
-            root.resendRemaining = 24
-            otpField.clear()
-        }
-
-        function onOtpRejected(message, reference) {
-            root.requesting = false
-            root.verifying = false
-            // The message is SeatHub copy; the reference is what support needs (ADR-0008).
-            root.errorText = message
-            root.errorReference = reference ? reference : ""
-            if (root.step === "code")
-                otpField.clear()
-        }
-
-        function onOtpAccepted() {
-            root.verifying = false
-            root.signedIn()
-        }
-
-        function onPasswordSignInRejected(message, reference) {
+        function onPasswordSignInRejected(message, reference, noAccount) {
             root.signingIn = false
+            // The message is SeatHub copy or the server's own sentence; the reference is what support
+            // needs (ADR-0008).
             root.errorText = message
             root.errorReference = reference ? reference : ""
+            root.noAccount = noAccount === true
             // The password is held for one attempt only.
             passwordField.text = ""
-            if (root.step === "password")
+            if (root.noAccount)
+                identifierField.focusInput()
+            else
                 passwordField.forceActiveFocus()
         }
 
@@ -219,7 +135,7 @@ Item {
             Text {
                 id: glyph
                 objectName: "errorGlyph"
-                text: "\u25c6"
+                text: "◆"
                 color: Tokens.destructiveDefault
                 font.family: Tokens.fontSansDefault
                 font.pixelSize: Metrics.s5
@@ -293,18 +209,17 @@ Item {
                 font.weight: Font.DemiBold
             }
 
-            // --- Step 1: the one field ---
+            // --- The identifier: an email or a phone number ---
             Column {
                 objectName: "identifierStep"
                 width: parent.width
                 spacing: Metrics.s2
-                visible: root.step === "identifier"
 
                 FieldLabel { text: qsTr("Email or phone") }
 
                 ErrorLine {
                     objectName: "fieldErrorLine"
-                    message: root.step === "identifier" ? root.fieldError : ""
+                    message: root.identifierError
                 }
 
                 SeatHubIdentifierField {
@@ -317,10 +232,24 @@ Item {
                                         ? root.client.defaultCountryCode : "JO"
                     animate: root.client && root.client.animationEffects !== undefined
                              ? root.client.animationEffects : true
-                    errorText: root.step === "identifier" ? root.fieldError : ""
-                    onAccepted: root.continueFromIdentifier()
-                    // What was wrong is no longer wrong once the customer edits the field.
-                    onTextChanged: if (root.fieldError.length > 0) root.fieldError = ""
+                    errorText: root.identifierError
+                    // Enter moves on to the password when it is still empty, and signs in when it is not.
+                    onAccepted: {
+                        if (passwordField.text === "")
+                            passwordField.forceActiveFocus()
+                        else
+                            root.signInWithPassword()
+                    }
+                    // What was wrong is no longer wrong once the customer edits the field, and a
+                    // different identifier is a different question for the server.
+                    onTextChanged: {
+                        if (root.identifierError.length > 0) root.identifierError = ""
+                        if (root.noAccount) {
+                            root.noAccount = false
+                            root.errorText = ""
+                            root.errorReference = ""
+                        }
+                    }
                 }
 
                 Text {
@@ -334,57 +263,11 @@ Item {
                 }
             }
 
-            // --- Step 2a: the one-time code (a phone number) ---
-            Column {
-                objectName: "codeStep"
-                width: parent.width
-                spacing: Metrics.s2
-                visible: root.step === "code"
-
-                FieldLabel { text: qsTr("Enter the 6-digit code") }
-
-                SeatHubOTPField {
-                    id: otpField
-                    objectName: "otpField"
-                    // The six cells share one label, the field's own (`copy.md` § Sign in).
-                    Accessible.role: Accessible.Grouping
-                    Accessible.name: qsTr("Enter the 6-digit code")
-                    entryEnabled: !root.working
-                    onCompleted: root.verify()
-                }
-
-                // Resend (audit F6): the countdown while the window runs, the action after it.
-                Row {
-                    width: parent.width
-                    spacing: Metrics.s3
-
-                    Text {
-                        visible: root.resendRemaining > 0
-                        text: qsTr("Resend in %1").arg(root.countdownText)
-                        color: Tokens.foregroundMutedDefault
-                        font.family: Tokens.fontMonoDefault
-                        font.pixelSize: Metrics.fontSm
-                        anchors.verticalCenter: parent.verticalCenter
-                    }
-
-                    SeatHubButton {
-                        id: resendButton
-                        visible: root.resendRemaining <= 0
-                        variant: "ghost"
-                        text: qsTr("Send code")
-                        enabled: !root.working
-
-                        onClicked: root.sendCode()
-                    }
-                }
-            }
-
-            // --- Step 2b: the password (an email) ---
+            // --- The password ---
             Column {
                 objectName: "passwordStep"
                 width: parent.width
                 spacing: Metrics.s2
-                visible: root.step === "password"
 
                 FieldLabel {
                     id: passwordLabel
@@ -396,7 +279,7 @@ Item {
 
                 ErrorLine {
                     objectName: "passwordErrorLine"
-                    message: root.step === "password" ? root.fieldError : ""
+                    message: root.passwordError
                 }
 
                 TextField {
@@ -416,18 +299,18 @@ Item {
                     // relation is what tells a screen reader this field is "Password".
                     Accessible.name: qsTr("Password")
                     Accessible.labelledBy: passwordLabel
-                    Accessible.description: root.fieldError
+                    Accessible.description: root.passwordError
                     background: Rectangle {
                         radius: Metrics.radiusSm
                         color: Tokens.surface2Default
                         border.width: passwordField.activeFocus ? 2 : 1
-                        border.color: root.fieldError.length > 0 && root.step === "password"
+                        border.color: root.passwordError.length > 0
                                       ? Tokens.destructiveDefault
                                       : (passwordField.activeFocus ? Tokens.focusDefault
                                                                    : Tokens.borderDefault)
                     }
                     onAccepted: root.signInWithPassword()
-                    onTextChanged: if (root.fieldError.length > 0) root.fieldError = ""
+                    onTextChanged: if (root.passwordError.length > 0) root.passwordError = ""
                 }
 
                 SeatHubButton {
@@ -438,13 +321,23 @@ Item {
                 }
             }
 
-            // --- Error, for the steps (audit F2) ---
-            // A refusal that names no field: outside the step columns on purpose, so a rejected
-            // phone number is visible even though the code column is still hidden.
+            // --- Error ---
+            // A refusal that names no field: above the control, with the reference in mono.
             ErrorLine {
                 objectName: "refusalLine"
                 message: root.errorText
                 reference: root.errorReference
+            }
+
+            // C-SIGNIN: when nothing matched, the website's sign-up page is offered beside the
+            // sentence. SeatHub never creates an account; the address is the facade's to build.
+            SeatHubButton {
+                objectName: "noAccountSignUp"
+                visible: root.noAccount
+                variant: "ghost"
+                text: qsTr("Create an account on the website")
+                glyph: "↗"
+                onClicked: root.client.openWebsite("signup")
             }
 
             // --- Primary action ---
@@ -455,14 +348,12 @@ Item {
                 width: parent.width
                 enabled: !root.working
                 busy: root.working
-                text: root.step === "code" ? qsTr("Verify and continue")
-                                           : (root.step === "password" ? qsTr("Sign in")
-                                                                       : qsTr("Continue"))
+                text: qsTr("Sign in")
 
-                onClicked: root.primaryAction()
+                onClicked: root.signInWithPassword()
             }
 
-            // --- The links and Back ---
+            // --- The two links to the website ---
             Column {
                 width: parent.width
                 spacing: Metrics.s1
@@ -471,29 +362,18 @@ Item {
                 // facade's to build; nothing is passed along with it.
                 SeatHubButton {
                     objectName: "createAccountLink"
-                    visible: root.step === "identifier"
                     variant: "ghost"
                     text: qsTr("New here? Create an account")
-                    glyph: "\u2197"
+                    glyph: "↗"
                     onClicked: root.client.openWebsite("signup")
                 }
 
                 SeatHubButton {
                     objectName: "forgotPasswordLink"
-                    visible: root.step === "identifier" || root.step === "password"
                     variant: "ghost"
                     text: qsTr("Forgot password?")
-                    glyph: "\u2197"
+                    glyph: "↗"
                     onClicked: root.client.openWebsite("reset")
-                }
-
-                SeatHubButton {
-                    objectName: "backButton"
-                    visible: root.step !== "identifier"
-                    variant: "ghost"
-                    text: qsTr("Back")
-                    enabled: !root.working
-                    onClicked: root.back()
                 }
             }
         }

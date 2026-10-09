@@ -78,6 +78,11 @@ struct PairingHandshakeResult
     /// How many tries of that step this Play made (ADR-0072 item 2): 1 normally, 2 after the
     /// G-06.2-2 clear-and-retry.
     int attempts = 1;
+    /// True when this result came from the warm return (the PIN handshake was skipped), false for
+    /// every PIN handshake - including the one a failed warm attempt falls back to (L07). Lets the
+    /// caller tell a reconnect attempt that streamed on held trust from one that streamed on a
+    /// fresh pairing; it carries no credential.
+    bool warm = false;
 };
 
 // Declared for the same reason as `SeatHubFailure` and `TeardownStage`: the handshake result
@@ -152,15 +157,17 @@ public:
     /// The handshake to run. Without one, every `pair()` fails closed: reporting success without
     /// having paired would tell the caller a rig was paired when nothing was.
     void setHandshake(PairingHandshake handshake);
-    /// The warm-return check (ADR-0074 W03). Without one, a target that carries `warmReturn` pairs
-    /// normally, exactly like one that does not.
+    /// The warm-return check (ADR-0074 W03, L07). Without one, a target that carries `warmReturn`
+    /// pairs normally, exactly like one that does not.
     ///
     /// The PIN handshake is skipped only when ALL of these hold: the target's `warmReturn` is true
-    /// (the control plane said so for this NEW session), this app run holds the host certificate it
-    /// pinned earlier (`HeldRigTrust`), and the check answers `ok`. In every other case - the field
-    /// absent or false, nothing held (a restart, a sign-out), a check that fails or is refused -
-    /// the normal handshake runs, with its own recovery, exactly as before. A PIN is always issued,
-    /// so a normal pairing is always possible.
+    /// (the control plane said so - for a NEW session on the caller's own free return hold, or for
+    /// an `ACTIVE` session reconnecting inside its disconnect grace), this app run holds the host
+    /// certificate it pinned earlier (`HeldRigTrust`), and the check answers `ok`. In every other
+    /// case - the field absent or false, nothing held (a restart, a sign-out), a check that fails
+    /// or is refused - the normal PIN handshake runs, with its own recovery, exactly as before. A
+    /// PIN is always issued, so a normal pairing is always possible, and the warm check and the
+    /// handshake that follows it run one after the other on one worker: never two at once.
     void setWarmReturnCheck(WarmReturnCheck check);
     /// Test seam. Same clock either way.
     void setDeadlineMs(int milliseconds);

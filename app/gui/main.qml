@@ -54,19 +54,31 @@ ApplicationWindow {
         // Settings and the profile are views inside the home state, not states of their own: a
         // session can end while either page is open, and it must still be the right view when it
         // does (and both keep the signed-in header, which `showsHeader` gives to "home").
-        case "home":       return seatHub.inSettings ? settingsComponent
-                                  : (seatHub.inProfile ? profileComponent : homeComponent)
-        case "connecting": return connectingComponent
+        case "home":       return window.withMenuView(homeComponent)
+        // R6A (screens.md §27): the menu is on the Connecting and Error views too, and choosing
+        // Profile or Settings there shows that view at once over the current one; Back returns to it.
+        // The client's state is untouched by this, so the view underneath is exactly where it was.
+        case "connecting": return window.withMenuView(connectingComponent)
         case "streaming":  return streamingComponent
-        case "error":      return errorComponent
+        case "error":      return window.withMenuView(errorComponent)
         }
         return signInComponent
     }
 
+    // The view the menu chose, if it chose one: Settings or the profile replace `view` while open (only
+    // one of them is ever open - the client keeps them exclusive), and `view` itself otherwise.
+    function withMenuView(view) {
+        if (seatHub.inSettings)
+            return settingsComponent
+        if (seatHub.inProfile)
+            return profileComponent
+        return view
+    }
+
     // Whether a view carries the header, and the balance in it (CUST-06, D-19): every signed-in view -
-    // Home, Settings (a view inside home), Connecting and the error view - and neither sign-in nor the
-    // restore splash, because there is no balance before sign-in. Anything this does not name has no
-    // header, so a new state cannot grow one by accident.
+    // Home, Settings and the profile (views over Home, Connecting and the error view), Connecting and
+    // the error view - and neither sign-in nor the restore splash, because there is no balance before
+    // sign-in. Anything this does not name has no header, so a new state cannot grow one by accident.
     function showsHeader(state, signedIn) {
         if (!signedIn)
             return false

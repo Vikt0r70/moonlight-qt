@@ -300,8 +300,8 @@ public:
         return count;
     }
 
-    // What `GET /api/me`, `GET /api/wallet`, `POST /api/auth/logout` and `POST
-    // /api/auth/otp/verify` answer. Status 0 is a transport failure.
+    // What `GET /api/me`, `GET /api/wallet` and `POST /api/auth/logout` answer. Status 0 is a
+    // transport failure.
     void answerMe(int status, const QByteArray& body)
     {
         QMutexLocker lock(&m_mutex);
@@ -326,19 +326,25 @@ public:
         m_playStatus = status;
         m_playBody = body;
     }
+    /// Answers for the next `POST /api/sessions` requests, one each and in the order queued. Once they
+    /// are used up `answerPlay()`'s answer applies again.
+    void queuePlay(int status, const QByteArray& body)
+    {
+        QMutexLocker lock(&m_mutex);
+        m_playQueue.append(qMakePair(status, body));
+    }
+    /// The `Idempotency-Key` of every `POST /api/sessions` so far, in order.
+    QList<QByteArray> playIdempotencyKeys() const
+    {
+        QMutexLocker lock(&m_mutex);
+        return m_playKeys;
+    }
     /// What `POST /api/auth/login` answers (status 0 is a transport failure).
     void answerLogin(int status, const QByteArray& body)
     {
         QMutexLocker lock(&m_mutex);
         m_loginStatus = status;
         m_loginBody = body;
-    }
-
-    /// What `POST /api/auth/otp/request` answers (status 0 is a transport failure).
-    void answerOtpRequest(int status)
-    {
-        QMutexLocker lock(&m_mutex);
-        m_otpRequestStatus = status;
     }
 
     /// What `GET /api/sessions/{id}/pairing` answers. The default is the documented refusal (no rig is
@@ -510,7 +516,7 @@ protected:
                                       || path == QLatin1String("/api/topup-notices"));
         const QString cursor = QUrlQuery(request.url()).queryItemValue(
             QStringLiteral("cursor"), QUrl::FullyDecoded);
-        int meStatus, walletStatus, logoutStatus, loginStatus, otpRequestStatus, playStatus;
+        int meStatus, walletStatus, logoutStatus, loginStatus, playStatus;
         int pairingStatus, endStatus, qualityStatus, qualityDelay;
         bool pairingCustom;
         QByteArray meBody, walletBody, loginBody, playBody, pairingBody, sessionBody, endBody,
@@ -531,7 +537,14 @@ protected:
             loginBody = m_loginBody;
             playStatus = m_playStatus;
             playBody = m_playBody;
-            otpRequestStatus = m_otpRequestStatus;
+            if (path == QLatin1String("/api/sessions") && !isGet) {
+                m_playKeys.append(request.rawHeader("Idempotency-Key"));
+                if (!m_playQueue.isEmpty()) {
+                    const QPair<int, QByteArray> queued = m_playQueue.takeFirst();
+                    playStatus = queued.first;
+                    playBody = queued.second;
+                }
+            }
             meStatus = m_meStatus;
             meBody = m_meBody;
             walletStatus = m_walletStatus;
@@ -600,12 +613,6 @@ protected:
         if (path == QLatin1String("/api/auth/login")) {
             return new FakeReply(loginStatus, loginBody, this);
         }
-        if (path == QLatin1String("/api/auth/otp/request")) {
-            return new FakeReply(otpRequestStatus, QByteArrayLiteral("{}"), this);
-        }
-        if (path == QLatin1String("/api/auth/otp/verify")) {
-            return new FakeReply(200, QByteArrayLiteral("{\"access_token\":\"sb_at_from_otp\"}"), this);
-        }
 
         if (path.endsWith(QLatin1String("/end"))) {
             {
@@ -671,7 +678,8 @@ private:
     QByteArray m_loginBody;
     int m_playStatus = 201;
     QByteArray m_playBody;
-    int m_otpRequestStatus = 200;
+    QList<QPair<int, QByteArray>> m_playQueue;
+    QList<QByteArray> m_playKeys;
     int m_meStatus = 200;
     QByteArray m_meBody;
     int m_walletStatus = 200;
@@ -1761,24 +1769,6 @@ private slots:
                  "the old slot is emptied once the credential is carried across");
     }
 
-    void signInByCodeStoresTheCredentialInTheAccessSlotAndReadsTheBalance()
-    {
-        SeatHubClient client;
-        isolateStore(client);
-        armControlPlane(client);
-        m_fake->answerWallet(200, walletBody(90));
-
-        client.verifyOtp(QStringLiteral("+962790000000"), QStringLiteral("123456"));
-        QTRY_COMPARE_WITH_TIMEOUT(client.appState(), QStringLiteral("home"), 15000);
-
-        QCOMPARE(client.credentialStore()->retrieveToken(TokenStore::accessTokenName()),
-                 QStringLiteral("sb_at_from_otp"));
-        QVERIFY(!client.credentialStore()->hasToken(TokenStore::refreshTokenName()));
-        QTRY_COMPARE_WITH_TIMEOUT(client.balanceText(), QStringLiteral("1 h 30 min"), 15000);
-        QCOMPARE(m_fake->authorizationFor(QStringLiteral("/api/wallet")),
-                 QByteArrayLiteral("Bearer sb_at_from_otp"));
-    }
-
     // --- Phase 5 plan 06: the email-and-password route and the website links --------------------
 
     static QByteArray refusalBody(const QString& sentence, const QString& reference)
@@ -1789,7 +1779,7 @@ private slots:
         return QJsonDocument(body).toJson(QJsonDocument::Compact);
     }
 
-    void aPasswordSignInStoresTheCredentialTheSameWayTheCodePathDoesAndReachesHome()
+    void aPasswordSignInStoresTheCredentialAndReachesHome()
     {
         SeatHubClient client;
         isolateStore(client);
@@ -1822,8 +1812,8 @@ private slots:
         QCOMPARE(sent.value(QStringLiteral("password")).toString(),
                  QStringLiteral("correct horse battery"));
 
-        // The credential is stored exactly as the code path stores it: the access slot, nothing in
-        // the old refresh slot, and the same bearer on the next request.
+        // The credential is stored in the access slot, nothing in the old refresh slot, and the
+        // same bearer is used on the next request.
         QCOMPARE(client.credentialStore()->retrieveToken(TokenStore::accessTokenName()),
                  QStringLiteral("sb_at_from_login"));
         QVERIFY(!client.credentialStore()->hasToken(TokenStore::refreshTokenName()));
@@ -1840,6 +1830,117 @@ private slots:
             const QByteArray bytes = blob.readAll();
             QVERIFY(!bytes.contains("correct horse battery"));
             QVERIFY(!bytes.contains("sb_at_from_login"));
+        }
+    }
+
+    void aPhoneSignsInWithThePasswordThroughLogin()
+    {
+        // A-ID / C-SIGNIN: a phone number signs in through the same call as an email. The client sends
+        // exactly what was typed and the picked ISO region; it never builds E.164 or a dial code, and
+        // no code step exists.
+        SeatHubClient client;
+        isolateStore(client);
+        armControlPlane(client);
+        m_fake->answerLogin(200, QByteArrayLiteral("{\"access_token\":\"sb_at_from_login\"}"));
+        m_fake->answerWallet(200, walletBody(90));
+
+        QSignalSpy accepted(&client, &SeatHubClient::passwordSignInAccepted);
+        QSignalSpy rejected(&client, &SeatHubClient::passwordSignInRejected);
+
+        // How a customer in Amman writes it: separators, a trunk zero, and a lower-case region.
+        client.signInWithPassword(QStringLiteral(" (079) 000-0000 "), QStringLiteral("a password"),
+                                  QStringLiteral("jo"));
+        QTRY_COMPARE_WITH_TIMEOUT(client.appState(), QStringLiteral("home"), 15000);
+        QCOMPARE(accepted.count(), 1);
+        QCOMPARE(rejected.count(), 0);
+
+        const QJsonObject sent = QJsonDocument::fromJson(
+            m_fake->bodyFor(QStringLiteral("/api/auth/login"))).object();
+        QCOMPARE(sent.value(QStringLiteral("identifier")).toString(),
+                 QStringLiteral("(079) 000-0000"));
+        QCOMPARE(sent.value(QStringLiteral("password")).toString(), QStringLiteral("a password"));
+        QCOMPARE(sent.value(QStringLiteral("region")).toString(), QStringLiteral("JO"));
+        QCOMPARE(sent.size(), 3);
+        QVERIFY2(!QString::fromUtf8(m_fake->bodyFor(QStringLiteral("/api/auth/login")))
+                      .contains(QStringLiteral("962")),
+                 "the client never puts a dial code in front of what was typed");
+
+        // The same credential handling as an email, and no code route was ever asked.
+        QCOMPARE(client.credentialStore()->retrieveToken(TokenStore::accessTokenName()),
+                 QStringLiteral("sb_at_from_login"));
+        QTRY_COMPARE_WITH_TIMEOUT(client.balanceText(), QStringLiteral("1 h 30 min"), 15000);
+        QCOMPARE(m_fake->authorizationFor(QStringLiteral("/api/wallet")),
+                 QByteArrayLiteral("Bearer sb_at_from_login"));
+        for (const QString& path : m_fake->requestPaths()) {
+            QVERIFY2(!path.contains(QStringLiteral("/otp")), qPrintable(path));
+        }
+
+        // A number written with its own country code is sent as typed too; the region is only the
+        // picked country, the server decides which one wins.
+        client.signOut();
+        QTRY_COMPARE_WITH_TIMEOUT(client.appState(), QStringLiteral("signed_out"), 15000);
+        client.signInWithPassword(QStringLiteral("+44 7911 123456"), QStringLiteral("a password"),
+                                  QStringLiteral("JO"));
+        QTRY_COMPARE_WITH_TIMEOUT(accepted.count(), 2, 15000);
+        const QJsonObject second = QJsonDocument::fromJson(
+            m_fake->bodyFor(QStringLiteral("/api/auth/login"))).object();
+        QCOMPARE(second.value(QStringLiteral("identifier")).toString(), QStringLiteral("+44 7911 123456"));
+        QCOMPARE(second.value(QStringLiteral("region")).toString(), QStringLiteral("JO"));
+    }
+
+    void noAccountOffersTheWebsiteSignUp()
+    {
+        // C-SIGNIN: when the server answers that no account uses that email or phone, the screen is
+        // told so (the third argument) and offers the website's sign-up page. SeatHub never creates an
+        // account: nothing here asks any route that could.
+        SeatHubClient client;
+        isolateStore(client);
+        armControlPlane(client);
+        const QString sentence = QStringLiteral("No account uses that email or phone.");
+        QJsonObject refusal;
+        refusal.insert(QStringLiteral("status"), false);
+        refusal.insert(QStringLiteral("error"), sentence);
+        refusal.insert(QStringLiteral("reference"), QStringLiteral("SH-3K2XQ1"));
+        refusal.insert(QStringLiteral("kind"), QStringLiteral("account.login.no_account"));
+        m_fake->answerLogin(401, QJsonDocument(refusal).toJson(QJsonDocument::Compact));
+
+        QSignalSpy rejected(&client, &SeatHubClient::passwordSignInRejected);
+        client.signInWithPassword(QStringLiteral("0790000000"), QStringLiteral("a password"),
+                                  QStringLiteral("JO"));
+        QTRY_COMPARE_WITH_TIMEOUT(rejected.count(), 1, 15000);
+        QCOMPARE(rejected.at(0).at(0).toString(), sentence);
+        QCOMPARE(rejected.at(0).at(1).toString(), QStringLiteral("SH-3K2XQ1"));
+        QVERIFY2(rejected.at(0).at(2).toBool(), "the refusal is flagged as no account");
+
+        // Every other refusal is not.
+        m_fake->answerLogin(401, refusalBody(QStringLiteral("That password is wrong."),
+                                             QStringLiteral("SH-4F7KQ2")));
+        client.signInWithPassword(QStringLiteral("0790000000"), QStringLiteral("a password"),
+                                  QStringLiteral("JO"));
+        QTRY_COMPARE_WITH_TIMEOUT(rejected.count(), 2, 15000);
+        QVERIFY(!rejected.at(1).at(2).toBool());
+        // An unreachable control plane says nothing about whether an account exists.
+        m_fake->answerLogin(0, QByteArray());
+        client.signInWithPassword(QStringLiteral("0790000000"), QStringLiteral("a password"),
+                                  QStringLiteral("JO"));
+        QTRY_COMPARE_WITH_TIMEOUT(rejected.count(), 3, 15000);
+        QVERIFY(!rejected.at(2).at(2).toBool());
+
+        // The offer opens the website's sign-up page, and only that page.
+        QList<QUrl> opened;
+        client.setUrlOpener([&opened](const QUrl& url) {
+            opened.append(url);
+            return true;
+        });
+        QVERIFY(client.openWebsite(QStringLiteral("signup")));
+        QCOMPARE(opened.size(), 1);
+        QCOMPARE(opened.first().toString(), QStringLiteral("https://sevenhills.damra.co/login?mode=signup"));
+        QVERIFY(opened.first().userInfo().isEmpty());
+
+        // Nothing was signed in and no route that makes an account was asked.
+        QVERIFY(!client.credentialStore()->hasToken(TokenStore::accessTokenName()));
+        for (const QString& path : m_fake->requestPaths()) {
+            QVERIFY2(path == QLatin1String("/api/auth/login"), qPrintable(path));
         }
     }
 
@@ -1878,6 +1979,9 @@ private slots:
 
         QCOMPARE(rejected.first().at(0).toString(), sentence);
         QCOMPARE(rejected.first().at(1).toString(), reference);
+        // Only the no-account refusal asks the screen to offer the website's sign-up page.
+        QCOMPARE(rejected.first().at(2).toBool(),
+                 sentence == QStringLiteral("No account uses that email or phone."));
         QCOMPARE(accepted.count(), 0);
         // A refusal signs nobody in and stores nothing.
         QVERIFY(client.appState() != QStringLiteral("home"));
@@ -1917,35 +2021,6 @@ private slots:
         QCOMPARE(rejected.at(1).at(0).toString(), QStringLiteral("Enter your password."));
         QVERIFY2(!m_fake->requestPaths().contains(QStringLiteral("/api/auth/login")),
                  "a field-level mistake must not cost a round trip");
-    }
-
-    void theCodePathSaysTheOfflineSentenceToo()
-    {
-        SeatHubClient client;
-        isolateStore(client);
-        armControlPlane(client);
-        m_fake->answerOtpRequest(0);
-
-        QSignalSpy rejected(&client, &SeatHubClient::otpRejected);
-        client.requestOtp(QStringLiteral("+962790000000"));
-        QTRY_COMPARE_WITH_TIMEOUT(rejected.count(), 1, 15000);
-        QCOMPARE(rejected.first().at(0).toString(),
-                 QStringLiteral("We couldn't reach SevenHills. Try again in a moment."));
-        QVERIFY(rejected.first().at(1).toString().isEmpty());
-    }
-
-    void aNationalNumberWithNoCountryIsRefusedLocallyAndNamed()
-    {
-        SeatHubClient client;
-        isolateStore(client);
-        armControlPlane(client);
-
-        QSignalSpy rejected(&client, &SeatHubClient::otpRejected);
-        client.requestOtp(QStringLiteral("0790000000"));
-        QCOMPARE(rejected.count(), 1);
-        QCOMPARE(rejected.first().at(0).toString(),
-                 QStringLiteral("That doesn't look like a phone number."));
-        QVERIFY(!m_fake->requestPaths().contains(QStringLiteral("/api/auth/otp/request")));
     }
 
     void theWebsiteLinksAreTheSpecsAddressesAndCarryNoCredential()
@@ -2204,6 +2279,219 @@ private slots:
         // Sign-out forgets it either way: the next customer on this PC inherits no session.
         client.signOut();
         QVERIFY(client.attachedSessionId().isEmpty());
+    }
+
+    // --- A-LC / C-SAMEPLAY: the Play that answers PREVIOUS_SESSION_ENDING is repeated ----------------
+
+    void aReplacedPlayRepeatsWithTheSameKeyUntilItGetsASession()
+    {
+        SeatHubClient client;
+        reachHome(client, 90);
+        QVERIFY(!QTest::currentTestFailed());
+        // No jitter, so the repeats land on the schedule (V9: 1 s, then x1.6).
+        client.setReconnectJitterProvider([]() { return 0.0; });
+        m_fake->answerPairing(409, playRefusalBody(QStringLiteral("The rig is not ready yet."),
+                                                   QStringLiteral("SH-2K2XQ1")));
+
+        const QByteArray ending = playRefusalBody(
+            QStringLiteral("Your previous session is still ending."), QStringLiteral("SH-7K2XQ1"),
+            QStringLiteral("PREVIOUS_SESSION_ENDING"));
+        m_fake->queuePlay(409, ending);
+        m_fake->queuePlay(409, ending);
+        m_fake->answerPlay(201, QByteArrayLiteral("{\"id\":\"s-replaced\"}"));
+
+        QStringList statuses;
+        QObject::connect(&client, &SeatHubClient::homeStatusChanged,
+                         [&]() { statuses.append(client.homeStatus()); });
+        client.start();
+
+        // The busy Play stays and says what is happening: no failure, no refusal, still Home.
+        QTRY_COMPARE_WITH_TIMEOUT(client.homeStatus(), QStringLiteral("previous_ending"), 15000);
+        QCOMPARE(client.appState(), QStringLiteral("home"));
+        QVERIFY(client.failure().isEmpty());
+        // A second press while it waits is the same Play, not a new one.
+        client.start();
+        QCOMPARE(m_fake->playIdempotencyKeys().size(), 1);
+
+        // Then the session arrives, on the third ask.
+        QTRY_COMPARE_WITH_TIMEOUT(client.appState(), QStringLiteral("connecting"), 30000);
+        QCOMPARE(client.attachedSessionId(), QStringLiteral("s-replaced"));
+        QCOMPARE(m_fake->requestPaths().count(QStringLiteral("/api/sessions")), 3);
+        const QList<QByteArray> keys = m_fake->playIdempotencyKeys();
+        QCOMPARE(keys.size(), 3);
+        QVERIFY(!keys.at(0).isEmpty());
+        QCOMPARE(keys.at(1), keys.at(0));
+        QCOMPARE(keys.at(2), keys.at(0));
+        // The wait is one stretch of the busy state, then ready - never a refusal or an error.
+        QVERIFY2(!statuses.contains(QStringLiteral("refused")), qPrintable(statuses.join(',')));
+        QVERIFY2(!statuses.contains(QStringLiteral("busy")), qPrintable(statuses.join(',')));
+        QCOMPARE(client.homeStatus(), QStringLiteral("ready"));
+        QVERIFY(client.failure().isEmpty());
+    }
+
+    void aRepeatedPlayStopsAtTheFirstOtherAnswerAndTheNextPlayHasAFreshKey()
+    {
+        SeatHubClient client;
+        reachHome(client, 90);
+        QVERIFY(!QTest::currentTestFailed());
+        client.setReconnectJitterProvider([]() { return 0.0; });
+
+        m_fake->queuePlay(409, playRefusalBody(QStringLiteral("Your previous session is still ending."),
+                                               QStringLiteral("SH-7K2XQ1"),
+                                               QStringLiteral("PREVIOUS_SESSION_ENDING")));
+        // `NO_HOST_AVAILABLE` keeps its own branch: the empty state, not an error and not a repeat.
+        m_fake->answerPlay(409, playRefusalBody(QStringLiteral("None available."),
+                                                QStringLiteral("SH-8K2XQ1"),
+                                                QStringLiteral("NO_HOST_AVAILABLE")));
+        client.start();
+        QTRY_COMPARE_WITH_TIMEOUT(client.homeStatus(), QStringLiteral("busy"), 30000);
+        QCOMPARE(m_fake->playIdempotencyKeys().size(), 2);
+        QCOMPARE(m_fake->playIdempotencyKeys().at(1), m_fake->playIdempotencyKeys().at(0));
+        // Nothing repeats after an answer that is not the retryable one.
+        QTest::qWait(2500);
+        QCOMPARE(m_fake->playIdempotencyKeys().size(), 2);
+
+        // The next press is a new Play with a new key.
+        m_fake->answerPlay(402, playRefusalBody(QStringLiteral("Not enough credit."),
+                                                QStringLiteral("SH-3K2XQ1")));
+        client.start();
+        QTRY_COMPARE_WITH_TIMEOUT(client.homeStatus(), QStringLiteral("refused"), 15000);
+        QCOMPARE(m_fake->playIdempotencyKeys().size(), 3);
+        QVERIFY(m_fake->playIdempotencyKeys().at(2) != m_fake->playIdempotencyKeys().at(0));
+
+        // `USER_HAS_NONTERMINAL_SESSION` is another answer too: it is shown, not repeated.
+        m_fake->answerPlay(409, playRefusalBody(QStringLiteral("You already have a session."),
+                                                QStringLiteral("SH-9K2XQ1"),
+                                                QStringLiteral("USER_HAS_NONTERMINAL_SESSION")));
+        client.start();
+        QTRY_COMPARE_WITH_TIMEOUT(m_fake->playIdempotencyKeys().size(), 4, 15000);
+        QTRY_COMPARE_WITH_TIMEOUT(client.homeStatus(), QStringLiteral("refused"), 15000);
+        QTest::qWait(1500);
+        QCOMPARE(m_fake->playIdempotencyKeys().size(), 4);
+    }
+
+    void aSignOutEndsTheWaitingPlayRepeat()
+    {
+        SeatHubClient client;
+        reachHome(client, 90);
+        QVERIFY(!QTest::currentTestFailed());
+        client.setReconnectJitterProvider([]() { return 0.0; });
+        m_fake->answerPlay(409, playRefusalBody(QStringLiteral("Your previous session is still ending."),
+                                                QStringLiteral("SH-7K2XQ1"),
+                                                QStringLiteral("PREVIOUS_SESSION_ENDING")));
+        client.start();
+        QTRY_COMPARE_WITH_TIMEOUT(client.homeStatus(), QStringLiteral("previous_ending"), 15000);
+        QCOMPARE(m_fake->playIdempotencyKeys().size(), 1);
+
+        client.signOut();
+        QTRY_COMPARE_WITH_TIMEOUT(client.appState(), QStringLiteral("signed_out"), 15000);
+        QCOMPARE(client.homeStatus(), QStringLiteral("ready"));
+        // The armed repeat finds nothing to repeat for.
+        QTest::qWait(2500);
+        QCOMPARE(m_fake->playIdempotencyKeys().size(), 1);
+        QCOMPARE(client.homeStatus(), QStringLiteral("ready"));
+    }
+
+    // --- R6A: Profile and Settings over Connecting and Error ----------------------------------------
+
+    void menuSettingsOverConnectingShowsAtOnceAndBackReturns()
+    {
+        SeatHubClient client;
+        beginStagedSession(client);
+        QVERIFY(!QTest::currentTestFailed());
+        QCOMPARE(client.attachedSessionId(), QStringLiteral("s-stages"));
+
+        // Settings from the menu on the Connecting view: shown at once, over it. The state and the
+        // session underneath are exactly where they were.
+        QSignalSpy settingsChanges(&client, &SeatHubClient::inSettingsChanged);
+        client.openSettings();
+        QVERIFY(client.inSettings());
+        QCOMPARE(settingsChanges.count(), 1);
+        QCOMPARE(client.appState(), QStringLiteral("connecting"));
+        QCOMPARE(client.attachedSessionId(), QStringLiteral("s-stages"));
+
+        // Back returns to Connecting, not to Home.
+        client.closeSettings();
+        QVERIFY(!client.inSettings());
+        QCOMPARE(client.appState(), QStringLiteral("connecting"));
+        QCOMPARE(client.attachedSessionId(), QStringLiteral("s-stages"));
+
+        // Profile opens there too, replaces Settings (only one shows), and Back returns the same way.
+        client.openProfile();
+        QVERIFY(client.inProfile());
+        QVERIFY(!client.inSettings());
+        QCOMPARE(client.appState(), QStringLiteral("connecting"));
+        client.openSettings();
+        QVERIFY(client.inSettings());
+        QVERIFY(!client.inProfile());
+        client.openProfile();
+        QVERIFY(client.inProfile() && !client.inSettings());
+        client.closeProfile();
+        QVERIFY(!client.inProfile() && !client.inSettings());
+        QCOMPARE(client.appState(), QStringLiteral("connecting"));
+        QCOMPARE(client.attachedSessionId(), QStringLiteral("s-stages"));
+    }
+
+    void menuSettingsOverTheErrorViewShowsAtOnceAndBackReturns()
+    {
+        SeatHubClient client;
+        beginStagedSession(client);
+        QVERIFY(!QTest::currentTestFailed());
+        client.teardown()->setVerifyIntervalMs(1);
+        m_fake->answerSession(QStringLiteral("s-stages"), QStringLiteral("CANCELLED"));
+        // No engine is attached, so pairing completing has nothing to start a stream with: the error view.
+        emit client.pairing()->pairingCompleted(QStringLiteral("aa:bb:cc:dd:ee:ff"));
+        QCOMPARE(client.appState(), QStringLiteral("error"));
+        const QVariantMap failure = client.failure();
+        QVERIFY(!failure.isEmpty());
+
+        client.openSettings();
+        QVERIFY(client.inSettings());
+        QCOMPARE(client.appState(), QStringLiteral("error"));
+        QCOMPARE(client.failure(), failure);
+        client.closeSettings();
+        QVERIFY(!client.inSettings());
+        QCOMPARE(client.appState(), QStringLiteral("error"));
+        QCOMPARE(client.failure(), failure);
+
+        client.openProfile();
+        QVERIFY(client.inProfile());
+        QCOMPARE(client.appState(), QStringLiteral("error"));
+        client.closeProfile();
+        QVERIFY(!client.inProfile());
+        QCOMPARE(client.appState(), QStringLiteral("error"));
+        QCOMPARE(client.failure(), failure);
+
+        // Try again leaves the menu's view behind with the error: it re-runs the step that failed.
+        client.openSettings();
+        client.retry();
+        QVERIFY(!client.inSettings());
+        QVERIFY(!client.inProfile());
+    }
+
+    void aMenuViewDoesNotSurviveTheStreamStartingOrASignOut()
+    {
+        auto* engine = new FakeEngineSession;
+        {
+            SeatHubClient client;
+            client.session()->attachSession(engine);
+            beginStagedSession(client);
+            QVERIFY(!QTest::currentTestFailed());
+            PairingController* pairing = client.pairing();
+            QMetaObject::invokeMethod(
+                pairing, [pairing]() { pairing->cancel(); }, Qt::BlockingQueuedConnection);
+
+            client.openSettings();
+            QVERIFY(client.inSettings());
+            emit engine->connectionStarted();
+            QCOMPARE(client.appState(), QStringLiteral("streaming"));
+            // The stream hides this window; nothing of the menu's view is left to come back to.
+            QVERIFY(!client.inSettings());
+            QVERIFY(!client.inProfile());
+
+            client.session()->attachSession(nullptr);
+        }
+        delete engine;
     }
 
     void aSessionTheServerReportsOverIsEndedAndPlayAsksForANewOne()
@@ -2616,10 +2904,10 @@ private slots:
         client.signOut();
         QTRY_COMPARE_WITH_TIMEOUT(client.appState(), QStringLiteral("signed_out"), 15000);
 
-        m_fake->answerOtpRequest(200);
-        client.requestOtp(QStringLiteral("+962790000000"));
+        m_fake->answerLogin(200, QByteArrayLiteral("{\"access_token\":\"sb_at_after_signout\"}"));
+        client.signInWithPassword(QStringLiteral("lina@example.com"), QStringLiteral("a password"));
         QTRY_VERIFY_WITH_TIMEOUT(
-            m_fake->requestPaths().contains(QStringLiteral("/api/auth/otp/request")), 15000);
+            m_fake->requestPaths().contains(QStringLiteral("/api/auth/login")), 15000);
         QVERIFY2(m_fake->traceparents().last().isEmpty(),
                  "signing out must not leave a Play's trace id on the next sign-in's own requests");
     }
@@ -2817,7 +3105,9 @@ private slots:
 
         // A fresh sign-in, first time - the outbox is empty, so the pre-WR-06 code never even
         // asked for the account id.
-        client.verifyOtp(QStringLiteral("+962790000000"), QStringLiteral("123456"));
+        m_fake->answerLogin(200, QByteArrayLiteral("{\"access_token\":\"sb_at_for_first\"}"));
+        client.signInWithPassword(QStringLiteral("+962790000000"), QStringLiteral("a password"),
+                                  QStringLiteral("JO"));
         QTRY_COMPARE_WITH_TIMEOUT(client.appState(), QStringLiteral("home"), 15000);
         QTRY_VERIFY_WITH_TIMEOUT(m_fake->requestPaths().contains(QStringLiteral("/api/me")), 15000);
 
@@ -2880,7 +3170,9 @@ private slots:
         // (the finding's own "Failed /api/me at sign-in" case).
         m_fake->answerMe(503, QByteArray());
         m_fake->answerWallet(200, walletBody(90));
-        client.verifyOtp(QStringLiteral("+962790000002"), QStringLiteral("123456"));
+        m_fake->answerLogin(200, QByteArrayLiteral("{\"access_token\":\"sb_at_for_a\"}"));
+        client.signInWithPassword(QStringLiteral("+962790000002"), QStringLiteral("a password"),
+                                  QStringLiteral("JO"));
         QTRY_COMPARE_WITH_TIMEOUT(client.appState(), QStringLiteral("home"), 15000);
         QTRY_VERIFY_WITH_TIMEOUT(m_fake->requestPaths().contains(QStringLiteral("/api/me")), 15000);
 
@@ -3368,6 +3660,11 @@ private slots:
             << "We lost contact with this rig, so the session ended. You were charged for 3 minutes."
             << QStringLiteral("We lost contact with this rig, so the session ended. You were charged "
                               "for %1 minutes.").arg(mono.arg(3));
+        QTest::newRow("the customer's new Play replaced it, one minute")
+            << "READY" << "COMPLETED" << "REPLACED_BY_PLAY" << 1 << stream
+            << "Ended by your new Play. You were charged for 1 minute."
+            << QStringLiteral("Ended by your new Play. You were charged for %1 minute.")
+                   .arg(mono.arg(1));
         QTest::newRow("support ended it")
             << "ALLOCATED" << "CANCELLED" << "OPERATOR_FORCED" << 0 << rig
             << "Support ended this session. You were charged for 0 minutes."
@@ -4690,6 +4987,28 @@ private slots:
             << "HOST_LOST" << 23
             << QStringLiteral("We lost contact with this rig, so the session ended. You were charged "
                               "for %1 minutes.").arg(mono.arg(23));
+        // C-SAMEPLAY: the customer's own Play ended the held session.
+        QTest::newRow("the customer's new Play replaced it")
+            << "REPLACED_BY_PLAY" << 23
+            << QStringLiteral("Ended by your new Play. You were charged for %1 minutes.")
+                   .arg(mono.arg(23));
+        // Every `You were charged for {minutes}.` sentence says `1 minute` in the singular.
+        QTest::newRow("the new Play replaced it, one minute")
+            << "REPLACED_BY_PLAY" << 1
+            << QStringLiteral("Ended by your new Play. You were charged for %1 minute.")
+                   .arg(mono.arg(1));
+        QTest::newRow("the rig was lost, one minute")
+            << "HOST_LOST" << 1
+            << QStringLiteral("We lost contact with this rig, so the session ended. You were charged "
+                              "for %1 minute.").arg(mono.arg(1));
+        QTest::newRow("the connection dropped too often, one minute")
+            << "RECONNECT_LIMIT" << 1
+            << QStringLiteral("Your connection dropped too many times, so the session ended. You were "
+                              "charged for %1 minute.").arg(mono.arg(1));
+        QTest::newRow("support ended it, one minute")
+            << "OPERATOR_FORCED" << 1
+            << QStringLiteral("Support ended this session. You were charged for %1 minute.")
+                   .arg(mono.arg(1));
         // No reason: Home says nothing rather than something invented.
         QTest::newRow("no reason at all") << QString() << 5 << QString();
     }
@@ -4777,9 +5096,11 @@ private slots:
         QCOMPARE(client.countries().size(), SeatHubCountries::all().size());
         QVERIFY(client.countries().size() > 0);
         QVERIFY(SeatHubCountries::contains(client.defaultCountryCode()));
-        QCOMPARE(client.toE164(QStringLiteral("0790000000"), QStringLiteral("+962")),
-                 QStringLiteral("+962790000000"));
-        QCOMPARE(client.toE164(QStringLiteral("0790000000"), QString()), QString());
+        // C-SIGNIN: Jordan is the default for every sign-in, whatever region this machine is set to.
+        QCOMPARE(client.defaultCountryCode(), QStringLiteral("JO"));
+        QCOMPARE(SeatHubCountries::find(client.defaultCountryCode())
+                     .value(QStringLiteral("dial")).toString(),
+                 QStringLiteral("+962"));
     }
 
     void signOutRevokesOnTheServerThenClearsTheStore()
@@ -5297,6 +5618,27 @@ private slots:
 
     // The other two lists' rows (D-15) -----------------------------------------------------------------
 
+    void aSessionRowEndedByANewPlaySaysSoInShortWords()
+    {
+        SeatHubClient client;
+        reachProfile(client);
+        m_fake->answerList(
+            QStringLiteral("/api/sessions"), QString(), 200,
+            pageBody("sessions",
+                     { sessionRow(QStringLiteral("a"), 12, QStringLiteral("REPLACED_BY_PLAY")),
+                       sessionRow(QStringLiteral("b"), 1, QStringLiteral("REPLACED_BY_PLAY")) },
+                     QString()));
+
+        SessionListModel* list = client.sessionHistory();
+        client.loadFirstPage(QStringLiteral("sessions"));
+        QTRY_COMPARE_WITH_TIMEOUT(list->status(), QStringLiteral("ready"), 15000);
+        QCOMPARE(list->count(), 2);
+        QCOMPARE(cell(list, 0, CustomerListModel::KindRole), QStringLiteral("Ended by your new Play"));
+        QCOMPARE(cell(list, 1, CustomerListModel::KindRole), QStringLiteral("Ended by your new Play"));
+        QCOMPARE(cell(list, 0, CustomerListModel::AmountRole), QStringLiteral("12 min"));
+        QCOMPARE(cell(list, 1, CustomerListModel::AmountRole), QStringLiteral("1 min"));
+    }
+
     void creditHistoryRowsSayThePlainKindAndTheSignedAmount()
     {
         SeatHubClient client;
@@ -5309,22 +5651,26 @@ private slots:
                        ledgerRowJson(QStringLiteral("l3"), QStringLiteral("session_debit"), -1),
                        ledgerRowJson(QStringLiteral("l4"), QStringLiteral("refund"), 45),
                        ledgerRowJson(QStringLiteral("l5"), QStringLiteral("adjustment"), -90),
-                       ledgerRowJson(QStringLiteral("l6"), QStringLiteral("shortfall"), -5) },
+                       ledgerRowJson(QStringLiteral("l6"), QStringLiteral("shortfall"), -5),
+                       // A-LC / L11: the extra minutes a held rental returns, in its own row.
+                       ledgerRowJson(QStringLiteral("l7"), QStringLiteral("held_return"), 7) },
                      QString()));
 
         CreditHistoryModel* list = client.creditHistory();
         client.loadFirstPage(QStringLiteral("credit"));
         QTRY_COMPARE_WITH_TIMEOUT(list->status(), QStringLiteral("ready"), 15000);
-        QCOMPARE(list->count(), 6);
+        QCOMPARE(list->count(), 7);
 
         const QStringList kinds = { QStringLiteral("Top-up"), QStringLiteral("First top-up bonus"),
                                     QStringLiteral("Played"), QStringLiteral("Refund"),
                                     QStringLiteral("Adjustment by support"),
-                                    QStringLiteral("Unpaid minutes") };
+                                    QStringLiteral("Unpaid minutes"),
+                                    QStringLiteral("Minutes returned") };
         const QStringList amounts = { QStringLiteral("+5 h 00 min"), QStringLiteral("+1 h 00 min"),
                                       QStringLiteral("-1 min"), QStringLiteral("+45 min"),
-                                      QStringLiteral("-1 h 30 min"), QStringLiteral("-5 min") };
-        for (int row = 0; row < 6; ++row) {
+                                      QStringLiteral("-1 h 30 min"), QStringLiteral("-5 min"),
+                                      QStringLiteral("+7 min") };
+        for (int row = 0; row < 7; ++row) {
             QCOMPARE(cell(list, row, CustomerListModel::WhenRole), QStringLiteral("Sat 12 Sep, 21:40"));
             QCOMPARE(cell(list, row, CustomerListModel::KindRole), kinds.at(row));
             QCOMPARE(cell(list, row, CustomerListModel::AmountRole), amounts.at(row));
@@ -5682,6 +6028,7 @@ private slots:
         QTest::addColumn<QString>("text");
 
         QTest::newRow("CUSTOMER_ENDED") << "CUSTOMER_ENDED" << "You ended it";
+        QTest::newRow("REPLACED_BY_PLAY") << "REPLACED_BY_PLAY" << "Ended by your new Play";
         QTest::newRow("CONNECT_FAILED") << "CONNECT_FAILED" << "Didn't start, not charged";
         QTest::newRow("BALANCE_EXHAUSTED") << "BALANCE_EXHAUSTED" << "Balance ran out";
         QTest::newRow("HOST_LOST") << "HOST_LOST" << "Lost contact with the rig";
@@ -5719,6 +6066,7 @@ private slots:
         QTest::newRow("refund") << "refund" << "Refund";
         QTest::newRow("adjustment") << "adjustment" << "Adjustment by support";
         QTest::newRow("shortfall") << "shortfall" << "Unpaid minutes";
+        QTest::newRow("held_return") << "held_return" << "Minutes returned";
         // The deck has no word for a kind it does not list, and a guess would be an invented string.
         QTest::newRow("a kind the deck does not list") << "chargeback" << "";
     }

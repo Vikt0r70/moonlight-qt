@@ -13,9 +13,8 @@
 //
 // The routes this client does own (`docs/spec/openapi.yaml`, version 1.8.0):
 //
-//   POST /api/auth/otp/request                 sign-in step 1
-//   POST /api/auth/otp/verify                  sign-in step 2            -> TokenPair
 //   POST /api/auth/login                       email/phone + password    -> TokenPair
+//                                              ({identifier, password, region?}, A-ID)
 //   POST /api/auth/logout                      revoke the credential     -> 204
 //   GET  /api/me                               who the credential is     -> Account
 //   GET  /api/wallet                           the balance in minutes    -> Wallet
@@ -151,11 +150,13 @@ struct SessionAuthorization
     int leaseSeq = 0;
     /// The CONNECT lease deadline (RFC 3339 UTC). Empty when absent.
     QString connectDeadlineAt;
-    /// ADR-0074 W03 (`SessionAuthorization.warm_return`, contract 3.11.0): true only for a NEW session
-    /// allocated from the caller's own valid free return hold while the rig keeps that customer's
-    /// pairing warm. Optional, default false: absent, null, false and every non-boolean value read
-    /// as false, so a client that is not told leaves the field out and pairs normally. Advisory
-    /// only - the rig's own certificate check is what admits the stream, and a PIN is still issued.
+    /// ADR-0074 W03 (`SessionAuthorization.warm_return`, contract 3.11.0; A-LC, 3.16.0): true for a
+    /// NEW session allocated from the caller's own valid free return hold while the rig keeps that
+    /// customer's pairing warm, and also for an `ACTIVE` session inside its disconnect grace (a
+    /// same-session reconnect). Optional, default false: absent, null, false and every non-boolean
+    /// value read as false, so a client that is not told leaves the field out and pairs normally.
+    /// Advisory only - the rig's own certificate check is what admits the stream, a PIN is still
+    /// issued, and a warm attempt that fails falls back to the PIN handshake (L07).
     bool warmReturn = false;
 
     static bool parse(const QJsonObject& body, SessionAuthorization* out);
@@ -282,7 +283,8 @@ struct CustomerSessionPage
 struct LedgerRow
 {
     QString id;
-    /// `LedgerKind`: topup_credit, first_bonus, session_debit, refund, adjustment, shortfall.
+    /// `LedgerKind`: topup_credit, first_bonus, session_debit, refund, adjustment, shortfall and,
+    /// from contract 3.16.0 (A-LC), held_return (one positive entry per held rental that ended).
     QString kind;
     /// Positive for a credit, negative for a debit; the server's own signed number.
     qint64 amountMinutes = 0;
@@ -354,19 +356,10 @@ public:
     /// `^SH-[0-9A-HJ-KM-NP-TV-Z]{6}$`.
     static bool isReferenceCode(const QString& reference);
 
-    /// The E.164 shape `docs/spec/openapi.yaml` puts on `phone_e164`
-    /// (`^\+[1-9][0-9]{7,14}$`).
-    static bool isPhoneE164(const QString& phoneE164);
-
-    /// Normalises a phone number the way the sign-in field is allowed to be typed, into E.164:
-    /// Arabic-Indic and Persian digits become Latin ones, the separators people actually type
-    /// (`space ( ) - .`) are dropped, a leading `+` or `00` is believed as already international,
-    /// and otherwise `dialCode` (the chosen country's, e.g. `+962`) is applied after one leading
-    /// trunk `0` is removed. With no `dialCode` a national number is refused rather than guessed.
-    /// Returns an empty string when what is left is not E.164. Deciding here keeps `requestOtp`
-    /// and `verifyOtp` from sending two spellings of the same number, and matches the website's
-    /// own `toE164`.
-    static QString normalisePhoneE164(const QString& raw, const QString& dialCode = QString());
+    /// A fresh `Idempotency-Key`: a uuid without braces. `requestSession()` mints one per call when
+    /// the caller names none; the facade mints one per Play press and reuses it for every repeat of
+    /// that press (A-LC `PREVIOUS_SESSION_ENDING`, ADR-0062 decision 11).
+    static QString newIdempotencyKey();
 
     /// Percent-encodes one path segment (a session id) so it cannot add structure to the route it
     /// is interpolated into.
@@ -387,11 +380,14 @@ public:
     // --- request builders. Static for the same reason: the documented payload shape is
     // --- asserted without a socket.
 
-    static QByteArray buildOtpRequest(const QString& phoneE164);
-    static QByteArray buildOtpVerify(const QString& phoneE164, const QString& code);
-    /// `LoginRequest`: `{identifier, password}`. The identifier is what the customer typed (an
-    /// email or an E.164 phone number); the control plane decides which it is.
-    static QByteArray buildLogin(const QString& identifier, const QString& password);
+    /// `LoginRequest` (A-ID, contract 3.15.0): `{identifier, password}` plus `region` when one is
+    /// named. The identifier is exactly what the customer typed, an email or a phone number in any
+    /// of the ways it can be typed; this client never builds E.164 or a doubled dial code. The
+    /// control plane decides whether it is phone-shaped and, if so, canonicalises it with
+    /// `region` (an ISO 3166-1 alpha-2 code; the server's own default is `JO`). An empty `region`
+    /// leaves the field out.
+    static QByteArray buildLogin(const QString& identifier, const QString& password,
+                                 const QString& region = QString());
     /// `SessionCreateRequest` (contract 3.3.0, ADR-0064/A-68): always `{}` - the request carries
     /// no quality field at all, since the customer's saved Settings are the only decider of
     /// stream quality (D-06 reversal).
@@ -512,13 +508,12 @@ public:
 
     using Callback = std::function<void(const ControlPlaneResult&)>;
 
-    void requestOtp(const QString& phoneE164, Callback callback);
-    void verifyOtp(const QString& phoneE164, const QString& code, Callback callback);
-
     /// `POST /api/auth/login`. Unauthenticated: no credential is attached. Returns `TokenPair`.
-    /// Called by the sign-in screen's password step; wired and tested here so that screen has a
-    /// real method to call.
+    /// The one sign-in call: a phone and an email both come through it (A-ID), and there is no
+    /// code step. `region` is the picked country's ISO code (empty: not sent).
     void login(const QString& identifier, const QString& password, Callback callback);
+    void login(const QString& identifier, const QString& password, const QString& region,
+               Callback callback);
 
     /// `POST /api/auth/logout`. Authenticated, empty body; the server revokes the presented
     /// credential and answers 204, which is success (it has no body to classify).
@@ -553,6 +548,11 @@ public:
     /// `POST /api/sessions` carrying the X02 identity (`buildSessionCreate(clientCertSha256)`).
     /// Same fresh `Idempotency-Key` per call as the overload above.
     void requestSession(const QString& clientCertSha256, Callback callback);
+    /// `POST /api/sessions` with an `Idempotency-Key` the caller names (A-LC): the repeat of a Play
+    /// that answered the retryable `PREVIOUS_SESSION_ENDING` sends the SAME key, so the server
+    /// sees one Play however many times it is asked. An empty key mints a fresh one.
+    void requestSession(const QString& clientCertSha256, const QString& idempotencyKey,
+                        Callback callback);
     void fetchSession(const QString& sessionId, Callback callback);
     void fetchSessionAuthorization(const QString& sessionId, Callback callback);
 

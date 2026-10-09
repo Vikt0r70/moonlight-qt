@@ -572,37 +572,11 @@ public:
     Q_INVOKABLE void signOut() { ++m_signOuts; }
     Q_INVOKABLE void retry() { ++m_retries; }
     Q_INVOKABLE void dismissError() { ++m_dismissals; }
-    Q_INVOKABLE void requestOtp(const QString& phone)
-    {
-        m_lastPhone = phone;
-        m_otpRequests.append(phone);
-    }
-    Q_INVOKABLE void verifyOtp(const QString& phone, const QString& code)
-    {
-        m_lastPhone = phone;
-        m_lastCode = code;
-    }
-    // A stand-in for the facade's E.164 builder: the dial code in front of the digits, one trunk
-    // zero dropped, a leading plus or double zero believed. The real rules are tested in
-    // `tst_control_plane`; this only has to give the screen a number to send.
-    Q_INVOKABLE QString toE164(const QString& typed, const QString& dial) const
-    {
-        QString digits = typed;
-        digits.remove(QRegularExpression(QStringLiteral("[^0-9+]")));
-        if (digits.startsWith(QLatin1String("00"))) {
-            digits = QStringLiteral("+") + digits.mid(2);
-        }
-        if (!digits.startsWith(QLatin1Char('+'))) {
-            if (digits.startsWith(QLatin1Char('0'))) {
-                digits.remove(0, 1);
-            }
-            digits = dial + digits;
-        }
-        return digits.size() >= 9 ? digits : QString();
-    }
-    Q_INVOKABLE void signInWithPassword(const QString& identifier, const QString& password)
+    Q_INVOKABLE void signInWithPassword(const QString& identifier, const QString& password,
+                                        const QString& region = QString())
     {
         m_passwordAttempts.append(qMakePair(identifier, password));
+        m_passwordRegions.append(region);
     }
     Q_INVOKABLE bool openWebsite(const QString& target)
     {
@@ -610,13 +584,15 @@ public:
         return true;
     }
 
-    QStringList otpRequests() const { return m_otpRequests; }
     QList<QPair<QString, QString>> passwordAttempts() const { return m_passwordAttempts; }
+    /// The ISO region each sign-in attempt carried ("" for none).
+    QStringList passwordRegions() const { return m_passwordRegions; }
     QStringList opened() const { return m_opened; }
 
-    void deliverPasswordRejected(const QString& message, const QString& reference)
+    void deliverPasswordRejected(const QString& message, const QString& reference,
+                                 bool noAccount = false)
     {
-        emit passwordSignInRejected(message, reference);
+        emit passwordSignInRejected(message, reference, noAccount);
     }
     void deliverPasswordAccepted() { emit passwordSignInAccepted(); }
 
@@ -626,14 +602,6 @@ public:
     int signOuts() const { return m_signOuts; }
     int retries() const { return m_retries; }
     int dismissals() const { return m_dismissals; }
-
-    void deliverOtpRequested(const QString& phone) { emit otpRequested(phone); }
-    void deliverOtpRejected(const QString& message, const QString& reference)
-    {
-        setFailure(message, reference);
-        emit otpRejected(message, reference);
-    }
-    void deliverOtpAccepted() { emit otpAccepted(); }
 
 signals:
     void accountChanged();
@@ -652,15 +620,12 @@ signals:
     void endReasonTextChanged();
     void identityChanged();
     void failureChanged();
-    void otpRequested(const QString& phoneE164);
-    void otpRejected(const QString& message, const QString& reference);
-    void otpAccepted();
-    void passwordSignInRejected(const QString& message, const QString& reference);
+    void passwordSignInRejected(const QString& message, const QString& reference, bool noAccount);
     void passwordSignInAccepted();
 
 private:
-    QStringList m_otpRequests;
     QList<QPair<QString, QString>> m_passwordAttempts;
+    QStringList m_passwordRegions;
     QStringList m_opened;
     qint64 m_balanceMinutes = -1;
     QString m_balanceText;
@@ -675,8 +640,6 @@ private:
     QString m_identity = QStringLiteral("+962 7 0001 0002");
     QString m_reference;
     QVariantMap m_failure;
-    QString m_lastPhone;
-    QString m_lastCode;
     bool m_liveSession = false;
     int m_connectStage = 0;
     bool m_connectFailed = false;
@@ -881,8 +844,7 @@ private slots:
     void menuOpensOnSpaceMovesWithArrowsAndEscapeReturnsFocusToTheTrigger();
     void restoreSplashShowsItsLineAndNeverTheSignInForm();
     void theShellRoutesTheRestoreStateToTheSplashNotToSignIn();
-    void signInScreenReachesThePhoneStepError();
-    void signInScreenCountsDownToResend();
+    void signInScreenShowsOneFieldAndOnePasswordAndNoCodeStep();
     void identifierFieldShowsTheTagAtThreeDigitsAndHidesItOnALetter();
     void identifierFieldNamesTheCountryANumberWritesForItself();
     void identifierFieldKeepsTheDigitsWhenTheCountryChanges();
@@ -891,12 +853,14 @@ private slots:
     void countryPickerSearchesByNameOrDialDigitsAndSaysSoWhenNothingMatches();
     void countryPickerHighlightsTheCountryInForceAndPicksIt();
     void countryPickerReadsOnlyTheBundledListAndElidesLongNames();
-    void signInRoutesAPhoneToTheCodeStepAndKeepsTheNumberOnBack();
-    void signInRoutesAnEmailToThePasswordStep();
+    void signInSendsAPhoneAsTypedWithThePickedRegionThroughThePassword();
+    void signInAnEmailSendsNoRegionAndHidesTheCountryTag();
     void signInNamesAFieldLevelMistakeBeforeAnythingIsSent();
     void signInShowsARefusalVerbatimAndClearsThePassword();
+    void signInOffersTheWebsiteSignUpWhenNoAccountMatches();
     void signInKeepsTheWidthOfTheBusyControl();
     void signInOpensTheWebsiteForSignupAndResetAndHasNoScreenOfItsOwn();
+    void theShellShowsTheMenuViewOverConnectingAndErrorAndHomeShowsTheWaitingPlay();
     void noSeatHubScreenBuildsAWebsiteAddressItself();
     void forcedUpdateModalKeepsUpdateTabbableAndUndismissable();
     void updateWindowShowsTheFrozenVariantsInARealWindow();
@@ -2211,7 +2175,7 @@ void TstUiScreens::theShellRoutesTheRestoreStateToTheSplashNotToSignIn()
     QVERIFY(qrcText.contains(QStringLiteral("gui/BalancePill.qml")));
 }
 
-void TstUiScreens::signInScreenReachesThePhoneStepError()
+void TstUiScreens::signInScreenShowsOneFieldAndOnePasswordAndNoCodeStep()
 {
     QQuickStyle::setStyle(QStringLiteral("Basic"));
     QQmlEngine engine;
@@ -2223,59 +2187,36 @@ void TstUiScreens::signInScreenReachesThePhoneStepError()
     QVERIFY2(screen, qPrintable(error));
     QVERIFY(screen->setProperty("client", QVariant::fromValue(static_cast<QObject*>(&client))));
 
-    // The one field is what is on screen before a code is ever sent (Phase 5: the field takes an
-    // email or a phone number, so its label is no longer "Enter your phone number").
+    // C-SIGNIN: the one field, the password and `Sign in` are all there at once, for a phone and an
+    // email alike. There is no `Continue` step and no code step.
     QVERIFY2(findVisibleTextItem(screen.data(), QStringLiteral("Email or phone")),
-             "the identifier step is the first thing sign-in shows");
+             "the identifier field is on screen from the start");
+    QVERIFY2(findVisibleTextItem(screen.data(), QStringLiteral("Password")),
+             "the password is on screen from the start, not behind a Continue step");
+    QVERIFY2(findVisibleTextItem(screen.data(), QStringLiteral("Show password")), "the reveal control");
+    QVERIFY2(!findVisibleTextItem(screen.data(), QStringLiteral("Continue")), "no Continue step remains");
     QVERIFY2(!findVisibleTextItem(screen.data(), QStringLiteral("Enter the 6-digit code")),
-             "the code step must stay hidden until the control plane says it sent a code");
+             "no code step remains");
+    QVERIFY2(!findVisibleTextItem(screen.data(), QStringLiteral("Create an account on the website")),
+             "the sign-up offer belongs to a no-account answer");
 
-    // Audit F2: a rejected *phone number* used to print nothing, because the only error
-    // Text lived inside the code step. It must now be visible without a code step.
-    const QString rejected = QStringLiteral("That code didn't match. Try again or resend.");
-    client.deliverOtpRejected(rejected, QStringLiteral("SH-4F7KQ2"));
+    // Nothing in the screen's source talks to a code route, and it never builds a phone number.
+    const QString source = readSource(guiDir() + QStringLiteral("/SignInScreen.qml"));
+    QVERIFY(!source.isEmpty());
+    for (const QString& retired : { QStringLiteral("verifyOtp"), QStringLiteral("requestOtp"),
+                                    QStringLiteral("toE164"), QStringLiteral("SeatHubOTPField"),
+                                    QStringLiteral("otpRequested") }) {
+        QVERIFY2(!source.contains(retired), qPrintable(retired));
+    }
 
+    // Audit F2: a refusal that names no field is visible, with its ADR-0008 reference in mono.
+    const QString rejected = QStringLiteral("That password is wrong.");
+    client.deliverPasswordRejected(rejected, QStringLiteral("SH-4F7KQ2"));
     QVERIFY2(findVisibleTextItem(screen.data(), rejected),
-             "a rejected phone number must show the control plane's reason (audit F2)");
+             "a refusal must show the control plane's reason (audit F2)");
     QObject* codeItem = findVisibleTextItem(screen.data(), QStringLiteral("SH-4F7KQ2"));
     QVERIFY2(codeItem, "the ADR-0008 reference must be rendered");
     QCOMPARE(codeItem->property("font").value<QFont>().family(), QString::fromLatin1(kMonoFamily));
-    QVERIFY2(!findVisibleTextItem(screen.data(), QStringLiteral("Enter the 6-digit code")),
-             "the code step still must not appear on a failed phone step");
-}
-
-void TstUiScreens::signInScreenCountsDownToResend()
-{
-    QQuickStyle::setStyle(QStringLiteral("Basic"));
-    QQmlEngine engine;
-    registerTokenSingletons(&engine);
-
-    FakeShellClient client;
-    QString error;
-    QScopedPointer<QObject> screen(instantiate(&engine, QStringLiteral("SignInScreen.qml"), &error));
-    QVERIFY2(screen, qPrintable(error));
-    QVERIFY(screen->setProperty("client", QVariant::fromValue(static_cast<QObject*>(&client))));
-
-    client.deliverOtpRequested(QStringLiteral("+962700000000"));
-
-    // copy.md §Sign in, path B: `Resend in 0:24` - ADR-0022's 24-second window.
-    QVERIFY2(findVisibleTextItem(screen.data(), QStringLiteral("Resend in 0:24")),
-             "the code step must offer the spec's resend countdown (audit F6)");
-
-    // The countdown is mono and tabular, like every other number in the shell.
-    QObject* countdown = findVisibleTextItem(screen.data(), QStringLiteral("Resend in 0:24"));
-    QCOMPARE(countdown->property("font").value<QFont>().family(), QString::fromLatin1(kMonoFamily));
-
-    // The resend control itself is a real button, not a text gesture (audit F3).
-    bool sawResendButton = false;
-    for (QObject* item : screen->findChildren<QObject*>()) {
-        if (item->inherits("QQuickButton")
-            && item->property("text").toString() == QStringLiteral("Send code")) {
-            sawResendButton = true;
-            break;
-        }
-    }
-    QVERIFY2(sawResendButton, "resending must be a real control, not a MouseArea on a Text");
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -2673,77 +2614,36 @@ struct SignInFixture
 
 } // namespace
 
-void TstUiScreens::signInRoutesAPhoneToTheCodeStepAndKeepsTheNumberOnBack()
+void TstUiScreens::signInSendsAPhoneAsTypedWithThePickedRegionThroughThePassword()
 {
     SignInFixture fx;
     QVERIFY2(fx.load(), qPrintable(fx.error));
     QVERIFY(fx.field());
-    QCOMPARE(fx.step(), QStringLiteral("identifier"));
     QVERIFY(fx.sees(QStringLiteral("Email or phone")));
     QVERIFY(fx.sees(QStringLiteral(
         "Enter an email address, or pick your country and enter your phone number.")));
-    QVERIFY(fx.sees(QStringLiteral("Continue")));
-
-    // A number typed the way a customer in Amman writes it: the code is asked for, as E.164.
-    fx.type(QStringLiteral("0790000000"));
-    fx.call("continueFromIdentifier");
-    QCOMPARE(fx.client.otpRequests(), QStringList{ QStringLiteral("+962790000000") });
-    // The screen waits for the server; the step has not changed yet, and the control is busy.
-    QCOMPARE(fx.step(), QStringLiteral("identifier"));
-    QVERIFY(fx.child("primaryAction")->property("busy").toBool());
-
-    fx.client.deliverOtpRequested(QStringLiteral("+962790000000"));
-    QCOMPARE(fx.step(), QStringLiteral("code"));
-    QVERIFY(fx.sees(QStringLiteral("Enter the 6-digit code")));
-    QVERIFY(fx.sees(QStringLiteral("Verify and continue")));
-    QVERIFY(!fx.sees(QStringLiteral("Continue")));
-    QVERIFY(!fx.child("primaryAction")->property("busy").toBool());
-
-    // Back returns to the field with what was typed still in it.
-    fx.click("backButton");
-    QCOMPARE(fx.step(), QStringLiteral("identifier"));
-    QCOMPARE(fx.field()->property("text").toString(), QStringLiteral("0790000000"));
-    QVERIFY(fx.field()->property("tagShown").toBool());
-
-    // A number typed with its own country code is believed over the tag.
-    fx.type(QStringLiteral("+447911123456"));
-    fx.call("continueFromIdentifier");
-    QCOMPARE(fx.client.otpRequests().last(), QStringLiteral("+447911123456"));
-}
-
-void TstUiScreens::signInRoutesAnEmailToThePasswordStep()
-{
-    SignInFixture fx;
-    QVERIFY2(fx.load(), qPrintable(fx.error));
-
-    fx.type(QStringLiteral("lina@example.com"));
-    fx.call("continueFromIdentifier");
-
-    // No code is asked for and nothing is sent: the password step is the next thing.
-    QVERIFY(fx.client.otpRequests().isEmpty());
-    QCOMPARE(fx.step(), QStringLiteral("password"));
     QVERIFY(fx.sees(QStringLiteral("Password")));
     QVERIFY(fx.sees(QStringLiteral("Sign in")));
-    QVERIFY(fx.sees(QStringLiteral("Show password")));
-    QVERIFY(!fx.sees(QStringLiteral("Enter the 6-digit code")));
+    QVERIFY(!fx.sees(QStringLiteral("Continue")));
+    // Jordan is the default country for every sign-in.
+    QCOMPARE(fx.field()->property("countryIso").toString(), QStringLiteral("JO"));
+    QCOMPARE(fx.field()->property("countryDial").toString(), QStringLiteral("+962"));
 
-    // The password is hidden until the reveal control is used, and the control says what it does.
+    // A number typed the way a customer in Amman writes it: sent exactly so, with the region. The
+    // client builds no E.164 and no dial code.
     QObject* password = fx.child("passwordField");
     QVERIFY(password);
-    QCOMPARE(password->property("echoMode").toInt(), kEchoPassword);
-    fx.click("revealPassword");
-    QCOMPARE(password->property("echoMode").toInt(), kEchoNormal);
-    QVERIFY(fx.sees(QStringLiteral("Hide password")));
-    fx.click("revealPassword");
-    QCOMPARE(password->property("echoMode").toInt(), kEchoPassword);
-
-    // Sign in sends the identifier as typed and the password.
+    fx.type(QStringLiteral("0790000000"));
+    QVERIFY(fx.field()->property("tagShown").toBool());
     password->setProperty("text", QStringLiteral("correct horse battery"));
     fx.call("signInWithPassword");
     QCOMPARE(fx.client.passwordAttempts().size(), 1);
-    QCOMPARE(fx.client.passwordAttempts().first().first, QStringLiteral("lina@example.com"));
+    QCOMPARE(fx.client.passwordAttempts().first().first, QStringLiteral("0790000000"));
     QCOMPARE(fx.client.passwordAttempts().first().second, QStringLiteral("correct horse battery"));
+    QCOMPARE(fx.client.passwordRegions(), QStringList{ QStringLiteral("JO") });
+    // The screen waits for the server; the control is busy and the typed number is still there.
     QVERIFY(fx.child("primaryAction")->property("busy").toBool());
+    QCOMPARE(fx.field()->property("text").toString(), QStringLiteral("0790000000"));
 
     // Accepted: the screen reports it, and the password is not kept.
     QSignalSpy signedIn(fx.screen.data(), SIGNAL(signedIn()));
@@ -2751,11 +2651,58 @@ void TstUiScreens::signInRoutesAnEmailToThePasswordStep()
     QCOMPARE(signedIn.count(), 1);
     QVERIFY(password->property("text").toString().isEmpty());
 
-    // Back from the password step keeps the email, drops the password and hides it again.
-    fx.click("backButton");
-    QCOMPARE(fx.step(), QStringLiteral("identifier"));
-    QCOMPARE(fx.field()->property("text").toString(), QStringLiteral("lina@example.com"));
-    QVERIFY(password->property("text").toString().isEmpty());
+    // A number typed with its own country code is believed over the tag: the country in force goes.
+    fx.type(QStringLiteral("+447911123456"));
+    QCOMPARE(fx.field()->property("countryIso").toString(), QStringLiteral("GB"));
+    password->setProperty("text", QStringLiteral("pw-two-pw-two"));
+    fx.call("signInWithPassword");
+    QCOMPARE(fx.client.passwordAttempts().last().first, QStringLiteral("+447911123456"));
+    QCOMPARE(fx.client.passwordRegions().last(), QStringLiteral("GB"));
+    fx.client.deliverPasswordRejected(QStringLiteral("That password is wrong."), QString());
+
+    // Another country picked with the tag: the digits stay as typed and the picked region goes.
+    fx.type(QStringLiteral("07911123456"));
+    QVERIFY(QMetaObject::invokeMethod(fx.field(), "setCountry", Q_ARG(QVariant, QStringLiteral("GB"))));
+    password->setProperty("text", QStringLiteral("pw-three-pw"));
+    fx.call("signInWithPassword");
+    QCOMPARE(fx.client.passwordAttempts().last().first, QStringLiteral("07911123456"));
+    QCOMPARE(fx.client.passwordRegions().last(), QStringLiteral("GB"));
+}
+
+void TstUiScreens::signInAnEmailSendsNoRegionAndHidesTheCountryTag()
+{
+    SignInFixture fx;
+    QVERIFY2(fx.load(), qPrintable(fx.error));
+
+    // No phone picker while an email is typed.
+    fx.type(QStringLiteral("lina@example.com"));
+    QVERIFY(!fx.field()->property("tagShown").toBool());
+    QCOMPARE(fx.field()->property("mode").toString(), QStringLiteral("email"));
+
+    // The password is hidden until the reveal control is used, and the control says what it does.
+    QObject* password = fx.child("passwordField");
+    QVERIFY(password);
+    QCOMPARE(password->property("echoMode").toInt(), kEchoPassword);
+    QVERIFY(fx.sees(QStringLiteral("Show password")));
+    fx.click("revealPassword");
+    QCOMPARE(password->property("echoMode").toInt(), kEchoNormal);
+    QVERIFY(fx.sees(QStringLiteral("Hide password")));
+    fx.click("revealPassword");
+    QCOMPARE(password->property("echoMode").toInt(), kEchoPassword);
+
+    // Sign in sends the identifier as typed, the password and no region.
+    password->setProperty("text", QStringLiteral("correct horse battery"));
+    fx.call("signInWithPassword");
+    QCOMPARE(fx.client.passwordAttempts().size(), 1);
+    QCOMPARE(fx.client.passwordAttempts().first().first, QStringLiteral("lina@example.com"));
+    QCOMPARE(fx.client.passwordAttempts().first().second, QStringLiteral("correct horse battery"));
+    QCOMPARE(fx.client.passwordRegions(), QStringList{ QString() });
+    QVERIFY(fx.child("primaryAction")->property("busy").toBool());
+
+    // Typing a letter over a phone number takes the picker away again.
+    fx.type(QStringLiteral("0790000000"));
+    QVERIFY(fx.field()->property("tagShown").toBool());
+    fx.type(QStringLiteral("0790000000a"));
     QVERIFY(!fx.field()->property("tagShown").toBool());
 }
 
@@ -2764,30 +2711,31 @@ void TstUiScreens::signInNamesAFieldLevelMistakeBeforeAnythingIsSent()
     SignInFixture fx;
     QVERIFY2(fx.load(), qPrintable(fx.error));
 
-    // Nothing typed.
-    fx.call("continueFromIdentifier");
+    // Nothing typed at all: both fields are named.
+    fx.call("signInWithPassword");
     QVERIFY(fx.sees(QStringLiteral("Enter your email or phone number.")));
+    QVERIFY(fx.sees(QStringLiteral("Enter your password.")));
 
     // Too few digits to be a number.
     fx.type(QStringLiteral("12"));
-    fx.call("continueFromIdentifier");
-    QVERIFY(fx.sees(QStringLiteral("That doesn't look like a phone number.")));
-    QVERIFY(!fx.sees(QStringLiteral("Enter your email or phone number.")));
+    fx.child("passwordField")->setProperty("text", QStringLiteral("x"));
+    fx.call("signInWithPassword");
+    QVERIFY(fx.sees(QStringLiteral("Enter your email or phone number.")));
+    QVERIFY(!fx.sees(QStringLiteral("Enter your password.")));
 
     // Something that is not an address.
     fx.type(QStringLiteral("lina@"));
-    fx.call("continueFromIdentifier");
+    fx.call("signInWithPassword");
     QVERIFY(fx.sees(QStringLiteral("Enter your email or phone number.")));
 
-    // A blank password, on the password step.
+    // A blank password, with a good identifier.
     fx.type(QStringLiteral("lina@example.com"));
-    fx.call("continueFromIdentifier");
-    QCOMPARE(fx.step(), QStringLiteral("password"));
+    fx.child("passwordField")->setProperty("text", QString());
     fx.call("signInWithPassword");
     QVERIFY(fx.sees(QStringLiteral("Enter your password.")));
+    QVERIFY(!fx.sees(QStringLiteral("Enter your email or phone number.")));
 
     // None of it reached the facade.
-    QVERIFY(fx.client.otpRequests().isEmpty());
     QVERIFY(fx.client.passwordAttempts().isEmpty());
 
     // And the message goes when the customer edits the field.
@@ -2801,7 +2749,6 @@ void TstUiScreens::signInShowsARefusalVerbatimAndClearsThePassword()
     QVERIFY2(fx.load(), qPrintable(fx.error));
 
     fx.type(QStringLiteral("lina@example.com"));
-    fx.call("continueFromIdentifier");
     QObject* password = fx.child("passwordField");
     password->setProperty("text", QStringLiteral("hunter22hunter"));
     fx.call("signInWithPassword");
@@ -2817,12 +2764,49 @@ void TstUiScreens::signInShowsARefusalVerbatimAndClearsThePassword()
     QVERIFY(password->property("text").toString().isEmpty());
     QVERIFY(!fx.child("primaryAction")->property("busy").toBool());
     QVERIFY(fx.child("primaryAction")->property("enabled").toBool());
+    // A refusal that is not "no account" offers no sign-up page.
+    QVERIFY(!fx.sees(QStringLiteral("Create an account on the website")));
 
     // The offline sentence is a refusal like any other.
     const QString offline = QStringLiteral("We couldn't reach SevenHills. Try again in a moment.");
     fx.client.deliverPasswordRejected(offline, QString());
     QVERIFY(fx.sees(offline));
     QVERIFY(!fx.sees(sentence));
+}
+
+void TstUiScreens::signInOffersTheWebsiteSignUpWhenNoAccountMatches()
+{
+    SignInFixture fx;
+    QVERIFY2(fx.load(), qPrintable(fx.error));
+
+    fx.type(QStringLiteral("0790000000"));
+    fx.child("passwordField")->setProperty("text", QStringLiteral("hunter22hunter"));
+    fx.call("signInWithPassword");
+
+    // The server's sentence, word for word, and now the offer to create an account on the website.
+    const QString sentence = QStringLiteral("No account uses that email or phone.");
+    QVERIFY(!fx.sees(QStringLiteral("Create an account on the website")));
+    fx.client.deliverPasswordRejected(sentence, QStringLiteral("SH-3K2XQ1"), true);
+    QVERIFY(fx.sees(sentence));
+    QVERIFY2(fx.sees(QStringLiteral("Create an account on the website")),
+             "C-SIGNIN: nothing matched, so the website's sign-up page is offered");
+    QVERIFY(fx.screen->property("noAccount").toBool());
+
+    // It is a real control that asks the facade to open the sign-up page; no address, no credential.
+    fx.click("noAccountSignUp");
+    QCOMPARE(fx.client.opened(), QStringList{ QStringLiteral("signup") });
+
+    // The offer belongs to this answer: a different identifier is a different question.
+    fx.type(QStringLiteral("0791111111"));
+    QVERIFY(!fx.sees(QStringLiteral("Create an account on the website")));
+    QVERIFY(!fx.sees(sentence));
+    QVERIFY(!fx.screen->property("noAccount").toBool());
+
+    // SeatHub never creates an account: the offer is the only place the sign-up page is named from a
+    // refusal, and the screen holds no control that makes one.
+    const QString source = readSource(guiDir() + QStringLiteral("/SignInScreen.qml"));
+    QVERIFY(source.contains(QStringLiteral("Create an account on the website")));
+    QVERIFY(!source.contains(QStringLiteral("createAccount(")));
 }
 
 void TstUiScreens::signInKeepsTheWidthOfTheBusyControl()
@@ -2837,12 +2821,13 @@ void TstUiScreens::signInKeepsTheWidthOfTheBusyControl()
     QVERIFY(primary->property("enabled").toBool());
 
     fx.type(QStringLiteral("0790000000"));
-    fx.call("continueFromIdentifier");
+    fx.child("passwordField")->setProperty("text", QStringLiteral("hunter22hunter"));
+    fx.call("signInWithPassword");
     QVERIFY(primary->property("busy").toBool());
     QVERIFY(!primary->property("enabled").toBool());
     QCOMPARE(primary->property("width").toDouble(), idleWidth);
     // The label stays put while it is busy: the width does not move because the text does not.
-    QCOMPARE(primary->property("text").toString(), QStringLiteral("Continue"));
+    QCOMPARE(primary->property("text").toString(), QStringLiteral("Sign in"));
 }
 
 void TstUiScreens::signInOpensTheWebsiteForSignupAndResetAndHasNoScreenOfItsOwn()
@@ -2858,12 +2843,6 @@ void TstUiScreens::signInOpensTheWebsiteForSignupAndResetAndHasNoScreenOfItsOwn(
     // The screen asks by name; the facade owns the addresses, and no credential goes with either.
     QCOMPARE(fx.client.opened(), (QStringList{ QStringLiteral("signup"), QStringLiteral("reset") }));
 
-    // The reset link is on the password step too.
-    fx.type(QStringLiteral("lina@example.com"));
-    fx.call("continueFromIdentifier");
-    fx.click("forgotPasswordLink");
-    QCOMPARE(fx.client.opened().last(), QStringLiteral("reset"));
-
     // Signup and reset are the website's: the client has no screen for either.
     const QDir gui(guiDir());
     for (const QString& name : gui.entryList({ QStringLiteral("*.qml") })) {
@@ -2875,6 +2854,62 @@ void TstUiScreens::signInOpensTheWebsiteForSignupAndResetAndHasNoScreenOfItsOwn(
     }
     const QString main = readSource(guiDir() + QStringLiteral("/main.qml"));
     QVERIFY(!main.contains(QStringLiteral("SignUp"), Qt::CaseInsensitive));
+}
+
+void TstUiScreens::theShellShowsTheMenuViewOverConnectingAndErrorAndHomeShowsTheWaitingPlay()
+{
+    // R6A (screens.md §27): the menu is on the Connecting and Error views, and choosing Profile or
+    // Settings there shows that view at once over the current one. `main.qml` routes by app state, so
+    // the routing is what is read: the menu's view is chosen for all three states the menu is on, and
+    // for no other.
+    const QString main = readSource(guiDir() + QStringLiteral("/main.qml"));
+    QVERIFY(!main.isEmpty());
+    QVERIFY(main.contains(QStringLiteral("function withMenuView(view)")));
+    for (const QString& state : { QStringLiteral("home"), QStringLiteral("connecting"),
+                                  QStringLiteral("error") }) {
+        const QRegularExpression routed(QStringLiteral("case \"%1\":\\s+return window\\.withMenuView\\(")
+                                            .arg(state));
+        QVERIFY2(main.contains(routed), qPrintable(state));
+    }
+    QVERIFY2(main.contains(QRegularExpression(QStringLiteral("case \"streaming\":\\s+return streamingComponent"))),
+             "a running stream is not a view the menu opens over");
+    // The helper puts Settings, then the profile, above the view it was given.
+    const int helper = main.indexOf(QStringLiteral("function withMenuView(view)"));
+    const int settings = main.indexOf(QStringLiteral("seatHub.inSettings"), helper);
+    const int profile = main.indexOf(QStringLiteral("seatHub.inProfile"), helper);
+    QVERIFY(helper >= 0 && settings > helper && profile > settings);
+    // And a change of either flag swaps the view at once, over whatever state is current.
+    QVERIFY(main.contains(QStringLiteral("function onInSettingsChanged()")));
+    QVERIFY(main.contains(QStringLiteral("function onInProfileChanged()")));
+
+    // Home while the Play that answered PREVIOUS_SESSION_ENDING is repeated (C-SAMEPLAY): the busy Play
+    // names what is happening, and it cannot be pressed again.
+    QQuickStyle::setStyle(QStringLiteral("Basic"));
+    QQmlEngine engine;
+    registerTokenSingletons(&engine);
+    FakeShellClient client;
+    QString error;
+    QScopedPointer<QObject> home(instantiate(&engine, QStringLiteral("HomeScreen.qml"), &error));
+    QVERIFY2(home, qPrintable(error));
+    QVERIFY(home->setProperty("client", QVariant::fromValue(static_cast<QObject*>(&client))));
+    home->setProperty("width", 960);
+    home->setProperty("height", 640);
+    QVERIFY(!findVisibleTextItem(home.data(), QStringLiteral("Ending your previous session…")));
+
+    client.setHomeStatus(QStringLiteral("previous_ending"));
+    QVERIFY2(findVisibleTextItem(home.data(), QStringLiteral("Ending your previous session…")),
+             "C-SAMEPLAY: the busy Play says what is happening");
+    QObject* play = home->findChild<QObject*>(QStringLiteral("playButton"));
+    QVERIFY(play);
+    QVERIFY(play->property("busy").toBool());
+    QVERIFY(!play->property("enabled").toBool());
+    // Nothing else claims the screen: no checking line, no refusal.
+    QVERIFY(!findVisibleTextItem(home.data(), QStringLiteral("Checking availability…")));
+
+    client.setHomeStatus(QStringLiteral("ready"));
+    QVERIFY(!findVisibleTextItem(home.data(), QStringLiteral("Ending your previous session…")));
+    QVERIFY(play->property("enabled").toBool());
+    QVERIFY(!play->property("busy").toBool());
 }
 
 void TstUiScreens::noSeatHubScreenBuildsAWebsiteAddressItself()
@@ -4801,8 +4836,14 @@ void TstUiScreens::theProfileIsRoutedAsAViewInsideHomeAndHomeNoLongerSignsOut()
     // a session that ends while it is open still lands on the right view. `main.qml` cannot be
     // instantiated without the real facade type, so its routing is asserted from its source.
     const QString main = readSource(guiDir() + QStringLiteral("/main.qml"));
-    QVERIFY2(main.contains(QStringLiteral("seatHub.inProfile ? profileComponent : homeComponent")),
-             "home must route to the profile while `inProfile` holds");
+    // R6A: Home, Connecting and Error all route through `withMenuView`, which puts the profile (and
+    // Settings) above the current view while `inProfile` (or `inSettings`) holds.
+    QVERIFY2(main.contains(QRegularExpression(
+                 QStringLiteral("if \\(seatHub\\.inProfile\\)\\s+return profileComponent"))),
+             "the menu's view must route to the profile while `inProfile` holds");
+    QVERIFY2(main.contains(QRegularExpression(
+                 QStringLiteral("case \"home\":\\s+return window\\.withMenuView\\(homeComponent\\)"))),
+             "home must route through the menu's view");
     QVERIFY(main.contains(QStringLiteral("onInProfileChanged")));
     QVERIFY(main.contains(QStringLiteral("ProfileScreen {")));
     QVERIFY2(!main.contains(QStringLiteral("\"profile\"")), "the profile is not an app state");
@@ -6081,21 +6122,25 @@ void TstUiScreens::checkSignInAt(const QSize& size)
         QObject* button = child(name);
         return button && QMetaObject::invokeMethod(button, "clicked");
     };
-    const QStringList identifierStops = { QStringLiteral("Email or phone"), QStringLiteral("Continue"),
-                                          QStringLiteral("New here? Create an account"),
-                                          QStringLiteral("Forgot password?") };
+    const QStringList emptyStops = { QStringLiteral("Email or phone"), QStringLiteral("Password"),
+                                     QStringLiteral("Show password"), QStringLiteral("Sign in"),
+                                     QStringLiteral("New here? Create an account"),
+                                     QStringLiteral("Forgot password?") };
 
-    // Empty: label, helper and an enabled Continue; the input takes focus; the order is the field, the
-    // primary action, then the two links to the website. The input is named after the field's label.
+    // Empty: both labels, the helper and an enabled Sign in; the input takes focus; the order is the
+    // field, the password with its reveal control, the primary action, then the two links to the
+    // website. The input is named after the field's label.
     QVERIFY2(sees(QStringLiteral("Email or phone")), qPrintable(where));
     QVERIFY2(sees(QStringLiteral(
                  "Enter an email address, or pick your country and enter your phone number.")),
              qPrintable(where));
+    QVERIFY2(sees(QStringLiteral("Password")), qPrintable(where));
     QObject* primary = child("primaryAction");
     QVERIFY(primary);
     QVERIFY(primary->property("enabled").toBool());
     QVERIFY(!primary->property("busy").toBool());
-    COMPARE_TABS( identifierStops);
+    QCOMPARE(spokenName(primary), QStringLiteral("Sign in"));
+    COMPARE_TABS(emptyStops);
     // WINDOWS #26: the external-link arrow on the two website links, at the ui.md §8 inline size.
     {
         int shownArrows = 0;
@@ -6115,14 +6160,21 @@ void TstUiScreens::checkSignInAt(const QSize& size)
     QTRY_VERIFY2(input->property("activeFocus").toBool(),
                  "the field starts focused so the customer can type at once");
 
-    // Error, before anything is sent: the message sits above the field and is the field's accessible
-    // description; the mark beside it is not read out.
-    QVERIFY(call("continueFromIdentifier"));
+    // Error, before anything is sent: each message sits above its own field and is that field's
+    // accessible description; the mark beside it is not read out.
+    QVERIFY(call("signInWithPassword"));
     QVERIFY2(sees(QStringLiteral("Enter your email or phone number.")), qPrintable(where));
+    QVERIFY2(sees(QStringLiteral("Enter your password.")), qPrintable(where));
     QCOMPARE(accessibleDescription(input), QStringLiteral("Enter your email or phone number."));
     QTRY_VERIFY2(sceneTop(child("fieldErrorLine")) < sceneTop(child("identifierField")),
              qPrintable(where + QStringLiteral(": the message sits above the field")));
-    QVERIFY(client.otpRequests().isEmpty());
+    QObject* password = child("passwordField");
+    QVERIFY(password);
+    QCOMPARE(spokenName(password), QStringLiteral("Password"));
+    QCOMPARE(accessibleDescription(password), QStringLiteral("Enter your password."));
+    QTRY_VERIFY2(sceneTop(child("passwordErrorLine")) < sceneTop(password),
+             qPrintable(where + QStringLiteral(": the password message sits above its field")));
+    QVERIFY(client.passwordAttempts().isEmpty());
     {
         const QList<QObject*> errorGlyphs = deepChildren(screen.data(), QStringLiteral("errorGlyph"));
         QVERIFY2(!errorGlyphs.isEmpty(), qPrintable(where));
@@ -6134,8 +6186,8 @@ void TstUiScreens::checkSignInAt(const QSize& size)
         }
     }
 
-    // Non-Jordan region: the tag starts on the machine's country (Jordan here), a country picked with
-    // the tag is believed, the digits stay, and the number goes out as E.164 for that country.
+    // Non-Jordan region: the tag starts on Jordan, a country picked with the tag is believed, the
+    // digits stay, and the number goes out as typed with that country's ISO code.
     type(QStringLiteral("07911123456"));
     QObject* field = child("identifierField");
     QVERIFY(field->property("tagShown").toBool());
@@ -6160,82 +6212,68 @@ void TstUiScreens::checkSignInAt(const QSize& size)
     QVERIFY2(!QTest::currentTestFailed(), qPrintable(where));
     COMPARE_TABS(
              (QStringList{ QStringLiteral("Country code: United Kingdom"), QStringLiteral("Email or phone"),
-                           QStringLiteral("Continue"), QStringLiteral("New here? Create an account"),
+                           QStringLiteral("Password"), QStringLiteral("Show password"),
+                           QStringLiteral("Sign in"), QStringLiteral("New here? Create an account"),
                            QStringLiteral("Forgot password?") }));
 
     // Loading: the pressed control keeps its label and its width and is busy.
+    password->setProperty("text", QStringLiteral("a good password"));
     const qreal buttonWidth = qobject_cast<QQuickItem*>(primary)->width();
-    QVERIFY(call("continueFromIdentifier"));
-    QCOMPARE(client.otpRequests(), QStringList{ QStringLiteral("+447911123456") });
+    QVERIFY(call("signInWithPassword"));
+    QCOMPARE(client.passwordAttempts().size(), 1);
+    QCOMPARE(client.passwordAttempts().last().first, QStringLiteral("07911123456"));
+    QCOMPARE(client.passwordRegions(), QStringList{ QStringLiteral("GB") });
     QVERIFY(primary->property("busy").toBool());
-    QCOMPARE(spokenName(primary), QStringLiteral("Continue"));
+    QCOMPARE(spokenName(primary), QStringLiteral("Sign in"));
     QCOMPARE(qobject_cast<QQuickItem*>(primary)->width(), buttonWidth);
 
     // Error, a refusal that names no field: above the button, with the reference in mono.
-    client.deliverOtpRejected(QStringLiteral("That didn't work. Try again."), QStringLiteral("SH-4F7KQ2"));
+    client.deliverPasswordRejected(QStringLiteral("That password is wrong."), QStringLiteral("SH-4F7KQ2"));
     QVERIFY(!primary->property("busy").toBool());
-    QVERIFY2(sees(QStringLiteral("That didn't work. Try again.")), qPrintable(where));
+    QVERIFY2(sees(QStringLiteral("That password is wrong.")), qPrintable(where));
     QObject* reference = findVisibleTextItem(screen.data(), QStringLiteral("SH-4F7KQ2"));
     QVERIFY2(reference, qPrintable(where));
     QCOMPARE(reference->property("font").value<QFont>().family(), QString::fromLatin1(kMonoFamily));
     QTRY_VERIFY2(sceneTop(child("refusalLine")) < sceneTop(primary), qPrintable(where));
+    QVERIFY2(!sees(QStringLiteral("Create an account on the website")), qPrintable(where));
 
     // Offline: the deck's sentence above the button, and no reference row (none exists for it).
-    client.deliverOtpRejected(QStringLiteral("We couldn't reach SevenHills. Try again in a moment."),
-                              QString());
+    client.deliverPasswordRejected(QStringLiteral("We couldn't reach SevenHills. Try again in a moment."),
+                                   QString());
     QVERIFY2(sees(QStringLiteral("We couldn't reach SevenHills. Try again in a moment.")),
              qPrintable(where));
     QVERIFY2(!findVisibleTextItem(screen.data(), QStringLiteral("SH-4F7KQ2")), qPrintable(where));
 
-    // The code step: the six cells share the field's one name, and the actions follow in order.
-    client.deliverOtpRequested(QStringLiteral("+447911123456"));
-    QCOMPARE(screen->property("step").toString(), QStringLiteral("code"));
-    QVERIFY2(sees(QStringLiteral("Enter the 6-digit code")), qPrintable(where));
-    QVERIFY2(sees(QStringLiteral("Resend in 0:24")), qPrintable(where));
-    QObject* otp = child("otpField");
-    QVERIFY(otp);
-    QCOMPARE(accessibleName(otp), QStringLiteral("Enter the 6-digit code"));
-    QCOMPARE(accessibleRole(otp), int(QAccessible::Grouping));
-    // Focus lands in the first cell as the step shows (the customer types the six digits at once). Every
-    // cell is a Tab stop (`ui.md` §9, every action reachable), each spoken as the field's one name, and
-    // the Tab order is the six cells, then the primary action, then Back.
+    // No account: the server's sentence and, beside it, the offer to create an account on the
+    // website. The offer is a Tab stop between the password and Sign in, with the external-link arrow.
+    password->setProperty("text", QStringLiteral("a good password"));
+    QVERIFY(call("signInWithPassword"));
+    client.deliverPasswordRejected(QStringLiteral("No account uses that email or phone."),
+                                   QStringLiteral("SH-3K2XQ1"), true);
+    QVERIFY2(sees(QStringLiteral("No account uses that email or phone.")), qPrintable(where));
+    QVERIFY2(sees(QStringLiteral("Create an account on the website")), qPrintable(where));
+    COMPARE_TABS(
+             (QStringList{ QStringLiteral("Country code: United Kingdom"), QStringLiteral("Email or phone"),
+                           QStringLiteral("Password"), QStringLiteral("Show password"),
+                           QStringLiteral("Create an account on the website"),
+                           QStringLiteral("Sign in"), QStringLiteral("New here? Create an account"),
+                           QStringLiteral("Forgot password?") }));
+    QTRY_VERIFY2(sceneTop(child("refusalLine")) < sceneTop(child("noAccountSignUp")),
+                 qPrintable(where + QStringLiteral(": the offer sits under the sentence")));
+    QTRY_VERIFY2(sceneTop(child("noAccountSignUp")) < sceneTop(primary), qPrintable(where));
     {
-        QQuickItem* firstCell = nullptr;
-        for (QQuickItem* control : controlsUnder(otp, true)) {
-            if (control->inherits("QQuickTextInput")) {
-                firstCell = control;
-                break;
+        int shownArrows = 0;
+        for (QObject* glyph : deepChildren(screen.data(), QStringLiteral("buttonGlyph"))) {
+            if (isShown(glyph)) {
+                ++shownArrows;
+                expectInlineGlyph(glyph, where + QStringLiteral(", website link arrow"), 40.0);
+                QVERIFY2(!QTest::currentTestFailed(), qPrintable(where));
             }
         }
-        QVERIFY2(firstCell, qPrintable(where));
-        QTRY_VERIFY2(firstCell->hasActiveFocus(), qPrintable(where + QStringLiteral(": the code step focuses its first cell")));
+        QVERIFY2(shownArrows == 3, qPrintable(where + QStringLiteral(": the offer carries the arrow too")));
     }
-    {
-        const QString cellName = QStringLiteral("Enter the 6-digit code");
-        COMPARE_TABS((QStringList{ cellName, cellName, cellName, cellName, cellName, cellName,
-                                   QStringLiteral("Verify and continue"), QStringLiteral("Back") }));
-    }
-    QVERIFY2(unnamedControls(screen.data(), true).isEmpty(),
-             qPrintable(where + QStringLiteral(": ") + unnamedControls(screen.data(), true).join(", ")));
-
-    // Back keeps the number; the email path goes to the password step.
-    QVERIFY(click("backButton"));
-    QCOMPARE(screen->property("step").toString(), QStringLiteral("identifier"));
-    QCOMPARE(child("identifierField")->property("text").toString(), QStringLiteral("07911123456"));
-    type(QStringLiteral("lina@example.com"));
-    QVERIFY(call("continueFromIdentifier"));
-    QCOMPARE(screen->property("step").toString(), QStringLiteral("password"));
-    COMPARE_TABS(
-             (QStringList{ QStringLiteral("Password"), QStringLiteral("Show password"),
-                           QStringLiteral("Sign in"), QStringLiteral("Forgot password?"),
-                           QStringLiteral("Back") }));
-    QObject* password = child("passwordField");
-    QVERIFY(password);
-    QCOMPARE(spokenName(password), QStringLiteral("Password"));
-    QVERIFY(call("signInWithPassword"));
-    QVERIFY2(sees(QStringLiteral("Enter your password.")), qPrintable(where));
-    QCOMPARE(accessibleDescription(password), QStringLiteral("Enter your password."));
-    QVERIFY(client.passwordAttempts().isEmpty());
+    QVERIFY(click("noAccountSignUp"));
+    QCOMPARE(client.opened().last(), QStringLiteral("signup"));
 
     QVERIFY2(unnamedControls(screen.data(), true).isEmpty(), qPrintable(where));
     QVERIFY2(host.textsOutsideWindow(screen.data(), true).isEmpty(),
@@ -6835,8 +6873,11 @@ void TstUiScreens::everyCustomerScreenHasSpecStates()
     }
     QVERIFY(!match.captured(1).contains(QStringLiteral("signed_out")));
     QVERIFY(!match.captured(1).contains(QStringLiteral("restoring")));
-    QVERIFY2(main.contains(QStringLiteral("seatHub.inProfile ? profileComponent : homeComponent")),
-             "the profile is a view inside home, so it carries the header");
+    QVERIFY2(main.contains(QRegularExpression(
+                 QStringLiteral("if \\(seatHub\\.inProfile\\)\\s+return profileComponent"))),
+             "the profile is a view over home, connecting and error, so it carries the header");
+    QVERIFY2(match.captured(1).contains(QStringLiteral("case \"error\":")),
+             "the error view carries the header, and so the menu the profile opens from");
 
     // The window title and size: `SeatHub` on a fixed 1100x720 window, 960x640 at the smallest; the
     // stream window is `Playing - SeatHub` (copy.md C9, the fixed neutral word).
@@ -6935,8 +6976,6 @@ void TstUiScreens::theSignInPasswordKeepsItsNameWhileAccessibilityIsActive()
         QVERIFY(host.show(screen.data(), QSize(1100, 720), 0));
         deepChild(screen.data(), QLatin1String("identifierField"))
             ->setProperty("text", QStringLiteral("lina@example.com"));
-        QVERIFY(QMetaObject::invokeMethod(screen.data(), "continueFromIdentifier"));
-        QCOMPARE(screen->property("step").toString(), QStringLiteral("password"));
 
         QObject* password = deepChild(screen.data(), QLatin1String("passwordField"));
         QVERIFY(password);

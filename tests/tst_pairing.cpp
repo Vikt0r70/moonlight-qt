@@ -2038,6 +2038,152 @@ private slots:
         }
     }
 
+    // -----------------------------------------------------------------------------------------
+    // L07: a warm SAME-SESSION reconnect. An `ACTIVE` session reconnecting inside its disconnect
+    // grace now carries `warm_return` too (contract 3.16.0). The attempt skips the PIN when the
+    // rig confirms the pin this run already holds, and falls back to the PIN handshake when that
+    // fails - one handshake at a time, whichever way it goes.
+    // -----------------------------------------------------------------------------------------
+
+    void aFailedWarmReconnectFallsBackToThePin()
+    {
+        const QByteArray firstPin = QByteArrayLiteral("-----BEGIN CERTIFICATE-----\nFIRST\n-----END CERTIFICATE-----\n");
+        const QByteArray secondPin = QByteArrayLiteral("-----BEGIN CERTIFICATE-----\nSECOND\n-----END CERTIFICATE-----\n");
+        const auto cleanup = qScopeGuard([]() { HeldRigTrust::clear(); });
+        HeldRigTrust::clear();
+        HeldRigTrust::remember(firstPin);
+
+        std::atomic<int> handshakes{0};
+        std::atomic<int> warmChecks{0};
+        std::atomic<int> running{0};
+        std::atomic<int> mostAtOnce{0};
+        std::atomic<bool> warmCheckOk{false};
+        QByteArray heldSeenByTheCheck;
+        // The warm check and the PIN handshake both count themselves in and out, so "never two at
+        // once" is something the test reads, not something it hopes for.
+        const auto enter = [&]() {
+            const int now = ++running;
+            int seen = mostAtOnce.load();
+            while (now > seen && !mostAtOnce.compare_exchange_weak(seen, now)) {
+            }
+            QThread::msleep(15);
+        };
+
+        // Declared before the controller, so the controller (which polls through the seam) is
+        // destroyed first.
+        ProductionPairingSeam seam;
+        seam.setHandshake([&](const PairingTarget&) {
+            enter();
+            ++handshakes;
+            // Production remembers the pin a full pairing produced (`pairing_handshake.cpp`).
+            HeldRigTrust::remember(secondPin);
+            PairingHandshakeResult result = handshakeResult(true, QStringLiteral("pin-identity"));
+            result.host = std::make_shared<PairedHost>();
+            --running;
+            return result;
+        });
+        seam.setWarmReturnCheck([&](const PairingTarget& target, const QByteArray& held) {
+            enter();
+            ++warmChecks;
+            heldSeenByTheCheck = held;
+            PairingHandshakeResult result;
+            // The check never sees the PIN's use: it is handed the target only to know the rig.
+            result.ok = warmCheckOk.load() && !target.hostAddress.isEmpty();
+            result.clientIdentity = result.ok ? QStringLiteral("warm-identity") : QString();
+            if (result.ok) {
+                result.host = std::make_shared<PairedHost>();
+            }
+            --running;
+            return result;
+        });
+
+        PairingController controller;
+        auto* fake = new FakeNetworkAccessManager;
+        wire(controller, fake);
+        controller.setSeam(&seam);
+
+        // The reconnect's authorization: the SAME session, ACTIVE, `warm_return` true, and a PIN
+        // (a PIN is always issued, so a normal pairing is always possible).
+        QJsonObject body = QJsonDocument::fromJson(
+            authorizationBody(QString::fromLatin1(kPin), QStringLiteral("ACTIVE"))).object();
+        body.insert(QStringLiteral("warm_return"), true);
+        fake->statuses = { 200 };
+        fake->bodies = { QJsonDocument(body).toJson(QJsonDocument::Compact) };
+
+        QSignalSpy completed(&controller, &PairingController::pairingCompleted);
+        QSignalSpy failed(&controller, &PairingController::pairingFailed);
+
+        // Attempt 1: the rig does not confirm the held pin. The warm attempt fails, the PIN
+        // handshake runs once after it, and that is what pairs.
+        controller.start(QString::fromLatin1(kSessionId));
+        QTRY_COMPARE_WITH_TIMEOUT(completed.count(), 1, 5000);
+        QCOMPARE(completed.at(0).at(0).toString(), QStringLiteral("pin-identity"));
+        QCOMPARE(warmChecks.load(), 1);
+        QCOMPARE(handshakes.load(), 1);
+        QCOMPARE(heldSeenByTheCheck, firstPin);
+        QCOMPARE(failed.count(), 0);
+
+        // Attempt 2 of the same session (the next reconnect try): the rig now confirms the pin the
+        // PIN pairing left held. The PIN handshake does not run again.
+        warmCheckOk = true;
+        controller.start(QString::fromLatin1(kSessionId));
+        QTRY_COMPARE_WITH_TIMEOUT(completed.count(), 2, 5000);
+        QCOMPARE(completed.at(1).at(0).toString(), QStringLiteral("warm-identity"));
+        QCOMPARE(warmChecks.load(), 2);
+        QCOMPARE(handshakes.load(), 1);
+        QCOMPARE(heldSeenByTheCheck, secondPin);
+        QCOMPARE(failed.count(), 0);
+
+        // And never two at once, warm check and PIN handshake together.
+        QCOMPARE(mostAtOnce.load(), 1);
+
+        // The seam says which kind of pairing the last result was, so the caller can drop the held
+        // trust when a warm attempt's stream then fails.
+        QVERIFY(seam.lastResult().warm);
+    }
+
+    void aWarmResultIsMarkedWarmAndAPinResultIsNot()
+    {
+        const auto cleanup = qScopeGuard([]() { HeldRigTrust::clear(); });
+        HeldRigTrust::clear();
+        HeldRigTrust::remember(QByteArrayLiteral("held"));
+
+        ProductionPairingSeam seam;
+        std::atomic<bool> warmOk{true};
+        seam.setHandshake([&](const PairingTarget&) {
+            PairingHandshakeResult result = handshakeResult(true, QStringLiteral("pin-identity"));
+            result.host = std::make_shared<PairedHost>();
+            return result;
+        });
+        seam.setWarmReturnCheck([&](const PairingTarget&, const QByteArray&) {
+            PairingHandshakeResult result;
+            result.ok = warmOk.load();
+            result.clientIdentity = result.ok ? QStringLiteral("warm-identity") : QString();
+            if (result.ok) {
+                result.host = std::make_shared<PairedHost>();
+            }
+            return result;
+        });
+
+        QVector<bool> warmFlags;
+        QObject::connect(&seam, &ProductionPairingSeam::handshakeClassified,
+                         [&](const PairingHandshakeResult& result) { warmFlags.append(result.warm); });
+
+        PairingTarget target = pairingTarget();
+        target.warmReturn = true;
+        SeamReport report;
+        seam.pair(target, recordInto(&report));
+        QTRY_COMPARE_WITH_TIMEOUT(report.count(), 1, 5000);
+        QCOMPARE(report.identities.first(), QStringLiteral("warm-identity"));
+
+        warmOk = false;
+        seam.pair(target, recordInto(&report));
+        QTRY_COMPARE_WITH_TIMEOUT(report.count(), 2, 5000);
+        QCOMPARE(report.identities.last(), QStringLiteral("pin-identity"));
+
+        QCOMPARE(warmFlags, (QVector<bool>{ true, false }));
+    }
+
     void heldRigTrustIsReplacedByTheNextPairingAndClearedOnDemand()
     {
         const auto cleanup = qScopeGuard([]() { HeldRigTrust::clear(); });

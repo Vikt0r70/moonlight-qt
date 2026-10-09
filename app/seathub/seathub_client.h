@@ -10,7 +10,7 @@
 //   * No credential ever crosses into the view layer - not a token, not a header.
 //
 // Plan 03-02 shipped this against a stubbed control plane and a tracer in place of a stream.
-// Both are gone: `requestOtp`/`verifyOtp` run the real `ControlPlaneClient`, and the stream is a
+// Both are gone: sign-in runs the real `ControlPlaneClient`, and the stream is a
 // real engine session the pairing handshake's resolved host is attached to. The tracer survives as
 // an explicitly injected fake (`stub_engine_session.h`), never as a fallback.
 
@@ -152,8 +152,10 @@ class SeatHubClient : public QObject
     /// could not be reached at all (`copy.md` §Support & errors, "Offline"), "refused" when the
     /// control plane answered and said no in its own words (the balance floor, or a session this
     /// customer already has) - `failure` and `reference` then hold that sentence and its code, shown
-    /// as they are - and "ready" for the populated state `screens.md` §23 draws. QML turns each into
-    /// a sentence; none of them is a failure, so none of them raises the error screen.
+    /// as they are - "previous_ending" while a Play that answered the retryable
+    /// `PREVIOUS_SESSION_ENDING` is being repeated (C-SAMEPLAY: the busy Play with `Ending your
+    /// previous session…`) - and "ready" for the populated state `screens.md` §23 draws. QML turns
+    /// each into a sentence; none of them is a failure, so none of them raises the error screen.
     Q_PROPERTY(QString homeStatus READ homeStatus NOTIFY homeStatusChanged)
 
     /// D-05/C4: true while `retry()`'s own end-then-fresh-Play sequence is running - the session
@@ -419,25 +421,17 @@ public:
     /// C-ENDING: is an End saved on disk for the signed-in account?
     bool hasSavedEnd() const;
 
-    /// Sign-in step 1 (D-55 shell, stubbed in Plan 03-02).
-    Q_INVOKABLE void requestOtp(const QString& phoneE164);
-
-    /// Sign-in step 2 (D-55 shell, stubbed in Plan 03-02).
-    Q_INVOKABLE void verifyOtp(const QString& phoneE164, const QString& code);
-
-    /// What a phone number typed into the sign-in field becomes as E.164, or an empty string when
-    /// it is not one. `dialCode` is the chosen country's (`+962`); a number already written with a
-    /// leading `+` or `00` is believed as it stands. The screen asks before it sends anything, so a
-    /// mis-typed number is named on the field and never spends a round trip.
-    Q_INVOKABLE QString toE164(const QString& typed, const QString& dialCode) const;
-
-    /// Sign in with an email and a password (`POST /api/auth/login`, the email step of the
-    /// sign-in screen). The identifier is sent as typed (only surrounding space is dropped) and the
-    /// server decides what it is. On success the credential is stored exactly as the code path
-    /// stores it and the client lands on Home; on refusal the server's own sentence and reference
-    /// come back through `passwordSignInRejected`. The password lives for the length of the
-    /// request: it is not stored, not kept by this object and not logged.
-    Q_INVOKABLE void signInWithPassword(const QString& identifier, const QString& password);
+    /// The one sign-in (`POST /api/auth/login`, A-ID, `screens.md` §22): the field's raw text and the
+    /// password, for a phone and an email alike. The identifier is sent as typed (only surrounding
+    /// space is dropped), together with `region`, the ISO code of the country picked in the field;
+    /// this client never builds E.164 or a doubled dial code - the server canonicalises a
+    /// phone-shaped identifier with that region and treats anything else as an email. SeatHub never
+    /// creates an account, and there is no code step. On success the credential is stored and the
+    /// client lands on Home; on refusal the server's own sentence and reference come back through
+    /// `passwordSignInRejected`, flagged when the refusal is `NO_ACCOUNT`. The password lives for the
+    /// length of the request: it is not stored, not kept by this object and not logged.
+    Q_INVOKABLE void signInWithPassword(const QString& identifier, const QString& password,
+                                        const QString& region = QString());
 
     /// The website address for `target` (`signup`, `reset`, `topup` or `home`, the origin itself that
     /// the profile's `Open the website` link opens), or an empty string for anything else. QML never builds an address itself; these come from `web_origin.h`, carry no
@@ -582,21 +576,15 @@ signals:
     void totalsChanged();
     void accountStatusChanged();
 
-    /// Step 1 succeeded - the view should show the code field.
-    void otpRequested(const QString& phoneE164);
+    /// The sign-in was refused, locally or by the server. `message` is the sentence to show (the
+    /// server's own, verbatim, or the offline or field-level one from the copy deck); `reference`
+    /// is the ADR-0008 code when the server gave one. `noAccount` is true when the server answered
+    /// that no account uses that email or phone (`NO_ACCOUNT`, C-SIGNIN): the screen then also
+    /// offers `Create an account on the website`.
+    void passwordSignInRejected(const QString& message, const QString& reference,
+                                bool noAccount = false);
 
-    /// Step 2 rejected the code. `message` is SeatHub copy, never engine text.
-    void otpRejected(const QString& message, const QString& reference);
-
-    /// Step 2 accepted the code.
-    void otpAccepted();
-
-    /// The email-and-password sign-in was refused, locally or by the server. `message` is the
-    /// sentence to show (the server's own, verbatim, or the offline or field-level one from the
-    /// copy deck); `reference` is the ADR-0008 code when the server gave one.
-    void passwordSignInRejected(const QString& message, const QString& reference);
-
-    /// The email-and-password sign-in succeeded; the credential is stored and Home is next.
+    /// The sign-in succeeded; the credential is stored and Home is next.
     void passwordSignInAccepted();
 
 private slots:
@@ -954,6 +942,18 @@ private:
     void releaseEngineSession();
     /// Play against the control plane: `POST /api/sessions`, then `beginSession()`.
     void beginPlayRequest();
+    /// One `POST /api/sessions` of the Play now in progress, with that Play's own `Idempotency-Key`.
+    /// `beginPlayRequest()` sends the first; `repeatPlayRequest()` sends each repeat with the SAME key.
+    void postPlayRequest();
+    /// A-LC / C-SAMEPLAY: the Play answered the retryable `PREVIOUS_SESSION_ENDING` - the server has
+    /// just ended this account's own held session and the rig is still closing it. Keeps the busy
+    /// Play (`homeStatus` "previous_ending") and arms the next repeat on the existing reconnect pace
+    /// (V9: 1 s growing x1.6 with up to 20% jitter to a 5 s cap - no pace of its own).
+    void schedulePlayRepeat();
+    /// Sends the repeat `schedulePlayRepeat()` armed, unless the Play it belongs to is over.
+    void repeatPlayRequest(quint64 playToken, quint64 authEpoch);
+    /// The Play in progress is over (a session, another answer, a sign-out): no repeat is pending.
+    void endPlayRepeat();
     /// Turns an allocation result into a home state: a refusal is the empty state, an
     /// unreachable control plane is the offline state, and anything else is a real failure.
     void applyPlayFailure(const ControlPlaneResult& result);
@@ -1079,6 +1079,9 @@ private:
     /// the seam reports from. Consumed - not merely read - by whichever handler runs next, so no
     /// later failure can inherit it. Empty until a result arrives.
     PairingHandshakeResult m_pairingClassification;
+    /// L07: the pairing that last completed skipped the PIN handshake (the warm return). A
+    /// reconnect attempt that then fails drops the held trust so the next attempt pairs with the PIN.
+    bool m_lastPairingWarm = false;
     EngineLaunchReason m_engineLaunchReason = EngineLaunchReason::Started;
     QString m_lastFailedStep;
     QElapsedTimer m_playElapsed;
@@ -1178,6 +1181,13 @@ private:
     bool m_engineFailed = false;
     /// D-05/C4: see the `retryBusy` Q_PROPERTY.
     bool m_retryBusy = false;
+    /// The Play press now in progress, for the repeat of `PREVIOUS_SESSION_ENDING`: its
+    /// `Idempotency-Key` (one per press, reused for every repeat), a token that names the press so
+    /// an armed repeat of an earlier press cannot act on a later one, and the next repeat's
+    /// delay. Empty / zero when no Play is waiting on its previous session.
+    QString m_playIdempotencyKey;
+    quint64 m_playToken = 0;
+    int m_playRepeatBackoffMs = 0;
 
     // --- 06.1-19/J-07: the reconnect state --------------------------------------------------------
 

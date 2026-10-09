@@ -12,8 +12,8 @@ import SeatHub.Tokens 1.0
 // (`screens.md` §22), not a feeling.
 //
 // The tag is a button that opens the country picker and reads its own country aloud. It starts on
-// the machine's region (`defaultCountryCode`, from the facade), and changing it never touches the
-// digits already typed. A number typed with a leading `+` or `00` names its own country, and the tag
+// Jordan (`defaultCountryCode`, from the facade: the one default for every sign-in, C-SIGNIN), any
+// other country stays selectable, and changing it never touches the digits already typed. A number typed with a leading `+` or `00` names its own country, and the tag
 // then shows the country the number matched: what the customer typed wins over what the tag says.
 //
 // MOTION (`ui.md` §6, §12): the tag reveals with opacity and a translate of the tag and the input
@@ -93,7 +93,8 @@ Item {
     }
 
     // Digits typed as Arabic-Indic or Persian numerals are the Latin digits they are, the same
-    // reading the website and `ControlPlaneClient::normalisePhoneE164` apply.
+    // reading the website applies. The field only classifies and counts digits; the number itself is
+    // never rewritten here, and the server canonicalises it (A-ID).
     function latinDigits(value) {
         return value.replace(/[\u0660-\u0669]/g, function (d) { return String(d.charCodeAt(0) - 0x0660) })
                     .replace(/[\u06f0-\u06f9]/g, function (d) { return String(d.charCodeAt(0) - 0x06f0) })

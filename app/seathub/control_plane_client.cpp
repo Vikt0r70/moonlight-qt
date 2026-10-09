@@ -526,59 +526,9 @@ bool ControlPlaneClient::isReferenceCode(const QString& reference)
     return re.match(reference).hasMatch();
 }
 
-bool ControlPlaneClient::isPhoneE164(const QString& phoneE164)
+QString ControlPlaneClient::newIdempotencyKey()
 {
-    static const QRegularExpression re(QStringLiteral("^\\+[1-9][0-9]{7,14}$"));
-    return re.match(phoneE164).hasMatch();
-}
-
-QString ControlPlaneClient::normalisePhoneE164(const QString& raw, const QString& dialCode)
-{
-    // The normalisation rule (ME-03), stated once, in one place, and tested. It is the website's
-    // own (`seathub-web/src/lib/auth-validation.ts` `toE164`), so a number typed the same way in
-    // either surface reaches the server as the same E.164:
-    //   1. digits typed as Arabic-Indic (U+0660..0669) or Persian (U+06F0..06F9) numerals are read
-    //      as the Latin digits they are;
-    //   2. drop the separators a person types between digits: space, '(', ')', '-' and '.';
-    //   3. a number already written with a leading '+' is believed as it stands, and so is one
-    //      written with the international prefix `00` (mapped to '+') - what the customer typed
-    //      wins over the country the tag shows;
-    //   4. otherwise the number is national: `dialCode` (the chosen country's, `+962`) is put in
-    //      front of it after one leading trunk '0' is dropped (`0790000000` in Jordan). With no
-    //      `dialCode` nothing is guessed - the spec defines no default - and the number is refused;
-    //   5. whatever results must match `^\+[1-9][0-9]{7,14}$` exactly, the pattern
-    //      `docs/spec/openapi.yaml` puts on `phone_e164`. Anything else returns an empty string and
-    //      the caller rejects locally instead of spending a round trip. The server validates again.
-    // No phone-parsing library is used: these are the same minimal rules the website applies.
-    static const QRegularExpression separators(QStringLiteral("[\\s()\\-.]+"));
-
-    QString digits;
-    digits.reserve(raw.size());
-    for (const QChar ch : raw) {
-        const ushort u = ch.unicode();
-        if (u >= 0x0660 && u <= 0x0669) {
-            digits.append(QChar(u - 0x0660 + u'0'));
-        }
-        else if (u >= 0x06F0 && u <= 0x06F9) {
-            digits.append(QChar(u - 0x06F0 + u'0'));
-        }
-        else {
-            digits.append(ch);
-        }
-    }
-    digits.remove(separators);
-
-    if (digits.startsWith(QLatin1String("00"))) {
-        digits = QStringLiteral("+") + digits.mid(2);
-    }
-    else if (!digits.startsWith(QLatin1Char('+')) && !dialCode.isEmpty()) {
-        if (digits.startsWith(QLatin1Char('0'))) {
-            digits.remove(0, 1);
-        }
-        digits = dialCode + digits;
-    }
-
-    return isPhoneE164(digits) ? digits : QString();
+    return QUuid::createUuid().toString(QUuid::WithoutBraces);
 }
 
 QString ControlPlaneClient::encodedPathSegment(const QString& segment)
@@ -672,26 +622,15 @@ ControlPlaneResult ControlPlaneClient::classify(int httpStatus, const QByteArray
 
 // ---------------------------------------------------------------- request builders
 
-QByteArray ControlPlaneClient::buildOtpRequest(const QString& phoneE164)
-{
-    QJsonObject object;
-    object.insert(QStringLiteral("phone_e164"), phoneE164);
-    return QJsonDocument(object).toJson(QJsonDocument::Compact);
-}
-
-QByteArray ControlPlaneClient::buildOtpVerify(const QString& phoneE164, const QString& code)
-{
-    QJsonObject object;
-    object.insert(QStringLiteral("phone_e164"), phoneE164);
-    object.insert(QStringLiteral("code"), code);
-    return QJsonDocument(object).toJson(QJsonDocument::Compact);
-}
-
-QByteArray ControlPlaneClient::buildLogin(const QString& identifier, const QString& password)
+QByteArray ControlPlaneClient::buildLogin(const QString& identifier, const QString& password,
+                                          const QString& region)
 {
     QJsonObject object;
     object.insert(QStringLiteral("identifier"), identifier);
     object.insert(QStringLiteral("password"), password);
+    if (!region.isEmpty()) {
+        object.insert(QStringLiteral("region"), region);
+    }
     return QJsonDocument(object).toJson(QJsonDocument::Compact);
 }
 
@@ -1113,23 +1052,17 @@ void ControlPlaneClient::finishReply(QNetworkReply* reply, Callback callback,
 
 // ---------------------------------------------------------------- calls
 
-void ControlPlaneClient::requestOtp(const QString& phoneE164, Callback callback)
-{
-    send(QStringLiteral("POST"), QStringLiteral("/api/auth/otp/request"),
-         buildOtpRequest(phoneE164), false, callback);
-}
-
-void ControlPlaneClient::verifyOtp(const QString& phoneE164, const QString& code, Callback callback)
-{
-    send(QStringLiteral("POST"), QStringLiteral("/api/auth/otp/verify"),
-         buildOtpVerify(phoneE164, code), false, callback);
-}
-
 void ControlPlaneClient::login(const QString& identifier, const QString& password,
                                Callback callback)
 {
+    login(identifier, password, QString(), callback);
+}
+
+void ControlPlaneClient::login(const QString& identifier, const QString& password,
+                               const QString& region, Callback callback)
+{
     send(QStringLiteral("POST"), QStringLiteral("/api/auth/login"),
-         buildLogin(identifier, password), false, callback);
+         buildLogin(identifier, password, region), false, callback);
 }
 
 void ControlPlaneClient::logout(Callback callback)
@@ -1182,15 +1115,23 @@ void ControlPlaneClient::requestSession(Callback callback)
 
 void ControlPlaneClient::requestSession(const QString& clientCertSha256, Callback callback)
 {
-    // ADR-0062 decision 11: every Play posts a fresh Idempotency-Key - a new uuid per press,
-    // never reused. A retry of the same press is the caller's to make with the same key; this
-    // client makes none of its own.
+    requestSession(clientCertSha256, QString(), callback);
+}
+
+void ControlPlaneClient::requestSession(const QString& clientCertSha256,
+                                        const QString& idempotencyKey, Callback callback)
+{
+    // ADR-0062 decision 11: every Play press posts its own Idempotency-Key - a new uuid per press,
+    // never shared between two presses. A repeat of the same press (A-LC: the Play that answered
+    // the retryable `PREVIOUS_SESSION_ENDING`) is the caller's to make, with the SAME key it
+    // named here; this client repeats nothing of its own. With no key named, one is minted.
     //
     // ADR-0074 X02: the body names the fingerprint of the client certificate this app pairs with
     // (empty -> `{}`, the pre-3.11.0 body), which is how the rig finds this customer's pairing.
+    const QString key = idempotencyKey.isEmpty() ? newIdempotencyKey() : idempotencyKey;
     send(QStringLiteral("POST"), QStringLiteral("/api/sessions"),
          buildSessionCreate(clientCertSha256), true, callback,
-         { { "Idempotency-Key", QUuid::createUuid().toString(QUuid::WithoutBraces).toUtf8() } });
+         { { "Idempotency-Key", key.toUtf8() } });
 }
 
 void ControlPlaneClient::fetchSession(const QString& sessionId, Callback callback)

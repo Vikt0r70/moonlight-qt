@@ -58,13 +58,16 @@ public:
         // changes. Nothing copies the target anywhere else, and nothing logs it.
         PairingHandshakeResult result;
 
-        // ADR-0074 W03, the warm return: the PIN handshake is skipped only when the control plane
-        // said so for this NEW session (`warmReturn`), this app run still holds the host
-        // certificate it pinned earlier, and the check - the rig's HTTPS serverinfo read with that
-        // pin - answers paired. Anything else (the field absent or false, nothing held after a
-        // restart or a sign-out, a failed or refused check) falls through to the normal
+        // ADR-0074 W03 / L07, the warm return: the PIN handshake is skipped only when the control
+        // plane said so (`warmReturn`: a NEW session on the caller's own free return hold, or an
+        // ACTIVE session reconnecting inside its disconnect grace), this app run still holds the
+        // host certificate it pinned earlier, and the check - the rig's HTTPS serverinfo read with
+        // that pin - answers paired. Anything else (the field absent or false, nothing held after a
+        // restart or a sign-out, a failed or refused check) falls through to the normal PIN
         // handshake below, untouched: a PIN is always issued, so a normal pairing is always
-        // possible, and the rig's own certificate check is what admits the stream either way.
+        // possible, and the rig's own certificate check is what admits the stream either way. The
+        // check and the handshake run one after the other on this one worker, so a failed warm
+        // attempt never leaves two handshakes in flight.
         bool warmReturned = false;
         if (m_target.warmReturn && m_warmCheck) {
             const QByteArray held = HeldRigTrust::held();
@@ -72,6 +75,7 @@ public:
                 PairingHandshakeResult warm = m_warmCheck(m_target, held);
                 if (warm.ok && !warm.clientIdentity.isEmpty() && warm.host) {
                     result = warm;
+                    result.warm = true;
                     warmReturned = true;
                 }
             }
