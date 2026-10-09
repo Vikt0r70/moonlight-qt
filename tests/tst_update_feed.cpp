@@ -2,16 +2,18 @@
 //
 // Two things are being proven here, and they are the two the threat register cares about:
 //
-//   * T-03-14 (tampering with the downloaded binary): a package is only ever reported as
-//     installable when its SHA-256 matches the digest the release pin carries. The digest check is
-//     verified against NIST's published vectors, so a test that passed by comparing a hash against
-//     itself cannot happen.
+//   * T-03-14 (tampering with the downloaded binary): a release row with no SHA-256 is refused before
+//     anything is downloaded (D-43), and the digest helpers are verified against NIST's published
+//     vectors, so a test that passed by comparing a hash against itself cannot happen. The package
+//     itself is Velopack's to verify (ADR-0086).
 //   * T-03-17 / Pitfall 8 (replacing the binary under a live stream): while a session is running
 //     nothing is checked, nothing is downloaded, nothing is installed, and the modal renders
 //     nothing.
 //
 // The feed's own HTTP path is exercised only against a closed local port - the release feed is a
-// real service and a unit test has no business calling it.
+// real service and a unit test has no business calling it. Download and apply go through the
+// Velopack seam (`VelopackUpdater::UpdateApplier`); every test here drives a fake one, so no network,
+// installed copy or updater runs, and no test needs the Velopack library.
 
 #include <QtTest>
 #include <QDir>
@@ -23,13 +25,19 @@
 #include <QQmlEngine>
 #include <QQuickItem>
 #include <QQuickStyle>
+#include <QMutex>
+#include <QMutexLocker>
+#include <QSemaphore>
 #include <QSignalSpy>
 #include <QTemporaryDir>
 #include <QUrl>
 
+#include <atomic>
 #include <functional>
+#include <memory>
 
 #include "seathub/update_feed_client.h"
+#include "seathub/velopack_updater.h"
 
 namespace {
 QString guiDir()
@@ -75,29 +83,78 @@ QQuickItem* hostItem(QObject* modal)
 // NIST's published SHA-256 vector for "abc".
 const char* const kAbcSha256 = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
 
-// ADR-0077 item 7: tests never read the machine they run on. This is a machine with no installer
-// anywhere and no recorded launch.
-InstallerObservation clearMachine(const UpdateRetryState&)
-{
-    InstallerObservation observation;
-    observation.owner = InstallerObservation::Owner::None;
-    observation.scan = InstallerObservation::Scan::Clear;
-    observation.boot = InstallerObservation::Boot::Same;
-    return observation;
-}
+// The release row the tests publish: Setup.exe sits in a folder on the control plane's host, and the
+// Velopack feed (releases.win.json and the full package) is the folder beside it.
+const char* const kSetupUrl = "https://api-sevenhills.damra.co/releases/client/SeatHub-Setup-0.2.0.exe";
+const char* const kSetupFolder = "https://api-sevenhills.damra.co/releases/client/";
 
-// A stand-in "installer" served through QNetworkAccessManager's own file:// backend, so the real
-// download -> verify -> install path runs end to end without a socket or the real release feed.
-QString writeAbcPackage(const QString& directory, const QString& name)
+// The Velopack seam, scripted. `download` runs on the client's worker thread exactly as the real one
+// does; `hold` lets a test keep a download in flight.
+class FakeApplier : public VelopackUpdater::UpdateApplier
 {
-    const QString path = directory + QLatin1Char('/') + name;
-    QFile file(path);
-    if (!file.open(QIODevice::WriteOnly)) {
-        return QString();
+public:
+    bool downloadOk = true;
+    bool applyOk = true;
+    QString carries = QStringLiteral("0.2.0"); // the version the release folder actually carries
+    QSemaphore* hold = nullptr;
+    std::function<void()> onApply;
+    std::atomic<int> downloads{0};
+    std::atomic<int> applies{0};
+
+    bool download(const QString& folder, const std::function<void(int)>& progress, QString* version,
+                  QString* error) override
+    {
+        ++downloads;
+        {
+            QMutexLocker lock(&m_mutex);
+            m_folders.append(folder);
+        }
+        if (hold != nullptr)
+            hold->acquire();
+        progress(40);
+        if (!downloadOk) {
+            *error = QStringLiteral("the update folder could not be read");
+            return false;
+        }
+        progress(100);
+        *version = carries;
+        return true;
     }
-    file.write(QByteArrayLiteral("abc"));
-    file.close();
-    return path;
+
+    bool applyAfterExit(QString* error) override
+    {
+        ++applies;
+        if (onApply)
+            onApply();
+        if (!applyOk) {
+            *error = QStringLiteral("the app folder is in use");
+            return false;
+        }
+        return true;
+    }
+
+    QStringList seenFolders()
+    {
+        QMutexLocker lock(&m_mutex);
+        return m_folders;
+    }
+
+private:
+    QMutex m_mutex;
+    QStringList m_folders;
+};
+
+// Puts a fake applier and a counting exit handler on `client`: the application quitting is what the
+// real exit handler does, and a unit test must never do that.
+std::shared_ptr<FakeApplier> useFake(UpdateFeedClient& client, int* exits)
+{
+    auto applier = std::make_shared<FakeApplier>();
+    client.setUpdateApplier(applier);
+    client.setExitHandler([exits]() {
+        if (exits != nullptr)
+            ++*exits;
+    });
+    return applier;
 }
 
 // Every piece of text the modal currently shows, for asserting what the customer reads.
@@ -189,23 +246,22 @@ private slots:
     void updatesAreBlockedDuringAStream();
     void forcedUpdateModalBlocksInteraction();
     void forcedUpdateModalIsNotShownDuringAStream();
-    void aVerifiedDownloadStartsTheInstallerWithoutASecondPress();
-    void aFailedLaunchIsShownAndTryAgainRetriesTheLaunch();
     void forcedUpdateModalOnlySaysStartingWhileTheInstallerIsLaunched();
     void latestReleaseIsMandatoryFloor();
     void aNewerInstalledBuildIsCurrentAndGetsNoOffer();
-    void additiveInstallerArgumentsAreExact();
     void persistentFailureReReadsTheFeedForReinstall();
     void tryAgainDownloadsTheRowJustRead();
     void aCachedOfferNeverLaunchesAnInstaller();
     void aCachedOfferIsReReadBeforeUpdateDownloads();
-    void quiescenceBlocksAnOverlappingLaunchWithoutSpendingTheBudget();
-    void aPendingLaunchIsNotJudgedWhileItMayStillBeWriting();
-    void aCancelledBlockRecordSpendsNoAttempt();
-    void aPendingLaunchInfersNoResultAndRetriesOnlyOnNextLaunch();
     void integrityExhaustionIsReportedOnceAcrossRestart();
     void theLastKnownOfferWorksOfflineAndFormatsTheRetryTime();
-    void aManualPendingLaunchDoesNotSpendAutomaticBudget();
+    void anAvailableReleaseIsAppliedThroughVelopack();
+    void aFailedApplyKeepsTheOldVersionAndTheRetryBudget();
+    void aFolderThatCarriesAnotherVersionIsNotApplied();
+    void aPendingHandOffThatLeftTheOldVersionIsOneFailedAttempt();
+    void aManualPendingHandOffDoesNotSpendAutomaticBudget();
+    void theReleaseFolderIsTheOneBesideSetupAndMustBeTrusted();
+    void theUninstallHookRemovesExactlyTheD45State();
 
 private:
     QTemporaryDir m_dir;
@@ -354,9 +410,13 @@ void TstUpdateFeed::downloadUpdateRefusesWithoutADigest()
     // Nothing here talks to the network: the refusal happens before any request is made.
     client.setBaseUrl(QStringLiteral("http://127.0.0.1:1"));
 
+    int exits = 0;
+    const auto applier = useFake(client, &exits);
+
     QCOMPARE(client.state(), QStringLiteral("idle"));
     QVERIFY(!client.downloadUpdate(QStringLiteral("https://example.invalid/a.exe"), QString()));
     QCOMPARE(client.state(), QStringLiteral("failed"));
+    QCOMPARE(applier->downloads.load(), 0); // a row with no digest never reaches Velopack
     QVERIFY(!client.failure().value(QStringLiteral("error")).toString().isEmpty());
     // ADR-0008: the client never generates a reference code, so a refusal it makes itself (no
     // digest, no URL) carries none - a code support cannot resolve is worse than no code.
@@ -366,12 +426,15 @@ void TstUpdateFeed::downloadUpdateRefusesWithoutADigest()
 
     // An empty URL is equally unactionable.
     QVERIFY(!client.downloadUpdate(QString(), QStringLiteral("ba7816bf")));
+    QCOMPARE(applier->downloads.load(), 0);
 }
 
 void TstUpdateFeed::updatesAreBlockedDuringAStream()
 {
     UpdateFeedClient client;
     client.setBaseUrl(QStringLiteral("http://127.0.0.1:1"));
+    int exits = 0;
+    const auto applier = useFake(client, &exits);
     QVERIFY(!client.blockedBySession());
 
     // Pitfall 8 / T-03-17: no check, no download, no install while a session is running.
@@ -383,6 +446,7 @@ void TstUpdateFeed::updatesAreBlockedDuringAStream()
     QVERIFY(!client.downloadUpdate(QStringLiteral("https://example.invalid/a.exe"),
                                    QStringLiteral("ba7816bf")));
     QVERIFY(!client.installDownloaded());
+    QCOMPARE(applier->downloads.load(), 0); QCOMPARE(applier->applies.load(), 0); QCOMPARE(exits, 0);
 
     // D-41: when the session ends the offer is looked for again. The address here is a closed
     // local port, so this exercises the failure path through the one error shape (D-51) without
@@ -511,94 +575,7 @@ void TstUpdateFeed::forcedUpdateModalIsNotShownDuringAStream()
     QCOMPARE(root->property("visible").toBool(), false);
 }
 
-void TstUpdateFeed::aVerifiedDownloadStartsTheInstallerWithoutASecondPress()
-{
-    // The "hangs at Starting the installer" defect (WINDOWS #21, CUST-18): a verified download
-    // stopped in "ready" with the modal's only action disabled, so nothing ever launched the
-    // installer. The one press - the download - has to carry through to the launch on its own.
-    QVERIFY(m_dir.isValid());
-    const QString source = writeAbcPackage(m_dir.path(), QStringLiteral("tst_update_feed-auto.exe"));
-    QVERIFY(!source.isEmpty());
 
-    UpdateFeedClient client;
-    client.setObservationProbe(clearMachine);
-    client.setBaseUrl(QStringLiteral("http://127.0.0.1:1"));
-
-    QStringList launchedPaths;
-    QStringList statesAtLaunch;
-    client.setInstallerLauncher([&](const QString& path) {
-        launchedPaths.append(path);
-        statesAtLaunch.append(client.state());
-        return true;
-    });
-    QSignalSpy verified(&client, &UpdateFeedClient::verified);
-    QSignalSpy requested(&client, &UpdateFeedClient::installRequested);
-
-    QVERIFY(client.downloadUpdate(QUrl::fromLocalFile(source).toString(),
-                                  QString::fromLatin1(kAbcSha256)));
-
-    QTRY_COMPARE(requested.count(), 1);
-    QCOMPARE(verified.count(), 1);
-    QCOMPARE(launchedPaths.size(), 1);
-    // The bytes that run are the bytes that were verified, and the launch happens in the one state
-    // whose copy says the installer is starting.
-    QCOMPARE(launchedPaths.first(), client.downloadedPath());
-    QCOMPARE(statesAtLaunch.first(), QStringLiteral("installing"));
-    QCOMPARE(client.state(), QStringLiteral("installing"));
-    QVERIFY(client.failure().isEmpty());
-
-    // Exactly one launch: nothing queued behind it starts the installer a second time.
-    QTest::qWait(100);
-    QCOMPARE(launchedPaths.size(), 1);
-    QCOMPARE(requested.count(), 1);
-
-    QFile::remove(client.downloadedPath());
-}
-
-void TstUpdateFeed::aFailedLaunchIsShownAndTryAgainRetriesTheLaunch()
-{
-    // A declined UAC prompt, or any other failed start, must end on a visible failure - never on
-    // "Starting the installer" forever. The verified package stays on disk, so Try again re-runs
-    // the launch (re-verifying first) instead of downloading the whole installer again.
-    QVERIFY(m_dir.isValid());
-    const QString source =
-        writeAbcPackage(m_dir.path(), QStringLiteral("tst_update_feed-declined.exe"));
-    QVERIFY(!source.isEmpty());
-
-    UpdateFeedClient client;
-    client.setObservationProbe(clearMachine);
-    client.setBaseUrl(QStringLiteral("http://127.0.0.1:1"));
-
-    int attempts = 0;
-    bool starts = false;
-    client.setInstallerLauncher([&](const QString&) {
-        ++attempts;
-        return starts;
-    });
-    QSignalSpy requested(&client, &UpdateFeedClient::installRequested);
-
-    QVERIFY(client.downloadUpdate(QUrl::fromLocalFile(source).toString(),
-                                  QString::fromLatin1(kAbcSha256)));
-
-    QTRY_COMPARE(client.state(), QStringLiteral("failed"));
-    QCOMPARE(attempts, 1);
-    QCOMPARE(requested.count(), 0);
-    // Something on this machine failed, not the network, and the client invents no reference.
-    QCOMPARE(client.failure().value(QStringLiteral("kind")).toString(), QStringLiteral("local"));
-    QVERIFY(!client.failure().value(QStringLiteral("error")).toString().isEmpty());
-    QVERIFY2(client.failure().value(QStringLiteral("reference")).toString().isEmpty(),
-             "the client must not invent an ADR-0008 reference code");
-    QVERIFY(client.readyToInstall());
-
-    starts = true;
-    QVERIFY(client.installDownloaded());
-    QCOMPARE(attempts, 2);
-    QCOMPARE(requested.count(), 1);
-    QCOMPARE(client.state(), QStringLiteral("installing"));
-    QVERIFY(client.failure().isEmpty());
-
-    QFile::remove(client.downloadedPath());
-}
 
 void TstUpdateFeed::forcedUpdateModalOnlySaysStartingWhileTheInstallerIsLaunched()
 {
@@ -720,11 +697,6 @@ void TstUpdateFeed::latestReleaseIsMandatoryFloor()
     UpdateFeedClient older; older.setRetryStatePath(path); older.setInstalledVersion("0.5.0");
     QVERIFY(older.mandatory()); QCOMPARE(older.state(), QString("failed"));
 }
-void TstUpdateFeed::additiveInstallerArgumentsAreExact()
-{
-    QCOMPARE(UpdateFeedClient::installerArguments("0.1.24", 3),
-             QString("SeatHubFromVersion=0.1.24 SeatHubAttempt=3"));
-}
 namespace {
 QString writeLocalFeed(const QString& folder, const QString& url, const QString& floor,
                        const QString& digest = QString::fromLatin1(kAbcSha256))
@@ -739,7 +711,7 @@ QString writeLocalFeed(const QString& folder, const QString& url, const QString&
 }
 namespace {
 const char* const kTrustedOld = "https://api-sevenhills.damra.co/releases/client/SeatHub-Setup-OLD.exe";
-const char* const kTrustedNew = "https://api-sevenhills.damra.co/releases/client/SeatHub-Setup-NEW.exe";
+const char* const kTrustedNew = "https://api-sevenhills.damra.co/releases/client/new/SeatHub-Setup-NEW.exe";
 // A client whose four automatic attempts are spent on 0.2.0, with a stale cached address.
 void exhaustedState(const QString& path)
 {
@@ -756,7 +728,6 @@ void TstUpdateFeed::persistentFailureReReadsTheFeedForReinstall()
     const auto path = dir.filePath("retry-state.json");
     exhaustedState(path);
     UpdateFeedClient client; client.setRetryStatePath(path); client.setInstalledVersion("0.1.0");
-    client.setObservationProbe(clearMachine);
     // Blocked, with the in-house reinstall available: the window is up and the budget is spent.
     QVERIFY(client.mandatory()); QVERIFY(client.exhausted());
     QCOMPARE(client.manualDownloadUrl(), QString::fromLatin1(kTrustedOld));
@@ -794,32 +765,23 @@ void TstUpdateFeed::tryAgainDownloadsTheRowJustRead()
     QTemporaryDir dir; QVERIFY(dir.isValid());
     const auto path = dir.filePath("retry-state.json");
     exhaustedState(path);
-    const auto package = writeAbcPackage(dir.path(), "tryagain-latest.exe");
-    // A setup left in the temp folder by an earlier target must never be run as "the latest".
-    const QString cached = QStandardPaths::writableLocation(QStandardPaths::TempLocation) + "/SeatHub/tryagain-latest.exe";
-    QDir().mkpath(QFileInfo(cached).absolutePath());
-    { QFile stale(cached); QVERIFY(stale.open(QIODevice::WriteOnly)); stale.write("an older setup"); }
     UpdateFeedClient client; client.setRetryStatePath(path); client.setInstalledVersion("0.1.0");
-    client.setObservationProbe(clearMachine);
-    QStringList launched; QString digestAtLaunch;
-    client.setInstallerLauncher([&](const QString& file){
-        launched.append(file); digestAtLaunch = UpdateFeedClient::fileSha256(file); return false; });
+    int exits = 0;
+    const auto applier = useFake(client, &exits);
     client.setBaseUrl("http://127.0.0.1:1");
-    // Unreachable feed: nothing is launched or downloaded and the budget is untouched.
+    // Unreachable feed: nothing is downloaded or applied and the budget is untouched.
     QVERIFY(client.tryAgain());
     QTRY_COMPARE(client.state(), QString("failed"));
-    QCOMPARE(launched.size(), 0); QCOMPARE(client.retryState().attemptsFailed, 4);
-    // Reachable feed: the row just read is downloaded and verified, then launched.
-    QJsonObject row{{"version", "0.2.0"}, {"url", QUrl::fromLocalFile(package).toString()},
-                    {"sha256", QString::fromLatin1(kAbcSha256)}};
-    QDir().mkpath(dir.path() + "/api/releases");
-    { QFile feed(dir.path() + "/api/releases/client"); QVERIFY(feed.open(QIODevice::WriteOnly)); feed.write(QJsonDocument(row).toJson()); }
-    client.setBaseUrl(QUrl::fromLocalFile(dir.path()).toString());
+    QCOMPARE(applier->downloads.load(), 0); QCOMPARE(applier->applies.load(), 0);
+    QCOMPARE(client.retryState().attemptsFailed, 4);
+    // Reachable feed: the release of the row just read is downloaded and applied - the folder beside the
+    // NEW row's Setup.exe, never the folder of the cached (old) row.
+    client.setBaseUrl(writeLocalFeed(dir.path(), QString::fromLatin1(kTrustedNew), "0.1.0"));
     QVERIFY(client.tryAgain());
-    QTRY_COMPARE(launched.size(), 1);
-    QCOMPARE(digestAtLaunch, QString::fromLatin1(kAbcSha256));
+    QTRY_COMPARE(applier->applies.load(), 1);
+    QCOMPARE(applier->seenFolders(), QStringList{QStringLiteral("https://api-sevenhills.damra.co/releases/client/new/")});
     QCOMPARE(client.retryState().attemptsFailed, 4); // a manual Try again is free
-    QFile::remove(cached);
+    QTRY_COMPARE(exits, 1);
 }
 void TstUpdateFeed::aCachedOfferNeverLaunchesAnInstaller()
 {
@@ -828,14 +790,15 @@ void TstUpdateFeed::aCachedOfferNeverLaunchesAnInstaller()
     state.lastOffer = UpdateFeedClient::parseRelease(feedRow("0.2.0"), "0.1.0", QString::fromLatin1(kAbcSha256));
     const auto path = dir.filePath("retry-state.json"); QVERIFY(state.save(path));
     UpdateFeedClient client; client.setRetryStatePath(path); client.setInstalledVersion("0.1.0");
-    client.setObservationProbe(clearMachine);
-    int launches = 0, downloads = 0;
-    client.setInstallerLauncher([&](const QString&){ ++launches; return true; });
+    int exits = 0;
+    const auto applier = useFake(client, &exits);
+    int downloads = 0;
     QObject::connect(&client, &UpdateFeedClient::stateChanged, [&]{ if (client.state() == "downloading") ++downloads; });
     client.setBaseUrl("http://127.0.0.1:1"); // the feed cannot be read
     QVERIFY(client.checkForUpdates()); QTRY_COMPARE(client.state(), QString("failed"));
     QTest::qWait(100);
-    QCOMPARE(launches, 0); QCOMPARE(downloads, 0);
+    QCOMPARE(applier->applies.load(), 0); QCOMPARE(applier->downloads.load(), 0); QCOMPARE(downloads, 0);
+    QCOMPARE(exits, 0);
     QVERIFY(client.mandatory()); // the last known offer still keeps the window up
     QCOMPARE(client.retryState().attemptsFailed, 1); // an unreachable feed is not an install failure
 }
@@ -850,145 +813,31 @@ void TstUpdateFeed::aCachedOfferIsReReadBeforeUpdateDownloads()
                                                      "0.1.0", QString::fromLatin1(kAbcSha256));
     QVERIFY(state.save(path));
     UpdateFeedClient client; client.setRetryStatePath(path); client.setInstalledVersion("0.1.0");
-    client.setObservationProbe(clearMachine);
     QCOMPARE(client.state(), QString("available"));
-    QStringList launched;
-    client.setInstallerLauncher([&](const QString& file){ launched.append(file); return true; });
-    // Offline: the press starts a read, finds nothing reachable, downloads and launches nothing.
+    int exits = 0;
+    const auto applier = useFake(client, &exits);
+    // Offline: the press starts a read, finds nothing reachable, downloads and applies nothing.
     client.setBaseUrl("http://127.0.0.1:1");
     QVERIFY(client.downloadUpdate(client.availableUpdate().value("url").toString(),
                                   client.availableUpdate().value("sha256").toString()));
     QTRY_COMPARE(client.state(), QString("failed"));
     QTest::qWait(100);
-    QVERIFY(launched.isEmpty()); QVERIFY(!client.readyToInstall());
+    QCOMPARE(applier->downloads.load(), 0); QVERIFY(!client.readyToInstall());
     QCOMPARE(client.failure().value("error").toString(), QString("We couldn't reach SevenHills. Try again in a moment."));
     QCOMPARE(client.retryState().attemptsFailed, 0);
     // Online: the same press downloads what the feed says now, whatever the cache said.
-    const auto package = writeAbcPackage(dir.path(), "fresh-row.exe");
-    client.setBaseUrl(writeLocalFeed(dir.path(), QUrl::fromLocalFile(package).toString(), "0.1.0"));
+    client.setBaseUrl(writeLocalFeed(dir.path(), QString::fromLatin1(kSetupUrl), "0.1.0"));
     QVERIFY(client.downloadUpdate(client.availableUpdate().value("url").toString(),
                                   client.availableUpdate().value("sha256").toString()));
-    QTRY_COMPARE(launched.size(), 1);
-    QVERIFY2(launched.first().endsWith("fresh-row.exe"), qPrintable(launched.first()));
-    QFile::remove(launched.first());
-}
-void TstUpdateFeed::quiescenceBlocksAnOverlappingLaunchWithoutSpendingTheBudget()
-{
-    QTemporaryDir dir; QVERIFY(dir.isValid());
-    const auto package = writeAbcPackage(dir.path(), "quiescence.exe");
-    using Owner = InstallerObservation::Owner; using Scan = InstallerObservation::Scan; using Boot = InstallerObservation::Boot;
-    struct Case { Owner owner; Scan scan; Boot boot; bool launches; };
-    const QList<Case> cases{
-        {Owner::Alive, Scan::Clear, Boot::Same, false},      // our installer is still running
-        {Owner::None, Scan::Present, Boot::Same, false},     // a setup anywhere, even one started by hand
-        {Owner::Gone, Scan::Unknown, Boot::Same, false},     // the machine could not be read
-        {Owner::Unknown, Scan::Clear, Boot::Same, false},    // an owner that cannot be identified
-        {Owner::Unknown, Scan::Clear, Boot::Changed, true},  // a reboot ends every process
-        {Owner::Gone, Scan::Clear, Boot::Same, true}};
-    int n = 0;
-    for (const Case& c : cases) {
-        UpdateFeedClient client;
-        client.setRetryStatePath(dir.filePath(QStringLiteral("retry-%1.json").arg(++n)));
-        client.setInstalledVersion("0.1.0");
-        client.setObservationProbe([c](const UpdateRetryState&) {
-            InstallerObservation observation;
-            observation.owner = c.owner; observation.scan = c.scan; observation.boot = c.boot;
-            return observation;
-        });
-        int launches = 0;
-        client.setInstallerLauncher([&](const QString&){ ++launches; return true; });
-        QVERIFY(client.downloadUpdate(QUrl::fromLocalFile(package).toString(), QString::fromLatin1(kAbcSha256)));
-        QTRY_VERIFY(client.state() == "failed" || client.state() == "installing");
-        QCOMPARE(launches, c.launches ? 1 : 0);
-        // A blocked launch spends nothing: no attempt, no decline, no report.
-        QCOMPARE(client.retryState().attemptsFailed, 0);
-        QCOMPARE(client.retryState().declines, 0);
-        QFile::remove(client.downloadedPath());
-    }
-}
-void TstUpdateFeed::aCancelledBlockRecordSpendsNoAttempt()
-{
-    // The setup refused to mutate because another installer was live and journaled the attempt as
-    // `cancelled`: that is a block, not a failure, so it is never reported and spends none of the four
-    // attempts (the client's own blocks spend nothing either).
-    QTemporaryDir dir; QVERIFY(dir.isValid());
-    const auto path = dir.filePath("retry-state.json");
-    UpdateRetryState pending; pending.target = "0.2.0"; pending.launched = true; QVERIFY(pending.save(path));
-    const auto now = QDateTime::currentDateTimeUtc();
-    const QJsonObject record{{"v", 1}, {"attempt", "0123456789abcdef"}, {"from", "0.1.0"}, {"to", "0.2.0"},
-        {"mode", "staged"}, {"started", now.addSecs(-60).toString(Qt::ISODate)}, {"ended", now.toString(Qt::ISODate)},
-        {"outcome", "cancelled"}, {"step", "preflight"}, {"class", "installer.locked_file"}, {"code", 0},
-        {"rollback", "not_needed"}, {"state", "old_intact"},
-        {"ms", QJsonObject{{"stage", 0}, {"swap", 0}, {"total", 10}}}, {"elevated", true}};
-    QVERIFY(QDir().mkpath(dir.filePath("journal")));
-    QFile file(dir.filePath("journal/attempt-0123456789abcdef.end.json"));
-    QVERIFY(file.open(QIODevice::WriteOnly)); file.write(QJsonDocument(record).toJson()); file.close();
-    UpdateFeedClient client; client.setRetryStatePath(path); client.setInstalledVersion("0.1.0");
-    client.setObservationProbe(clearMachine); client.setJournalFolder(dir.filePath("journal"));
-    const auto package = writeAbcPackage(dir.path(), "cancelled.exe");
-    client.setBaseUrl(writeLocalFeed(dir.path(), QUrl::fromLocalFile(package).toString(), "0.2.0"));
-    int reports = 0;
-    client.setInstallerReporter([&](const InstallJournalRecord&){ ++reports; return true; });
-    QVERIFY(client.checkForUpdates()); QTRY_VERIFY(client.state() != "checking");
-    QCOMPARE(reports, 0);
-    QCOMPARE(client.retryState().attemptsFailed, 0);
-    QVERIFY(!client.retryState().launched);
-}
-void TstUpdateFeed::aPendingLaunchIsNotJudgedWhileItMayStillBeWriting()
-{
-    QTemporaryDir dir; QVERIFY(dir.isValid());
-    const auto path = dir.filePath("retry-state.json");
-    UpdateRetryState pending; pending.target = "0.2.0"; pending.launched = true; pending.trace.pid = 4242;
-    pending.trace.pidCreated = "133000000000000000"; QVERIFY(pending.save(path));
-    UpdateFeedClient client; client.setRetryStatePath(path); client.setInstalledVersion("0.1.0");
-    client.setJournalFolder(dir.filePath("no-journal"));
-    InstallerObservation seen; seen.owner = InstallerObservation::Owner::Alive; seen.scan = InstallerObservation::Scan::Present;
-    client.setObservationProbe([&](const UpdateRetryState&){ return seen; });
-    const auto package = writeAbcPackage(dir.path(), "pending.exe");
-    client.setBaseUrl(writeLocalFeed(dir.path(), QUrl::fromLocalFile(package).toString(), "0.2.0"));
-    int reports = 0, launches = 0;
-    client.setInstallerReporter([&](const InstallJournalRecord& r){ if (r.failureClass == "installer.no_result") ++reports; return true; });
-    client.setInstallerLauncher([&](const QString&){ ++launches; return false; });
-    QVERIFY(client.checkForUpdates()); QTRY_VERIFY(client.state() != "checking");
-    QCOMPARE(reports, 0); QCOMPARE(launches, 0);
-    QVERIFY(client.retryState().launched); QCOMPARE(client.retryState().attemptsFailed, 0);
-    QVERIFY(UpdateRetryState::load(path).trace.observations >= 1); // the observation itself is recorded
-    // The writer is proven gone: the next read judges the launch exactly once.
-    seen.owner = InstallerObservation::Owner::Gone; seen.scan = InstallerObservation::Scan::Clear;
-    QVERIFY(client.checkForUpdates()); QTRY_COMPARE(reports, 1);
-    QVERIFY(!UpdateRetryState::load(path).launched);
-}
-void TstUpdateFeed::aPendingLaunchInfersNoResultAndRetriesOnlyOnNextLaunch()
-{
-    QTemporaryDir dir; QVERIFY(dir.isValid());
-    const auto path = dir.filePath("retry-state.json");
-    UpdateRetryState pending; pending.target = "0.2.0"; pending.launched = true; QVERIFY(pending.save(path));
-    UpdateFeedClient client; client.setRetryStatePath(path); client.setInstalledVersion("0.1.0");
-    client.setObservationProbe(clearMachine);
-    client.setJournalFolder(dir.filePath("no-journal"));
-    const auto package = writeAbcPackage(dir.path(), "no-result.exe");
-    client.setBaseUrl(writeLocalFeed(dir.path(), QUrl::fromLocalFile(package).toString(), "0.2.0"));
-    int reports = 0, launches = 0; bool durableAtLaunch = false;
-    client.setInstallerReporter([&](const InstallJournalRecord& r){
-        if (r.failureClass == "installer.no_result") ++reports;
-        return true;
-    });
-    client.setInstallerLauncher([&](const QString&){
-        ++launches; durableAtLaunch = UpdateRetryState::load(path).launched; return false;
-    });
-    QVERIFY(client.checkForUpdates()); QTRY_COMPARE(launches, 1);
-    QVERIFY(durableAtLaunch); QCOMPARE(reports, 1);
-    QCOMPARE(client.retryState().attemptsFailed, 1); QCOMPARE(client.retryState().declines, 1);
-    QVERIFY(!UpdateRetryState::load(path).launched);
-    QVERIFY(client.checkForUpdates()); QTRY_VERIFY(client.state() != "checking");
-    QCOMPARE(reports, 1); QCOMPARE(launches, 1); // declined elevation pauses this launch.
+    QTRY_COMPARE(applier->applies.load(), 1);
+    QCOMPARE(applier->seenFolders(), QStringList{QString::fromLatin1(kSetupFolder)});
+    QTRY_COMPARE(exits, 1);
 }
 void TstUpdateFeed::integrityExhaustionIsReportedOnceAcrossRestart()
 {
     QTemporaryDir dir; QVERIFY(dir.isValid());
     const auto path = dir.filePath("retry-state.json");
-    const auto package = writeAbcPackage(dir.path(), "missing-digest.exe");
-    const auto base = writeLocalFeed(dir.path(), QUrl::fromLocalFile(package).toString(), "0.2.0", {});
+    const auto base = writeLocalFeed(dir.path(), QString::fromLatin1(kSetupUrl), "0.2.0", {});
     int reports = 0;
     for (int launch = 0; launch < 2; ++launch) {
         UpdateFeedClient client; client.setRetryStatePath(path); client.setInstalledVersion("0.1.0");
@@ -1024,20 +873,340 @@ void TstUpdateFeed::theLastKnownOfferWorksOfflineAndFormatsTheRetryTime()
     QVERIFY(older.mandatory()); QCOMPARE(older.state(), QString("failed")); // the cached floor is ignored (ADR-0077)
     older.setInstalledVersion("0.2.0"); QVERIFY(!older.retryState().exhausted()); // equal to the target: done
 }
-void TstUpdateFeed::aManualPendingLaunchDoesNotSpendAutomaticBudget()
+
+void TstUpdateFeed::anAvailableReleaseIsAppliedThroughVelopack()
+{
+    // SC8: an available release chosen by the feed client is downloaded with progress and applied
+    // through Velopack, the application is asked to quit so the updater can swap the app folder, and the
+    // person pressed Update once.
+    QTemporaryDir dir; QVERIFY(dir.isValid());
+    const auto path = dir.filePath("retry-state.json");
+    UpdateFeedClient client; client.setRetryStatePath(path); client.setInstalledVersion("0.1.0");
+    int exits = 0;
+    const auto applier = useFake(client, &exits);
+    bool markerDurableAtApply = false;
+    QString stateAtApply;
+    applier->onApply = [&]() {
+        markerDurableAtApply = UpdateRetryState::load(path).launched;
+        stateAtApply = client.state();
+    };
+    const QString base = writeLocalFeed(dir.path(), QString::fromLatin1(kSetupUrl), "0.1.0");
+    QVERIFY(!base.isEmpty());
+    client.setBaseUrl(base);
+    QSignalSpy downloaded(&client, &UpdateFeedClient::downloaded);
+    QSignalSpy requested(&client, &UpdateFeedClient::installRequested);
+    QList<int> progress;
+    QObject::connect(&client, &UpdateFeedClient::progressChanged, [&]() { progress.append(client.progress()); });
+
+    QVERIFY(client.checkForUpdates());
+    QTRY_COMPARE(client.state(), QStringLiteral("available"));
+    QVERIFY(client.mandatory());
+    QCOMPARE(applier->downloads.load(), 0); // an offer alone starts nothing
+
+    QVERIFY(client.downloadUpdate(client.availableUpdate().value("url").toString(),
+                                  client.availableUpdate().value("sha256").toString()));
+    QTRY_COMPARE(requested.count(), 1);
+    QCOMPARE(downloaded.count(), 1);
+    QCOMPARE(downloaded.first().first().toString(), QStringLiteral("0.2.0"));
+    // The updater is pointed at the folder beside the row's Setup.exe, and nowhere else.
+    QCOMPARE(applier->seenFolders(), QStringList{QString::fromLatin1(kSetupFolder)});
+    QCOMPARE(applier->applies.load(), 1);
+    QCOMPARE(stateAtApply, QStringLiteral("installing"));
+    QVERIFY2(markerDurableAtApply, "the pending hand-off marker must be on disk before Velopack is asked");
+    QVERIFY(progress.contains(40));
+    QCOMPARE(client.progress(), 100);
+    QTRY_COMPARE(exits, 1);
+    QCOMPARE(client.state(), QStringLiteral("installing"));
+    QVERIFY(client.failure().isEmpty());
+    QCOMPARE(client.installedVersion(), QStringLiteral("0.1.0")); // the swap happens after this process exits
+    QCOMPARE(client.retryState().attemptsFailed, 0);
+
+    // Exactly one hand-off: nothing queued behind it asks the updater a second time.
+    QTest::qWait(100);
+    QCOMPARE(applier->applies.load(), 1);
+    QCOMPARE(requested.count(), 1);
+    QCOMPARE(exits, 1);
+}
+
+void TstUpdateFeed::aFailedApplyKeepsTheOldVersionAndTheRetryBudget()
+{
+    // SC8 + ADR-0077/V34: when the updater does not take the release, nothing changes - the old version
+    // keeps running, Play stays blocked behind the window, and the failure is one attempt under the
+    // bounded retry: four in total, the first retry at the next launch with no wait, then 1 to 2 h and 2 to
+    // 4 h, a manual Try again free, one report on exhaustion.
+    QTemporaryDir dir; QVERIFY(dir.isValid());
+    const auto path = dir.filePath("retry-state.json");
+    const QString base = writeLocalFeed(dir.path(), QString::fromLatin1(kSetupUrl), "0.1.0");
+    QVERIFY(!base.isEmpty());
+    QDateTime clock = QDateTime::fromString("2026-10-09T09:00:00Z", Qt::ISODate);
+    QStringList reported;
+    const auto reporter = [&](const InstallJournalRecord& record) { reported.append(record.failureClass); return true; };
+    const auto launch = [&](UpdateFeedClient& client, int* exits) {
+        client.setRetryStatePath(path); client.setInstalledVersion("0.1.0");
+        client.setBaseUrl(base);
+        client.setRetryClock([&clock]() { return clock; });
+        client.setInstallerReporter(reporter);
+        const auto applier = useFake(client, exits);
+        applier->applyOk = false;
+        return applier;
+    };
+
+    // Launch 1: the person presses Update and the updater refuses.
+    {
+        UpdateFeedClient client; int exits = 0;
+        const auto applier = launch(client, &exits);
+        QVERIFY(client.checkForUpdates());
+        QTRY_COMPARE(client.state(), QStringLiteral("available"));
+        QVERIFY(client.downloadUpdate(client.availableUpdate().value("url").toString(),
+                                      client.availableUpdate().value("sha256").toString()));
+        QTRY_COMPARE(applier->applies.load(), 1);
+        QCOMPARE(client.state(), QStringLiteral("failed"));
+        QCOMPARE(exits, 0);                                              // the app did not quit
+        QCOMPARE(client.installedVersion(), QStringLiteral("0.1.0"));    // the old version keeps running
+        QCOMPARE(client.failure().value("kind").toString(), QStringLiteral("local"));
+        QCOMPARE(client.failure().value("error").toString(), QStringLiteral("The installer couldn't be started."));
+        QVERIFY2(client.failure().value("reference").toString().isEmpty(), "the client invents no reference");
+        QVERIFY(client.mandatory());                                     // a failed update never unblocks Play
+        QVERIFY(client.readyToInstall());
+        QCOMPARE(client.retryState().attemptsFailed, 1);
+        QVERIFY(!UpdateRetryState::load(path).launched);
+
+        // A manual Try again re-reads the feed, downloads again, and is free.
+        QVERIFY(client.tryAgain());
+        QTRY_COMPARE(applier->applies.load(), 2);
+        QCOMPARE(client.state(), QStringLiteral("failed"));
+        QCOMPARE(applier->downloads.load(), 2);
+        QCOMPARE(client.retryState().attemptsFailed, 1);
+        // The first retry is the NEXT launch, not this one.
+        QVERIFY(!client.retryState().automaticAttemptAllowed(clock, false));
+    }
+
+    // Launch 2 (no wait): the first automatic retry runs at once and fails.
+    {
+        UpdateFeedClient client; int exits = 0;
+        const auto applier = launch(client, &exits);
+        QVERIFY(client.checkForUpdates());
+        QTRY_COMPARE(applier->applies.load(), 1);
+        QCOMPARE(client.state(), QStringLiteral("failed"));
+        QCOMPARE(exits, 0);
+        QCOMPARE(client.retryState().attemptsFailed, 2);
+        QVERIFY(client.retryState().nextAllowedAt >= clock.addSecs(3600));
+        QVERIFY(client.retryState().nextAllowedAt <= clock.addSecs(7200));
+    }
+
+    // Launch 3, too early: nothing is downloaded or applied, and nothing is spent.
+    {
+        clock = clock.addSecs(60);
+        UpdateFeedClient client; int exits = 0;
+        const auto applier = launch(client, &exits);
+        QSignalSpy checked(&client, &UpdateFeedClient::checkFinished);
+        QVERIFY(client.checkForUpdates());
+        QTRY_VERIFY(!checked.isEmpty());
+        QTest::qWait(100);
+        QCOMPARE(applier->downloads.load(), 0);
+        QCOMPARE(client.retryState().attemptsFailed, 2);
+    }
+
+    // Launch 3, after the wait: the second retry runs and fails.
+    {
+        clock = clock.addSecs(7200);
+        UpdateFeedClient client; int exits = 0;
+        const auto applier = launch(client, &exits);
+        QVERIFY(client.checkForUpdates());
+        QTRY_COMPARE(applier->applies.load(), 1);
+        QCOMPARE(client.retryState().attemptsFailed, 3);
+        QVERIFY(client.retryState().nextAllowedAt >= clock.addSecs(7200));
+        QVERIFY(client.retryState().nextAllowedAt <= clock.addSecs(14400));
+        QVERIFY(reported.isEmpty()); // nothing is reported before the budget is spent
+    }
+
+    // Launch 4: the last attempt fails, the budget is spent, one report is sent, and the window stays.
+    {
+        clock = clock.addSecs(14400);
+        UpdateFeedClient client; int exits = 0;
+        const auto applier = launch(client, &exits);
+        QVERIFY(client.checkForUpdates());
+        QTRY_COMPARE(applier->applies.load(), 1);
+        QCOMPARE(client.retryState().attemptsFailed, 4);
+        QVERIFY(client.exhausted());
+        QVERIFY(client.mandatory());
+        QCOMPARE(reported, QStringList{QStringLiteral("installer.retries_exhausted")});
+        QCOMPARE(exits, 0);
+    }
+
+    // Launch 5, a year later: no automatic attempt and no second report - only the target changing resets it.
+    {
+        clock = clock.addDays(365);
+        UpdateFeedClient client; int exits = 0;
+        const auto applier = launch(client, &exits);
+        QSignalSpy checked(&client, &UpdateFeedClient::checkFinished);
+        QVERIFY(client.checkForUpdates());
+        QTRY_VERIFY(!checked.isEmpty());
+        QTest::qWait(100);
+        QCOMPARE(applier->downloads.load(), 0);
+        QVERIFY(client.exhausted());
+        QVERIFY(client.mandatory());
+        QCOMPARE(reported.size(), 1);
+    }
+}
+
+void TstUpdateFeed::aFolderThatCarriesAnotherVersionIsNotApplied()
+{
+    // The row names 0.2.0 but the release folder carries 0.3.0 (for example the row was updated before the
+    // folder was): nothing is applied, the old version keeps running, and it is an ordinary failed attempt.
+    QTemporaryDir dir; QVERIFY(dir.isValid());
+    UpdateFeedClient client; client.setRetryStatePath(dir.filePath("retry-state.json"));
+    client.setInstalledVersion("0.1.0");
+    int exits = 0;
+    const auto applier = useFake(client, &exits);
+    applier->carries = QStringLiteral("0.3.0");
+    client.setBaseUrl(writeLocalFeed(dir.path(), QString::fromLatin1(kSetupUrl), "0.1.0"));
+    QVERIFY(client.checkForUpdates());
+    QTRY_COMPARE(client.state(), QStringLiteral("available"));
+    QVERIFY(client.downloadUpdate(client.availableUpdate().value("url").toString(),
+                                  client.availableUpdate().value("sha256").toString()));
+    QTRY_COMPARE(client.state(), QStringLiteral("failed"));
+    QCOMPARE(applier->downloads.load(), 1);
+    QCOMPARE(applier->applies.load(), 0);
+    QCOMPARE(exits, 0);
+    QVERIFY(!client.readyToInstall());
+    QVERIFY(client.mandatory());
+    QCOMPARE(client.retryState().attemptsFailed, 1);
+}
+
+void TstUpdateFeed::aPendingHandOffThatLeftTheOldVersionIsOneFailedAttempt()
+{
+    // ADR-0086: a release was handed to the updater (the marker was durable) and this start is still the
+    // OLD version, so the swap did not happen and the old version relaunched. That is one failed attempt,
+    // reported once, and the first retry runs at this launch with no wait.
+    QTemporaryDir dir; QVERIFY(dir.isValid());
+    const auto path = dir.filePath("retry-state.json");
+    UpdateRetryState pending; pending.target = "0.2.0"; pending.launched = true; QVERIFY(pending.save(path));
+    UpdateFeedClient client; client.setRetryStatePath(path); client.setInstalledVersion("0.1.0");
+    int exits = 0;
+    const auto applier = useFake(client, &exits);
+    QSemaphore gate;
+    applier->hold = &gate;       // keep the retry's download in flight so the first failure stands alone
+    applier->downloadOk = false;
+    client.setBaseUrl(writeLocalFeed(dir.path(), QString::fromLatin1(kSetupUrl), "0.1.0"));
+    int reports = 0;
+    client.setInstallerReporter([&](const InstallJournalRecord& r) {
+        if (r.failureClass == "installer.unknown") ++reports;
+        return true;
+    });
+    QVERIFY(client.checkForUpdates());
+    QTRY_COMPARE(applier->downloads.load(), 1);                 // the first retry runs at this launch
+    QCOMPARE(reports, 1);
+    QCOMPARE(client.retryState().attemptsFailed, 1);
+    QVERIFY(!client.retryState().launched);
+    QVERIFY(!UpdateRetryState::load(path).launched);
+    QCOMPARE(client.state(), QStringLiteral("downloading"));
+    gate.release();
+    QTRY_COMPARE(client.state(), QStringLiteral("failed"));
+    QCOMPARE(client.retryState().attemptsFailed, 2);
+    QCOMPARE(reports, 1);                                       // one failure, one report
+    QCOMPARE(exits, 0);
+}
+
+void TstUpdateFeed::aManualPendingHandOffDoesNotSpendAutomaticBudget()
 {
     QTemporaryDir dir; QVERIFY(dir.isValid());
+    const auto path = dir.filePath("retry-state.json");
     UpdateRetryState state; state.target = "0.2.0"; state.launched = state.launchedManual = true;
-    const auto path = dir.filePath("retry-state.json"); QVERIFY(state.save(path));
+    QVERIFY(state.save(path));
     UpdateFeedClient client; client.setRetryStatePath(path); client.setInstalledVersion("0.1.0");
-    client.setObservationProbe(clearMachine);
-    client.setJournalFolder(dir.filePath("absent"));
-    const auto package = writeAbcPackage(dir.path(), "manual.exe");
-    client.setBaseUrl(writeLocalFeed(dir.path(), QUrl::fromLocalFile(package).toString(), "0.2.0"));
-    int launches = 0;
-    client.setInstallerLauncher([&](const QString&){ ++launches; return false; });
-    QVERIFY(client.checkForUpdates()); QTRY_COMPARE(launches, 1);
-    QCOMPARE(client.retryState().attemptsFailed, 0); QVERIFY(!client.retryState().launchedManual);
+    int exits = 0;
+    const auto applier = useFake(client, &exits);
+    QSemaphore gate;
+    applier->hold = &gate;
+    applier->downloadOk = false;
+    client.setBaseUrl(writeLocalFeed(dir.path(), QString::fromLatin1(kSetupUrl), "0.1.0"));
+    QVERIFY(client.checkForUpdates());
+    QTRY_COMPARE(applier->downloads.load(), 1);
+    QCOMPARE(client.retryState().attemptsFailed, 0); // the pending hand-off was a manual press: free
+    QVERIFY(!client.retryState().launchedManual);
+    QVERIFY(!client.retryState().launched);
+    gate.release();
+    QTRY_COMPARE(client.state(), QStringLiteral("failed"));
+}
+
+void TstUpdateFeed::theReleaseFolderIsTheOneBesideSetupAndMustBeTrusted()
+{
+    using namespace VelopackUpdater;
+    const QString host = QUrl(UpdateFeedClient::defaultBaseUrl()).host();
+    QCOMPARE(feedFolderOf(QUrl(QString::fromLatin1(kSetupUrl))).toString(), QString::fromLatin1(kSetupFolder));
+    QCOMPARE(feedFolderOf(QUrl(QStringLiteral("https://api-sevenhills.damra.co/downloads/Setup.exe?x=1#frag"))).toString(),
+             QStringLiteral("https://api-sevenhills.damra.co/downloads/"));
+    QVERIFY(isTrustedFeedFolder(QUrl(QString::fromLatin1(kSetupFolder)), host));
+    // Only https on the control plane's own host: a hostile feed row points the updater nowhere else.
+    for (const QString& hostile : {QStringLiteral("http://api-sevenhills.damra.co/releases/"),
+                                   QStringLiteral("https://evil.invalid/releases/"),
+                                   QStringLiteral("https://api-sevenhills.damra.co.evil.invalid/releases/"),
+                                   QStringLiteral("https://user:pass@api-sevenhills.damra.co/releases/"),
+                                   QStringLiteral("file:///C:/private/"), QStringLiteral("C:/private/"), QString()})
+        QVERIFY2(!isTrustedFeedFolder(QUrl(hostile), host), qPrintable(hostile));
+    QVERIFY(!isTrustedFeedFolder(QUrl(QString::fromLatin1(kSetupFolder)), QString()));
+}
+
+namespace {
+void touch(const QString& path)
+{
+    QVERIFY(QDir().mkpath(QFileInfo(path).absolutePath()));
+    QFile file(path);
+    QVERIFY(file.open(QIODevice::WriteOnly));
+    file.write("x");
+}
+}
+
+void TstUpdateFeed::theUninstallHookRemovesExactlyTheD45State()
+{
+    // I-SEATHUB / client.md: the before-uninstall hook removes the sign-in and telemetry folder under
+    // %APPDATA%, the crash-db, log-spool and update folders under %LOCALAPPDATA%\Seven Hills\SeatHub, and the
+    // HKCU Settings key - and nothing else: not the install folder, not the rest of the local folder, not a
+    // neighbouring app, not the retired client's own folder.
+    QTemporaryDir dir; QVERIFY(dir.isValid());
+    const QString roaming = dir.filePath("Roaming");
+    const QString local = dir.filePath("Local");
+    const QString localApp = local + "/Seven Hills/SeatHub";
+    const QStringList removed{
+        roaming + "/Seven Hills/SeatHub/access.dpapi", roaming + "/Seven Hills/SeatHub/telemetry.json",
+        roaming + "/Seven Hills/SeatHub/end-outbox/pending.json",
+        localApp + "/crash-db/reports/a.dmp", localApp + "/log-spool/spool-1.jsonl",
+        localApp + "/update/retry-state.json"};
+    const QStringList kept{
+        roaming + "/Seven Hills/HostHub/keep.txt", roaming + "/Other/keep.txt",
+        localApp + "/qmlcache/keep.bin", localApp + "/keep.log",
+        local + "/Seven Hills/HostHub/keep.txt", local + "/SeatHub/keep.txt",
+        local + "/SeatHubVelopackProof/current/SeatHub.exe", local + "/SeatHubVelopackProof/Update.exe"};
+    for (const QString& file : removed + kept) { touch(file); QVERIFY(!QTest::currentTestFailed()); }
+
+    const VelopackUpdater::D45Roots roots{roaming, local};
+    const auto state = VelopackUpdater::d45State(roots);
+    QStringList expectedDirs{roaming + "/Seven Hills/SeatHub", localApp + "/crash-db", localApp + "/log-spool",
+                             localApp + "/update"};
+    QStringList actualDirs = state.directories;
+    expectedDirs.sort(); actualDirs.sort();
+    QCOMPARE(actualDirs, expectedDirs);
+    QCOMPARE(state.registryKey, QStringLiteral("Software\\Seven Hills\\SeatHub"));
+
+    QStringList keys;
+    QVERIFY(VelopackUpdater::removeD45State(roots, [&](const QString& key) { keys.append(key); return true; }));
+    QCOMPARE(keys, QStringList{QStringLiteral("Software\\Seven Hills\\SeatHub")}); // exactly one key
+    for (const QString& file : removed) QVERIFY2(!QFileInfo::exists(file), qPrintable(file));
+    for (const QString& folder : expectedDirs) QVERIFY2(!QFileInfo::exists(folder), qPrintable(folder));
+    for (const QString& file : kept) QVERIFY2(QFileInfo::exists(file), qPrintable(file));
+
+    // Running it again (an uninstall retried) finds nothing and still reports success.
+    QVERIFY(VelopackUpdater::removeD45State(roots, [](const QString&) { return true; }));
+    for (const QString& file : kept) QVERIFY2(QFileInfo::exists(file), qPrintable(file));
+
+    // A key that will not delete is reported, and does not stop the folders from being removed.
+    touch(roaming + "/Seven Hills/SeatHub/access.dpapi");
+    QVERIFY(!VelopackUpdater::removeD45State(roots, [](const QString&) { return false; }));
+    QVERIFY(!QFileInfo::exists(roaming + "/Seven Hills/SeatHub"));
+
+    // With no roots (the environment gave none) nothing is derived, so nothing relative can be removed.
+    QVERIFY(VelopackUpdater::d45State({}).directories.isEmpty());
 }
 
 QTEST_MAIN(TstUpdateFeed)

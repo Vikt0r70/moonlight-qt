@@ -54,6 +54,8 @@ win32 {
     # SeatHub: DPAPI (`CryptProtectData` / `CryptUnprotectData`) for the credential store
     # (D-30, app/seathub/token_store.cpp).
     LIBS += crypt32.lib
+    # SeatHub: RegDeleteTreeW for the Velopack before-uninstall hook (app/seathub/velopack_updater.cpp).
+    LIBS += advapi32.lib
 
     # SeatHub: sentry-native with the crashpad backend (06.3.1 D-02, ADR-0044 amendment),
     # built by scripts/build-seathub.ps1 into build/sentry-native-<ver>/install.
@@ -61,6 +63,19 @@ win32 {
     isEmpty(SEATHUB_SENTRY_DIR): SEATHUB_SENTRY_DIR = $$PWD/../build/sentry-native-0.17.1/install
     INCLUDEPATH += $$SEATHUB_SENTRY_DIR/include
     LIBS += -L$$SEATHUB_SENTRY_DIR/lib -lsentry
+
+    # SeatHub: Velopack's C library (ADR-0086; velopack_libc 1.2.161, the version
+    # docs/evidence/m001/velopack-proof.md recorded), fetched and SHA-256 checked into
+    # build/velopack-libc-<ver> by scripts/build-seathub.ps1. x64 only, like every Windows build here.
+    # SEATHUB_VELOPACK compiles the real updater into app/seathub/velopack_updater.cpp; the unit
+    # suites do not define it and need no library.
+    SEATHUB_VELOPACK_DIR = $$(SEATHUB_VELOPACK_DIR)
+    isEmpty(SEATHUB_VELOPACK_DIR): SEATHUB_VELOPACK_DIR = $$PWD/../build/velopack-libc-1.2.161
+    contains(QT_ARCH, x86_64) {
+        DEFINES += SEATHUB_VELOPACK
+        INCLUDEPATH += $$SEATHUB_VELOPACK_DIR/include
+        LIBS += $$SEATHUB_VELOPACK_DIR/lib/velopack_libc_win_x64_msvc.dll.lib
+    }
 
     # Work around a conflict with math.h inclusion between SDL and Qt 6
     DEFINES += _USE_MATH_DEFINES
@@ -213,6 +228,7 @@ SOURCES += \
     seathub/session_lifecycle.cpp \
     seathub/settings_bridge.cpp \
     seathub/update_feed_client.cpp \
+    seathub/velopack_updater.cpp \
     seathub/error_map.cpp \
     seathub/agent_config.cpp \
     seathub/hud_overlay.cpp \
@@ -288,6 +304,7 @@ HEADERS += \
     seathub/session_lifecycle.h \
     seathub/settings_bridge.h \
     seathub/update_feed_client.h \
+    seathub/velopack_updater.h \
     seathub/seathub_version.h \
     seathub/error_map.h \
     seathub/agent_config.h \

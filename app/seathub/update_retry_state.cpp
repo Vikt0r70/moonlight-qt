@@ -11,88 +11,6 @@
 #include <QVersionNumber>
 #include <limits>
 
-Admission admitInstallerLaunch(const InstallerObservation& o)
-{
-    using Owner = InstallerObservation::Owner;
-    using Scan = InstallerObservation::Scan;
-    using Boot = InstallerObservation::Boot;
-    // A live installer of ours, or any setup anywhere, is never overlapped.
-    if (o.owner == Owner::Alive || o.scan == Scan::Present) return Admission::Blocked;
-    // If the machine could not be read, the absence of a writer is not proven.
-    if (o.scan == Scan::Unknown) return Admission::Blocked;
-    // An owner that cannot be identified stays blocked until a reboot proves it ended.
-    if (o.owner == Owner::Unknown && o.boot != Boot::Changed) return Admission::Blocked;
-    return Admission::Quiescent;
-}
-const char* ownerName(InstallerObservation::Owner owner)
-{
-    switch (owner) {
-    case InstallerObservation::Owner::None: return "none";
-    case InstallerObservation::Owner::Alive: return "alive";
-    case InstallerObservation::Owner::Gone: return "gone";
-    case InstallerObservation::Owner::Unknown: return "unknown";
-    }
-    return "unknown";
-}
-const char* scanName(InstallerObservation::Scan scan)
-{
-    switch (scan) {
-    case InstallerObservation::Scan::Clear: return "clear";
-    case InstallerObservation::Scan::Present: return "present";
-    case InstallerObservation::Scan::Unknown: return "unknown";
-    }
-    return "unknown";
-}
-const char* bootName(InstallerObservation::Boot boot)
-{
-    switch (boot) {
-    case InstallerObservation::Boot::Same: return "same";
-    case InstallerObservation::Boot::Changed: return "changed";
-    case InstallerObservation::Boot::Unknown: return "unknown";
-    }
-    return "unknown";
-}
-
-namespace {
-QJsonObject traceToJson(const InstallerTrace& t)
-{
-    return {{"requested_at", t.requestedAt.toUTC().toString(Qt::ISODateWithMs)},
-        {"returned_at", t.returnedAt.toUTC().toString(Qt::ISODateWithMs)},
-        {"shell_error", double(t.shellError)}, {"pid", double(t.pid)}, {"pid_created", t.pidCreated},
-        {"launcher_pid", double(t.launcherPid)}, {"launcher_session", double(t.launcherSession)},
-        {"installer_session", double(t.installerSession)}, {"boot_uptime_ms", double(t.bootUptimeMs)},
-        {"observations", t.observations}, {"last_owner", t.lastOwner}, {"last_scan", t.lastScan},
-        {"last_boot", t.lastBoot}, {"owner_access_denied", t.ownerAccessDenied},
-        {"observer_changed", t.observerChanged}, {"journal_start_present", t.journalStartPresent},
-        {"stage_present", t.stagePresent}, {"progress_changed", t.progressChanged}};
-}
-InstallerTrace traceFromJson(const QJsonObject& o)
-{
-    InstallerTrace t;
-    t.requestedAt = QDateTime::fromString(o.value("requested_at").toString(), Qt::ISODateWithMs).toUTC();
-    t.returnedAt = QDateTime::fromString(o.value("returned_at").toString(), Qt::ISODateWithMs).toUTC();
-    t.shellError = qint64(o.value("shell_error").toDouble());
-    t.pid = qint64(o.value("pid").toDouble());
-    static const QRegularExpression digits("^[0-9]{1,20}$");
-    const auto created = o.value("pid_created").toString();
-    if (digits.match(created).hasMatch()) t.pidCreated = created;
-    t.launcherPid = qint64(o.value("launcher_pid").toDouble());
-    t.launcherSession = qint64(o.value("launcher_session").toDouble(-1));
-    t.installerSession = qint64(o.value("installer_session").toDouble(-1));
-    t.bootUptimeMs = qint64(o.value("boot_uptime_ms").toDouble());
-    t.observations = qBound(0, o.value("observations").toInt(), 1000000);
-    t.lastOwner = o.value("last_owner").toString();
-    t.lastScan = o.value("last_scan").toString();
-    t.lastBoot = o.value("last_boot").toString();
-    t.ownerAccessDenied = o.value("owner_access_denied").toBool();
-    t.observerChanged = o.value("observer_changed").toBool();
-    t.journalStartPresent = o.value("journal_start_present").toBool();
-    t.stagePresent = o.value("stage_present").toBool();
-    t.progressChanged = o.value("progress_changed").toBool();
-    return t;
-}
-}
-
 QString UpdateRetryState::defaultPath()
 {
     return QStandardPaths::writableLocation(QStandardPaths::AppLocalDataLocation)
@@ -118,7 +36,6 @@ UpdateRetryState UpdateRetryState::load(const QString& path)
     state.launched = obj.value("launched").toBool();
     state.launchedManual = obj.value("launched_manual").toBool();
     state.lastOffer = obj.value("last_offer").toObject().toVariantMap();
-    state.trace = traceFromJson(obj.value("launch_trace").toObject());
     static const QRegularExpression id("^[0-9a-f]{16}$");
     for (const auto& value : obj.value("reported_ids").toArray())
         if (value.isString() && id.match(value.toString()).hasMatch()) state.rememberReport(value.toString());
@@ -134,7 +51,7 @@ bool UpdateRetryState::save(const QString& path) const
         {"last_failed_at", lastFailedAt.toUTC().toString(Qt::ISODate)},
         {"next_allowed_at", nextAllowedAt.toUTC().toString(Qt::ISODate)}, {"last_class", lastClass},
         {"exhausted_reported", exhaustedReported}, {"reported_ids", ids}, {"launched", launched},
-        {"launched_manual", launchedManual}, {"launch_trace", traceToJson(trace)},
+        {"launched_manual", launchedManual},
         {"last_offer", QJsonObject::fromVariantMap(lastOffer)}};
     QSaveFile file(path);
     file.setDirectWriteFallback(false);

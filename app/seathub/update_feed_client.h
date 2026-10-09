@@ -6,29 +6,32 @@
 #include <QUrl>
 #include "update_retry_state.h"
 #include "install_journal.h"
+#include "velopack_updater.h"
 
 #include <functional>
+#include <memory>
 
 class QNetworkAccessManager;
 class QNetworkReply;
-class QFile;
 
-// The release feed client (ADR-0026, D-38, D-41, D-43, D-44).
+// The release feed client (ADR-0026, D-38, D-41, D-43, D-44; ADR-0077 floor and retry; ADR-0086 Velopack).
 //
 // One source of truth: `GET /api/releases/{app}` - the same row the website's download button
 // reads. There is no generated `latest.json`, no second manifest, and no separate update
 // channel (D-15, ADR-0026). The base URL is the control plane's public API host
 // (`openapi.yaml` `servers[0].url`).
 //
+// Download and apply are Velopack's (ADR-0086): the release row's `url` is the release's `Setup.exe`, the
+// folder beside it carries Velopack's `releases.win.json` and the full package, and `Update.exe` swaps the
+// app folder after this process exits (a failed swap relaunches the old version). Everything else - the
+// floor, the mandatory window, newer-is-current, the bounded retry - stays here.
+//
 // Two rules this class exists to hold, both of which fail closed:
 //
-//   * Integrity (D-43). A downloaded package is never installed without a SHA-256 that matches.
-//     The expected digest comes from the release feed's integrity field when the feed carries
-//     one, and otherwise from the pin baked in at release prep from `seathub-ops/pins.yaml`.
-//     When neither is available - which is the state of the world until release prep closes -
-//     the download is reported as uninstallable and nothing is executed. Code signing is
-//     deliberately absent and its absence is expected (D-43); the checksum is the whole of the
-//     integrity story.
+//   * Integrity (D-43). A release row with no SHA-256 is refused before anything is downloaded; the
+//     digest comes from the feed row or the pin baked in at release prep. The package itself is
+//     verified by Velopack against the digest in the release manifest it downloads. Code signing is
+//     deliberately absent and its absence is expected (D-43).
 //   * Timing (D-41, Pitfall 8, T-03-17). While a stream is running nothing is offered and
 //     nothing is installed: replacing the binary a live session is running from would be
 //     tampering with the running application. A release detected while streaming is held and
@@ -38,8 +41,8 @@ class UpdateFeedClient : public QObject
     Q_OBJECT
 
     /// idle | checking | available | downloading | verifying | ready | installing | failed
-    /// `ready` is transient: a verified download moves on to `installing` by itself. `installing`
-    /// is set only when the installer's launch is actually attempted.
+    /// `ready` is transient: a downloaded release moves on to `installing` by itself. `installing`
+    /// is set only when the hand-off to Velopack's updater is actually attempted.
     Q_PROPERTY(QString state READ state NOTIFY stateChanged)
     /// version, url, sha256, notes, mandatory. Empty when there is nothing to offer.
     Q_PROPERTY(QVariantMap availableUpdate READ availableUpdate NOTIFY availableUpdateChanged)
@@ -48,7 +51,7 @@ class UpdateFeedClient : public QObject
     Q_PROPERTY(QString installedVersion READ installedVersion WRITE setInstalledVersion NOTIFY installedVersionChanged)
     /// True while a stream is running; updates are neither offered nor installed (D-41).
     Q_PROPERTY(bool blockedBySession READ blockedBySession NOTIFY blockedBySessionChanged)
-    /// True once a verified package is on disk and waiting to be run.
+    /// True once a release is downloaded and waiting to be applied.
     Q_PROPERTY(bool readyToInstall READ readyToInstall NOTIFY readyToInstallChanged)
     /// ADR-0077: the newest published release is the floor. Every offer is mandatory: an installed
     /// version older than the current release is blocked by the update window. A newer one is current.
@@ -59,6 +62,7 @@ class UpdateFeedClient : public QObject
 
 public:
     explicit UpdateFeedClient(QObject* parent = nullptr);
+    ~UpdateFeedClient() override;
 
     /// The control plane's public API host (ADR-0018, `openapi.yaml` `servers[0].url`).
     static QString defaultBaseUrl();
@@ -85,20 +89,19 @@ public:
     static QString fileSha256(const QString& path);
 
     Q_INVOKABLE bool checkForUpdates();
-    /// Downloads the offered package and verifies it. `expectedSha256` overrides the digest the
-    /// offer carries; it exists so the caller can hand in the release pin from
+    /// Downloads the offered release through Velopack, with progress. `expectedSha256` overrides the
+    /// digest the offer carries; it exists so the caller can hand in the release pin from
     /// `seathub-ops/pins.yaml` at release prep time. An empty expected digest is a refusal.
     Q_INVOKABLE bool downloadUpdate(const QString& url, const QString& expectedSha256);
     Q_INVOKABLE bool downloadUpdate();
-    /// Launches the verified installer and asks the application to quit so the installer can
-    /// replace it. The installer is unsigned (D-43), so Windows shows its own SmartScreen
-    /// warning and the per-machine install raises a UAC prompt (D-42) - both expected.
-    /// Runs by itself once a download verifies (one press, D-41). Callers only need it to retry
-    /// a launch that failed - a declined UAC prompt - while the verified package is still on disk.
+    /// Hands the downloaded release to Velopack's updater and asks the application to quit so it can
+    /// replace the app folder (no administrator prompt, ADR-0086). Runs by itself once a download
+    /// completes (one press, D-41). When the hand-off fails the running version is untouched and the
+    /// failure is counted under the bounded retry.
     Q_INVOKABLE bool installDownloaded();
-    /// ADR-0077 item 5: re-reads the current release from the feed, then downloads and verifies THAT
-    /// row's installer and runs it. No cached address and no cached setup is used. True when the
-    /// attempt started; an unreachable feed starts nothing, shows why and consumes no attempt.
+    /// ADR-0077 item 5: re-reads the current release from the feed, then downloads THAT row's release
+    /// and applies it. No cached address and no cached download is used. True when the attempt
+    /// started; an unreachable feed starts nothing, shows why and consumes no attempt.
     Q_INVOKABLE bool tryAgain();
     /// Re-reads the current release from the feed, then opens only that row's installer address after
     /// the https and control-plane host check (client.md § Website links). Never opens a cached address.
@@ -107,19 +110,13 @@ public:
     bool exhausted() const { return m_retry.exhausted(); }
     QString nextAttemptText() const;
     QString manualDownloadUrl() const;
-    static QString installerArguments(const QString& installed, int attempt);
-    /// ADR-0077 item 7: the facts the pre-journal quiescence rule reads. The default reads the machine;
-    /// tests replace it. It carries no clock and no duration.
-    using ObservationProbe = std::function<InstallerObservation(const UpdateRetryState&)>;
-    void setObservationProbe(ObservationProbe probe) { m_probe = std::move(probe); }
-    static InstallerObservation observeMachine(const UpdateRetryState& retry, const QString& journalFolder,
-                                              InstallerTrace* trace = nullptr);
     using UrlOpener = std::function<bool(const QUrl&)>;
     void setUrlOpener(UrlOpener opener) { m_urlOpener = std::move(opener); }
     using InstallerReporter = std::function<bool(const InstallJournalRecord&)>;
     void setInstallerReporter(InstallerReporter reporter) { m_reporter = std::move(reporter); }
     void setRetryStatePath(const QString& path);
-    void setJournalFolder(const QString& folder) { m_journalFolder = folder; }
+    /// Velopack writes no install journal (ADR-0086); kept only so existing callers still compile.
+    void setJournalFolder(const QString&) {}
     void setRetryClock(std::function<QDateTime()> clock) { m_retry.setClock(std::move(clock)); }
     UpdateRetryState retryState() const { return m_retry; }
     void reportPendingInstallerEvents() { reportExhaustion(); }
@@ -130,14 +127,15 @@ public:
     QVariantMap failure() const { return m_failure; }
     QString installedVersion() const { return m_installedVersion; }
     bool blockedBySession() const { return m_streaming; }
-    bool readyToInstall() const { return !m_downloadedPath.isEmpty(); }
-    QString downloadedPath() const { return m_downloadedPath; }
+    bool readyToInstall() const { return m_staged; }
 
-    /// Starts the verified installer at `path`; false when it did not start (including a declined
-    /// UAC prompt). The default is `launchInstaller`. Tests replace it so that no real installer
-    /// runs and no UAC prompt is raised.
-    using InstallerLauncher = std::function<bool(const QString& path)>;
-    void setInstallerLauncher(InstallerLauncher launcher) { m_launcher = std::move(launcher); }
+    /// The Velopack seam: downloads a release and hands it to the updater. The default is the real
+    /// Velopack applier; tests replace it with a fake so that no network, installed copy or updater runs.
+    void setUpdateApplier(std::shared_ptr<VelopackUpdater::UpdateApplier> applier) { m_applier = std::move(applier); }
+    /// What the application does once the updater has the release: quit, so `Update.exe` can replace the
+    /// app folder (it waits at most 60 s). The default is `QCoreApplication::quit`; tests replace it.
+    using ExitHandler = std::function<void()>;
+    void setExitHandler(ExitHandler handler) { m_exit = std::move(handler); }
 
     void setInstalledVersion(const QString& version);
     void setPinnedSha256(const QString& sha256) { m_pinnedSha256 = sha256; }
@@ -160,17 +158,16 @@ signals:
     void readyToInstallChanged();
     void checkFinished();
     void retryChanged();
-    /// Emitted after a verified download. The client starts the installer itself straight after;
-    /// nothing has to answer this for the update to proceed.
-    void verified(QString version, QString path);
-    /// The application should exit so the installer can replace the running binary.
+    /// Emitted after a completed download. The client hands the release to the updater itself straight
+    /// after; nothing has to answer this for the update to proceed.
+    void downloaded(QString version);
+    /// The updater has the release: the application should exit so it can replace the app folder.
     void installRequested();
 
 private:
-    /// The production launcher: an elevated start of the per-machine installer (D-42).
-    static bool launchInstaller(const QString& path, const QString& arguments, InstallerTrace* trace);
-    bool installerQuiescent();
-    void recordObservation(const InstallerObservation& observation);
+    struct WorkerLink;
+    void onDownloadProgress(int percent);
+    void onDownloadFinished(bool ok, const QString& resolvedVersion, const QString& error);
     void startFreshDownload();
     void finishPendingActions(bool feedRead);
     void adoptOffer(const QVariantMap& offer);
@@ -178,7 +175,7 @@ private:
     void inspectPendingLaunch();
     void maybeAutomaticAttempt();
     void recordFailure(const QString& failureClass, bool permanent = false);
-    void reportInference(const QString& failureClass);
+    void reportFailure(const QString& failureClass);
     void reportExhaustion();
 
     void setState(const QString& state);
@@ -189,14 +186,18 @@ private:
 
     QNetworkAccessManager* m_network = nullptr;
     QNetworkReply* m_reply = nullptr;
-    QFile* m_downloadFile = nullptr;
-    InstallerLauncher m_launcher;
+    std::shared_ptr<VelopackUpdater::UpdateApplier> m_applier;
+    ExitHandler m_exit;
+    std::shared_ptr<WorkerLink> m_link;
+    // True while a Velopack download runs on its worker thread.
+    bool m_downloading = false;
+    // True once a release is downloaded and waiting to be handed to the updater.
+    bool m_staged = false;
 
     QString m_baseUrl;
     QString m_installedVersion;
     QString m_pinnedSha256;
     QString m_expectedSha256;
-    QString m_downloadedPath;
     QString m_state;
 
     bool m_streaming = false;
@@ -207,14 +208,13 @@ private:
     QVariantMap m_available;
     QVariantMap m_failure;
     UpdateRetryState m_retry;
-    QString m_retryStatePath = UpdateRetryState::defaultPath(), m_journalFolder;
+    QString m_retryStatePath = UpdateRetryState::defaultPath();
     bool m_manualAttempt = false, m_outcomeChecked = false;
     // True only while the offer in `m_available` came from a feed read made by THIS process. An offer
     // restored from the retry state keeps the window up but never launches an installer (ADR-0077 item 3).
     bool m_offerFresh = false;
     // Try again and Download first re-read the feed; these carry the press across that read.
     bool m_pendingTryAgain = false, m_pendingDownload = false;
-    ObservationProbe m_probe;
     UrlOpener m_urlOpener;
     InstallerReporter m_reporter;
 };

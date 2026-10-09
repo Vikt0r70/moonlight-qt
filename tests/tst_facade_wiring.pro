@@ -34,8 +34,8 @@ INCLUDEPATH += $$PWD/.. $$PWD/../app
 
 win32 {
     INCLUDEPATH += $$PWD/../libs/windows/include $$PWD/../libs/windows/include/x64
-    # shell32: ShellExecuteW, the update feed client's elevated installer launch (D-42).
-    LIBS += -L$$PWD/../libs/windows/lib/x64 -lSDL2 -lcrypt32 -lshell32
+    # advapi32: RegDeleteTreeW, the Velopack uninstall hook's HKCU key removal (velopack_updater.cpp).
+    LIBS += -L$$PWD/../libs/windows/lib/x64 -lSDL2 -lcrypt32 -ladvapi32
 }
 
 # Plan 15 (Task 2): `seathub_client.cpp` now calls `SeatHubTelemetry::*` (`telemetry.h`), so this
@@ -88,6 +88,7 @@ SOURCES += \
     ../app/seathub/error_map.cpp \
     ../app/seathub/settings_bridge.cpp \
     ../app/seathub/update_feed_client.cpp \
+    ../app/seathub/velopack_updater.cpp \
     ../app/seathub/agent_config.cpp \
     ../app/settings/streamingpreferences.cpp \
     ../app/path.cpp \
@@ -133,6 +134,7 @@ HEADERS += \
     ../app/seathub/error_map.h \
     ../app/seathub/settings_bridge.h \
     ../app/seathub/update_feed_client.h \
+    ../app/seathub/velopack_updater.h \
     ../app/seathub/agent_config.h \
     ../app/seathub/seathub_version.h \
     ../app/settings/streamingpreferences.h \

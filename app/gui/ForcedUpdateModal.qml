@@ -13,8 +13,9 @@ import SeatHub.Tokens 1.0
 // while `updates.blockedBySession` is true. An offer that arrives mid-session is offered again
 // the moment the session ends.
 //
-// The installer is unsigned (D-43). Windows shows its own SmartScreen warning when it runs, and
-// the per-machine install raises a UAC prompt (D-42); both are expected and neither is a bug.
+// SeatHub updates through Velopack (ADR-0086): the one press downloads the release and hands it to
+// Velopack's updater, which shows its own small progress window while it swaps the app folder and then
+// reopens SeatHub. There is no administrator prompt. The release is unsigned (D-43).
 Item {
     id: modal
 
@@ -33,8 +34,8 @@ Item {
     readonly property bool requiredUpdate: hasOffer
     readonly property bool exhausted: requiredUpdate && updates.exhausted === true
     readonly property bool shown: hasOffer && updates.blockedBySession !== true
-    // `ready` is a verified download on its way to `installing`: the client starts the installer
-    // by itself, because the one press that began the download is the only one there is (D-41).
+    // `ready` is a finished download on its way to `installing`: the client hands it to Velopack's
+    // updater by itself, because the one press that began the download is the only one there is (D-41).
     readonly property bool busy: updates !== null && updates !== undefined
                                  && (updates.state === "downloading"
                                      || updates.state === "verifying"
@@ -152,9 +153,9 @@ Item {
                 spacing: Metrics.s1
                 visible: modal.busy
 
-                // "Starting the installer" only while the launch is really being attempted
-                // (`installing`); a verified download that has not been launched yet still reads
-                // as the finished check, so the copy never claims a launch that has not happened.
+                // "Starting the installer" only while the hand-off is really being attempted
+                // (`installing`); a finished download that has not been handed over yet still reads
+                // as the finished check, so the copy never claims a hand-off that has not happened.
                 Text {
                     text: updates && updates.state === "installing"
                           ? qsTr("Starting the installer\u2026")
@@ -246,8 +247,8 @@ Item {
                     else if (updates.state === "available") {
                         // The digest the offer carries is the one baked in from the release pin
                         // at release prep. When it is empty the client refuses to install and
-                        // says so, rather than running an unverified binary (D-43). A verified
-                        // download goes on to launch the installer by itself.
+                        // says so, rather than applying an unverified release (D-43). A finished
+                        // download goes on to Velopack's updater by itself.
                         updates.downloadUpdate(String(updates.availableUpdate.url),
                                                String(updates.availableUpdate.sha256))
                     }

@@ -80,10 +80,11 @@ jobs:
           submodules: recursive
 
       # Toolchain. Plan 03-01 left this as a placeholder rather than guess at provisioning, and
-      # Plan 03-06 replaces it now that the recipe is proven on a real machine. Qt and the Qt
-      # Installer Framework are installed with aqtinstall, whose layout is the same one the Qt
-      # Online Installer writes, so the paths below match scripts\build-seathub.ps1's defaults and
-      # the install paths pinned in seathub-ops/pins.yaml.
+      # Plan 03-06 replaces it now that the recipe is proven on a real machine. Qt is installed
+      # with aqtinstall, whose layout is the same one the Qt Online Installer writes, so the paths
+      # below match scripts\build-seathub.ps1's defaults and the install paths pinned in
+      # seathub-ops/pins.yaml. SeatHub is packaged with Velopack (ADR-0086), so the Qt Installer
+      # Framework is no longer installed.
       #
       # MSVC is not provisioned: windows-latest already carries Visual Studio 2022 with the
       # Desktop C++ workload, and the script finds vcvars64.bat for an install that actually has
@@ -102,7 +103,7 @@ jobs:
       # (it is listed by `aqt list-qt windows desktop --archives 6.11.2 win64_msvc2022_64`), so
       # naming it as a module fails with "The packages ['qtsvg'] were not found". That error was
       # invisible until the version error above was fixed, because it never got that far.
-      - name: Install Qt 6.11.2 (MSVC 2022 x64) and Qt Installer Framework
+      - name: Install Qt 6.11.2 (MSVC 2022 x64)
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -113,15 +114,27 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "aqtinstall could not be installed." }
           python -m aqt install-qt windows desktop 6.11.2 win64_msvc2022_64 -m qtwebsockets -O C:\Qt
           if ($LASTEXITCODE -ne 0) { throw "Qt 6.11.2 install failed." }
-          # Pinned to 4.7 because build-seathub.ps1 defaults -IfwDir to
-          # C:\Qt\Tools\QtInstallerFramework\4.7. Unpinned, aqt installs whatever is current, and the day Qt
-          # ships 4.8 this breaks with "Qt Installer Framework directory not found" and
-          # reads as a new bug rather than a version bump.
-          python -m aqt install-tool windows desktop tools_ifw qt.tools.ifw.47 -O C:\Qt
-          if ($LASTEXITCODE -ne 0) { throw "Qt Installer Framework install failed." }
           if (-not (Test-Path -LiteralPath 'C:\Qt\6.11.2\msvc2022_64')) {
             throw "Qt reported success but C:\Qt\6.11.2\msvc2022_64 does not exist."
           }
+
+      # Velopack (ADR-0086). vpk is a .NET tool, so the SDK T082 proved the pack with (8.0.425) is
+      # installed first, then the pinned vpk (1.2.161, the CLI version of the proof). Both pins mirror
+      # docs/evidence/m001/velopack-proof.md in the monorepo; scripts/pack-seathub.ps1 refuses any other
+      # vpk version. The Velopack C library (velopack_libc 1.2.161) is fetched and SHA-256 checked by
+      # scripts/build-seathub.ps1 itself.
+      - name: Install the .NET SDK 8.0.425 (for vpk)
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.425'
+
+      - name: Install vpk 1.2.161 (the pinned Velopack CLI)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          dotnet tool install --global vpk --version 1.2.161
+          if ($LASTEXITCODE -ne 0) { throw "vpk 1.2.161 could not be installed." }
+          Add-Content -Path $env:GITHUB_PATH -Value (Join-Path $env:USERPROFILE '.dotnet\tools')
 
       # Cache the built sentry-native install (06.3.1 D-02, D-18, ADR-0063): build-seathub.ps1
       # itself skips the build when this directory already has sentry.h (cache hit), so this step
@@ -134,7 +147,7 @@ jobs:
           path: build/sentry-native-0.17.1/install
           key: sentry-native-0.17.1-${{ hashFiles('scripts/build-seathub.ps1') }}-msvc
 
-      - name: Build, deploy and package SeatHub
+      - name: Build and deploy SeatHub
         shell: pwsh
         run: ./scripts/build-seathub.ps1
 
@@ -181,6 +194,13 @@ jobs:
             }
           }
           Write-Host "no PDB in $deployDir, and no Sentry DSN is compiled into any shipped exe/dll (narrow and UTF-16LE scans)"
+
+      # ADR-0086: the deploy folder becomes the Velopack release - Setup.exe (per user, no administrator
+      # prompt), the full package and releases.win.json. Runs after the scan above, so exactly what was
+      # scanned is what is packed. Unsigned (D-43): "No signing parameters provided" is expected.
+      - name: Pack SeatHub with Velopack
+        shell: pwsh
+        run: ./scripts/pack-seathub.ps1
 
       # ADR-0063, D-12: every CI build uploads SeatHub's debug symbols to Sentry, so a crash is a
       # readable stack, not an address. A Sentry-side refusal (wrong project slug, wrong region)
@@ -309,16 +329,20 @@ jobs:
 
           if ($uploadFailed) { exit 0 }
 
-      - name: Record the installer hash
+      - name: Record the Setup.exe hash
         shell: pwsh
         run: |
-          Get-Content build\installer-x64-release\sha256.txt
+          Get-Content build\velopack-x64-release\setup-sha256.txt
           Write-Output "Publish with POST /api/admin/releases (D-40); see docs/runbooks/client-release.md in the monorepo."
 
+      # The three release assets (ADR-0086): Setup.exe, the full package and releases.win.json.
       - uses: actions/upload-artifact@v4
         with:
-          name: SeatHub-Setup
-          path: build\installer-x64-release\SeatHub-Setup-*.exe
+          name: SeatHub-Velopack
+          path: |
+            build\velopack-x64-release\*-win-Setup.exe
+            build\velopack-x64-release\*-full.nupkg
+            build\velopack-x64-release\releases.win.json
           if-no-files-found: error
 
       # NOT YET EXERCISED: this job has not been run. It is the proven local recipe wired into CI,
@@ -327,7 +351,9 @@ jobs:
 
   # Publish the freshly built client to the release feed (Phase 3 UAT test 8 / D-40, ADR-0026).
   # Mirrors the control repo's owner-app.yml publish job. The client is verified by checksum only
-  # (D-43): no signature is sent, and the feed row's signature stays null. Publishing sets this row
+  # (D-43): no signature is sent, and the feed row's signature stays null. The row's `url` is the
+  # release's Setup.exe and the folder it sits in also holds Velopack's releases.win.json and the full
+  # package (the `url-folder` update source, ADR-0086), uploaded BEFORE the row is published. Publishing sets this row
   # `is_current` and clears the previous one in a single transaction (see app/releases.py), so this
   # supersedes the retired Tauri `client` row without a manual delete.
   #
@@ -351,7 +377,7 @@ jobs:
 
       - uses: actions/download-artifact@v4
         with:
-          name: SeatHub-Setup
+          name: SeatHub-Velopack
           path: dist
 
       - name: Check the release credentials are present
@@ -376,18 +402,24 @@ jobs:
             echo "ok=true" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Resolve the installer and version
+      - name: Resolve the installer, the package and the version
         id: artifact
         if: steps.creds.outputs.ok == 'true'
         run: |
           set -euo pipefail
-          file=$(ls dist/SeatHub-Setup-*.exe | head -1 || true)
-          [ -n "$file" ] || { echo "::error::No SeatHub-Setup-*.exe in the build artifact"; exit 1; }
+          file=$(ls dist/*-win-Setup.exe | head -1 || true)
+          [ -n "$file" ] || { echo "::error::No *-win-Setup.exe in the build artifact"; exit 1; }
           base=$(basename "$file")
-          version=$(echo "$base" | sed -E 's/^SeatHub-Setup-(.+)\.exe$/\1/')
+          packid="${base%-win-Setup.exe}"
+          full=$(ls dist/"$packid"-*-full.nupkg | head -1 || true)
+          [ -n "$full" ] || { echo "::error::No $packid-*-full.nupkg in the build artifact"; exit 1; }
+          [ -f dist/releases.win.json ] || { echo "::error::No releases.win.json in the build artifact"; exit 1; }
+          fullbase=$(basename "$full")
+          version=$(echo "$fullbase" | sed -E "s/^${packid}-(.+)-full\.nupkg$/\1/")
           echo "installer=$base" >> "$GITHUB_OUTPUT"
+          echo "package=$fullbase" >> "$GITHUB_OUTPUT"
           echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "Installer: $base (version $version)"
+          echo "Installer: $base, package: $fullbase (version $version)"
 
       - name: Set up the deploy key
         if: steps.creds.outputs.ok == 'true'
@@ -423,31 +455,39 @@ jobs:
             case "$out" in *"HTTP 404"*) echo "$tag is free.";; *) echo "::error::could not check $tag: $out"; exit 1;; esac
           fi
 
-      - name: Upload the installer to the VPS
+      # The package first, the installer next and the manifest last: releases.win.json is what makes a
+      # release visible to an updating client, so it only appears once everything it names is in place.
+      - name: Upload Setup.exe, the full package and releases.win.json to the VPS
         if: steps.creds.outputs.ok == 'true'
         env:
           VPS: ${{ secrets.SEATHUB_VPS_HOST }}
           INSTALLER: ${{ steps.artifact.outputs.installer }}
+          PACKAGE: ${{ steps.artifact.outputs.package }}
         run: |
           set -euo pipefail
           ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new "$VPS" 'mkdir -p ~/seathub/downloads'
-          scp -o BatchMode=yes -o StrictHostKeyChecking=accept-new "dist/$INSTALLER" "$VPS:~/seathub/downloads/"
-          ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new "$VPS" "chmod 644 ~/seathub/downloads/'$INSTALLER'"
+          for f in "$PACKAGE" "$INSTALLER" releases.win.json; do
+            scp -o BatchMode=yes -o StrictHostKeyChecking=accept-new "dist/$f" "$VPS:~/seathub/downloads/"
+            ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new "$VPS" "chmod 644 ~/seathub/downloads/'$f'"
+          done
 
       - name: Prove the download works
         if: steps.creds.outputs.ok == 'true'
         env:
           CONTROL_URL: ${{ secrets.SEATHUB_CONTROL_URL }}
           INSTALLER: ${{ steps.artifact.outputs.installer }}
+          PACKAGE: ${{ steps.artifact.outputs.package }}
         run: |
           set -euo pipefail
-          url="$CONTROL_URL/downloads/$INSTALLER"
-          code=$(curl -sS -o /dev/null -w '%{http_code}' -I "$url")
-          if [ "$code" != "200" ]; then
-            echo "::error::$url answered $code. The API container may have started before ~/seathub/downloads existed; re-run deploy.yml to restart it."
-            exit 1
-          fi
-          echo "$url is reachable"
+          for f in "$INSTALLER" "$PACKAGE" releases.win.json; do
+            url="$CONTROL_URL/downloads/$f"
+            code=$(curl -sS -o /dev/null -w '%{http_code}' -I "$url")
+            if [ "$code" != "200" ]; then
+              echo "::error::$url answered $code. The API container may have started before ~/seathub/downloads existed; re-run deploy.yml to restart it."
+              exit 1
+            fi
+            echo "$url is reachable"
+          done
 
       - name: Put this build in the client release feed
         if: steps.creds.outputs.ok == 'true'
@@ -511,7 +551,11 @@ jobs:
           echo "$feed" | jq .
           [ "$(echo "$feed" | jq -r '.version')" = "$VERSION" ] || { echo "::error::feed is not serving $VERSION"; exit 1; }
           [ "$(echo "$feed" | jq -r '.sha256')" != "null" ] || { echo "::error::feed row has no sha256, so no installed client can verify this build"; exit 1; }
-          echo "Feed now serves client $VERSION with a checksum. The retired Tauri row is superseded."
+          # The update source: the folder beside the row's Setup.exe must serve Velopack's manifest for this version.
+          folder="$(echo "$feed" | jq -r '.url' | sed -E 's#/[^/]*$#/#')"
+          curl -sS "${folder}releases.win.json" | jq -e --arg v "$VERSION" '.Assets[] | select(.Type == "Full" and .Version == $v)' > /dev/null \
+            || { echo "::error::${folder}releases.win.json does not list a Full package for $VERSION"; exit 1; }
+          echo "Feed now serves client $VERSION with a checksum, and ${folder}releases.win.json lists its full package. The retired Tauri row is superseded."
 
       # Owner decision A-22 (seven-hills-alpha OWNER-ACTIONS.md): every published build is also a
       # GitHub Release, so the newest installer can be fetched without asking anyone. Last, after
@@ -523,6 +567,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ steps.artifact.outputs.version }}
           INSTALLER: ${{ steps.artifact.outputs.installer }}
+          PACKAGE: ${{ steps.artifact.outputs.package }}
         run: |
           set -euo pipefail
           sha=$(sha256sum "dist/$INSTALLER" | cut -d' ' -f1)
@@ -531,8 +576,8 @@ jobs:
             echo "Release $tag already exists (a re-run); leaving it as it is."
             exit 0
           fi
-          gh release create "$tag" "dist/$INSTALLER" \
+          gh release create "$tag" "dist/$INSTALLER" "dist/$PACKAGE" dist/releases.win.json \
             --repo "$GITHUB_REPOSITORY" \
             --target "$GITHUB_SHA" \
             --title "SeatHub $VERSION" \
-            --notes "SeatHub client $VERSION, built from ${GITHUB_SHA::7}. Installer SHA-256: \`$sha\`. The same build the in-app update feed serves."
+            --notes "SeatHub client $VERSION, built from ${GITHUB_SHA::7}. Setup.exe SHA-256: \`$sha\`. The same build the in-app update feed serves: Setup.exe, the full package and releases.win.json."

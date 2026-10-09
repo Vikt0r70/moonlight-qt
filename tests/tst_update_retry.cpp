@@ -1,12 +1,9 @@
 #include <QtTest>
 #include <QTemporaryDir>
-#include <type_traits>
 #include "seathub/update_retry_state.h"
 
-// ADR-0077 item 7 / V38: the quiescence rule is a pure function of observed state. It takes no clock, no
-// duration and no journal age, so there is nothing to encode and nothing that elapsed time could unlock.
-static_assert(std::is_same_v<decltype(&admitInstallerLaunch), Admission (*)(const InstallerObservation&)>,
-              "admission must not take a time parameter");
+// ADR-0086 supersedes the pre-journal quiescence rule (V38) and the launch trace of the setup the client
+// used to start; the bounded retry (V34, ADR-0077) is what these tests keep.
 
 class TstUpdateRetry : public QObject
 {
@@ -62,56 +59,22 @@ private slots:
         state.noteFailure("installer.verify_failed", true, true);
         state.noteDecline(); QVERIFY(state.exhausted()); QCOMPARE(state.attemptsFailed, 0);
     }
-    void admissionIsAStateRuleWithNoDuration()
+    void aStateFileFromTheStagedInstallerStillLoads()
     {
-        using Owner = InstallerObservation::Owner; using Scan = InstallerObservation::Scan; using Boot = InstallerObservation::Boot;
-        // Every combination: only a proven absence of a writer admits a new installer.
-        for (const auto owner : {Owner::None, Owner::Alive, Owner::Gone, Owner::Unknown})
-            for (const auto scan : {Scan::Clear, Scan::Present, Scan::Unknown})
-                for (const auto boot : {Boot::Same, Boot::Changed, Boot::Unknown}) {
-                    InstallerObservation o; o.owner = owner; o.scan = scan; o.boot = boot;
-                    const bool expected = owner != Owner::Alive && scan == Scan::Clear
-                        && (owner != Owner::Unknown || boot == Boot::Changed);
-                    QVERIFY2((admitInstallerLaunch(o) == Admission::Quiescent) == expected,
-                             qPrintable(QStringLiteral("%1 %2 %3").arg(ownerName(owner), scanName(scan), bootName(boot))));
-                }
-        // Journal age, retry timing and the clock are not inputs: the answer cannot change with time.
-        UpdateRetryState state; state.setClock([this]{ return clock; });
-        InstallerObservation held; held.owner = Owner::Alive; held.scan = Scan::Clear;
-        state.noteFailure("installer.locked_file");
-        state.setClock([this]{ return clock.addDays(365); });
-        QCOMPARE(admitInstallerLaunch(held), Admission::Blocked);
-    }
-    void launchTraceSurvivesRestartAndStaysBoundedByConstruction()
-    {
+        // A file written before ADR-0086 carries the launch trace and the pending marker of a setup that no
+        // longer exists. The budget it holds is honoured; the trace is ignored and never written back.
         QTemporaryDir dir; QVERIFY(dir.isValid());
         const auto path = dir.filePath("retry-state.json");
-        UpdateRetryState state; state.target = "0.2.0";
-        state.trace.requestedAt = clock; state.trace.returnedAt = clock.addMSecs(81234);
-        state.trace.shellError = 1223; state.trace.pid = 4242; state.trace.pidCreated = "133000000000000001";
-        state.trace.launcherPid = 77; state.trace.launcherSession = 1; state.trace.installerSession = 2;
-        state.trace.bootUptimeMs = 123456789012; state.trace.observations = 3;
-        state.trace.lastOwner = "gone"; state.trace.lastScan = "clear"; state.trace.lastBoot = "changed";
-        state.trace.ownerAccessDenied = true; state.trace.observerChanged = true;
-        state.trace.journalStartPresent = true; state.trace.stagePresent = true; state.trace.progressChanged = true;
+        QFile old(path); QVERIFY(old.open(QIODevice::WriteOnly));
+        old.write("{\"v\":1,\"target\":\"0.2.0\",\"attempts_failed\":2,\"last_class\":\"installer.locked_file\","
+                  "\"launched\":true,\"launch_trace\":{\"pid\":4242,\"observations\":3}}");
+        old.close();
+        auto state = UpdateRetryState::load(path);
+        QCOMPARE(state.target, QString("0.2.0")); QCOMPARE(state.attemptsFailed, 2);
+        QVERIFY(state.launched);
         QVERIFY(state.save(path));
-        const auto back = UpdateRetryState::load(path).trace;
-        QCOMPARE(back.requestedAt, clock); QCOMPARE(back.returnedAt, clock.addMSecs(81234));
-        QCOMPARE(back.shellError, qint64(1223)); QCOMPARE(back.pid, qint64(4242));
-        QCOMPARE(back.pidCreated, QString("133000000000000001")); QCOMPARE(back.launcherPid, qint64(77));
-        QCOMPARE(back.launcherSession, qint64(1)); QCOMPARE(back.installerSession, qint64(2));
-        QCOMPARE(back.bootUptimeMs, qint64(123456789012)); QCOMPARE(back.observations, 3);
-        QCOMPARE(back.lastOwner, QString("gone")); QCOMPARE(back.lastBoot, QString("changed"));
-        QVERIFY(back.ownerAccessDenied && back.observerChanged && back.journalStartPresent
-                && back.stagePresent && back.progressChanged);
-        // The next launch replaces it: one record, so the file cannot grow with the number of launches.
-        const auto first = QFileInfo(path).size();
-        for (int i = 0; i < 20; ++i) { state.trace.observations = 3; QVERIFY(state.save(path)); }
-        QCOMPARE(QFileInfo(path).size(), first);
-        // A state written before the observer existed has an empty trace, not an error.
-        QFile old(path); QVERIFY(old.open(QIODevice::WriteOnly)); old.write("{\"v\":1,\"target\":\"0.2.0\"}"); old.close();
-        const auto empty = UpdateRetryState::load(path).trace;
-        QCOMPARE(empty.pid, qint64(0)); QVERIFY(empty.pidCreated.isEmpty()); QCOMPARE(empty.launcherSession, qint64(-1));
+        QFile again(path); QVERIFY(again.open(QIODevice::ReadOnly));
+        QVERIFY(!again.readAll().contains("launch_trace"));
     }
     void aNewerInstalledBuildCountsAsReached()
     {

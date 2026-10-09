@@ -22,17 +22,20 @@ INCLUDEPATH += $$PWD/.. $$PWD/../app
 
 DEFINES += FORK_ROOT=\\\"$$PWD/..\\\"
 
-# ShellExecuteW - the elevated installer launch (D-42) - lives in shell32. A console testcase does
-# not get it from qmake's defaults, so without this the suite stops linking.
-win32: LIBS += -lshell32
+# Velopack (ADR-0086): the suite compiles the updater seam WITHOUT SEATHUB_VELOPACK, so the real
+# Velopack C library is neither included nor linked; every test drives a fake UpdateApplier.
+# advapi32: RegDeleteTreeW, the uninstall hook's HKCU key removal.
+win32: LIBS += -ladvapi32
 
 SOURCES += tst_update_feed.cpp \
     ../app/seathub/update_feed_client.cpp \
+    ../app/seathub/velopack_updater.cpp \
     ../app/seathub/update_retry_state.cpp \
     ../app/seathub/install_journal.cpp \
     ../app/seathub/error_map.cpp
 
 HEADERS += ../app/seathub/update_feed_client.h \
+    ../app/seathub/velopack_updater.h \
     ../app/seathub/update_retry_state.h \
     ../app/seathub/install_journal.h \
     ../app/seathub/error_map.h \

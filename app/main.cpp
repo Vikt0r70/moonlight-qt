@@ -52,6 +52,7 @@
 #include "seathub/settings_bridge.h"
 #include "seathub/telemetry.h"
 #include "seathub/update_feed_client.h"
+#include "seathub/velopack_updater.h"
 
 #if defined(Q_OS_WIN32)
 #define IS_UNSPECIFIED_HANDLE(x) ((x) == INVALID_HANDLE_VALUE || (x) == NULL)
@@ -297,6 +298,13 @@ LONG WINAPI UnhandledExceptionHandler(struct _EXCEPTION_POINTERS *ExceptionInfo)
 
 int main(int argc, char *argv[])
 {
+    // Velopack (ADR-0086): this is the C-API form of `VelopackApp::Build().Run()` and it must be the first
+    // statement of main. When Velopack relaunches this exe for its install, update or uninstall hooks it
+    // does that work here (including the D-45 wipe of the before-uninstall hook) and the process exits
+    // without returning; on an ordinary start it returns at once. The C API is used rather than the C++
+    // header because it is the documented surface (docs.velopack.io, reference/cpp/c-api).
+    VelopackUpdater::runStartupHook();
+
     SDL_SetMainReady();
 
     // Set the app version for the QCommandLineParser's showVersion() command

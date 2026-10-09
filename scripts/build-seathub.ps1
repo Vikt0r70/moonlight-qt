@@ -1,4 +1,8 @@
-# Builds, deploys and packages the SeatHub client (D-15, D-16, D-42, D-43).
+# Builds and deploys the SeatHub client (D-15, D-16, D-43; ADR-0086).
+#
+# Packaging is a separate step: scripts\pack-seathub.ps1 turns the deploy folder into the Velopack
+# release (Setup.exe, the full package and releases.win.json). Nothing here needs the Qt Installer
+# Framework any more - SeatHub installs and updates through Velopack (ADR-0086).
 #
 # This is the recipe the fork was missing: the binary built, but nothing put it in a folder with
 # the libraries it needs, so it would not launch. Upstream's scripts\build-arch.bat does exactly
@@ -8,14 +12,12 @@
 # run here. This script calls BuildTools' vcvars64.bat directly instead.
 #
 # Usage, from anywhere:
-#     pwsh -File scripts\build-seathub.ps1                 # full build, deploy and package
+#     pwsh -File scripts\build-seathub.ps1                 # full build and deploy
 #     pwsh -File scripts\build-seathub.ps1 -SkipBuild      # reuse the existing release build
 #
 # Output:
 #     build\deploy-x64-release\                the complete, launchable client folder
-#     build\installer-x64-release\SeatHub-Setup-<version>.exe   the unsigned installer (D-43)
-#     build\installer-x64-release\sha256.txt   the installer's SHA-256 - the value that must land
-#                                              in seathub-ops/pins.yaml and in the release row
+#     build\velopack-libc-<version>\           Velopack's C library, fetched when absent (pinned URL and SHA-256)
 #
 # There is no build number here: D-46 keeps SeatHub's version and a monotonic build number in the
 # feed row, and the number is a property of the *release*, not of the binary.
@@ -23,7 +25,6 @@
 [CmdletBinding()]
 param(
     [string]$QtDir = 'C:\Qt\6.11.2\msvc2022_64',
-    [string]$IfwDir = 'C:\Qt\Tools\QtInstallerFramework\4.7',
     [string]$VcVars = '',
     [switch]$SkipBuild
 )
@@ -35,11 +36,6 @@ $RepoRoot = Split-Path -Parent $PSScriptRoot
 $BuildRoot = Join-Path $RepoRoot 'build'
 $BuildFolder = Join-Path $BuildRoot 'build-x64-release'
 $DeployFolder = Join-Path $BuildRoot 'deploy-x64-release'
-$InstallerFolder = Join-Path $BuildRoot 'installer-x64-release'
-$InstallerSource = Join-Path $RepoRoot 'installer'
-$PackageRoot = Join-Path $InstallerSource 'packages\com.seathub.client'
-$PackageData = Join-Path $PackageRoot 'data'
-$PackageMeta = Join-Path $PackageRoot 'meta'
 
 function Step($text) { Write-Host "`n=== $text ===" -ForegroundColor Cyan }
 function Require($path, $what) {
@@ -83,19 +79,16 @@ function Find-VcVars {
 # ---------------------------------------------------------------- toolchain
 Step 'Toolchain'
 Require $QtDir "Qt directory (pass -QtDir)"
-Require $IfwDir "Qt Installer Framework directory (pass -IfwDir)"
 if (-not $VcVars) { $VcVars = Find-VcVars }
 Require $VcVars "MSVC vcvars64.bat"
 
 $qmake = Join-Path $QtDir 'bin\qmake.exe'
 $windeployqt = Join-Path $QtDir 'bin\windeployqt.exe'
-$binarycreator = Join-Path $IfwDir 'bin\binarycreator.exe'
 $jom = Join-Path $RepoRoot 'scripts\jom.exe'
-foreach ($tool in @($qmake, $windeployqt, $binarycreator, $jom)) { Require $tool "build tool" }
+foreach ($tool in @($qmake, $windeployqt, $jom)) { Require $tool "build tool" }
 
 # The MSVC environment has to be imported into this shell: the compiler, the linker and
-# windeployqt's dependency walk all need it, and the Qt Installer Framework needs `cl` on PATH for
-# nothing - it just must not be the first thing that breaks.
+# windeployqt's dependency walk all need it.
 $env:PATH = "$(Join-Path $QtDir 'bin');$env:PATH"
 cmd /c "`"$VcVars`" >nul 2>&1 && set" | ForEach-Object {
     if ($_ -match '^([^=]+)=(.*)$') { Set-Item -Path "env:$($matches[1])" -Value $matches[2] }
@@ -221,6 +214,46 @@ if (($dependents | Out-String) -match 'VCRUNTIME140') {
 $env:SEATHUB_SENTRY_DIR = $SentryInstallDir
 Write-Host "sentry-native install: $SentryInstallDir"
 
+# ---------------------------------------------------------------- velopack_libc (ADR-0086)
+# Velopack's C library (MIT), the version and update source docs/evidence/m001/velopack-proof.md recorded.
+# Fetched into build\ when absent. GitHub publishes no checksum file for this asset, so the SHA-256 below
+# is the digest T082 computed over the exact 30,774,789-byte download; the build verifies it itself and
+# refuses a tampered or corrupted download. The pin is mirrored from the same evidence, like sentry-native's.
+Step 'velopack_libc 1.2.161 (Velopack C library)'
+$VelopackVersion = '1.2.161'
+$VelopackZipSha256 = '31de8f2cf05a47bd5328a9f98b0c41aec1582156f6075f1058b26941f7f17c20'
+$VelopackRoot = Join-Path $BuildRoot "velopack-libc-$VelopackVersion"
+$VelopackHeader = Join-Path $VelopackRoot 'include\Velopack.h'
+$VelopackDll = Join-Path $VelopackRoot 'lib\velopack_libc_win_x64_msvc.dll'
+$VelopackImportLib = Join-Path $VelopackRoot 'lib\velopack_libc_win_x64_msvc.dll.lib'
+
+if ((Test-Path -LiteralPath $VelopackHeader) -and (Test-Path -LiteralPath $VelopackDll) -and (Test-Path -LiteralPath $VelopackImportLib)) {
+    Write-Host "velopack_libc $VelopackVersion already extracted at $VelopackRoot (cache hit)"
+}
+else {
+    New-Item -ItemType Directory -Force -Path $BuildRoot | Out-Null
+    $VelopackZipPath = Join-Path $BuildRoot "velopack_libc_$VelopackVersion.zip"
+    if (-not (Test-Path -LiteralPath $VelopackZipPath)) {
+        $VelopackZipUrl = "https://github.com/velopack/velopack/releases/download/$VelopackVersion/velopack_libc_$VelopackVersion.zip"
+        Write-Host "Downloading $VelopackZipUrl"
+        Invoke-WebRequest -Uri $VelopackZipUrl -OutFile $VelopackZipPath
+    }
+    $actualVelopackHash = (Get-FileHash -LiteralPath $VelopackZipPath -Algorithm SHA256).Hash.ToLower()
+    if ($actualVelopackHash -ne $VelopackZipSha256) {
+        Remove-Item -LiteralPath $VelopackZipPath -Force
+        throw "velopack_libc zip SHA-256 mismatch: expected $VelopackZipSha256, got $actualVelopackHash (refusing a tampered or corrupted download)"
+    }
+    if (Test-Path -LiteralPath $VelopackRoot) { Remove-Item -LiteralPath $VelopackRoot -Recurse -Force }
+    New-Item -ItemType Directory -Force -Path $VelopackRoot | Out-Null
+    Expand-Archive -LiteralPath $VelopackZipPath -DestinationPath $VelopackRoot -Force
+    Require $VelopackHeader 'Velopack.h (velopack_libc zip)'
+    Require $VelopackDll 'velopack_libc_win_x64_msvc.dll (velopack_libc zip)'
+    Require $VelopackImportLib 'velopack_libc_win_x64_msvc.dll.lib (velopack_libc zip)'
+}
+# app\app.pro reads this at qmake time, like SEATHUB_SENTRY_DIR above.
+$env:SEATHUB_VELOPACK_DIR = $VelopackRoot
+Write-Host "velopack_libc: $VelopackRoot"
+
 # ---------------------------------------------------------------- build
 if (-not $SkipBuild) {
     Step "Build (release, all of moonlight-qt.pro: app, AntiHooking, soundio)"
@@ -335,6 +368,17 @@ foreach ($sentryFile in @('sentry.dll', 'crashpad_handler.exe', 'crashpad_wer.dl
     Copy-Item -LiteralPath (Join-Path $SentryInstallDir "bin\$sentryFile") -Destination $DeployFolder -Force
 }
 
+# 6c. Velopack's C library, under the exact file name the built client imports (read from the exe itself, so
+#     a rename in a later library version fails the build here, not on a customer PC). Update.exe and the
+#     install, update and uninstall hooks all run through this DLL (ADR-0086).
+$velopackImports = (& $dumpbin /dependents $clientExe | Out-String)
+if ($LASTEXITCODE -ne 0) { throw "dumpbin /dependents $clientExe failed with exit code $LASTEXITCODE" }
+$velopackImportMatch = [regex]::Match($velopackImports, '(?im)^\s+(velopack[^\s]*\.dll)\s*$')
+if (-not $velopackImportMatch.Success) { throw "$clientExe does not import a velopack DLL; app.pro did not link velopack_libc" }
+$velopackDeployName = $velopackImportMatch.Groups[1].Value
+Copy-Item -LiteralPath $VelopackDll -Destination (Join-Path $DeployFolder $velopackDeployName) -Force
+Write-Host "Velopack library deployed as $velopackDeployName"
+
 # 7. The Microsoft-signed VC++ runtime, copied from the redistributable directory and NOT harvested:
 #    repackaging the unsiged build-tree copies would break their signature.
 #    The redist folder is versioned separately from the toolset (14.44.35112 against a 14.44.35207
@@ -368,103 +412,34 @@ $licensesDir = Join-Path $DeployFolder 'licenses'
 New-Item -ItemType Directory -Force -Path $licensesDir | Out-Null
 Copy-Item -LiteralPath (Join-Path $RepoRoot 'app\seathub\fonts\OFL.txt') -Destination (Join-Path $licensesDir 'OpenSans-OFL.txt') -Force
 
+# 10. The GPL text and the corresponding-source offer. The Qt Installer Framework licence page used to show
+#     them; Velopack's Setup has no licence page, so they travel inside the app folder instead (Pitfall 9: a
+#     licence file on its own does not discharge the source obligation, so the offer ships with it).
+Copy-Item -LiteralPath (Join-Path $RepoRoot 'GPL-3.0.txt') -Destination (Join-Path $licensesDir 'GPL-3.0.txt') -Force
+Copy-Item -LiteralPath (Join-Path $RepoRoot 'installer\WRITTEN-OFFER.txt') -Destination (Join-Path $licensesDir 'WRITTEN-OFFER.txt') -Force
+
 # ---------------------------------------------------------------- verify deploy
 Step 'Verify the deploy folder'
 $missing = @()
 foreach ($required in @('SeatHub.exe', 'AntiHooking.dll', 'gamecontrollerdb.txt', 'Qt6Core.dll',
         'Qt6Quick.dll', 'Qt6WebSockets.dll', 'Qt6Svg.dll', 'SDL2.dll', 'avcodec-61.dll', 'opus.dll',
         'libssl-3-x64.dll', 'msvcp140.dll', 'vcruntime140.dll',
-        'sentry.dll', 'crashpad_handler.exe', 'crashpad_wer.dll')) {
+        'sentry.dll', 'crashpad_handler.exe', 'crashpad_wer.dll', $velopackDeployName)) {
     if (-not (Test-Path -LiteralPath (Join-Path $DeployFolder $required))) { $missing += $required }
 }
 foreach ($requiredDir in @('platforms', 'imageformats', 'tls', 'qml')) {
     if (-not (Test-Path -LiteralPath (Join-Path $DeployFolder $requiredDir))) { $missing += "$requiredDir\" }
 }
-if (-not (Test-Path -LiteralPath (Join-Path $DeployFolder 'licenses\OpenSans-OFL.txt'))) { $missing += 'licenses\OpenSans-OFL.txt' }
+foreach ($licenceFile in @('OpenSans-OFL.txt', 'GPL-3.0.txt', 'WRITTEN-OFFER.txt')) {
+    if (-not (Test-Path -LiteralPath (Join-Path $DeployFolder "licenses\$licenceFile"))) { $missing += "licenses\$licenceFile" }
+}
 if ($missing.Count -gt 0) { throw "deploy folder is incomplete, missing: $($missing -join ', ')" }
 $deploySize = (Get-ChildItem -LiteralPath $DeployFolder -Recurse -File | Measure-Object -Property Length -Sum).Sum
 Write-Host ('OK - {0:N1} MB' -f ($deploySize / 1MB))
 
-# ---------------------------------------------------------------- package
-Step 'Package: assemble the component and run binarycreator'
-New-Item -ItemType Directory -Force -Path $PackageData, $PackageMeta | Out-Null
-if (Test-Path -LiteralPath $PackageData) { Remove-Item -LiteralPath $PackageData -Recurse -Force }
-New-Item -ItemType Directory -Force -Path $PackageData | Out-Null
-Copy-Item -Path (Join-Path $DeployFolder '*') -Destination $PackageData -Recurse -Force
-
-# The licence page shows the GPL text *and* the corresponding-source offer, in that order
-# (Pitfall 9: a licence file on its own does not discharge the source obligation).
-$licensePath = Join-Path $PackageMeta 'license.txt'
-$writtenOffer = Get-Content -LiteralPath (Join-Path $InstallerSource 'WRITTEN-OFFER.txt') -Raw
-$gplText = Get-Content -LiteralPath (Join-Path $RepoRoot 'GPL-3.0.txt') -Raw
-Set-Content -LiteralPath $licensePath -Value ($writtenOffer + "`r`n" + $gplText) -Encoding UTF8
-
-# The installer's own icon. IFW looks the file up by appending '.ico' on Windows.
-Copy-Item -LiteralPath (Join-Path $RepoRoot 'app\seathub.ico') -Destination (Join-Path $InstallerSource 'config\seathub.ico') -Force
-
-# The setup must know its own version: the control script reads installer.value("ProductVersion")
-# for the install journal's `to` field (ADR-0070 items 6 and 10). The tracked config.xml and
-# package.xml stay unstamped templates on purpose, so the stamp is a BUILD-TIME COPY that
-# binarycreator reads - never an in-place edit of a tracked file. (Updates.xml is the one tracked
-# file the existing build already rewrites, with the installer's SHA-256 below; it is handled by
-# the release record commit, not by this stamp.) IFW resolves <ControlScript> and the icon
-# relative to the -c config file's directory, so the copy carries the whole config directory; on
-# the package side only meta is copied (package.xml is what IFW reads) and the payload data
-# directory is junctioned instead of copying the ~157 MB deploy tree a second time.
-$StampRoot = Join-Path $BuildRoot 'installer-stamp'
-if (Test-Path -LiteralPath $StampRoot) {
-    # rmdir removes a junction itself; Remove-Item -Recurse could follow it into the payload.
-    cmd /c "rmdir /s /q `"$StampRoot`"" | Out-Null
-    if (Test-Path -LiteralPath $StampRoot) { Remove-Item -LiteralPath $StampRoot -Recurse -Force }
-}
-$StampConfig = Join-Path $StampRoot 'config'
-$StampPackages = Join-Path $StampRoot 'packages'
-$StampPackageDir = Join-Path $StampPackages 'com.seathub.client'
-New-Item -ItemType Directory -Force -Path $StampConfig, (Join-Path $StampPackageDir 'meta') | Out-Null
-Copy-Item -Path (Join-Path $InstallerSource 'config\*') -Destination $StampConfig -Force
-Copy-Item -Path (Join-Path $PackageMeta '*') -Destination (Join-Path $StampPackageDir 'meta') -Force
-$StampData = Join-Path $StampPackageDir 'data'
-try {
-    New-Item -ItemType Junction -Path $StampData -Target $PackageData | Out-Null
-} catch {
-    Write-Host "junction failed ($($_.Exception.Message)); copying the payload instead"
-    Copy-Item -LiteralPath $PackageData -Destination $StampData -Recurse -Force
-}
-foreach ($stampFile in @((Join-Path $StampConfig 'config.xml'), (Join-Path $StampPackageDir 'meta\package.xml'))) {
-    $stamped = Get-Content -LiteralPath $stampFile -Raw
-    $stamped = $stamped -replace '<Version>[^<]*</Version>', "<Version>$Version</Version>"
-    if ($stamped -notmatch "<Version>$([regex]::Escape($Version))</Version>") {
-        throw "version stamp failed: $stampFile does not carry <Version>$Version</Version>"
-    }
-    Set-Content -LiteralPath $stampFile -Value $stamped -Encoding UTF8
-}
-Write-Host "Stamped $Version into the build-time config.xml and package.xml ($StampRoot)"
-
-New-Item -ItemType Directory -Force -Path $InstallerFolder | Out-Null
-$installerName = "SeatHub-Setup-$Version.exe"
-$installerPath = Join-Path $InstallerFolder $installerName
-& $binarycreator --offline-only -c (Join-Path $StampConfig 'config.xml') -p $StampPackages $installerPath
-if ($LASTEXITCODE -ne 0) { throw "binarycreator failed with exit code $LASTEXITCODE" }
-Require $installerPath 'installer'
-
-Step 'Checksum'
-$hash = (Get-FileHash -LiteralPath $installerPath -Algorithm SHA256).Hash.ToLower()
-$installerBytes = (Get-Item -LiteralPath $installerPath).Length
-Write-Host "$installerName  $([math]::Round($installerBytes / 1MB, 1)) MB"
-Write-Host "sha256  $hash"
-Set-Content -LiteralPath (Join-Path $InstallerFolder 'sha256.txt') -Value $hash -Encoding ASCII
-
-# The installer hash is the value the release row and the client's pinned checksum must both carry
-# (D-43). Writing it where the record already looks for it keeps the two from drifting apart.
-$updatesPath = Join-Path $PackageMeta 'Updates.xml'
-$updates = Get-Content -LiteralPath $updatesPath -Raw
-$updates = $updates -replace '<Sha256>.*?</Sha256>', "<Sha256>$hash</Sha256>"
-Set-Content -LiteralPath $updatesPath -Value $updates -Encoding UTF8
-
 Write-Host "`nDone." -ForegroundColor Green
 Write-Host "  deploy   : $DeployFolder"
-Write-Host "  installer: $installerPath"
-Write-Host "  sha256   : $hash"
-Write-Host "`nNext: copy the sha256 into seathub-ops/pins.yaml (installer.sha256) and publish the"
-Write-Host "package with POST /api/admin/releases (D-40). The installer is unsigned (D-43): Windows"
-Write-Host "will show its unknown-publisher warning once, and the per-machine install raises UAC."
+Write-Host "`nNext: pwsh -File scripts\pack-seathub.ps1 packs the deploy folder into the Velopack release"
+Write-Host "(Setup.exe, the full package and releases.win.json). The release is unsigned (D-43): Windows"
+Write-Host "may show its unknown-publisher warning for a browser download of Setup.exe; the install itself"
+Write-Host "is per user and raises no administrator prompt (ADR-0086)."
