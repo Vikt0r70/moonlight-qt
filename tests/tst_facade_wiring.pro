@@ -53,6 +53,7 @@ LIBS += -L$$SEATHUB_SENTRY_DIR/lib -lsentry
 SOURCES += \
     tst_facade_wiring.cpp \
     ../app/seathub/seathub_client.cpp \
+    ../app/seathub/stream_freeze_watchdog.cpp \
     ../app/seathub/session_lifecycle.cpp \
     ../app/seathub/engine_session.cpp \
     ../app/seathub/control_plane_client.cpp \
@@ -98,6 +99,7 @@ SOURCES += \
 # upstream class links as four unresolved externals.
 HEADERS += \
     ../app/seathub/seathub_client.h \
+    ../app/seathub/stream_freeze_watchdog.h \
     ../app/seathub/session_lifecycle.h \
     ../app/seathub/engine_session.h \
     ../app/seathub/control_plane_client.h \

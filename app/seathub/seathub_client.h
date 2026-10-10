@@ -49,6 +49,7 @@
 #include "session_lifecycle.h"
 #include "session_websocket.h"
 #include "sse_client.h"
+#include "stream_freeze_watchdog.h"
 #include "stream_stats.h"
 // Included rather than forward-declared: moc needs complete types for the `SettingsBridge*` and
 // `UpdateFeedClient*` properties below (a bare forward declaration fails the pointer-metatype
@@ -329,6 +330,8 @@ public:
     /// reads `interval()` to check the doubling (2s, 4s, 8s, capped at 15s) without waiting for it
     /// in real time, and restarts it at 0ms to drive the next attempt at once.
     QTimer* reconnectTimer() const { return m_reconnectTimer; }
+    StreamFreezeWatchdog* freezeWatchdog() { return &m_freezeWatchdog; }
+    void setStatsOverlayVisible(bool visible);
     /// The control-plane session this facade is attached to now, or empty. Exposed the same way, so
     /// a test can say that a restart or a sign-in reattaches nothing and that a finished teardown
     /// detaches. Nothing in the app reads it through here, and nothing offers to resume it.
@@ -1268,5 +1271,6 @@ private:
     // reads it, because the HUD is not QML on this tier; the lifecycle drives it and the
     // publisher composites it.
     HudOverlay m_hud;
+    StreamFreezeWatchdog m_freezeWatchdog;
     bool m_inSettings = false;
 };

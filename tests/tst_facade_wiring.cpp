@@ -8267,6 +8267,71 @@ private slots:
         delete engine;
     }
 
+    void test_watchdog_reconnects_after_freeze_timeout()
+    {
+        auto* engine = new FakeEngineSession;
+        SeatHubClient client;
+        WalletTicks ticks;
+        beginStreaming(client, engine, &ticks, 90, 80);
+        QVERIFY(!QTest::currentTestFailed());
+
+        QVERIFY(client.freezeWatchdog()->isArmed());
+
+        client.freezeWatchdog()->forceTimeout();
+
+        QVERIFY(client.freezeWatchdog()->isStalled());
+        QCOMPARE(client.appState(), QStringLiteral("connecting"));
+        QVERIFY(client.reconnecting());
+
+        emit engine->readyForDeletion();
+        QVERIFY(!m_fake->requestPaths().contains(QStringLiteral("/api/sessions/s-live/end")));
+
+        client.session()->attachSession(nullptr);
+        delete engine;
+    }
+
+    void aTenSecondFreezeReconnectsWithoutEnd()
+    {
+        auto* engine = new FakeEngineSession;
+        SeatHubClient client;
+        WalletTicks ticks;
+        beginStreaming(client, engine, &ticks, 90, 80);
+        QVERIFY(!QTest::currentTestFailed());
+
+        client.freezeWatchdog()->noteFrameStatsTap();
+        QVERIFY(!client.freezeWatchdog()->isStalled());
+
+        client.freezeWatchdog()->forceTimeout();
+        QVERIFY(client.freezeWatchdog()->isStalled());
+        QVERIFY(client.reconnecting());
+
+        emit engine->readyForDeletion();
+        QVERIFY(!m_fake->requestPaths().contains(QStringLiteral("/api/sessions/s-live/end")));
+
+        client.session()->attachSession(nullptr);
+        delete engine;
+    }
+
+    void aHiddenStatsOverlayNeverTriggersTheWatchdog()
+    {
+        auto* engine = new FakeEngineSession;
+        SeatHubClient client;
+        WalletTicks ticks;
+        beginStreaming(client, engine, &ticks, 90, 80);
+        QVERIFY(!QTest::currentTestFailed());
+
+        client.setStatsOverlayVisible(false);
+        QVERIFY(!client.freezeWatchdog()->isArmed());
+
+        client.freezeWatchdog()->forceTimeout();
+        QVERIFY(!client.freezeWatchdog()->isStalled());
+        QVERIFY(!client.reconnecting());
+        QCOMPARE(client.appState(), QStringLiteral("streaming"));
+
+        client.session()->attachSession(nullptr);
+        delete engine;
+    }
+
 };
 
 QTEST_MAIN(TstFacadeWiring)

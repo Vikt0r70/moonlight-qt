@@ -225,6 +225,7 @@ SOURCES += \
     gui/computermodel.cpp \
     gui/appmodel.cpp \
     seathub/seathub_client.cpp \
+    seathub/stream_freeze_watchdog.cpp \
     seathub/session_lifecycle.cpp \
     seathub/settings_bridge.cpp \
     seathub/update_feed_client.cpp \
@@ -301,6 +302,7 @@ HEADERS += \
     gui/computermodel.h \
     gui/appmodel.h \
     seathub/seathub_client.h \
+    seathub/stream_freeze_watchdog.h \
     seathub/session_lifecycle.h \
     seathub/settings_bridge.h \
     seathub/update_feed_client.h \

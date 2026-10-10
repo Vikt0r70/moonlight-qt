@@ -561,6 +561,17 @@ SeatHubClient::SeatHubClient(QObject* parent)
     connect(m_session, &SessionLifecycle::sessionFinished, this, &SeatHubClient::handleSessionFinished);
     connect(m_session, &SessionLifecycle::readyForDeletion, this, &SeatHubClient::handleReadyForDeletion);
 
+    m_freezeWatchdog.onTimeout([this]() {
+        // SC30 / ADR-0087: 10s freeze -> set stall flag and trigger reconnect logic
+        if (m_appState != QLatin1String(kStateStreaming) && !m_streamStarted) {
+            return;
+        }
+        enterReconnect();
+        if (m_session) {
+            m_session->interrupt();
+        }
+    });
+
     // ---------------------------------------------------------------- the control-plane bridge
     //
     // One object owns each safety-critical sequence, and the facade owns the objects. The
@@ -995,6 +1006,7 @@ void SeatHubClient::setAppState(const QString& state)
     const bool isStreaming = m_appState == QLatin1String(kStateStreaming);
 
     if (wasStreaming != isStreaming) {
+        m_freezeWatchdog.setStreaming(isStreaming);
         // Pitfall 6 / T-03-15: the settings page stops accepting writes for the duration.
         // Pitfall 8 / T-03-17: so does the updater - replacing the binary a live session is
         // running from is not something this client does (D-41).
@@ -2989,10 +3001,13 @@ void SeatHubClient::handleConnectionStarted()
 
     const bool firstConnection = m_streamStartMs < 0;
     if (firstConnection) m_streamStartMs = m_playElapsed.elapsed();
+    m_freezeWatchdog.setStreaming(true);
+    m_freezeWatchdog.clearStall();
     const auto generation = m_playGeneration.load();
     const QElapsedTimer clock = m_playElapsed;
     m_hud.compositor().setStatsTap([this, generation, clock](const VideoStats& stats) {
         if (generation != m_playGeneration.load()) return;
+        m_freezeWatchdog.noteFrameStatsTap();
         m_sampler->feed(stats);
         qint64 absent = -1;
         if (stats.renderedFps.present && stats.renderedFps.value > 0
@@ -3175,8 +3190,14 @@ void SeatHubClient::handleSessionFinished(int portTestResult)
     }
 }
 
+void SeatHubClient::setStatsOverlayVisible(bool visible)
+{
+    m_freezeWatchdog.setStatsVisible(visible);
+}
+
 void SeatHubClient::handleReadyForDeletion()
 {
+    m_freezeWatchdog.setStreaming(false);
     if (m_reconnecting) {
         // 06.1-19/J-07: the engine that just tore itself down was this reconnect's own attempt
         // (the drop that started it, or a retry's own engine dropping again). This is not an
@@ -4103,6 +4124,7 @@ void SeatHubClient::handleHostResolved(const QString& sessionId, const PairedHos
     // rows are visible. The tap is removed at stream end (handleTeardownCompleted clears it
     // by passing nullptr). The compositor holds the function-pointer behind its own mutex.
     m_hud.compositor().setStatsTap([this](const VideoStats& stats) {
+        m_freezeWatchdog.noteFrameStatsTap();
         m_sampler->feed(stats);
     });
 

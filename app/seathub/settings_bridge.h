@@ -196,6 +196,9 @@ private:
     /// SeatHub's own captured values, applied once on first run where ADR-0042 freezes a
     /// default that differs from upstream's (capture-system-keys: checked + "In fullscreen").
     void applySeatHubDefaults();
+    /// Recalculates default bitrate using upstream StreamingPreferences::getDefaultBitrate
+    /// when resolution or framerate changes (SC30 / ADR-0087).
+    void recalculateDefaultBitrate();
     /// D-25/D-25a: `language`, `richpresence`, `mdns`, `detectnetblocking` and `quitAppAfter` are
     /// corrected back to their fixed value and saved, on every load - not only the first
     /// (T-05-45). `hostaudio` is deliberately excluded (D-25a amendment): it stays user-editable.

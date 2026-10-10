@@ -3,11 +3,36 @@
 #include "stats_catalogue.h"
 #include "stream_stats.h"
 
+#include <QDateTime>
 #include <QMutexLocker>
+#include <QPainter>
+#include <QPainterPath>
 
+#include <cmath>
 #include <cstring>
 
 namespace {
+
+static void paintHintText(QPainter& painter, const QPointF& baseline, const QFont& font,
+                          const QString& text, QRgb fillColor, qreal outlinePx)
+{
+    if (text.isEmpty()) {
+        return;
+    }
+
+    QPainterPath path;
+    path.addText(baseline, font, text);
+
+    QPainterPath shadowPath;
+    shadowPath.addText(baseline + QPointF(1.0, 1.0), font, text);
+    painter.fillPath(shadowPath, QColor::fromRgba(kOsdOutline));
+
+    QPen outlinePen(QColor::fromRgba(kOsdOutline), 2.0 * outlinePx, Qt::SolidLine,
+                    Qt::RoundCap, Qt::RoundJoin);
+    painter.strokePath(path, outlinePen);
+
+    painter.fillPath(path, QColor::fromRgba(fillColor));
+}
 
 // CR-03 (`hud_overlay.cpp`'s own rule, ADR-0045): the surface owns its pixels - a fresh
 // allocation and a byte-for-byte row copy, never a view onto `image`'s own buffer, because
@@ -184,6 +209,82 @@ SDL_Surface* OsdCompositor::rasterize(Overlay::OverlayType type, const char* tex
     return static_cast<OsdCompositor*>(context)->rasterizeInstance(type, text, enabled, color);
 }
 
+void OsdCompositor::showStartHint(bool show)
+{
+    QMutexLocker locker(&m_mutex);
+    m_state.startHintActive = show;
+    if (show) {
+        m_state.startHintTimestamp = QDateTime::currentMSecsSinceEpoch();
+    } else {
+        m_state.startHintTimestamp = 0;
+    }
+}
+
+bool OsdCompositor::isStartHintActive() const
+{
+    QMutexLocker locker(&m_mutex);
+    if (!m_state.startHintActive) {
+        return false;
+    }
+    if (m_state.startHintTimestamp > 0) {
+        const qint64 elapsed = QDateTime::currentMSecsSinceEpoch() - m_state.startHintTimestamp;
+        if (elapsed >= 10000) {
+            return false;
+        }
+    }
+    return true;
+}
+
+QImage OsdCompositor::renderBottom(const State& current) const
+{
+    const bool hintActive = isStartHintActive();
+    if (!hintActive) {
+        return renderOsdBottom(current.windowWidth, current.windowHeight, current.engineText,
+                               current.engineColor, current.timeLeft);
+    }
+
+    // SC13 / ADR-0087: start-of-stream hint renders in the Time left slot (bottom-right)
+    // beside Moonlight's status text without hiding it.
+    OsdTimeLeft noTimeLeft = current.timeLeft;
+    noTimeLeft.visible = false;
+
+    QImage base = renderOsdBottom(current.windowWidth, current.windowHeight, current.engineText,
+                                  current.engineColor, noTimeLeft);
+
+    const OsdSizes sizes = osdSizesFor(current.windowHeight);
+    const QFont hintFont = osdFont(sizes.valuePx);
+    const QFontMetricsF hintMetrics(hintFont);
+    const QString hintText = QStringLiteral("Ctrl+Alt+Shift+Q ends the session. Ctrl+Alt+Shift+S shows stats.");
+    const qreal hintWidth = hintMetrics.horizontalAdvance(hintText);
+    const qreal hintHeight = hintMetrics.height();
+    const qreal hintBlockHeight = hintHeight + sizes.timeLeftInset;
+
+    const int targetHeight = static_cast<int>(std::ceil(std::max(
+        base.isNull() ? 0.0 : static_cast<qreal>(base.height()), hintBlockHeight)));
+
+    if (targetHeight <= 0) {
+        return QImage();
+    }
+
+    QImage image(std::max(1, current.windowWidth), targetHeight, QImage::Format_ARGB32_Premultiplied);
+    image.fill(Qt::transparent);
+
+    QPainter painter(&image);
+    painter.setRenderHint(QPainter::Antialiasing, true);
+    painter.setRenderHint(QPainter::TextAntialiasing, true);
+
+    if (!base.isNull()) {
+        painter.drawImage(0, targetHeight - base.height(), base);
+    }
+
+    const qreal baselineY = static_cast<qreal>(targetHeight) - sizes.timeLeftInset - hintMetrics.descent();
+    const qreal x = static_cast<qreal>(current.windowWidth) - sizes.timeLeftInset - hintWidth;
+
+    paintHintText(painter, QPointF(x, baselineY), hintFont, hintText, kOsdValue, sizes.outlinePx);
+
+    return image;
+}
+
 SDL_Surface* OsdCompositor::rasterizeInstance(Overlay::OverlayType type, const char* text,
                                                bool enabled, SDL_Color color)
 {
@@ -207,16 +308,17 @@ SDL_Surface* OsdCompositor::rasterizeInstance(Overlay::OverlayType type, const c
         current = m_state;
     }
 
-    if (!enabled) {
+    if (!enabled && !isStartHintActive()) {
         // Nothing would draw it, and `OverlayManager`'s own refusal rule would discard whatever
         // this returned anyway (the same rule `updateOverlaySurface()` applies) - returning
         // nullptr here up front avoids the wasted render.
         return nullptr;
     }
 
-    const QImage image = renderOsdBottom(current.windowWidth, current.windowHeight,
-                                          current.engineText, current.engineColor,
-                                          current.timeLeft);
+    const QImage image = renderBottom(current);
+    if (image.isNull()) {
+        return nullptr;
+    }
     return toOwnedArgbSurface(image);
 }
 
@@ -272,6 +374,5 @@ SDL_Surface* OsdCompositor::rasterizeStats(const char* text, bool enabled) const
 QImage OsdCompositor::composedBottom() const
 {
     const State current = snapshot();
-    return renderOsdBottom(current.windowWidth, current.windowHeight, current.engineText,
-                            current.engineColor, current.timeLeft);
+    return renderBottom(current);
 }

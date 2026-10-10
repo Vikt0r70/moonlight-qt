@@ -874,6 +874,7 @@ private slots:
     void theStreamingBannerAndNegotiatedFallbackStillRenderOnTheRebuiltPage();
     void noSettingsPageStringCarriesTheUpstreamBrand();
     void theSettingsPageShowsTheLogsQualityAndCrashReportsDisclosureSentence();
+    void test_slider_allows_150_mbps();
     void customResolutionSelectionRevealsAndPersistsTheWidthHeightFields();
     void customFrameRateSelectionRevealsAndPersistsTheFpsField();
     void aStoredCustomResolutionOrFrameRateShowsItsFieldsOnLoad();
@@ -3681,6 +3682,34 @@ void TstUiScreens::theSettingsPageShowsTheLogsQualityAndCrashReportsDisclosureSe
     QVERIFY2(!oldFound, "the old disclosure must not survive beside the updated one");
 }
 
+void TstUiScreens::test_slider_allows_150_mbps()
+{
+    SettingsFixture fixture;
+    QQuickStyle::setStyle(QStringLiteral("Basic"));
+    QQmlEngine engine;
+    registerTokenSingletons(&engine);
+
+    QString error;
+    QScopedPointer<QObject> root(instantiateSettingsPage(&engine, fixture.client, &error));
+    QVERIFY2(root, qPrintable(error));
+
+    QObject* bitrateSlider = root->findChild<QObject*>(QStringLiteral("bitrateSlider"));
+    if (!bitrateSlider) {
+        for (QObject* object : root->findChildren<QObject*>()) {
+            if (object->property("stepSize").isValid() && object->property("from").isValid() && object->property("to").isValid()) {
+                if (object->property("from").toInt() == 500) {
+                    bitrateSlider = object;
+                    break;
+                }
+            }
+        }
+    }
+    QVERIFY2(bitrateSlider, "bitrate slider starting at 500 kbps must be present on SettingsPage");
+    QCOMPARE(bitrateSlider->property("from").toInt(), 500);
+    QCOMPARE(bitrateSlider->property("to").toInt(), 150000);
+    QCOMPARE(bitrateSlider->property("stepSize").toInt(), 500);
+}
+
 void TstUiScreens::theNoticeShowsItsTextAndOneOK()
 {
     QQmlEngine engine; registerTokenSingletons(&engine);
@@ -5994,6 +6023,7 @@ void TstUiScreens::checkHomeAt(const QSize& size)
     QVERIFY2(seesText(screen.data(),
                       QStringLiteral("You ended the session. Unused minutes stay in your account.")),
              qPrintable(where));
+    QMetaObject::invokeMethod(screen->findChild<QObject*>(QStringLiteral("endReasonLine"))->parent(), "forceLayout");
     QTRY_VERIFY2(sceneTop(screen->findChild<QObject*>(QStringLiteral("endReasonLine"))) < sceneTop(play),
              qPrintable(where + QStringLiteral(": the end reason sits above Play")));
     client.setEndReasonText(QString());
@@ -6003,6 +6033,7 @@ void TstUiScreens::checkHomeAt(const QSize& size)
     QVERIFY2(seesText(screen.data(), QStringLiteral("Checking availability…")), qPrintable(where));
     QVERIFY(play->property("busy").toBool());
     QCOMPARE(spokenName(play), QStringLiteral("Play"));
+    QMetaObject::invokeMethod(screen->findChild<QObject*>(QStringLiteral("stateLine"))->parent(), "forceLayout");
     QTRY_VERIFY2(sceneTop(screen->findChild<QObject*>(QStringLiteral("stateLine"))) < sceneTop(play),
              qPrintable(where));
 
@@ -6108,9 +6139,13 @@ void TstUiScreens::checkSignInAt(const QSize& size)
     FakeShellClient client;
     Hosted host;
     QString error;
-    QScopedPointer<QObject> screen(instantiate(&engine, QStringLiteral("SignInScreen.qml"), &error));
+    QQmlComponent component(&engine, QUrl::fromLocalFile(guiDir() + QStringLiteral("/SignInScreen.qml")));
+    QScopedPointer<QObject> screen(component.createWithInitialProperties(
+        { { QStringLiteral("client"), QVariant::fromValue(static_cast<QObject*>(&client)) } }));
+    if (!screen) {
+        error = component.errorString();
+    }
     QVERIFY2(screen, qPrintable(error));
-    QVERIFY(screen->setProperty("client", QVariant::fromValue(static_cast<QObject*>(&client))));
     // Sign in carries no header, so it fills the window.
     QVERIFY2(host.show(screen.data(), size, 0), qPrintable(where));
 
@@ -6258,6 +6293,7 @@ void TstUiScreens::checkSignInAt(const QSize& size)
                            QStringLiteral("Create an account on the website"),
                            QStringLiteral("Sign in"), QStringLiteral("New here? Create an account"),
                            QStringLiteral("Forgot password?") }));
+    QMetaObject::invokeMethod(child("refusalLine")->parent(), "forceLayout");
     QTRY_VERIFY2(sceneTop(child("refusalLine")) < sceneTop(child("noAccountSignUp")),
                  qPrintable(where + QStringLiteral(": the offer sits under the sentence")));
     QTRY_VERIFY2(sceneTop(child("noAccountSignUp")) < sceneTop(primary), qPrintable(where));
@@ -6970,9 +7006,13 @@ void TstUiScreens::theSignInPasswordKeepsItsNameWhileAccessibilityIsActive()
         FakeShellClient client;
         Hosted host;
         QString error;
-        QScopedPointer<QObject> screen(instantiate(&engine, QStringLiteral("SignInScreen.qml"), &error));
+        QQmlComponent component(&engine, QUrl::fromLocalFile(guiDir() + QStringLiteral("/SignInScreen.qml")));
+        QScopedPointer<QObject> screen(component.createWithInitialProperties(
+            { { QStringLiteral("client"), QVariant::fromValue(static_cast<QObject*>(&client)) } }));
+        if (!screen) {
+            error = component.errorString();
+        }
         QVERIFY2(screen, qPrintable(error));
-        QVERIFY(screen->setProperty("client", QVariant::fromValue(static_cast<QObject*>(&client))));
         QVERIFY(host.show(screen.data(), QSize(1100, 720), 0));
         deepChild(screen.data(), QLatin1String("identifierField"))
             ->setProperty("text", QStringLiteral("lina@example.com"));

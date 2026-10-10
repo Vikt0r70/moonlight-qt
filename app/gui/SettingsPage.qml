@@ -257,18 +257,65 @@ Item {
                             maximum: 480
                         }
 
-                        // --bitrate . Upstream's slider goes 500-150000 Kbps, or 500-500000 while
-                        // "Unlock bitrate limit" is on (Advanced Settings) - no new bound.
-                        NamedNumberField {
-                            settingKey: "bitrate"
-                            bridge: page.prefs
-                            title: qsTr("Video bitrate")
-                            description: qsTr("500 Kbps up to the unlock-bitrate ceiling below. Lower it on slower connections.")
-                            suffix: qsTr("Kbps")
-                            minimum: 500
-                            maximum: page.prefs ? page.prefs.bitrateMaximum() : 150000
-                            maximumProvider: function() { return page.prefs ? page.prefs.bitrateMaximum() : 150000 }
-                            refreshTriggerKeys: ["unlockbitrate"]
+                        Column {
+                            id: bitrateColumn
+                            property string title: qsTr("Video bitrate")
+                            width: parent.width
+                            spacing: Metrics.s2
+
+                            Text {
+                                id: bitrateTitle
+                                text: qsTr("Video bitrate: %1 Mbps").arg(bitrateSlider.value / 1000.0)
+                                color: Tokens.foregroundDefault
+                                font.family: Tokens.fontDisplayDefault
+                                font.pixelSize: Metrics.fontBody
+                                font.weight: Font.Medium
+                            }
+
+                            Text {
+                                id: bitrateDesc
+                                text: qsTr("Lower the bitrate on slower connections. Raise the bitrate to increase image quality.")
+                                color: Tokens.foregroundMutedDefault
+                                font.family: Tokens.fontDisplayDefault
+                                font.pixelSize: Metrics.fontSm
+                                wrapMode: Text.Wrap
+                                width: parent.width
+                            }
+
+                            Slider {
+                                id: bitrateSlider
+                                objectName: "bitrateSlider"
+                                Accessible.name: qsTr("Video bitrate")
+                                width: parent.width
+                                from: 500
+                                to: page.prefs ? page.prefs.bitrateMaximum() : 150000
+                                stepSize: 500
+                                snapMode: Slider.SnapOnRelease
+                                enabled: page.prefs ? page.prefs.writable : true
+
+                                value: page.prefs ? page.prefs.getSavedValue("bitrate") : 20000
+
+                                onMoved: {
+                                    if (page.prefs) {
+                                        page.prefs.setValue("bitrate", Math.round(value))
+                                    }
+                                }
+
+                                Keys.onPressed: function(event) {
+                                    if (event.key === Qt.Key_PageUp || event.key === Qt.Key_PageDown) {
+                                        event.accepted = true;
+                                    }
+                                }
+
+                                Connections {
+                                    target: page.prefs
+                                    function onValueChanged(key) {
+                                        if (key === "bitrate" || key === "unlockbitrate") {
+                                            bitrateSlider.value = page.prefs.getSavedValue("bitrate")
+                                        }
+                                    }
+                                }
+                            }
                         }
 
                         // One control over `windowmode` and its legacy predecessor `fullscreen`;
@@ -429,7 +476,7 @@ Item {
                             settingKey: "mouseacceleration"
                             bridge: page.prefs
                             title: qsTr("Optimize mouse for remote desktop instead of games")
-                            description: qsTr("Seamless pointer control. Doesn't work in most games.")
+                            description: qsTr("Seamless pointer control. Doesn't work in most games. You can toggle this while streaming using Ctrl+Alt+Shift+M.")
                         }
 
                         // ------------------------------------------------- capture system keys

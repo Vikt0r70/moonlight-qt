@@ -44,6 +44,10 @@ private slots:
     void settingsShowTheSavedValuesOnly();
     void theOverrideMechanismIsGone();
     void negotiatedResultsAreExposedOnlyAfterConnectionStarted();
+    void anEmptyStoreGetsTheMoonlightDefaultFor1080p60();
+    void savedValuesAreNeverReset();
+    void aSizeOrRateChangeRecalculatesLikeMoonlight();
+    void test_settings_bridge_recalculates_on_resolution_change();
 
 private:
     QTemporaryDir m_settingsDir;
@@ -535,6 +539,70 @@ void TstSettingsBridge::negotiatedResultsAreExposedOnlyAfterConnectionStarted()
     QVERIFY(!m_bridge->hasNegotiatedResults());
     QVERIFY(!m_bridge->hasNegotiationWarning(QStringLiteral("hdr")));
     QCOMPARE(m_bridge->negotiationWarnings().size(), 0);
+}
+
+void TstSettingsBridge::anEmptyStoreGetsTheMoonlightDefaultFor1080p60()
+{
+    // Empty settings store: SeatHub defaults to 1080p 60fps at Moonlight default bitrate (20 Mbps = 20000 kbps)
+    QSettings settings;
+    settings.clear();
+    StreamingPreferences::get()->reload();
+
+    SettingsBridge freshBridge(this);
+
+    QCOMPARE(freshBridge.getValue(QStringLiteral("width")).toInt(), 1920);
+    QCOMPARE(freshBridge.getValue(QStringLiteral("height")).toInt(), 1080);
+    QCOMPARE(freshBridge.getValue(QStringLiteral("fps")).toInt(), 60);
+    QCOMPARE(freshBridge.getValue(QStringLiteral("bitrate")).toInt(), 20000);
+    QCOMPARE(StreamingPreferences::get()->captureSysKeysMode, StreamingPreferences::CSK_FULLSCREEN);
+}
+
+void TstSettingsBridge::savedValuesAreNeverReset()
+{
+    // Existing saved values in settings must be preserved and never overwritten on startup
+    QSettings settings;
+    settings.clear();
+    settings.setValue(QStringLiteral("width"), 2560);
+    settings.setValue(QStringLiteral("height"), 1440);
+    settings.setValue(QStringLiteral("fps"), 120);
+    settings.setValue(QStringLiteral("bitrate"), 45000);
+    settings.sync();
+
+    StreamingPreferences::get()->reload();
+    SettingsBridge bridge(this);
+
+    QCOMPARE(bridge.getValue(QStringLiteral("width")).toInt(), 2560);
+    QCOMPARE(bridge.getValue(QStringLiteral("height")).toInt(), 1440);
+    QCOMPARE(bridge.getValue(QStringLiteral("fps")).toInt(), 120);
+    QCOMPARE(bridge.getValue(QStringLiteral("bitrate")).toInt(), 45000);
+}
+
+void TstSettingsBridge::aSizeOrRateChangeRecalculatesLikeMoonlight()
+{
+    // Changing framerate or resolution recalculates bitrate via StreamingPreferences::getDefaultBitrate
+    QVERIFY(m_bridge->setValue(QStringLiteral("fps"), 30));
+    const int expected30Fps = StreamingPreferences::getDefaultBitrate(
+        m_bridge->getValue(QStringLiteral("width")).toInt(),
+        m_bridge->getValue(QStringLiteral("height")).toInt(),
+        30,
+        StreamingPreferences::get()->enableYUV444);
+    QCOMPARE(m_bridge->getValue(QStringLiteral("bitrate")).toInt(), expected30Fps);
+
+    // Changing resolution preset also recalculates bitrate
+    QVERIFY(m_bridge->setResolutionPreset(QStringLiteral("720p")));
+    const int expected720p30 = StreamingPreferences::getDefaultBitrate(
+        1280, 720, 30, StreamingPreferences::get()->enableYUV444);
+    QCOMPARE(m_bridge->getValue(QStringLiteral("bitrate")).toInt(), expected720p30);
+}
+
+void TstSettingsBridge::test_settings_bridge_recalculates_on_resolution_change()
+{
+    // Verified grep target: recalculate bitrate when resolution changes
+    QVERIFY(m_bridge->setValue(QStringLiteral("fps"), 60));
+    QVERIFY(m_bridge->setResolutionPreset(QStringLiteral("1440p")));
+    const int expected1440p = StreamingPreferences::getDefaultBitrate(
+        2560, 1440, 60, StreamingPreferences::get()->enableYUV444);
+    QCOMPARE(m_bridge->getValue(QStringLiteral("bitrate")).toInt(), expected1440p);
 }
 
 QTEST_MAIN(TstSettingsBridge)

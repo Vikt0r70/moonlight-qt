@@ -68,6 +68,12 @@ public:
     /// HUD's own publish path (Plan 14) - both draw from the one recorded state.
     QImage composedBottom() const;
 
+    /// Start-of-stream on-screen hint (SC13 / ADR-0087):
+    /// displayed for 10 seconds in the Time left slot:
+    /// "Ctrl+Alt+Shift+Q ends the session. Ctrl+Alt+Shift+S shows stats."
+    void showStartHint(bool show = true);
+    bool isStartHintActive() const;
+
 private:
     struct State
     {
@@ -77,7 +83,11 @@ private:
         QRgb engineColor = qRgba(0, 0, 0, 0);
         OsdTimeLeft timeLeft{ false, 0, false };
         QStringList enabledStatsLabels;
+        bool startHintActive = false;
+        qint64 startHintTimestamp = 0;
     };
+
+    QImage renderBottom(const State& current) const;
 
     SDL_Surface* rasterizeInstance(Overlay::OverlayType type, const char* text, bool enabled,
                                     SDL_Color color);

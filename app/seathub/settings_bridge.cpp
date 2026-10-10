@@ -659,9 +659,11 @@ bool SettingsBridge::writeThrough(const QString& key, const QVariant& value)
 
     if (key == QLatin1String("width")) {
         m_preferences->width = value.toInt();
+        recalculateDefaultBitrate();
     }
     else if (key == QLatin1String("height")) {
         m_preferences->height = value.toInt();
+        recalculateDefaultBitrate();
     }
     else if (key == QLatin1String("fps")) {
         const int fps = value.toInt();
@@ -669,6 +671,7 @@ bool SettingsBridge::writeThrough(const QString& key, const QVariant& value)
             return false;
         }
         m_preferences->fps = fps;
+        recalculateDefaultBitrate();
     }
     else if (key == QLatin1String("bitrate")) {
         const int bitrate = value.toInt();
@@ -1166,18 +1169,53 @@ void SettingsBridge::noteLaunchWarning(const QString& engineText)
 
 void SettingsBridge::applySeatHubDefaults()
 {
-    // ADR-0042 freezes a SeatHub default that differs from upstream's: capture-system-keys
-    // ships checked with "In fullscreen", where upstream's own default is never. Applied once,
-    // through the same preference object everything else uses, so the stored value and the
-    // control agree from the first launch onwards.
+    // ADR-0042 / ADR-0087 (SC30): SeatHub defaults that differ from upstream's.
+    // Applied once when keys are absent from the store.
     QSettings settings;
-    if (settings.contains(QStringLiteral("capturesyskeys"))) {
-        return;
+    bool changed = false;
+
+    if (!settings.contains(QStringLiteral("capturesyskeys"))) {
+        m_preferences->captureSysKeysMode = StreamingPreferences::CSK_FULLSCREEN;
+        changed = true;
+        qCInfo(seathubSettings) << "applied SeatHub's capture-system-keys default (ADR-0042)";
     }
 
-    m_preferences->captureSysKeysMode = StreamingPreferences::CSK_FULLSCREEN;
-    m_preferences->save();
-    qCInfo(seathubSettings) << "applied SeatHub's capture-system-keys default (ADR-0042)";
+    if (!settings.contains(QStringLiteral("width"))) {
+        m_preferences->width = 1920;
+        changed = true;
+    }
+
+    if (!settings.contains(QStringLiteral("height"))) {
+        m_preferences->height = 1080;
+        changed = true;
+    }
+
+    if (!settings.contains(QStringLiteral("fps"))) {
+        m_preferences->fps = 60;
+        changed = true;
+    }
+
+    if (!settings.contains(QStringLiteral("bitrate"))) {
+        m_preferences->bitrateKbps = StreamingPreferences::getDefaultBitrate(
+            m_preferences->width, m_preferences->height, m_preferences->fps, m_preferences->enableYUV444);
+        changed = true;
+    }
+
+    if (!settings.contains(QStringLiteral("mouseacceleration"))) {
+        m_preferences->absoluteMouseMode = false;
+        changed = true;
+    }
+
+    if (changed) {
+        m_preferences->save();
+    }
+}
+
+void SettingsBridge::recalculateDefaultBitrate()
+{
+    m_preferences->bitrateKbps = StreamingPreferences::getDefaultBitrate(
+        m_preferences->width, m_preferences->height, m_preferences->fps, m_preferences->enableYUV444);
+    emit valueChanged(QStringLiteral("bitrate"));
 }
 
 void SettingsBridge::applyForcedValues()

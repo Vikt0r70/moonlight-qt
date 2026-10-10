@@ -437,6 +437,41 @@ private slots:
         QVERIFY(regionHasPixelNear(image, rightHalf, qRgb(0xEF, 0x44, 0x44)));
     }
 
+    void test_osd_renders_start_hint()
+    {
+        QVERIFY(registerOsdFonts());
+        OsdCompositor compositor;
+        compositor.setWindowSize(1920, 1080);
+        compositor.showStartHint(true);
+        QVERIFY(compositor.isStartHintActive());
+
+        const QImage image = compositor.composedBottom();
+        QVERIFY(!image.isNull());
+
+        // The hint text renders in the Time left slot (bottom-right)
+        const QRect rightHalf(image.width() / 2, 0, image.width() - (image.width() / 2), image.height());
+        QVERIFY(regionHasPixelNear(image, rightHalf, qRgb(0xFF, 0xFF, 0xFF)));
+        QVERIFY(regionHasNearBlackPixel(image, rightHalf));
+
+        // It appears beside Moonlight's status text without hiding it
+        auto* surface = OsdCompositor::rasterize(Overlay::OverlayStatusUpdate,
+            "Poor connection to PC", true, SDL_Color{0xCC, 0, 0, 0xFF}, &compositor);
+        QVERIFY(surface != nullptr);
+        SDL_FreeSurface(surface);
+
+        const QImage composed = compositor.composedBottom();
+        QVERIFY(!composed.isNull());
+        const QRect leftHalf(0, 0, composed.width() / 2, composed.height());
+        QVERIFY(regionHasPixelNear(composed, leftHalf, qRgb(0xCC, 0x00, 0x00)));
+        QVERIFY(regionHasPixelNear(composed, rightHalf, qRgb(0xFF, 0xFF, 0xFF)));
+
+        // Disarming the hint with no timeLeft and no engine text yields a null image
+        compositor.showStartHint(false);
+        QVERIFY(!compositor.isStartHintActive());
+        OsdCompositor::rasterize(Overlay::OverlayStatusUpdate, "", false, SDL_Color{0, 0, 0, 0}, &compositor);
+        QVERIFY(compositor.composedBottom().isNull());
+    }
+
     // `ui.md` §4: digits never jitter - every one of them has the same horizontal advance.
     void digitsAreTabular()
     {
