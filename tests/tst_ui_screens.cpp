@@ -875,6 +875,7 @@ private slots:
     void noSettingsPageStringCarriesTheUpstreamBrand();
     void theSettingsPageShowsTheLogsQualityAndCrashReportsDisclosureSentence();
     void test_slider_allows_150_mbps();
+    void theBitrateSliderFollowsUnlockKeysAndDragAtBothDesktopSizes();
     void customResolutionSelectionRevealsAndPersistsTheWidthHeightFields();
     void customFrameRateSelectionRevealsAndPersistsTheFpsField();
     void aStoredCustomResolutionOrFrameRateShowsItsFieldsOnLoad();
@@ -7034,6 +7035,108 @@ void TstUiScreens::theSignInPasswordKeepsItsNameWhileAccessibilityIsActive()
         checkSignInAt(size);
         QVERIFY2(!QTest::currentTestFailed(), qPrintable(QStringLiteral("§22 Sign in at ") + sizeLabel(size)
                                                          + QStringLiteral(" with accessibility active")));
+    }
+}
+
+// F2 (wave 29 cycle 1): the Unlock ceiling must follow the toggle inside ONE page instance, the value
+// is the mono trailing label, and the arrow keys and a drag write through - at both desktop sizes.
+void TstUiScreens::theBitrateSliderFollowsUnlockKeysAndDragAtBothDesktopSizes()
+{
+    for (const QSize& size : customerDesktopSizes()) {
+        const QString where = QStringLiteral("Bitrate slider at ") + sizeLabel(size);
+        SettingsFixture fixture;
+        QQuickStyle::setStyle(QStringLiteral("Basic"));
+        QQmlEngine engine;
+        registerTokenSingletons(&engine);
+        SettingsBridge* bridge = fixture.bridge;
+
+        // Unlock OFF, a saved value the default ceiling holds.
+        QVERIFY(bridge->setValue(QStringLiteral("unlockbitrate"), false));
+        QVERIFY(bridge->setValue(QStringLiteral("bitrate"), 45000));
+
+        Hosted host;
+        QString error;
+        QScopedPointer<QObject> screen(instantiateSettingsPage(&engine, fixture.client, &error));
+        QVERIFY2(screen, qPrintable(error));
+        QVERIFY2(host.show(screen.data(), size, kSignedInHeaderPx), qPrintable(where));
+
+        QObject* slider = deepChild(screen.data(), QLatin1String("bitrateSlider"));
+        QObject* valueLabel = deepChild(screen.data(), QLatin1String("bitrateValue"));
+        QVERIFY2(slider && valueLabel, qPrintable(where));
+        auto savedBitrate = [&]() { return bridge->getSavedValue(QStringLiteral("bitrate")).toInt(); };
+
+        // Mono trailing value in Mbps; the title keeps the display font.
+        QCOMPARE(valueLabel->property("text").toString(), QStringLiteral("45 Mbps"));
+        QObject* titleLabel = deepChild(screen.data(), QLatin1String("bitrateTitle"));
+        QVERIFY2(titleLabel, qPrintable(where));
+        QVERIFY2(valueLabel->property("font").value<QFont>().family()
+                     != titleLabel->property("font").value<QFont>().family(),
+                 qPrintable(where + QStringLiteral(": the value must be mono, the title display")));
+        QVERIFY2(seesText(screen.data(), QStringLiteral("Video bitrate:")), qPrintable(where));
+        QCOMPARE(slider->property("from").toInt(), 500);
+        QCOMPARE(slider->property("to").toInt(), 150000);
+
+        // Bring the slider into view and give it the keyboard focus (the page scrolls).
+        auto reveal = [&]() {
+            QQuickItem* item = qobject_cast<QQuickItem*>(slider);
+            for (QQuickItem* p = item->parentItem(); p; p = p->parentItem()) {
+                if (p->metaObject()->indexOfProperty("contentY") >= 0) {
+                    const QPointF at = item->mapToItem(p->property("contentItem").value<QQuickItem*>(),
+                                                       QPointF(0, 0));
+                    p->setProperty("contentY", std::max(0.0, at.y() - 100.0));
+                    break;
+                }
+            }
+            QTest::qWait(30);
+        };
+        reveal();
+        QVERIFY(QMetaObject::invokeMethod(slider, "forceActiveFocus"));
+
+        // Arrow keys: one step of 500 each way; Page Up / Page Down do nothing.
+        QTest::keyClick(&host.window, Qt::Key_Right);
+        QCOMPARE(savedBitrate(), 45500);
+        QCOMPARE(valueLabel->property("text").toString(), QStringLiteral("45.5 Mbps"));
+        QTest::keyClick(&host.window, Qt::Key_Left);
+        QCOMPARE(savedBitrate(), 45000);
+        QTest::keyClick(&host.window, Qt::Key_PageUp);
+        QTest::keyClick(&host.window, Qt::Key_PageDown);
+        QCOMPARE(savedBitrate(), 45000);
+
+        // Unlock false -> true in the SAME instance: the ceiling widens, a high saved value is kept.
+        QVERIFY(bridge->setValue(QStringLiteral("unlockbitrate"), true));
+        QCOMPARE(slider->property("to").toInt(), 500000);
+        QVERIFY(bridge->setValue(QStringLiteral("bitrate"), 300000));
+        QCOMPARE(slider->property("value").toInt(), 300000);
+        QCOMPARE(valueLabel->property("text").toString(), QStringLiteral("300 Mbps"));
+        QTest::keyClick(&host.window, Qt::Key_Right);
+        QCOMPARE(savedBitrate(), 300500);
+
+        // Unlock true -> false: the ceiling narrows, the saved value never lowers itself, and the
+        // label tells the stored truth.
+        QVERIFY(bridge->setValue(QStringLiteral("unlockbitrate"), false));
+        QCOMPARE(slider->property("to").toInt(), 150000);
+        QCOMPARE(savedBitrate(), 300500);
+        QCOMPARE(valueLabel->property("text").toString(), QStringLiteral("300.5 Mbps"));
+
+        // And back on: the handle returns to the saved value.
+        QVERIFY(bridge->setValue(QStringLiteral("unlockbitrate"), true));
+        QCOMPARE(slider->property("to").toInt(), 500000);
+        QCOMPARE(slider->property("value").toInt(), 300500);
+
+        // Drag: with Unlock off, press and release mid-track; the value snaps to a 500 step, is
+        // written through to the store and persisted.
+        QVERIFY(bridge->setValue(QStringLiteral("unlockbitrate"), false));
+        QVERIFY(bridge->setValue(QStringLiteral("bitrate"), 20000));
+        reveal();
+        QQuickItem* sliderItem = qobject_cast<QQuickItem*>(slider);
+        const QPointF mid = sliderItem->mapToScene(QPointF(sliderItem->width() / 2, sliderItem->height() / 2));
+        QTest::mousePress(&host.window, Qt::LeftButton, Qt::NoModifier, mid.toPoint());
+        QTest::mouseMove(&host.window, QPoint(mid.toPoint().x() + 20, mid.toPoint().y()));
+        QTest::mouseRelease(&host.window, Qt::LeftButton, Qt::NoModifier, QPoint(mid.toPoint().x() + 20, mid.toPoint().y()));
+        const int dragged = savedBitrate();
+        QVERIFY2(dragged != 20000 && dragged % 500 == 0 && dragged > 500 && dragged <= 150000,
+                 qPrintable(where + QStringLiteral(": drag wrote ") + QString::number(dragged)));
+        QCOMPARE(QSettings().value(QStringLiteral("bitrate")).toInt(), dragged);
     }
 }
 

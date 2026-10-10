@@ -62,6 +62,7 @@
 
 #include <atomic>
 #include <functional>
+#include <thread>
 
 #include "seathub/control_plane_client.h"
 #include "seathub/countries.h"
@@ -76,6 +77,7 @@
 #include "seathub/telemetry.h"
 #include "seathub/token_store.h"
 #include "seathub/web_origin.h"
+#include "settings/streamingpreferences.h"
 
 // ---------------------------------------------------------------- the two stitched seams -------
 //
@@ -713,7 +715,7 @@ public:
     bool publishOverlaySurface(SDL_Surface*) override { return true; }
 
     QList<QWindow*> runs;
-    int interrupts = 0;
+    std::atomic<int> interrupts{0}; // atomic: the freeze watchdog interrupts from its own thread
 };
 
 /// Waits for `condition` WITHOUT running this thread's event loop, and says whether it came true.
@@ -1276,6 +1278,8 @@ private slots:
         SeatHubTelemetry::clearUser();
         SeatHubTelemetry::clearSession();
         SeatHubTelemetry::clearTrace();
+        // The engine's own start-up state for its Debug (stats) overlay (upstream default: hidden).
+        StreamingPreferences::get()->showPerformanceOverlay = false;
     }
 
     void cleanup()
@@ -1436,7 +1440,7 @@ private slots:
 
             // D-02 reaches the engine through the facade.
             client.interrupt();
-            QCOMPARE(engine->interrupts, 1);
+            QCOMPARE(engine->interrupts.load(), 1);
 
             emit engine->sessionFinished(0);
             emit engine->readyForDeletion();
@@ -4594,7 +4598,7 @@ private slots:
             // interrupt and posts nothing itself; the appState only moves once the engine's own
             // teardown sequence (`readyForDeletion`) says so, never fast-forwarded to Home the way
             // the not-yet-active branch above is.
-            QCOMPARE(engine->interrupts, 1);
+            QCOMPARE(engine->interrupts.load(), 1);
             QCOMPARE(client.appState(), QStringLiteral("streaming"));
 
             emit engine->sessionFinished(0);
@@ -4902,7 +4906,7 @@ private slots:
             // customer's own quit, not a connection failure.
             QVERIFY(client.session()->start(nullptr));
             client.interrupt();
-            QCOMPARE(engine->interrupts, 1);
+            QCOMPARE(engine->interrupts.load(), 1);
             emit engine->stageFailed(QStringLiteral("RTSP handshake"), -1, QString());
 
             QTRY_VERIFY_WITH_TIMEOUT(
@@ -6284,6 +6288,9 @@ private slots:
             { 200, QByteArrayLiteral("{}"), "an answer with no balance in it" },
             { 401, refusedBody(), "a rejected credential" },
         };
+        // The start hint (SC13) shares the bar for its first ten seconds; this test is about Time
+        // left, so the hint is cleared first.
+        client.hud()->compositor().showStartHint(false);
         for (const Failure& failure : failures) {
             m_fake->answerWallet(failure.status, failure.body);
             const int failedBefore = ticks.failed.load();
@@ -6327,6 +6334,7 @@ private slots:
         // tick can, and it leaves no earlier answer in flight to arrive one step late in the loop.
         QVERIFY(settleIntoTheStream(client, &ticks));
         QCOMPARE(client.hud()->creditMinutes(), qint64(90));
+        client.hud()->compositor().showStartHint(false); // the start hint (SC13) is not under test
         client.hud()->tick();
         QVERIFY2(client.hud()->compositor().composedBottom().isNull(), "ninety minutes shows nothing");
 
@@ -6453,6 +6461,7 @@ private slots:
         QCOMPARE(ticks.failed.load(), 2);
 
         QCOMPARE(client.hud()->creditMinutes(), qint64(1));
+        client.hud()->compositor().showStartHint(false); // the start hint (SC13) is not under test
         client.hud()->tick();
         QVERIFY2(client.hud()->compositor().composedBottom().isNull(),
                  "the seed alone must not show Time left (D-16) - a failed read fires nothing");
@@ -7273,6 +7282,9 @@ private slots:
         auto* engine = new FakeEngineSession;
         SeatHubClient client;
         WalletTicks ticks;
+        // This test drives the reconnect by hand and can run past ten seconds without a stats tap;
+        // the freeze watchdog's real clock (now armed from streaming entry) is not under test here.
+        client.freezeWatchdog()->setTimeoutMs(10 * 60 * 1000);
         beginStreaming(client, engine, &ticks, 90, 80);
         QVERIFY(!QTest::currentTestFailed());
 
@@ -7494,7 +7506,7 @@ private slots:
         QVERIFY2(!client.settings()->sessionActive(),
                  "WR-14(a): the Settings/updater lock must release once this branch clears "
                  "m_reconnecting");
-        QCOMPARE(secondEngine->interrupts, 1);
+        QCOMPARE(secondEngine->interrupts.load(), 1);
 
         emit secondEngine->readyForDeletion();
     }
@@ -8269,6 +8281,7 @@ private slots:
 
     void test_watchdog_reconnects_after_freeze_timeout()
     {
+        StreamingPreferences::get()->showPerformanceOverlay = true;
         auto* engine = new FakeEngineSession;
         SeatHubClient client;
         WalletTicks ticks;
@@ -8292,6 +8305,7 @@ private slots:
 
     void aTenSecondFreezeReconnectsWithoutEnd()
     {
+        StreamingPreferences::get()->showPerformanceOverlay = true;
         auto* engine = new FakeEngineSession;
         SeatHubClient client;
         WalletTicks ticks;
@@ -8314,6 +8328,7 @@ private slots:
 
     void aHiddenStatsOverlayNeverTriggersTheWatchdog()
     {
+        StreamingPreferences::get()->showPerformanceOverlay = true;
         auto* engine = new FakeEngineSession;
         SeatHubClient client;
         WalletTicks ticks;
@@ -8327,6 +8342,220 @@ private slots:
         QVERIFY(!client.freezeWatchdog()->isStalled());
         QVERIFY(!client.reconnecting());
         QCOMPARE(client.appState(), QStringLiteral("streaming"));
+
+        client.session()->attachSession(nullptr);
+        delete engine;
+    }
+
+    // --- the freeze watchdog on its real clock (SC30, ADR-0087) ---------------------------------
+    // The facade's own thread is suspended for a whole stream, so these wait WITHOUT the event
+    // loop first: only the watchdog's thread and the thread-safe interrupt can make them true.
+
+    static void feedTheRealDebugOverlay(OsdCompositor* compositor, bool enabled)
+    {
+        SDL_Surface* surface = OsdCompositor::rasterize(
+            Overlay::OverlayDebug,
+            enabled ? "Rendering frame rate: 59.00 FPS\nAverage network latency: 23 ms (variance: 1 ms)"
+                    : "",
+            enabled, SDL_Color{255, 255, 255, 255}, compositor);
+        if (surface) SDL_FreeSurface(surface);
+    }
+
+    void aStreamThatNeverTapsReconnectsOnTheRealTimer()
+    {
+        StreamingPreferences::get()->showPerformanceOverlay = true;
+        auto* engine = new FakeEngineSession;
+        SeatHubClient client;
+        WalletTicks ticks;
+        client.freezeWatchdog()->setTimeoutMs(300);
+        beginStreaming(client, engine, &ticks, 90, 80);
+        QVERIFY(!QTest::currentTestFailed());
+        QVERIFY(client.session()->start(nullptr)); // as in production: the engine is running
+
+        // No tap is ever delivered: the deadline began at streaming entry.
+        QVERIFY(waitWithoutTheEventLoop([&]() { return engine->interrupts.load() >= 1; }, 5000));
+        QVERIFY(client.freezeWatchdog()->isStalled());
+        QVERIFY2(!client.reconnecting(), "the facade thread has not run: only the interrupt happened");
+
+        QTRY_VERIFY(client.reconnecting());
+        QCOMPARE(client.appState(), QStringLiteral("connecting"));
+        QCOMPARE(engine->interrupts.load(), 1);
+        emit engine->readyForDeletion();
+        QVERIFY(!m_fake->requestPaths().contains(QStringLiteral("/api/sessions/s-live/end")));
+
+        client.session()->attachSession(nullptr);
+        delete engine;
+    }
+
+    void theDefaultFreezeDeadlineIsTenRealSeconds()
+    {
+        StreamingPreferences::get()->showPerformanceOverlay = true;
+        QCOMPARE(StreamFreezeWatchdog::kFreezeTimeoutMs, 10000);
+        auto* engine = new FakeEngineSession;
+        SeatHubClient client;
+        WalletTicks ticks;
+        beginStreaming(client, engine, &ticks, 90, 80);
+        QVERIFY(!QTest::currentTestFailed());
+        QVERIFY(client.session()->start(nullptr));
+
+        QElapsedTimer waited;
+        waited.start();
+        QVERIFY(!waitWithoutTheEventLoop([&]() { return engine->interrupts.load() >= 1; }, 9000));
+        QVERIFY(!client.freezeWatchdog()->isStalled());
+        QVERIFY(waitWithoutTheEventLoop([&]() { return engine->interrupts.load() >= 1; }, 3000));
+        QVERIFY2(waited.elapsed() >= 9500 && waited.elapsed() <= 12500,
+                 qPrintable(QString::number(waited.elapsed())));
+        QVERIFY(client.freezeWatchdog()->isStalled());
+
+        emit engine->readyForDeletion(); // ends the lifecycle the test started
+        client.session()->attachSession(nullptr);
+        delete engine;
+    }
+
+    void decoderThreadFrameStatsTapsKeepTheStreamAlive()
+    {
+        StreamingPreferences::get()->showPerformanceOverlay = true;
+        auto* engine = new FakeEngineSession;
+        SeatHubClient client;
+        WalletTicks ticks;
+        client.freezeWatchdog()->setTimeoutMs(500);
+        beginStreaming(client, engine, &ticks, 90, 80);
+        QVERIFY(!QTest::currentTestFailed());
+        QVERIFY(client.session()->start(nullptr));
+
+        // The real production path, from a thread that is not the facade's: the compositor's
+        // rasterizer calls the stats tap, which notes the frame.
+        OsdCompositor* compositor = &client.hud()->compositor();
+        std::atomic<bool> stop{false};
+        std::thread decoder([&]() {
+            while (!stop.load()) {
+                feedTheRealDebugOverlay(compositor, true);
+                QThread::msleep(100);
+            }
+        });
+        QThread::msleep(1500);
+        const bool stalledWhileTapping = client.freezeWatchdog()->isStalled();
+        const int interruptsWhileTapping = engine->interrupts.load();
+        stop.store(true);
+        decoder.join();
+        QVERIFY(!stalledWhileTapping);
+        QCOMPARE(interruptsWhileTapping, 0);
+
+        // The taps stop: the watchdog fires after the (shortened) deadline.
+        QVERIFY(waitWithoutTheEventLoop([&]() { return engine->interrupts.load() >= 1; }, 5000));
+        QVERIFY(client.freezeWatchdog()->isStalled());
+
+        emit engine->readyForDeletion(); // ends the lifecycle the test started
+        client.session()->attachSession(nullptr);
+        delete engine;
+    }
+
+    void theRealDebugOverlayStateArmsAndDisarmsTheWatchdog()
+    {
+        StreamingPreferences::get()->showPerformanceOverlay = true;
+        auto* engine = new FakeEngineSession;
+        SeatHubClient client;
+        WalletTicks ticks;
+        client.freezeWatchdog()->setTimeoutMs(300);
+        beginStreaming(client, engine, &ticks, 90, 80);
+        QVERIFY(!QTest::currentTestFailed());
+        QVERIFY(client.session()->start(nullptr));
+        OsdCompositor* compositor = &client.hud()->compositor();
+        QVERIFY(client.freezeWatchdog()->isArmed());
+
+        // The hotkey hides the overlay: the engine notifies the rasterizer with enabled == false.
+        feedTheRealDebugOverlay(compositor, false);
+        QVERIFY(!client.freezeWatchdog()->isArmed());
+        QVERIFY(!waitWithoutTheEventLoop([&]() { return engine->interrupts.load() >= 1; }, 800));
+        QVERIFY(!client.freezeWatchdog()->isStalled());
+
+        // Shown again: armed with a fresh deadline, and a silent stream is then caught.
+        feedTheRealDebugOverlay(compositor, true);
+        QVERIFY(client.freezeWatchdog()->isArmed());
+        QVERIFY(waitWithoutTheEventLoop([&]() { return engine->interrupts.load() >= 1; }, 5000));
+        QVERIFY(client.freezeWatchdog()->isStalled());
+
+        emit engine->readyForDeletion(); // ends the lifecycle the test started
+        client.session()->attachSession(nullptr);
+        delete engine;
+    }
+
+    void aStreamStartedWithTheStatsOverlayHiddenNeverTriggersTheWatchdog()
+    {
+        // `prepareForSession()` forces the engine's Debug producer on for every stream, so a
+        // stream always starts shown (armed); the hotkey hides it through the real notification.
+        auto* engine = new FakeEngineSession;
+        SeatHubClient client;
+        WalletTicks ticks;
+        client.freezeWatchdog()->setTimeoutMs(300);
+        beginStreaming(client, engine, &ticks, 90, 80);
+        QVERIFY(!QTest::currentTestFailed());
+        QVERIFY(client.session()->start(nullptr));
+        QVERIFY(client.freezeWatchdog()->isArmed());
+
+        feedTheRealDebugOverlay(&client.hud()->compositor(), false);
+        QVERIFY(!client.freezeWatchdog()->isArmed());
+        QVERIFY(!waitWithoutTheEventLoop([&]() { return engine->interrupts.load() >= 1; }, 800));
+        QVERIFY(!client.freezeWatchdog()->isStalled());
+        QVERIFY(!client.reconnecting());
+
+        // The hotkey shows it again: the real notification arms the watchdog.
+        feedTheRealDebugOverlay(&client.hud()->compositor(), true);
+        QVERIFY(client.freezeWatchdog()->isArmed());
+
+        emit engine->readyForDeletion(); // ends the lifecycle the test started
+        client.session()->attachSession(nullptr);
+        delete engine;
+    }
+
+    // --- the start-of-stream hint (SC13) ---------------------------------------------------------
+
+    void theStartHintShowsFromConnectionStartedAndExpiresThroughTheHud()
+    {
+        auto* engine = new FakeEngineSession;
+        SeatHubClient client;
+        WalletTicks ticks;
+        std::atomic<qint64> now{1000000};
+        std::atomic<int> published{0};
+        client.hud()->compositor().setClock([&now]() { return now.load(); });
+        client.hud()->setPublisher([&published](SDL_Surface* surface) {
+            if (surface) {
+                ++published;
+                SDL_FreeSurface(surface);
+            }
+            return true;
+        });
+        beginStreaming(client, engine, &ticks, 90, 80);
+        QVERIFY(!QTest::currentTestFailed());
+
+        QVERIFY(client.hud()->compositor().isStartHintActive());
+        client.hud()->tick();
+        QVERIFY(published.load() >= 1);
+        const QImage withHint = client.hud()->compositor().composedBottom();
+        QVERIFY(!withHint.isNull());
+
+        now += 9999;
+        QVERIFY(client.hud()->compositor().isStartHintActive());
+        now += 2;
+        QVERIFY(!client.hud()->compositor().isStartHintActive());
+        client.hud()->tick();
+        QVERIFY(client.hud()->compositor().composedBottom() != withHint);
+
+        client.session()->attachSession(nullptr);
+        delete engine;
+    }
+
+    void theStartHintIsClearedWhenTheSessionFinishes()
+    {
+        auto* engine = new FakeEngineSession;
+        SeatHubClient client;
+        WalletTicks ticks;
+        beginStreaming(client, engine, &ticks, 90, 80);
+        QVERIFY(!QTest::currentTestFailed());
+        QVERIFY(client.hud()->compositor().isStartHintActive());
+
+        emit engine->sessionFinished(0);
+        QVERIFY(!client.hud()->compositor().isStartHintActive());
 
         client.session()->attachSession(nullptr);
         delete engine;

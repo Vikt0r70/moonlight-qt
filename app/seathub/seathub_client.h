@@ -30,6 +30,7 @@
 #include <functional>
 #include <limits>
 #include <memory>
+#include <mutex>
 
 #include "authorized_through_timer.h"
 #include "control_plane_client.h"
@@ -793,6 +794,12 @@ private:
     /// reconnect state and the first backoff, and reports the stage at once (`LivenessTimer`
     /// narrows its own immediate report to exactly this transition, Task 2).
     void enterReconnect();
+    /// The facade-thread half of the freeze watchdog's reconnect (SC30). The watchdog fires on its
+    /// own thread while this one is suspended inside the engine's SDL loop, so the fire path only
+    /// raises `m_freezeReconnectPending` and interrupts the engine; this runs the reconnect once
+    /// the facade thread is back - queued from the fire path, and again first thing in
+    /// `handleSessionFinished()` / `handleReadyForDeletion()`. Idempotent.
+    void applyPendingFreezeReconnect();
     /// `m_reconnectTimer`'s own timeout: re-runs the full pairing handshake for `m_sessionId`
     /// (STREAM-10 forbids anything cheaper), leaving `appState` at "connecting" and the stepper at
     /// stage 3, and never restarting `m_liveness` (it never stopped across the drop). A no-op
@@ -1272,5 +1279,10 @@ private:
     // publisher composites it.
     HudOverlay m_hud;
     StreamFreezeWatchdog m_freezeWatchdog;
+    std::atomic<bool> m_freezeReconnectPending{false};
+    /// True while a started engine may be interrupted from the watchdog thread; guards the
+    /// `m_session->interrupt()` call there against the engine going away.
+    std::mutex m_freezeInterruptMutex;
+    bool m_freezeInterruptLive = false;
     bool m_inSettings = false;
 };

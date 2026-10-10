@@ -658,20 +658,34 @@ bool SettingsBridge::writeThrough(const QString& key, const QVariant& value)
     bool ok = true;
 
     if (key == QLatin1String("width")) {
-        m_preferences->width = value.toInt();
-        recalculateDefaultBitrate();
+        // V-STREAM: the bitrate follows the size only when the size actually changes, as
+        // upstream's `updateBitrateForSelection` does - a write of the saved value must not
+        // replace a bitrate the customer chose.
+        const int width = value.toInt();
+        const bool changed = m_preferences->width != width;
+        m_preferences->width = width;
+        if (changed) {
+            recalculateDefaultBitrate();
+        }
     }
     else if (key == QLatin1String("height")) {
-        m_preferences->height = value.toInt();
-        recalculateDefaultBitrate();
+        const int height = value.toInt();
+        const bool changed = m_preferences->height != height;
+        m_preferences->height = height;
+        if (changed) {
+            recalculateDefaultBitrate();
+        }
     }
     else if (key == QLatin1String("fps")) {
         const int fps = value.toInt();
         if (fps <= 0) {
             return false;
         }
+        const bool changed = m_preferences->fps != fps;
         m_preferences->fps = fps;
-        recalculateDefaultBitrate();
+        if (changed) {
+            recalculateDefaultBitrate();
+        }
     }
     else if (key == QLatin1String("bitrate")) {
         const int bitrate = value.toInt();
@@ -1093,6 +1107,11 @@ QString SettingsBridge::warningKeyFor(const QString& engineText)
 }
 
 // ------------------------------------------------------------------ lifecycle hooks
+
+bool SettingsBridge::statsOverlayShownAtStart() const
+{
+    return m_preferences->showPerformanceOverlay;
+}
 
 bool SettingsBridge::writable() const
 {

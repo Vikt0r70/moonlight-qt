@@ -200,6 +200,23 @@ void OsdCompositor::setStatsTap(StatsTapFn tap)
     m_statsTap = std::move(tap);
 }
 
+void OsdCompositor::setStatsVisibilityTap(StatsVisibilityFn tap)
+{
+    QMutexLocker locker(&m_mutex);
+    m_statsVisibilityTap = std::move(tap);
+}
+
+void OsdCompositor::setClock(ClockFn clock)
+{
+    QMutexLocker locker(&m_mutex);
+    m_clock = std::move(clock);
+}
+
+qint64 OsdCompositor::nowMsLocked() const
+{
+    return m_clock ? m_clock() : QDateTime::currentMSecsSinceEpoch();
+}
+
 SDL_Surface* OsdCompositor::rasterize(Overlay::OverlayType type, const char* text, bool enabled,
                                        SDL_Color color, void* context)
 {
@@ -214,7 +231,7 @@ void OsdCompositor::showStartHint(bool show)
     QMutexLocker locker(&m_mutex);
     m_state.startHintActive = show;
     if (show) {
-        m_state.startHintTimestamp = QDateTime::currentMSecsSinceEpoch();
+        m_state.startHintTimestamp = nowMsLocked();
     } else {
         m_state.startHintTimestamp = 0;
     }
@@ -227,7 +244,7 @@ bool OsdCompositor::isStartHintActive() const
         return false;
     }
     if (m_state.startHintTimestamp > 0) {
-        const qint64 elapsed = QDateTime::currentMSecsSinceEpoch() - m_state.startHintTimestamp;
+        const qint64 elapsed = nowMsLocked() - m_state.startHintTimestamp;
         if (elapsed >= 10000) {
             return false;
         }
@@ -324,6 +341,19 @@ SDL_Surface* OsdCompositor::rasterizeInstance(Overlay::OverlayType type, const c
 
 SDL_Surface* OsdCompositor::rasterizeStats(const char* text, bool enabled) const
 {
+    {
+        // The engine's real Debug overlay state, reported before any early return so a hide
+        // (the hotkey, or the slot being disabled) reaches the freeze watchdog too.
+        StatsVisibilityFn visibility;
+        {
+            QMutexLocker locker(&m_mutex);
+            visibility = m_statsVisibilityTap;
+        }
+        if (visibility) {
+            visibility(enabled);
+        }
+    }
+
     if (!enabled) {
         // OD-04 (now SeatHub's own rule): a disabled slot draws nothing, whatever is ticked.
         return nullptr;

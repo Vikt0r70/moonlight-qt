@@ -47,6 +47,8 @@ private slots:
     void anEmptyStoreGetsTheMoonlightDefaultFor1080p60();
     void savedValuesAreNeverReset();
     void aSizeOrRateChangeRecalculatesLikeMoonlight();
+    void aSameValueWriteKeepsAManualBitrate();
+    void reselectingTheCurrentPresetKeepsAManualBitrate();
     void test_settings_bridge_recalculates_on_resolution_change();
 
 private:
@@ -593,6 +595,48 @@ void TstSettingsBridge::aSizeOrRateChangeRecalculatesLikeMoonlight()
     const int expected720p30 = StreamingPreferences::getDefaultBitrate(
         1280, 720, 30, StreamingPreferences::get()->enableYUV444);
     QCOMPARE(m_bridge->getValue(QStringLiteral("bitrate")).toInt(), expected720p30);
+
+    // The exact round trip: 1080p 60 -> 4K 60 -> 1080p 60 (Moonlight's formula: 20,000 and 80,000).
+    QVERIFY(m_bridge->setResolutionPreset(QStringLiteral("1080p")));
+    QVERIFY(m_bridge->setValue(QStringLiteral("fps"), 60));
+    QCOMPARE(m_bridge->getValue(QStringLiteral("bitrate")).toInt(), 20000);
+    QVERIFY(m_bridge->setResolutionPreset(QStringLiteral("4K")));
+    QCOMPARE(m_bridge->getValue(QStringLiteral("bitrate")).toInt(), 80000);
+    QVERIFY(m_bridge->setResolutionPreset(QStringLiteral("1080p")));
+    QCOMPARE(m_bridge->getValue(QStringLiteral("bitrate")).toInt(), 20000);
+}
+
+void TstSettingsBridge::aSameValueWriteKeepsAManualBitrate()
+{
+    // V-STREAM: the bitrate is recalculated only when the size or rate actually changes. Writing
+    // the value that is already saved must leave a bitrate the customer chose alone.
+    QVERIFY(m_bridge->setResolutionPreset(QStringLiteral("1080p")));
+    QVERIFY(m_bridge->setValue(QStringLiteral("fps"), 60));
+    QVERIFY(m_bridge->setValue(QStringLiteral("bitrate"), 45000));
+
+    QVERIFY(m_bridge->setValue(QStringLiteral("fps"), 60));
+    QCOMPARE(m_bridge->getValue(QStringLiteral("bitrate")).toInt(), 45000);
+    QVERIFY(m_bridge->setValue(QStringLiteral("width"), 1920));
+    QCOMPARE(m_bridge->getValue(QStringLiteral("bitrate")).toInt(), 45000);
+    QVERIFY(m_bridge->setValue(QStringLiteral("height"), 1080));
+    QCOMPARE(m_bridge->getValue(QStringLiteral("bitrate")).toInt(), 45000);
+
+    // A real change still recalculates, so the guard is not simply disabling the recalculation.
+    QVERIFY(m_bridge->setValue(QStringLiteral("fps"), 30));
+    QCOMPARE(m_bridge->getValue(QStringLiteral("bitrate")).toInt(),
+             StreamingPreferences::getDefaultBitrate(1920, 1080, 30,
+                                                     StreamingPreferences::get()->enableYUV444));
+}
+
+void TstSettingsBridge::reselectingTheCurrentPresetKeepsAManualBitrate()
+{
+    QVERIFY(m_bridge->setResolutionPreset(QStringLiteral("1080p")));
+    QVERIFY(m_bridge->setFrameRatePreset(QStringLiteral("60 FPS")));
+    QVERIFY(m_bridge->setValue(QStringLiteral("bitrate"), 45000));
+
+    QVERIFY(m_bridge->setResolutionPreset(QStringLiteral("1080p")));
+    QVERIFY(m_bridge->setFrameRatePreset(QStringLiteral("60 FPS")));
+    QCOMPARE(m_bridge->getValue(QStringLiteral("bitrate")).toInt(), 45000);
 }
 
 void TstSettingsBridge::test_settings_bridge_recalculates_on_resolution_change()

@@ -263,13 +263,34 @@ Item {
                             width: parent.width
                             spacing: Metrics.s2
 
-                            Text {
-                                id: bitrateTitle
-                                text: qsTr("Video bitrate: %1 Mbps").arg(bitrateSlider.value / 1000.0)
-                                color: Tokens.foregroundDefault
-                                font.family: Tokens.fontDisplayDefault
-                                font.pixelSize: Metrics.fontBody
-                                font.weight: Font.Medium
+                            // ui.md Slider entry: the title in the display font, the value as a mono
+                            // label in the row's trailing slot. The two read as the copy.md title
+                            // `Video bitrate: {n} Mbps`. The value is the SAVED bitrate, so a saved
+                            // value above a lowered ceiling is shown as it is stored.
+                            RowLayout {
+                                width: parent.width
+                                spacing: Metrics.s2
+
+                                Text {
+                                    id: bitrateTitle
+                                    objectName: "bitrateTitle"
+                                    text: qsTr("Video bitrate:")
+                                    color: Tokens.foregroundDefault
+                                    font.family: Tokens.fontDisplayDefault
+                                    font.pixelSize: Metrics.fontBody
+                                    font.weight: Font.Medium
+                                    Layout.fillWidth: true
+                                }
+
+                                Text {
+                                    id: bitrateValue
+                                    objectName: "bitrateValue"
+                                    text: qsTr("%1 Mbps").arg(bitrateSlider.savedKbps / 1000.0)
+                                    color: Tokens.foregroundDefault
+                                    font.family: Tokens.fontMonoDefault
+                                    font.pixelSize: Metrics.fontBody
+                                    horizontalAlignment: Text.AlignRight
+                                }
                             }
 
                             Text {
@@ -287,8 +308,12 @@ Item {
                                 objectName: "bitrateSlider"
                                 Accessible.name: qsTr("Video bitrate")
                                 width: parent.width
+                                // `bitrateMaximum()` is a plain method with no change signal, so the
+                                // ceiling is held in a property that the Unlock change refreshes.
+                                property int ceilingKbps: page.prefs ? page.prefs.bitrateMaximum() : 150000
+                                property int savedKbps: page.prefs ? page.prefs.getSavedValue("bitrate") : 20000
                                 from: 500
-                                to: page.prefs ? page.prefs.bitrateMaximum() : 150000
+                                to: ceilingKbps
                                 stepSize: 500
                                 snapMode: Slider.SnapOnRelease
                                 enabled: page.prefs ? page.prefs.writable : true
@@ -311,7 +336,10 @@ Item {
                                     target: page.prefs
                                     function onValueChanged(key) {
                                         if (key === "bitrate" || key === "unlockbitrate") {
-                                            bitrateSlider.value = page.prefs.getSavedValue("bitrate")
+                                            // The ceiling first, so the value is never clamped by the old one.
+                                            bitrateSlider.ceilingKbps = page.prefs.bitrateMaximum()
+                                            bitrateSlider.savedKbps = page.prefs.getSavedValue("bitrate")
+                                            bitrateSlider.value = bitrateSlider.savedKbps
                                         }
                                     }
                                 }

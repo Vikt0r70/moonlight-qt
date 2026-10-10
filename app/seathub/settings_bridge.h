@@ -182,6 +182,9 @@ public:
     void noteLaunchWarning(const QString& engineText);
 
     bool writable() const;
+    /// The engine's own start-up state for its Debug (stats) overlay - what `Session::exec()` reads
+    /// before it ever notifies the text rasterizer.
+    bool statsOverlayShownAtStart() const;
     bool sessionActive() const;
 
 signals:

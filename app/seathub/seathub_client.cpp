@@ -562,14 +562,20 @@ SeatHubClient::SeatHubClient(QObject* parent)
     connect(m_session, &SessionLifecycle::readyForDeletion, this, &SeatHubClient::handleReadyForDeletion);
 
     m_freezeWatchdog.onTimeout([this]() {
-        // SC30 / ADR-0087: 10s freeze -> set stall flag and trigger reconnect logic
-        if (m_appState != QLatin1String(kStateStreaming) && !m_streamStarted) {
-            return;
+        // SC30 / ADR-0087: 10s freeze -> set stall flag and trigger reconnect logic. Runs on the
+        // watchdog's thread (or on the caller of `forceTimeout()`): the facade thread is
+        // suspended inside the engine's SDL loop for the whole stream, so the thread-safe
+        // interrupt (an SDL_PushEvent) is what ends it, and the reconnect itself is applied on
+        // the facade thread - at once when this already is it, else as soon as it is back.
+        m_freezeReconnectPending.store(true);
+        {
+            std::lock_guard<std::mutex> lock(m_freezeInterruptMutex);
+            if (m_freezeInterruptLive && m_session) {
+                m_session->interrupt();
+            }
         }
-        enterReconnect();
-        if (m_session) {
-            m_session->interrupt();
-        }
+        QMetaObject::invokeMethod(this, [this]() { applyPendingFreezeReconnect(); },
+                                  Qt::AutoConnection);
     });
 
     // ---------------------------------------------------------------- the control-plane bridge
@@ -718,8 +724,10 @@ SeatHubClient::SeatHubClient(QObject* parent)
 SeatHubClient::~SeatHubClient()
 {
     const bool summarisedAtQuit = m_playSummaryPending;
+    m_freezeWatchdog.shutdown();
     finishPlay(QStringLiteral("app_quit"), QStringLiteral("cancelled"));
     m_hud.compositor().setStatsTap(nullptr);
+    m_hud.compositor().setStatsVisibilityTap(nullptr);
     if (m_statusSinkHandle != 0) LogTee::removeSink(m_statusSinkHandle);
     m_statusSinkHandle = 0;
     // D-17/A-51: unregister both `LogTee` sinks FIRST, before anything either lambda captures -
@@ -3001,8 +3009,21 @@ void SeatHubClient::handleConnectionStarted()
 
     const bool firstConnection = m_streamStartMs < 0;
     if (firstConnection) m_streamStartMs = m_playElapsed.elapsed();
-    m_freezeWatchdog.setStreaming(true);
+    // The engine's own Debug overlay state at start-up: it is applied before any renderer exists,
+    // so no notification announces it. The deadline begins now, so a stream whose first tap
+    // never comes is caught as well. Later hotkey toggles arrive through the visibility tap.
+    m_freezeWatchdog.setStatsVisible(m_settings->statsOverlayShownAtStart());
     m_freezeWatchdog.clearStall();
+    m_freezeWatchdog.setStreaming(true);
+    {
+        std::lock_guard<std::mutex> lock(m_freezeInterruptMutex);
+        m_freezeInterruptLive = true;
+    }
+    // The engine's real Debug overlay state (shown or hidden, hotkey included) on every
+    // notification, so a hidden overlay disarms the watchdog and a shown one re-arms it.
+    m_hud.compositor().setStatsVisibilityTap([this](bool shown) {
+        m_freezeWatchdog.setStatsVisible(shown);
+    });
     const auto generation = m_playGeneration.load();
     const QElapsedTimer clock = m_playElapsed;
     m_hud.compositor().setStatsTap([this, generation, clock](const VideoStats& stats) {
@@ -3051,6 +3072,9 @@ void SeatHubClient::handleConnectionStarted()
     // registered; the 1 Hz heartbeat re-publishes and the stream picks Time left up on its first
     // eligible read.
     m_hud.beginSession();
+    // SC13: the start hint shows for 10 seconds in the HUD's Time left slot; the HUD's 1 Hz
+    // heartbeat publishes it and hides it again when it expires.
+    m_hud.compositor().showStartHint(true);
 
     // WR-04: the moment the stream truly begins is the right anchor for the first decoder
     // segment's own duration - not the facade's `beginSession()`, which can run well before the
@@ -3175,10 +3199,19 @@ void SeatHubClient::handleSessionFinished(int portTestResult)
     // the app is quit after the session) - same fallback, same unreduced close, no-op normally.
     m_streamTime->closeOpenSegment();
 
+    // The engine's loop has returned: nothing is left to interrupt, and a freeze that fired during
+    // the stream is applied now that this thread is back (before the port-test check below).
+    {
+        std::lock_guard<std::mutex> lock(m_freezeInterruptMutex);
+        m_freezeInterruptLive = false;
+    }
+    applyPendingFreezeReconnect();
     m_hud.compositor().setStatsTap(nullptr);
+    m_hud.compositor().setStatsVisibilityTap(nullptr);
     m_sampler->finish();
     // D-56: the duration timer stops here, which is the interval the plan specifies.
     m_hud.endSession();
+    m_hud.compositor().showStartHint(false);
 
     // 06.1-19/J-07: upstream runs its own port test on every session end, including a connection
     // drop this reconnect is about to keep - `raiseFailure()` here would flip `appState` to
@@ -3195,8 +3228,21 @@ void SeatHubClient::setStatsOverlayVisible(bool visible)
     m_freezeWatchdog.setStatsVisible(visible);
 }
 
+void SeatHubClient::applyPendingFreezeReconnect()
+{
+    if (!m_freezeReconnectPending.exchange(false)) {
+        return;
+    }
+    if (m_reconnecting
+        || (m_appState != QLatin1String(kStateStreaming) && !m_streamStarted)) {
+        return;
+    }
+    enterReconnect();
+}
+
 void SeatHubClient::handleReadyForDeletion()
 {
+    applyPendingFreezeReconnect();
     m_freezeWatchdog.setStreaming(false);
     if (m_reconnecting) {
         // 06.1-19/J-07: the engine that just tore itself down was this reconnect's own attempt
@@ -3712,6 +3758,7 @@ void SeatHubClient::finishPlay(const QString& exitPath, const QString& outcome,
     // The renderer only feeds/captures the first-frame timestamp. Final aggregation, shipping
     // and the bounded SDK flush never run on that hot thread.
     m_hud.compositor().setStatsTap(nullptr);
+    m_hud.compositor().setStatsVisibilityTap(nullptr);
     QJsonObject attributes = m_playConfiguration;
     attributes.insert("exit_path", exitPath);
     attributes.insert("outcome", outcome);
@@ -4501,6 +4548,7 @@ void SeatHubClient::handleTeardownCompleted(const SessionInfo& finalSession,
     // the compositor's stats tap so the render thread stops feeding into a stopped sampler.
     // `finish()` re-invokes itself queued onto the network thread, consistent with `stop()`.
     m_hud.compositor().setStatsTap(nullptr);
+    m_hud.compositor().setStatsVisibilityTap(nullptr);
     m_sampler->finish();
     m_horizon->disarm();
     m_sessionChannel->close();
