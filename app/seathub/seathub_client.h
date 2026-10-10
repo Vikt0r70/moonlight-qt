@@ -792,7 +792,8 @@ private:
     /// A stream that had started (`m_streamStarted`) just ended on a reconnect-eligible code
     /// (`handleDisplayLaunchError`'s not-connecting branch): keeps the session, starts the
     /// reconnect state and the first backoff, and reports the stage at once (`LivenessTimer`
-    /// narrows its own immediate report to exactly this transition, Task 2).
+    /// narrows its own immediate report to exactly this transition, Task 2). Does nothing for a
+    /// session that has ended (`m_sessionEnded`, T127): there is nothing to hold.
     void enterReconnect();
     /// Who ended the current stream (T126). The freeze watchdog fires on its own thread and the
     /// engine's own Ctrl+Alt+Shift+Q is seen only as the engine's `Quit event received` log line,
@@ -810,14 +811,17 @@ private:
         HeldEnd,
         EngineQuit,
     };
-    /// Records `cause` as the end of the live stream (first cause wins; the customer's own End
-    /// outranks any cause already recorded) and stops the watchdog, so no deadline can run out
-    /// during the teardown that follows. Ignored when no stream is live. Safe from any thread.
+    /// Records `cause` as the end of the live stream by rank (T127) and stops the watchdog, so no
+    /// deadline can run out during the teardown that follows. `AppEnd` (the customer's own End)
+    /// outranks every recorded cause; `ServerTerminal`, `Horizon` and `HeldEnd` outrank `Live` and
+    /// `Watchdog` only and otherwise the first recorded stays; `EngineQuit` is recorded only on a
+    /// `Live` stream, so it never overrides the watchdog's own interrupt. Ignored when no stream
+    /// is live. Safe from any thread.
     void noteStreamEnd(StreamEnd cause);
     /// The one reconnect decision of a watchdog-ended stream (SC30, T126). The stream is
     /// reconnected without an `/end` only when the recorded cause is the watchdog, the customer
-    /// has not quit (`m_customerQuit`) and the app is still streaming; any other cause ends
-    /// normally. `engineLoopReturned` is `handleSessionFinished()`: the engine's loop is over, so
+    /// has not quit (`m_customerQuit`), the session has not ended (`m_sessionEnded`) and the app
+    /// is still streaming; any other cause ends normally. `engineLoopReturned` is `handleSessionFinished()`: the engine's loop is over, so
     /// the record is cleared whatever it held. The watchdog's fire path also queues it
     /// (`engineLoopReturned` false) for a facade thread that is not inside the engine's loop. The
     /// decision is consumed, so it runs at most once per stream.
@@ -1302,9 +1306,9 @@ private:
     HudOverlay m_hud;
     StreamFreezeWatchdog m_freezeWatchdog;
     /// The record of who ended the current stream (`StreamEnd`), written by the watchdog thread,
-    /// the log sink and the facade thread, always under `m_freezeInterruptMutex`; the same lock
-    /// guards the `m_session->interrupt()` call in the watchdog's fire path against the engine
-    /// going away. Reset to `Live` in `handleConnectionStarted()`.
+    /// the log sink and the facade thread, always under `m_freezeInterruptMutex`. The watchdog's
+    /// fire path calls `m_session->interrupt()` after releasing the lock (the interrupt can log,
+    /// and the log sink takes this lock). Reset to `Live` in `handleConnectionStarted()`.
     std::mutex m_freezeInterruptMutex;
     StreamEnd m_streamEnd = StreamEnd::NotLive;
     /// The engine's `Quit event received` line (its Ctrl+Alt+Shift+Q hotkey), recorded as

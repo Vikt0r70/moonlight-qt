@@ -568,20 +568,25 @@ SeatHubClient::SeatHubClient(QObject* parent)
         // interrupt (an SDL_PushEvent) is what ends it, and the reconnect itself is applied on
         // the facade thread - at once when this already is it, else as soon as it is back.
         //
-        // T126: the watchdog records that IT ended the stream, and only when nobody else has -
-        // the customer's End, the control plane's terminal read, the horizon, the held-session
-        // End and the engine's own quit hotkey each record their cause first (`noteStreamEnd()`),
-        // and a deadline that runs out during their teardown then does nothing. The cause is
-        // recorded before the interrupt, so the engine's own `Quit event received` line for this
-        // interrupt finds it taken.
+        // T126: the watchdog records that IT ended the stream, and only on a stream nobody has
+        // ended - a deadline that runs out during another cause's teardown does nothing. T127: the
+        // record is ranked (`noteStreamEnd()`), so a later explicit end still outranks it. The
+        // cause is recorded before the interrupt, so the engine's own `Quit event received` line
+        // for this interrupt finds it taken.
+        //
+        // The interrupt runs AFTER the record's lock is released: `interrupt()` can log
+        // (`SDL_LogWarn`), the log sink takes this same lock, and a writer waiting on the log's
+        // lock while this thread held ours would close a cycle. `m_session` is created once in
+        // the constructor and the destructor joins this thread (`m_freezeWatchdog.shutdown()`)
+        // before it goes, so it needs no protection here.
         {
             std::lock_guard<std::mutex> lock(m_freezeInterruptMutex);
             if (m_streamEnd != StreamEnd::Live || !m_session) {
                 return;
             }
             m_streamEnd = StreamEnd::Watchdog;
-            m_session->interrupt();
         }
+        m_session->interrupt();
         QMetaObject::invokeMethod(this, [this]() { applyWatchdogReconnect(false); },
                                   Qt::AutoConnection);
     });
@@ -1502,6 +1507,11 @@ bool SeatHubClient::isReconnectEligible(int code)
 
 void SeatHubClient::enterReconnect()
 {
+    // T127: a session the control plane (or the horizon) has ended has nothing to hold; the
+    // ordinary end path runs from `readyForDeletion`.
+    if (m_sessionEnded) {
+        return;
+    }
     m_reconnecting = true;
     m_reconnectBackoffMs = kReconnectInitialBackoffMs;
     m_pairingLimited = false;
@@ -1583,7 +1593,10 @@ void SeatHubClient::retryReconnectOrGiveUp()
             }
             SessionInfo session;
             if (result.ok && SessionInfo::parse(result.body, &session)) {
-                if (session.isTerminal()) {
+                // T127: only a terminal read of THIS session ends the held episode, the same
+                // identity rule `handleSessionState()` applies; a read of another session says
+                // nothing about the held one (and `enterReconnect()` now refuses an ended session).
+                if (session.isTerminal() && (session.id.isEmpty() || session.id == m_sessionId)) {
                     handleReconnectEnded(session);
                     return;
                 }
@@ -3259,9 +3272,32 @@ void SeatHubClient::setStatsOverlayVisible(bool visible)
 void SeatHubClient::noteStreamEnd(StreamEnd cause)
 {
     {
+        // T127: the reasons are ranked, not first-come. The customer's End outranks everything;
+        // a SeatHub-side explicit end (the control plane's terminal read, the horizon, the held
+        // session's End) outranks only the watchdog, because the watchdog ending a stream the
+        // control plane has ended must never turn it into a reconnect; among themselves the first
+        // stays. The engine's quit line is the lowest: it counts only on a stream nobody has
+        // ended, so the watchdog's own interrupt is never read as the customer's hotkey.
         std::lock_guard<std::mutex> lock(m_freezeInterruptMutex);
-        if (m_streamEnd == StreamEnd::Live
-                || (cause == StreamEnd::AppEnd && m_streamEnd != StreamEnd::NotLive)) {
+        bool record = false;
+        switch (cause) {
+        case StreamEnd::AppEnd:
+            record = m_streamEnd != StreamEnd::NotLive;
+            break;
+        case StreamEnd::ServerTerminal:
+        case StreamEnd::Horizon:
+        case StreamEnd::HeldEnd:
+            record = m_streamEnd == StreamEnd::Live || m_streamEnd == StreamEnd::Watchdog;
+            break;
+        case StreamEnd::EngineQuit:
+            record = m_streamEnd == StreamEnd::Live;
+            break;
+        case StreamEnd::NotLive:
+        case StreamEnd::Live:
+        case StreamEnd::Watchdog: // recorded by the watchdog's own fire path only
+            break;
+        }
+        if (record) {
             m_streamEnd = cause;
         }
     }
@@ -3283,10 +3319,10 @@ void SeatHubClient::applyWatchdogReconnect(bool engineLoopReturned)
     if (cause != StreamEnd::Watchdog) {
         return;
     }
-    // Only a stream that is still streaming and was not ended by the customer reconnects.
-    // `endIsCustomerQuit()` is not the test here: its second arm is also true for the quit the
-    // watchdog itself causes.
-    if (m_customerQuit || m_reconnecting
+    // Only a stream that is still streaming, whose session is still on and that the customer did
+    // not quit reconnects. `endIsCustomerQuit()` is not the test here: its second arm is also true
+    // for the quit the watchdog itself causes.
+    if (m_customerQuit || m_reconnecting || m_sessionEnded
         || m_appState != QLatin1String(kStateStreaming)) {
         return;
     }
