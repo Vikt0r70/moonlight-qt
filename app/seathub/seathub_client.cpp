@@ -56,10 +56,10 @@ const char* kStateError = "error";
 // Widening the frozen wording requires an ADR-0070 amendment and a version bump.
 constexpr int kDiagnosticsNoticeVersion = 1;
 
-// ADR-0066 decision 9 (amended 2026-10-07): the reconnect pace is a first attempt at once, then
-// 1 s growing x1.6 with up to 20% jitter to a 5 s cap. `timing.md` V9.
-const int kReconnectInitialBackoffMs = 1000;
-const int kReconnectMaxBackoffMs = 5000;
+// Play-repeat pace (the same 1 s growing x1.6 with up to 20% jitter to a 5 s cap the retired
+// reconnect loop used; ADR-0090 withdrew only the reconnect loop).
+const int kPlayRepeatInitialBackoffMs = 1000;
+const int kPlayRepeatMaxBackoffMs = 5000;
 
 // V-OUTBOX (`timing.md` V42): the saved End is re-sent at once, then 1 s doubling with up to 20%
 // jitter to a 10 s cap.
@@ -441,12 +441,6 @@ SeatHubClient::SeatHubClient(QObject* parent)
             }
         });
 
-    // 06.1-19/J-07: the reconnect backoff. Parented to `this` (never moved to the network
-    // thread, unlike `m_liveness`/`m_pairing`): no engine runs between a drop and a successful
-    // reconnect, so the facade's own event loop is not suspended for the backoff to wait through.
-    m_reconnectTimer = new QTimer(this);
-    m_reconnectTimer->setSingleShot(true);
-    connect(m_reconnectTimer, &QTimer::timeout, this, &SeatHubClient::resumeAfterReconnect);
     // V-COUNTDOWN: one tick per second keeps the held-retry and live-retry countdowns moving while
     // either is pending; it is stopped the moment neither is.
     m_retryTickTimer = new QTimer(this);
@@ -474,7 +468,7 @@ SeatHubClient::SeatHubClient(QObject* parent)
     }
 
     // 06.4/ADR-0067, D-04/D-06: the paused-fallback read (L5). Repeating, parented to `this` for
-    // the same reason `m_reconnectTimer` is (its class comment above).
+    // the same reason `m_retryTickTimer` is.
     m_accountFallbackTimer = new QTimer(this);
     connect(m_accountFallbackTimer, &QTimer::timeout, this,
             &SeatHubClient::fetchAccountStateFallback);
@@ -561,48 +555,6 @@ SeatHubClient::SeatHubClient(QObject* parent)
     connect(m_session, &SessionLifecycle::sessionFinished, this, &SeatHubClient::handleSessionFinished);
     connect(m_session, &SessionLifecycle::readyForDeletion, this, &SeatHubClient::handleReadyForDeletion);
 
-    m_freezeWatchdog.onTimeout([this]() {
-        // SC30 / ADR-0087: 10s freeze -> set stall flag and trigger reconnect logic. Runs on the
-        // watchdog's thread (or on the caller of `forceTimeout()`): the facade thread is
-        // suspended inside the engine's SDL loop for the whole stream, so the thread-safe
-        // interrupt (an SDL_PushEvent) is what ends it, and the reconnect itself is applied on
-        // the facade thread - at once when this already is it, else as soon as it is back.
-        //
-        // T126: the watchdog records that IT ended the stream, and only on a stream nobody has
-        // ended - a deadline that runs out during another cause's teardown does nothing. T127: the
-        // record is ranked (`noteStreamEnd()`), so a later explicit end still outranks it. The
-        // cause is recorded before the interrupt, so the engine's own `Quit event received` line
-        // for this interrupt finds it taken.
-        //
-        // The interrupt runs AFTER the record's lock is released: `interrupt()` can log
-        // (`SDL_LogWarn`), the log sink takes this same lock, and a writer waiting on the log's
-        // lock while this thread held ours would close a cycle. `m_session` is created once in
-        // the constructor and the destructor joins this thread (`m_freezeWatchdog.shutdown()`)
-        // before it goes, so it needs no protection here.
-        {
-            std::lock_guard<std::mutex> lock(m_freezeInterruptMutex);
-            if (m_streamEnd != StreamEnd::Live || !m_session) {
-                return;
-            }
-            m_streamEnd = StreamEnd::Watchdog;
-        }
-        m_session->interrupt();
-        QMetaObject::invokeMethod(this, [this]() { applyWatchdogReconnect(false); },
-                                  Qt::AutoConnection);
-    });
-
-    // T126: the engine's own Ctrl+Alt+Shift+Q never reaches the facade; its only trace is the
-    // `Quit event received` line it logs. Recorded only while the stream is live and unended, so
-    // the line the watchdog's own interrupt makes (its cause is already recorded) is not read as
-    // a hotkey. The sink only takes the record's lock and stops the watchdog - it never blocks.
-    m_engineQuitSinkHandle = LogTee::addSink([this](LogLevel, int category, int priority,
-                                                    const QString& message) {
-        if (category != SDL_LOG_CATEGORY_APPLICATION || priority != SDL_LOG_PRIORITY_INFO
-                || message.trimmed() != QLatin1String("Quit event received")) {
-            return;
-        }
-        noteStreamEnd(StreamEnd::EngineQuit);
-    });
 
     // ---------------------------------------------------------------- the control-plane bridge
     //
@@ -636,9 +588,6 @@ SeatHubClient::SeatHubClient(QObject* parent)
     // moves here now.
     connect(m_sessionChannel, &SessionWebSocket::opened, this, [this]() {
         m_liveness->setStage(QStringLiteral("streaming"));
-    });
-    connect(m_sessionChannel, &SessionWebSocket::dropped, this, [this](int, int) {
-        m_liveness->setStage(QStringLiteral("reconnecting"));
     });
 
     // The session as the control plane reports it, read on the pairing poll's own tick (ADR-0055):
@@ -674,18 +623,10 @@ SeatHubClient::SeatHubClient(QObject* parent)
             this, &SeatHubClient::handlePairingCompleted);
     connect(m_pairing, &PairingController::pairingFailed,
             this, &SeatHubClient::handlePairingFailed);
-    connect(m_pairing, &PairingController::pairingLimited,
-            this, &SeatHubClient::handlePairingLimited);
     connect(m_pairing, &PairingController::stepFailed, this,
             [this](const QString& step, const QString& failureClass, qint64 elapsedMs) {
-                if (m_reconnecting) {
-                    m_lastFailedStep = QStringLiteral("reconnect");
-                    noteStepOutcome(m_lastFailedStep, QStringLiteral("failed"),
-                                    QStringLiteral("attempt_pair_failed"), elapsedMs, 1);
-                } else {
-                    m_lastFailedStep = step;
-                    noteStepOutcome(step, QStringLiteral("failed"), failureClass, elapsedMs, 1);
-                }
+                m_lastFailedStep = step;
+                noteStepOutcome(step, QStringLiteral("failed"), failureClass, elapsedMs, 1);
             });
 
     // A-68 / D-06 reversal: carries no quality profile any more (nothing applies one). Kept as
@@ -750,13 +691,8 @@ SeatHubClient::SeatHubClient(QObject* parent)
 SeatHubClient::~SeatHubClient()
 {
     const bool summarisedAtQuit = m_playSummaryPending;
-    // The engine-quit sink captures `this`: unregistered before anything else is destroyed.
-    LogTee::removeSink(m_engineQuitSinkHandle);
-    m_engineQuitSinkHandle = 0;
-    m_freezeWatchdog.shutdown();
     finishPlay(QStringLiteral("app_quit"), QStringLiteral("cancelled"));
     m_hud.compositor().setStatsTap(nullptr);
-    m_hud.compositor().setStatsVisibilityTap(nullptr);
     if (m_statusSinkHandle != 0) LogTee::removeSink(m_statusSinkHandle);
     m_statusSinkHandle = 0;
     // D-17/A-51: unregister both `LogTee` sinks FIRST, before anything either lambda captures -
@@ -956,28 +892,6 @@ void SeatHubClient::beginSession(const QString& sessionId)
     // reconnect) left over from whatever this client streamed before must never leak into this
     // one's own first `handleDisplayLaunchError()`.
     m_lastTerminationCode.store(kNoTerminationCode, std::memory_order_relaxed);
-    if (m_reconnecting) {
-        m_reconnectTimer->stop();
-        m_reconnecting = false;
-        emit reconnectingChanged();
-    }
-    m_reconnectBackoffMs = 0;
-    if (m_reconnectEnded) {
-        m_reconnectEnded = false;
-        emit connectFailedChanged();
-    }
-    if (m_reconnectStillTrying) {
-        m_reconnectStillTrying = false;
-        emit reconnectStillTryingChanged();
-    }
-    if (m_reconnectCount != 0) {
-        m_reconnectCount = 0;
-        emit reconnectCountChanged();
-    }
-    if (m_graceMinutesLeft != -1) {
-        m_graceMinutesLeft = -1;
-        emit graceMinutesLeftChanged();
-    }
 
     // D-09/D-13: `hostId` is not known yet at this call - only `handleSessionState()`'s own
     // `SessionInfo` names it, once the server answers - so this starts the tag/attribute with an
@@ -1043,7 +957,6 @@ void SeatHubClient::setAppState(const QString& state)
     const bool isStreaming = m_appState == QLatin1String(kStateStreaming);
 
     if (wasStreaming != isStreaming) {
-        m_freezeWatchdog.setStreaming(isStreaming);
         // Pitfall 6 / T-03-15: the settings page stops accepting writes for the duration.
         // Pitfall 8 / T-03-17: so does the updater - replacing the binary a live session is
         // running from is not something this client does (D-41).
@@ -1211,11 +1124,6 @@ void SeatHubClient::onNetworkBack()
     // V-WAKE (ADR-0083 decision 3): the network came back. This is a wake-up hint, never a
     // connectivity gate and never shown as "you are offline" - if it never fires the ordinary
     // retry schedule still runs. It starts the next attempt at once and resets the backoff.
-    if (m_reconnecting && m_reconnectTimer->isActive()) {
-        m_reconnectBackoffMs = kReconnectInitialBackoffMs;
-        m_reconnectTimer->start(0);
-        recomputeRetrySeconds();
-    }
     if (m_sse) {
         onClientThread(m_sse, [this]() { m_sse->wakeNow(); });
     }
@@ -1230,15 +1138,8 @@ void SeatHubClient::onNetworkBack()
 
 void SeatHubClient::retryNow()
 {
-    // C-RECONNECT (copy.md §Reconnect): `Try now` starts the next attempt at once. On the reconnect
-    // screen that is the held session's own attempt; on Home/offline the same press wakes the
-    // live-updates stream, the fallback read and any unconfirmed End, which are what those surfaces
-    // are counting down.
-    if (m_reconnecting && m_reconnectTimer->isActive()) {
-        m_reconnectBackoffMs = kReconnectInitialBackoffMs;
-        m_reconnectTimer->start(0);
-        recomputeRetrySeconds();
-    }
+    // Home/offline `Try now` wakes the live-updates stream, the fallback read and any unconfirmed
+    // End, which are what those surfaces are counting down.
     if (m_sse) {
         onClientThread(m_sse, [this]() { m_sse->wakeNow(); });
     }
@@ -1251,23 +1152,6 @@ void SeatHubClient::retryNow()
         m_endOutboxTimer->stop();
         m_endOutboxBackoffMs = kEndOutboxInitialBackoffMs;
         drainEndOutbox();
-    }
-}
-
-void SeatHubClient::handlePairingLimited()
-{
-    // V10 (ADR-0066 decision 8): the reconnect episode has spent its three PIN-bearing pairings
-    // (409 `session.pairing_limit`). Stop arming new attempts, but keep the reconnect screen and
-    // the held session until the server's grace ends (`handleReconnectEnded()`).
-    if (!m_reconnecting) {
-        return;
-    }
-    m_pairingLimited = true;
-    m_reconnectTimer->stop();
-    recomputeRetrySeconds();
-    if (!m_reconnectStillTrying) {
-        m_reconnectStillTrying = true;
-        emit reconnectStillTryingChanged();
     }
 }
 
@@ -1437,15 +1321,8 @@ bool SeatHubClient::hasSavedEnd() const
 void SeatHubClient::recomputeRetrySeconds()
 {
     // V-COUNTDOWN (ADR-0083 decision 7): republish the two countdowns each second while one is
-    // pending. The held retry is the facade's own `m_reconnectTimer`; the live retry is the sooner
-    // of the SSE client's published wait and the 10 s fallback read.
-    int held = -1;
-    if (m_reconnecting && m_reconnectTimer->isActive()) {
-        const int remaining = m_reconnectTimer->remainingTime();
-        if (remaining >= 0) {
-            held = (remaining + 999) / 1000;
-        }
-    }
+    // V-COUNTDOWN (ADR-0083 decision 7): republish the live countdown each second while one is
+    // pending: the sooner of the SSE client's published wait and the 10 s fallback read.
     int live = m_liveSseRetrySeconds;
     if (m_accountFallbackTimer->isActive()) {
         const int remaining = m_accountFallbackTimer->remainingTime();
@@ -1454,17 +1331,13 @@ void SeatHubClient::recomputeRetrySeconds()
             live = (live < 0) ? fallback : qMin(live, fallback);
         }
     }
-    if (held != m_heldRetrySeconds) {
-        m_heldRetrySeconds = held;
-        emit reconnectRetrySecondsChanged();
-    }
     if (live != m_liveRetrySeconds) {
         m_liveRetrySeconds = live;
         emit liveRetrySecondsChanged();
     }
     // The tick runs only while something is genuinely pending - a new wait after a previous one
     // ended starts it again, so a countdown is never left stale or invisible.
-    const bool pending = m_heldRetrySeconds > 0 || m_liveRetrySeconds > 0;
+    const bool pending = m_liveRetrySeconds > 0;
     if (pending) {
         if (!m_retryTickTimer->isActive()) {
             m_retryTickTimer->start(1000);
@@ -1480,249 +1353,6 @@ void SeatHubClient::handleSseRetrySeconds(int seconds)
     // republish the surfaces. This is the queued hand-off - the timer itself is never read here.
     m_liveSseRetrySeconds = seconds;
     recomputeRetrySeconds();
-}
-
-// ---------------------------------------------------------------------------
-// 06.1-19/J-07: the reconnect state (D-03, screens.md §24)
-// ---------------------------------------------------------------------------
-
-bool SeatHubClient::isReconnectEligible(int code)
-{
-    if (code == kNoTerminationCode) {
-        return false;
-    }
-    switch (code) {
-    case 0:    // ML_ERROR_GRACEFUL_TERMINATION - a deliberate stop (a quit, or the host ending it)
-    case -102: // ML_ERROR_UNEXPECTED_EARLY_TERMINATION - host-side
-    case -103: // ML_ERROR_PROTECTED_CONTENT - host-side
-    case -104: // ML_ERROR_FRAME_CONVERSION - host-side
-        return false;
-    default:
-        // Every other code, including ENet's `-1` (the actual code a network blip produces) and
-        // `ML_ERROR_NO_VIDEO_TRAFFIC`/`ML_ERROR_NO_VIDEO_FRAME` - the network-loss family FORK
-        // research §1.2 narrows this to.
-        return true;
-    }
-}
-
-void SeatHubClient::enterReconnect()
-{
-    // T127: a session the control plane (or the horizon) has ended has nothing to hold; the
-    // ordinary end path runs from `readyForDeletion`.
-    if (m_sessionEnded) {
-        return;
-    }
-    m_reconnecting = true;
-    m_reconnectBackoffMs = kReconnectInitialBackoffMs;
-    m_pairingLimited = false;
-    // V-COUNTDOWN: a new episode starts with no retry armed, so no stale countdown shows.
-    recomputeRetrySeconds();
-    // WR-15: this is the header's own documented reset point ("Reset in `enterReconnect()`") -
-    // without it, once any attempt in an earlier episode of this same session ever reached
-    // `retryReconnectOrGiveUp()` once, every later episode's own first attempt would show "Still
-    // trying" instead of the in-flight "Reconnecting…".
-    if (m_reconnectStillTrying) {
-        m_reconnectStillTrying = false;
-        emit reconnectStillTryingChanged();
-    }
-    // O02: a minutes figure belongs to one interruption. The previous interruption's deadline is
-    // not this one's, so no figure shows until a read of THIS interruption returns
-    // `grace_deadline_at` (`applyReconnectSessionFields()`).
-    if (m_graceMinutesLeft != -1) {
-        m_graceMinutesLeft = -1;
-        emit graceMinutesLeftChanged();
-    }
-    // `setAppState()` itself would unlock Settings/the updater here (leaving "streaming"); this
-    // relocks them at once, for the whole episode (T-06.1-57).
-    setAppState(QString::fromLatin1(kStateConnecting));
-    setReconnectLock(true);
-    m_liveness->setStage(QStringLiteral("reconnecting"));
-    emit reconnectingChanged();
-}
-
-void SeatHubClient::resumeAfterReconnect()
-{
-    // A no-op once the episode is no longer reconnecting: superseded by a give-up
-    // (`handleReconnectEnded()`) or by the customer's own `endHeldSession()` while this timeout
-    // was already queued.
-    if (!m_reconnecting || m_sessionId.isEmpty()) {
-        return;
-    }
-    m_clientUuid.clear();
-    // D-25/T-05-45: the same correction `beginSession()` makes, before this attempt's engine
-    // reads preferences.
-    m_settings->prepareForSession();
-    startNetworkThreads();
-    // STREAM-10: the client keeps no stored pairing of its own, so this is a fresh pairing against
-    // the same session id, which `beginSession()` also runs for a new session, just without
-    // resetting `appState`, the stepper or `m_liveness` (none of those stopped across the drop).
-    // When the authorization says `warm_return` (an ACTIVE session inside its grace, L07) the seam
-    // first tries the pin this app run already holds and skips the PIN if the rig confirms it;
-    // otherwise, or when that attempt fails, it runs the PIN handshake. This is the in-process
-    // recovery of an `ACTIVE` session only (UD-04 R14); nothing reattaches a session after a
-    // restart, close, crash or sign-in.
-    const QString sessionId = m_sessionId;
-    onClientThread(m_pairing, [this, sessionId]() { m_pairing->start(sessionId); });
-}
-
-void SeatHubClient::retryReconnectOrGiveUp()
-{
-    if (!m_reconnectStillTrying) {
-        m_reconnectStillTrying = true;
-        emit reconnectStillTryingChanged();
-    }
-
-    // ADR-0066 decision 9: arm this retry at the current backoff (with up to 20% jitter), then
-    // grow the next one by x1.6 to the 5 s cap. The first attempt of the episode was already made
-    // at once (`handleReadyForDeletion()` arms 0), so this is the second attempt onwards.
-    m_reconnectTimer->start(jitteredReconnectDelay(m_reconnectBackoffMs));
-    recomputeRetrySeconds();
-    m_reconnectBackoffMs = qMin(int(m_reconnectBackoffMs * 1.6), kReconnectMaxBackoffMs);
-
-    // No poll runs during the backoff gap between attempts (the pairing controller has already
-    // failed or finished for this attempt): fetched once here so a server-side ending reached
-    // while nothing was polling is still caught before the next attempt starts. V9: the next
-    // attempt is armed above whether or not this read answers - and with the 8 s request limit
-    // (V-REQ) it always answers, so the retry cannot hang on a dead connection.
-    const QString sessionId = m_sessionId;
-    m_controlPlane->fetchSession(sessionId, [this, sessionId](const ControlPlaneResult& result) {
-        onClientThread(this, [this, sessionId, result]() {
-            if (!m_reconnecting || sessionId != m_sessionId) {
-                // Superseded (ended, or reconnected already) while this read was in flight.
-                return;
-            }
-            SessionInfo session;
-            if (result.ok && SessionInfo::parse(result.body, &session)) {
-                // T127: only a terminal read of THIS session ends the held episode, the same
-                // identity rule `handleSessionState()` applies; a read of another session says
-                // nothing about the held one (and `enterReconnect()` now refuses an ended session).
-                if (session.isTerminal() && (session.id.isEmpty() || session.id == m_sessionId)) {
-                    handleReconnectEnded(session);
-                    return;
-                }
-                applyReconnectSessionFields(session);
-            }
-        });
-    });
-}
-
-void SeatHubClient::handleReconnectEnded(const SessionInfo& session)
-{
-    m_reconnectTimer->stop();
-    m_reconnecting = false;
-    m_reconnectBackoffMs = 0;
-    m_reconnectEnded = true;
-    setReconnectLock(false);
-    setAttachedSessionEnded(true);
-    m_liveness->stop();
-    onClientThread(m_pairing, [this]() { m_pairing->cancel(); });
-    const QString reconnectClass = session.endReason == QLatin1String("GRACE_EXPIRED")
-        ? QStringLiteral("grace_expired")
-        : (session.endReason == QLatin1String("RECONNECT_LIMIT")
-               ? QStringLiteral("reconnect_limit") : QString());
-    if (!reconnectClass.isEmpty()) {
-        m_lastFailedStep = QStringLiteral("reconnect");
-        noteStepOutcome(m_lastFailedStep, QStringLiteral("failed"), reconnectClass,
-                        m_playElapsed.isValid() ? m_playElapsed.elapsed() : -1, 1);
-    }
-    finishPlay(QStringLiteral("reconnect_ended"), QStringLiteral("failed"),
-               QStringLiteral("reconnect"), reconnectClass);
-    // CR-06: this IS an ending - the server gave up on this episode, not the customer or a locally-
-    // running engine - so it must run the same D-10/STREAM-10 disable/remove/verify sequence every
-    // other ending path runs (`endAttachedSessionBeforeStream()`, `endPreStreamSessionWithReport()`,
-    // `handleReadyForDeletion()`'s ordinary branch). Without this, the dead Play's D-27 trace id
-    // leaks onto the next request, `m_horizon` stays armed, and `m_sessionId` stays attached to a
-    // session that is over.
-    if (inControlPlaneSession() && m_teardownGuard.markStarted()) {
-        EndReport report;
-        report.attemptStep = m_lastFailedStep;
-        m_teardown->teardown(m_sessionId, m_clientUuid, !report.attemptStep.isEmpty(), report);
-    }
-    emit reconnectingChanged();
-    // The existing connecting-failure path: the stage that was active (stage 3, still active
-    // throughout the whole episode) turns destructive, and `session`'s own end reason - here
-    // `GRACE_EXPIRED` or `RECONNECT_LIMIT` - is the sentence under it. `reconnectEnded` (which
-    // shares this call's own `connectFailedChanged`) is what tells the screen to offer only
-    // `Back to home`.
-    raiseConnectFailure(SeatHubFailure::generic(), session.endReason, session.minutesBilled);
-}
-
-void SeatHubClient::setReconnectLock(bool locked)
-{
-    m_settings->setStreamingActive(locked);
-    m_updates->setStreamingActive(locked);
-}
-
-void SeatHubClient::applyReconnectSessionFields(const SessionInfo& session)
-{
-    if (m_reconnectCount != session.reconnectCount) {
-        m_reconnectCount = session.reconnectCount;
-        emit reconnectCountChanged();
-    }
-    const int minutesLeft = computeGraceMinutesLeft(session.graceDeadlineAt);
-    if (m_graceMinutesLeft != minutesLeft) {
-        m_graceMinutesLeft = minutesLeft;
-        emit graceMinutesLeftChanged();
-    }
-}
-
-int SeatHubClient::computeGraceMinutesLeft(const QString& graceDeadlineAt)
-{
-    if (graceDeadlineAt.isEmpty()) {
-        return -1;
-    }
-    const QDateTime deadline = QDateTime::fromString(graceDeadlineAt, Qt::ISODate);
-    if (!deadline.isValid()) {
-        return -1;
-    }
-    // Whole minutes, floored, computed once against this client's own clock at the moment the
-    // read that named this deadline is applied - never a client-owned countdown ticking on its
-    // own (screens.md §24: "never a client timer").
-    const qint64 msLeft = QDateTime::currentDateTimeUtc().msecsTo(deadline);
-    if (msLeft <= 0) {
-        return 0;
-    }
-    return static_cast<int>(msLeft / 60000);
-}
-
-void SeatHubClient::endHeldSession()
-{
-    if (!m_reconnecting) {
-        return;
-    }
-    // O01: the customer's own End session press, never a reported failure.
-    m_customerQuit = true;
-    noteStreamEnd(StreamEnd::HeldEnd);
-    finishPlay(QStringLiteral("ended_held"), QStringLiteral("cancelled"), QStringLiteral("reconnect"));
-    m_reconnectTimer->stop();
-    m_reconnecting = false;
-    m_reconnectBackoffMs = 0;
-    setReconnectLock(false);
-    emit reconnectingChanged();
-
-    if (m_session->active()) {
-        // A retry's own engine is mid-launch. Its own quit keystroke does the stopping; the
-        // control-plane teardown runs from `handleReadyForDeletion()` once it does - the same
-        // order `interrupt()` documents for the ordinary in-stream case - and `m_reconnecting` is
-        // already false here, so that handler takes the ordinary (non-reconnect) path and posts
-        // the ordinary `/end`.
-        m_session->interrupt();
-        return;
-    }
-
-    // No engine is running for this attempt (the backoff gap, or still re-pairing): the same
-    // pre-engine sequence `interrupt()` uses, adapted for a session that already streamed once.
-    onClientThread(m_pairing, [this]() { m_pairing->cancel(); });
-    m_liveness->stop();
-    endAttachedSessionBeforeStream(false);
-    m_sessionChannel->close();
-    resetConnecting();
-    // C-ENDING (screens.md §23): `endAttachedSessionBeforeStream()` above already saved the End and
-    // put Home into the ending state; it must stay there until the server confirms, so this must
-    // not force "ready" back over it.
-    updateHomeStatusForEndOutbox();
-    setAppState(!m_signedIn ? QString::fromLatin1(kStateSignedOut)
-                            : QString::fromLatin1(kStateHome));
 }
 
 void SeatHubClient::setInSettings(bool inSettings)
@@ -2035,7 +1665,7 @@ void SeatHubClient::beginPlayRequest()
     // for an earlier press can never act on this one.
     m_playIdempotencyKey = ControlPlaneClient::newIdempotencyKey();
     ++m_playToken;
-    m_playRepeatBackoffMs = kReconnectInitialBackoffMs;
+    m_playRepeatBackoffMs = kPlayRepeatInitialBackoffMs;
 
     // The session create goes out first - existing trace-id tests index requests relative to this
     // being the first one a Play makes - the telemetry refresh right after it (still unguarded by
@@ -2108,7 +1738,7 @@ void SeatHubClient::schedulePlayRepeat()
     // repeat and this adds no value of its own; the repeat ends with the first answer that is not
     // `PREVIOUS_SESSION_ENDING`.
     const int delayMs = jitteredReconnectDelay(m_playRepeatBackoffMs);
-    m_playRepeatBackoffMs = qMin(int(m_playRepeatBackoffMs * 1.6), kReconnectMaxBackoffMs);
+    m_playRepeatBackoffMs = qMin(int(m_playRepeatBackoffMs * 1.6), kPlayRepeatMaxBackoffMs);
 
     const quint64 playToken = m_playToken;
     const quint64 authEpoch = m_authEpoch;
@@ -2243,9 +1873,6 @@ void SeatHubClient::interrupt()
     // O01: whichever branch runs, this is the customer's own quit. It is remembered for the
     // attempt, so the end that follows (the engine's, below) is never reported as a failure.
     m_customerQuit = true;
-    // T126: the customer's End outranks a freeze that fired a moment ago, and a freeze deadline
-    // that runs out while the engine tears down must not turn it into a reconnect.
-    noteStreamEnd(StreamEnd::AppEnd);
     if (!m_session->active()) {
         finishPlay(QStringLiteral("cancelled"), QStringLiteral("cancelled"), m_lastFailedStep);
         onClientThread(m_pairing, [this]() { m_pairing->cancel(); });
@@ -2542,16 +2169,6 @@ void SeatHubClient::signOut()
     endPlayRepeat();
     if (m_homeStatus == QLatin1String(kHomePreviousEnding)) {
         setHomeStatus(QString::fromLatin1(kHomeReady));
-    }
-    // WR-14: signing out mid-episode (e.g. during the backoff gap) stops and clears every other
-    // piece of reconnect state above, but left `m_reconnectTimer`, `m_reconnecting` and the
-    // Settings/updater lock stuck exactly as `enterReconnect()` set them - nobody signed in to
-    // notice, until the next `beginSession()`'s own lock cycle happened to touch it.
-    if (m_reconnecting) {
-        m_reconnectTimer->stop();
-        m_reconnecting = false;
-        setReconnectLock(false);
-        emit reconnectingChanged();
     }
 
     // The server's revoke goes out first - it is the only thing that makes "signed out" true for
@@ -2974,18 +2591,6 @@ void SeatHubClient::handleStageStarting(const QString& stage)
 
 void SeatHubClient::handleStageFailed(const QString& stage, int errorCode, const QString& failingPorts)
 {
-    if (m_reconnecting) {
-        // A retry's own engine failed inside its second stage - the same class of failure as a
-        // pairing failure during reconnect (below): schedule the next attempt, and leave the
-        // liveness stage exactly where it already is (`reconnecting`) rather than reporting
-        // `failed` for an attempt, not the session.
-        m_lastFailedStep = QStringLiteral("reconnect");
-        noteStepOutcome(m_lastFailedStep, QStringLiteral("failed"),
-                        QStringLiteral("attempt_engine_failed"),
-                        m_playElapsed.isValid() ? m_playElapsed.elapsed() : -1, 1);
-        retryReconnectOrGiveUp();
-        return;
-    }
 
     // O01: the engine named a failure for this attempt, so its end is not a quit.
     m_engineFailed = true;
@@ -3050,26 +2655,10 @@ void SeatHubClient::handleConnectionStarted()
 
     const bool firstConnection = m_streamStartMs < 0;
     if (firstConnection) m_streamStartMs = m_playElapsed.elapsed();
-    // The engine's own Debug overlay state at start-up: it is applied before any renderer exists,
-    // so no notification announces it. The deadline begins now, so a stream whose first tap
-    // never comes is caught as well. Later hotkey toggles arrive through the visibility tap.
-    m_freezeWatchdog.setStatsVisible(m_settings->statsOverlayShownAtStart());
-    m_freezeWatchdog.clearStall();
-    m_freezeWatchdog.setStreaming(true);
-    {
-        std::lock_guard<std::mutex> lock(m_freezeInterruptMutex);
-        m_streamEnd = StreamEnd::Live;
-    }
-    // The engine's real Debug overlay state (shown or hidden, hotkey included) on every
-    // notification, so a hidden overlay disarms the watchdog and a shown one re-arms it.
-    m_hud.compositor().setStatsVisibilityTap([this](bool shown) {
-        m_freezeWatchdog.setStatsVisible(shown);
-    });
     const auto generation = m_playGeneration.load();
     const QElapsedTimer clock = m_playElapsed;
     m_hud.compositor().setStatsTap([this, generation, clock](const VideoStats& stats) {
         if (generation != m_playGeneration.load()) return;
-        m_freezeWatchdog.noteFrameStatsTap();
         m_sampler->feed(stats);
         qint64 absent = -1;
         if (stats.renderedFps.present && stats.renderedFps.value > 0
@@ -3081,17 +2670,6 @@ void SeatHubClient::handleConnectionStarted()
             }, Qt::QueuedConnection);
         }
     });
-    // 06.1-19/J-07: the reconnect (if this was one) just succeeded - the stream is back before
-    // anything else here runs.
-    if (m_reconnecting) {
-        noteStepOutcome(QStringLiteral("reconnect"), QStringLiteral("ok"), QStringLiteral("ok"),
-                        m_playElapsed.isValid() ? m_playElapsed.elapsed() : -1,
-                        qMax(1, m_reconnectCount));
-        m_reconnecting = false;
-        m_reconnectBackoffMs = 0;
-        m_lastFailedStep.clear();
-        emit reconnectingChanged();
-    }
 
     // D-14: from here on the settings page can report what the session actually settled on,
     // rather than what was asked for.
@@ -3147,29 +2725,6 @@ void SeatHubClient::handleConnectionStarted()
 
 void SeatHubClient::handleDisplayLaunchError(const QString& text)
 {
-    // 06.1-19/J-07: this reconnect attempt's own engine failed before it reached streaming again
-    // (or dropped again immediately after) - schedule the next attempt rather than ending a
-    // session J-07 exists to keep held. Checked before `connectingSession()`: `appState` stays
-    // "connecting" throughout a reconnect (no new appState value - `main.qml`'s
-    // `componentForState`/`showsHeader` switches are not this plan's to edit), so that check
-    // alone cannot tell a reconnect's own attempt apart from an ordinary Play.
-    if (m_reconnecting) {
-        m_lastFailedStep = QStringLiteral("reconnect");
-        noteStepOutcome(m_lastFailedStep, QStringLiteral("failed"),
-                        QStringLiteral("attempt_engine_failed"),
-                        m_playElapsed.isValid() ? m_playElapsed.elapsed() : -1, 1);
-        // L07: a warm attempt that failed - the rig answered paired to the held pin and the stream
-        // still did not come up - falls back to the PIN handshake: the held trust is forgotten, so
-        // the next attempt of this episode pairs with the PIN. An attempt that had paired with the
-        // PIN keeps its trust for the next one.
-        if (m_lastPairingWarm) {
-            HeldRigTrust::clear();
-            m_lastPairingWarm = false;
-        }
-        retryReconnectOrGiveUp();
-        return;
-    }
-
     // O01: the engine named a failure for this attempt, so its end is not a quit.
     m_engineFailed = true;
 
@@ -3192,9 +2747,9 @@ void SeatHubClient::handleDisplayLaunchError(const QString& text)
         return;
     }
 
-    // 06.1-19/J-07: a stream that had started ended on a connection-class engine code - not a
-    // deliberate stop and not a host-side fault (FORK research §1.2) - while the server still
-    // holds the session. SeatHub keeps it and relaunches, instead of tearing down below.
+    // ADR-0090: Moonlight ended a started stream on its own termination code. No reconnect and no
+    // SeatHub text over Moonlight's message: the ordinary end path (`handleReadyForDeletion()`)
+    // queues the one End and returns Home.
     const int terminationCode = m_lastTerminationCode.load(std::memory_order_relaxed);
     if (m_streamStarted) {
         m_lastFailedStep = QStringLiteral("stream");
@@ -3202,15 +2757,8 @@ void SeatHubClient::handleDisplayLaunchError(const QString& text)
                         classForStreamError(terminationCode),
                         m_playElapsed.isValid() ? m_playElapsed.elapsed() : -1, 1);
     }
-    if (m_streamStarted && inControlPlaneSession()
-            && isReconnectEligible(terminationCode)) {
-        enterReconnect();
-        return;
-    }
-
     finishPlay(QStringLiteral("terminated"), QStringLiteral("failed"),
                QStringLiteral("stream"), classForStreamError(terminationCode));
-    raiseFailure(mapLaunchError(text));
 }
 
 void SeatHubClient::handleDisplayLaunchWarning(const QString& text)
@@ -3240,114 +2788,19 @@ void SeatHubClient::handleSessionFinished(int portTestResult)
     // the app is quit after the session) - same fallback, same unreduced close, no-op normally.
     m_streamTime->closeOpenSegment();
 
-    // The engine's loop has returned: nothing is left to interrupt, and every end signal of the
-    // stream has arrived. This is the one reconnect decision (T126): a stream the watchdog ended
-    // is reconnected now that this thread is back (before the port-test check below), any other
-    // cause ends normally. From here a deadline that runs out sets nothing: the teardown that
-    // follows is not a frozen stream.
-    applyWatchdogReconnect(true);
-    m_freezeWatchdog.setStreaming(false);
     m_hud.compositor().setStatsTap(nullptr);
-    m_hud.compositor().setStatsVisibilityTap(nullptr);
     m_sampler->finish();
     // D-56: the duration timer stops here, which is the interval the plan specifies.
     m_hud.endSession();
     m_hud.compositor().showStartHint(false);
 
-    // 06.1-19/J-07: upstream runs its own port test on every session end, including a connection
-    // drop this reconnect is about to keep - `raiseFailure()` here would flip `appState` to
-    // "error" out from under `enterReconnect()`'s own "connecting" (T-06.1-57). No fake in this
-    // suite emits this signal, so no test slot depends on the ordinary path running while
-    // reconnecting.
-    if (!m_reconnecting && portTestResult != 0 && portTestResult != -1 && m_failure.isEmpty()) {
+    if (portTestResult != 0 && portTestResult != -1 && m_failure.isEmpty()) {
         raiseFailure(mapPortTestFailure(portTestResult));
     }
 }
 
-void SeatHubClient::setStatsOverlayVisible(bool visible)
-{
-    m_freezeWatchdog.setStatsVisible(visible);
-}
-
-void SeatHubClient::noteStreamEnd(StreamEnd cause)
-{
-    {
-        // T127: the reasons are ranked, not first-come. The customer's End outranks everything;
-        // a SeatHub-side explicit end (the control plane's terminal read, the horizon, the held
-        // session's End) outranks only the watchdog, because the watchdog ending a stream the
-        // control plane has ended must never turn it into a reconnect; among themselves the first
-        // stays. The engine's quit line is the lowest: it counts only on a stream nobody has
-        // ended, so the watchdog's own interrupt is never read as the customer's hotkey.
-        std::lock_guard<std::mutex> lock(m_freezeInterruptMutex);
-        bool record = false;
-        switch (cause) {
-        case StreamEnd::AppEnd:
-            record = m_streamEnd != StreamEnd::NotLive;
-            break;
-        case StreamEnd::ServerTerminal:
-        case StreamEnd::Horizon:
-        case StreamEnd::HeldEnd:
-            record = m_streamEnd == StreamEnd::Live || m_streamEnd == StreamEnd::Watchdog;
-            break;
-        case StreamEnd::EngineQuit:
-            record = m_streamEnd == StreamEnd::Live;
-            break;
-        case StreamEnd::NotLive:
-        case StreamEnd::Live:
-        case StreamEnd::Watchdog: // recorded by the watchdog's own fire path only
-            break;
-        }
-        if (record) {
-            m_streamEnd = cause;
-        }
-    }
-    // Outside the record's lock: a deadline that runs out during the teardown that follows must
-    // not raise a stall. Harmless when no stream is live.
-    m_freezeWatchdog.setStreaming(false);
-}
-
-void SeatHubClient::applyWatchdogReconnect(bool engineLoopReturned)
-{
-    StreamEnd cause;
-    {
-        std::lock_guard<std::mutex> lock(m_freezeInterruptMutex);
-        cause = m_streamEnd;
-        if (cause == StreamEnd::Watchdog || engineLoopReturned) {
-            m_streamEnd = StreamEnd::NotLive;
-        }
-    }
-    if (cause != StreamEnd::Watchdog) {
-        return;
-    }
-    // Only a stream that is still streaming, whose session is still on and that the customer did
-    // not quit reconnects. `endIsCustomerQuit()` is not the test here: its second arm is also true
-    // for the quit the watchdog itself causes.
-    if (m_customerQuit || m_reconnecting || m_sessionEnded
-        || m_appState != QLatin1String(kStateStreaming)) {
-        return;
-    }
-    enterReconnect();
-}
-
 void SeatHubClient::handleReadyForDeletion()
 {
-    m_freezeWatchdog.setStreaming(false);
-    if (m_reconnecting) {
-        // 06.1-19/J-07: the engine that just tore itself down was this reconnect's own attempt
-        // (the drop that started it, or a retry's own engine dropping again). This is not an
-        // ending: `m_liveness` keeps running (it never stopped across the drop - the server must
-        // still see `reconnecting` and hold the grace) and the session's own teardown never runs.
-        // Only the local engine object goes away, and the next attempt starts after the backoff.
-        releaseEngineSession();
-        m_settings->noteSessionFinished();
-        // ADR-0066 decision 9: the first attempt of a reconnect episode is made at once. The
-        // backoff applies to the attempts after it (`retryReconnectOrGiveUp()`).
-        m_reconnectBackoffMs = kReconnectInitialBackoffMs;
-        m_reconnectTimer->start(0);
-        recomputeRetrySeconds();
-        return;
-    }
-
     finishPlay(m_streamStarted ? QStringLiteral("ended") : QStringLiteral("cancelled"),
                m_streamStarted ? QStringLiteral("ok") : QStringLiteral("cancelled"),
                m_streamStarted ? QStringLiteral("stream") : m_lastFailedStep,
@@ -3691,14 +3144,6 @@ void SeatHubClient::handleSessionState(const SessionInfo& session)
         return;
     }
 
-    // 06.1-19/J-07: the reconnect screen's own count and grace countdown, cached from whichever
-    // read reaches the facade first - the pairing poll's own `sessionRead` while an attempt is
-    // actively re-pairing, or `retryReconnectOrGiveUp()`'s explicit fetch during the backoff gap
-    // between attempts (no poll runs there).
-    if (m_reconnecting) {
-        applyReconnectSessionFields(session);
-    }
-
     // D-09/D-13: `beginSession()` does not know the rig yet - this is the first (and only) place a
     // `SessionInfo` names one, so this is where the crash tags/attributes actually gain `host_id`.
     if (!session.hostId.isEmpty()) {
@@ -3734,25 +3179,8 @@ void SeatHubClient::handleSessionState(const SessionInfo& session)
         m_liveness->stop();
         if (m_session->active() || m_appState == QLatin1String(kStateStreaming)) {
             finishPlay(QStringLiteral("server_ended"), QStringLiteral("ok"), QStringLiteral("stream"));
-            // 06.1-19/J-07: if this engine belongs to a reconnect attempt that just resumed
-            // streaming, this same terminal read still wins - clear `m_reconnecting` first, so
-            // `handleReadyForDeletion()`, once this interrupt reaches it, takes the ordinary end
-            // path instead of scheduling another attempt for a session that is already over.
-            // WR-14: only when a retry's engine is still genuinely `m_reconnecting` - the ordinary
-            // already-`"streaming"` sub-case (`m_reconnecting` already false here) is unlocked by
-            // `setAppState()`'s own toggle once `handleReadyForDeletion()` leaves "streaming", and
-            // releasing the Settings/updater lock again here would double-unlock it.
-            if (m_reconnecting) {
-                m_reconnecting = false;
-                setReconnectLock(false);
-                emit reconnectingChanged();
-            }
             // The engine is running: it stops it, and its own end path carries the customer home.
-            noteStreamEnd(StreamEnd::ServerTerminal);
             m_session->interrupt();
-        }
-        else if (m_reconnecting) {
-            handleReconnectEnded(session);
         }
         else if (connectingSession()) {
             // No engine has started, so there is nothing to interrupt and the customer would sit on a
@@ -3847,7 +3275,6 @@ void SeatHubClient::finishPlay(const QString& exitPath, const QString& outcome,
     // The renderer only feeds/captures the first-frame timestamp. Final aggregation, shipping
     // and the bounded SDK flush never run on that hot thread.
     m_hud.compositor().setStatsTap(nullptr);
-    m_hud.compositor().setStatsVisibilityTap(nullptr);
     QJsonObject attributes = m_playConfiguration;
     attributes.insert("exit_path", exitPath);
     attributes.insert("outcome", outcome);
@@ -3883,7 +3310,6 @@ void SeatHubClient::finishPlay(const QString& exitPath, const QString& outcome,
     else QMetaObject::invokeMethod(m_sampler, finishSampler, Qt::BlockingQueuedConnection);
     if (m_streamStartMs >= 0) {
         attributes.insert("stream_s", (m_playElapsed.elapsed() - m_streamStartMs) / 1000.0);
-        attributes.insert("reconnects", m_reconnectCount);
         if (m_statsAggregator.hasSegments()) {
             const auto quality = m_statsAggregator.aggregate();
             struct Field { const char* name; OptionalMetric VideoStats::* member; };
@@ -4064,11 +3490,7 @@ void SeatHubClient::handleSessionWarning(const QString& sessionId, const QString
     m_billing.insert(QStringLiteral("warning_deadline_at"), deadlineAt);
     emit sessionWarningChanged();
 
-    // Audit F12: `DISCONNECTED` is the server saying this client stopped reporting. The HUD's own
-    // reconnect line this used to also flip is dead code Plan 22 removes (D-12); only the
-    // liveness stage moves here now.
-    const bool reconnecting = warning == QLatin1String("DISCONNECTED");
-    m_liveness->setStage(reconnecting ? QStringLiteral("reconnecting") : QStringLiteral("streaming"));
+    m_liveness->setStage(QStringLiteral("streaming"));
 }
 
 // ---------------------------------------------------------------------------
@@ -4091,7 +3513,6 @@ void SeatHubClient::handleHorizonReached()
                m_streamStarted ? QStringLiteral("stream") : m_lastFailedStep);
     m_liveness->stop();
     m_sessionChannel->close();
-    noteStreamEnd(StreamEnd::Horizon);
     m_session->interrupt();
 }
 
@@ -4143,13 +3564,6 @@ void SeatHubClient::handlePairingCompleted(const QString& clientUuid)
     // session against nothing. Before the Plan 03-06 fix this `start()` fell through to the 03-02
     // tracer, which is how the client paired for real and then streamed a fake.
     if (!m_session->start(m_hostWindow)) {
-        if (m_reconnecting) {
-            // 06.1-19/J-07: this retry paired but had nothing to attach to start with - the same
-            // class of failure as a pairing or stage failure during reconnect: schedule the next
-            // attempt rather than ending the held session.
-            retryReconnectOrGiveUp();
-            return;
-        }
         const EngineLaunchReason launchReason = m_engineLaunchReason == EngineLaunchReason::Started
             ? EngineLaunchReason::StartRefused : m_engineLaunchReason;
         m_lastFailedStep = QStringLiteral("engine_prepare");
@@ -4194,12 +3608,7 @@ void SeatHubClient::handlePairingCompleted(const QString& clientUuid)
     }
 
     // The engine session is attached and about to start: connecting is now under way (D-11).
-    // 06.1-19/J-07: unless this is a reconnect's own re-pairing, in which case the stage stays
-    // `reconnecting` (`aReconnectKeepsTheReconnectingStageUntilTheStreamIsBack`) - the server
-    // learns the stream is actually back only from `handleConnectionStarted()`'s own `streaming`.
-    if (!m_reconnecting) {
-        m_liveness->setStage(QStringLiteral("connecting"));
-    }
+    m_liveness->setStage(QStringLiteral("connecting"));
 }
 
 void SeatHubClient::handleHostResolved(const QString& sessionId, const PairedHostPtr& host)
@@ -4261,7 +3670,6 @@ void SeatHubClient::handleHostResolved(const QString& sessionId, const PairedHos
     // rows are visible. The tap is removed at stream end (handleTeardownCompleted clears it
     // by passing nullptr). The compositor holds the function-pointer behind its own mutex.
     m_hud.compositor().setStatsTap([this](const VideoStats& stats) {
-        m_freezeWatchdog.noteFrameStatsTap();
         m_sampler->feed(stats);
     });
 
@@ -4335,31 +3743,6 @@ void SeatHubClient::handlePairingFailed(const SeatHubFailure& failure)
     const PairingHandshakeResult classification = m_pairingClassification;
     m_pairingClassification = PairingHandshakeResult();
 
-    if (m_reconnecting) {
-        if (m_pairingLimited) {
-            // V10 (ADR-0066 decision 8): this episode has spent its three PIN-bearing pairings
-            // (409 `session.pairing_limit`). Do not arm another attempt - keep the reconnect screen
-            // and the held session until the server's grace ends (`handleReconnectEnded()`).
-            return;
-        }
-        // 06.1-19/J-07: a pairing failure during a reconnect attempt - nothing streams on this
-        // attempt, but the session is still the server's to end, not this client's: schedule the
-        // next attempt instead of the ordinary pre-stream teardown below, which would end a
-        // session J-07 exists to keep. The liveness stage stays `reconnecting` (no `reportFailure`
-        // call here, unlike the ordinary path) for the same reason `handlePairingCompleted()`'s
-        // own reconnect branch leaves it alone. No `play.step` either: the step a reconnect
-        // attempt fails is `reconnect`, and every reconnect emission is plan 22's.
-        if (classification.attemptStep == QLatin1String("pair_handshake")) {
-            m_lastFailedStep = QStringLiteral("reconnect");
-            noteStepOutcome(m_lastFailedStep, QStringLiteral("failed"),
-                            QStringLiteral("attempt_pair_failed"),
-                            m_playElapsed.isValid() ? m_playElapsed.elapsed() : -1,
-                            classification.attempts);
-        }
-        retryReconnectOrGiveUp();
-        return;
-    }
-
     // Plan 09 (ADR-0072 item 1): one `play.step` per classified pairing failure, WARN because it
     // failed, with only allow-listed attributes. `elapsed_ms` rides "where known" (item 6) - the
     // pairing path does not time its step yet, so it is absent rather than invented. Emitted
@@ -4428,11 +3811,7 @@ void SeatHubClient::handleAuthorizationGranted()
 
     // D-11: a real authorization means the rig has a pairing target - the session has moved past
     // the 409 "not ready yet" polls that are `preparing_rig`, whether or not a PIN has arrived yet.
-    // 06.1-19/J-07: unless this authorization belongs to a reconnect's own re-pairing, in which
-    // case the stage stays `reconnecting` (see `handlePairingCompleted()`'s matching guard).
-    if (!m_reconnecting) {
-        m_liveness->setStage(QStringLiteral("pairing"));
-    }
+    m_liveness->setStage(QStringLiteral("pairing"));
 }
 
 void SeatHubClient::handleVideoStatsParsed(VideoStats stats)
@@ -4638,7 +4017,6 @@ void SeatHubClient::handleTeardownCompleted(const SessionInfo& finalSession,
     // the compositor's stats tap so the render thread stops feeding into a stopped sampler.
     // `finish()` re-invokes itself queued onto the network thread, consistent with `stop()`.
     m_hud.compositor().setStatsTap(nullptr);
-    m_hud.compositor().setStatsVisibilityTap(nullptr);
     m_sampler->finish();
     m_horizon->disarm();
     m_sessionChannel->close();

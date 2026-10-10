@@ -158,11 +158,6 @@ signals:
     void pairingCompleted(const QString& clientUuid);
     /// Pairing failed closed. Always a SeatHub failure, never engine text in `error`.
     void pairingFailed(const SeatHubFailure& failure);
-    /// V10 / ADR-0066 decision 8: this reconnect episode has issued its three PIN-bearing
-    /// pairings; the server answered 409 `session.pairing_limit` to a fourth. New PIN-bearing
-    /// handshakes stop for the episode, but this is not a `pairingFailed`: the facade keeps the
-    /// reconnect screen until the server ends the session at grace expiry.
-    void pairingLimited();
     /// Closed attempt classification for authorization failures; never carries response text.
     void stepFailed(const QString& step, const QString& failureClass, qint64 elapsedMs);
     /// The session exactly as `GET /api/sessions/{id}` reported it on one poll tick. It rides the

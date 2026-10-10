@@ -38,7 +38,7 @@ const char* const kExpectedSteps[] = {
     "engine_connect",
     "first_frame",
     "stream",
-    "reconnect",
+    "reconnect", // historical token: the header list is frozen, the client emits it no more (ADR-0090)
     "teardown",
 };
 

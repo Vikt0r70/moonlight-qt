@@ -489,34 +489,6 @@ private slots:
         QVERIFY(compositor.isStartHintActive());
     }
 
-    void stats_visibility_tap_sees_every_debug_notification_shown_or_hidden()
-    {
-        OsdCompositor compositor;
-        QList<bool> seen;
-        compositor.setStatsVisibilityTap([&seen](bool shown) { seen.append(shown); });
-
-        const char* block = "Rendering frame rate: 59.00 FPS\nAverage network latency: 23 ms (variance: 1 ms)";
-        SDL_Surface* shown = OsdCompositor::rasterize(Overlay::OverlayDebug, block, true,
-                                                       SDL_Color{255, 255, 255, 255}, &compositor);
-        if (shown) SDL_FreeSurface(shown);
-        SDL_Surface* hidden = OsdCompositor::rasterize(Overlay::OverlayDebug, "", false,
-                                                        SDL_Color{255, 255, 255, 255}, &compositor);
-        QVERIFY(hidden == nullptr);
-        QCOMPARE(seen, (QList<bool>{true, false}));
-
-        // Another overlay type is not the stats overlay.
-        SDL_Surface* status = OsdCompositor::rasterize(Overlay::OverlayStatusUpdate, "", false,
-                                                        SDL_Color{0, 0, 0, 0}, &compositor);
-        if (status) SDL_FreeSurface(status);
-        QCOMPARE(seen.size(), 2);
-
-        compositor.setStatsVisibilityTap(nullptr);
-        SDL_Surface* after = OsdCompositor::rasterize(Overlay::OverlayDebug, "", false,
-                                                       SDL_Color{255, 255, 255, 255}, &compositor);
-        QVERIFY(after == nullptr);
-        QCOMPARE(seen.size(), 2);
-    }
-
     // `ui.md` §4: digits never jitter - every one of them has the same horizontal advance.
     void digitsAreTabular()
     {

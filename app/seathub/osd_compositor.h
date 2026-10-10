@@ -49,13 +49,6 @@ public:
     using StatsTapFn = std::function<void(const VideoStats&)>;
     void setStatsTap(StatsTapFn tap);
 
-    /// Told the real shown / hidden state of the engine's Debug (stats) overlay on EVERY
-    /// notification the engine makes for it, including the one that hides it (the stats tap above
-    /// only fires on a shown overlay). Runs on the engine's decoder or SDL thread. Pass nullptr
-    /// to detach.
-    using StatsVisibilityFn = std::function<void(bool)>;
-    void setStatsVisibilityTap(StatsVisibilityFn tap);
-
     /// Millisecond clock the start hint's 10 s expiry reads; wall clock by default. A test seam.
     using ClockFn = std::function<qint64()>;
     void setClock(ClockFn clock);
@@ -110,7 +103,6 @@ private:
     mutable QMutex m_mutex;
     State m_state;
     StatsTapFn m_statsTap; // guarded by m_mutex
-    StatsVisibilityFn m_statsVisibilityTap; // guarded by m_mutex
     ClockFn m_clock; // guarded by m_mutex
     qint64 nowMsLocked() const;
 };

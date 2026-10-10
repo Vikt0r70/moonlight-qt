@@ -84,7 +84,7 @@ const char* kProductionBaseUrl = "https://api-sevenhills.damra.co";
 const char* const kTerminalStates[] = { "COMPLETED", "FAILED", "EXPIRED", "CANCELLED" };
 
 // `docs/spec/openapi.yaml` `liveness.requestBody.state` - closed enum, 1.6.0.
-const char* const kLivenessStates[] = { "streaming", "reconnecting", "ending" };
+const char* const kLivenessStates[] = { "streaming", "ending" };
 
 // ADR-0008 / `Error.reference`, `ReferenceCode`, `liveness.error_code`. The alphabet
 // excludes I, L and O so a reference read off a screen is unambiguous.

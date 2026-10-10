@@ -518,7 +518,6 @@ int runDiagChild(int argc, char* argv[])
             {QStringLiteral("engine_prepare"), QStringLiteral("no_app")},
             {QStringLiteral("engine_connect"), QStringLiteral("rtsp_handshake")},
             {QStringLiteral("stream"), QStringLiteral("no_video_frame")},
-            {QStringLiteral("reconnect"), QStringLiteral("grace_expired")},
             {QStringLiteral("teardown"), QStringLiteral("failed_auth")},
         };
         for (const auto& item : outcomes) {
@@ -2251,7 +2250,7 @@ private slots:
                                      QStringLiteral("pair_handshake"),
                                      QStringLiteral("engine_prepare"),
                                      QStringLiteral("engine_connect"), QStringLiteral("stream"),
-                                     QStringLiteral("reconnect"), QStringLiteral("teardown") }) {
+                                     QStringLiteral("teardown") }) {
             QVERIFY2(emittedSteps.contains(step),
                          qPrintable(QStringLiteral("hostile-all omitted play.step for %1").arg(step)));
         }
@@ -2290,9 +2289,6 @@ private slots:
                 QStringLiteral("no_video_frame"), QStringLiteral("early_termination"),
                 QStringLiteral("protected_content"), QStringLiteral("frame_conversion"),
                 QStringLiteral("net_other")}},
-            {QStringLiteral("reconnect"), {QStringLiteral("attempt_pair_failed"),
-                QStringLiteral("attempt_engine_failed"), QStringLiteral("grace_expired"),
-                QStringLiteral("reconnect_limit"), QStringLiteral("ok")}},
             {QStringLiteral("teardown"), {QStringLiteral("failed_net"), QStringLiteral("failed_api"),
                 QStringLiteral("failed_auth"), QStringLiteral("failed_local"), QStringLiteral("ok")}},
         };

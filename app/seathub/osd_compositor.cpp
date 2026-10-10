@@ -200,12 +200,6 @@ void OsdCompositor::setStatsTap(StatsTapFn tap)
     m_statsTap = std::move(tap);
 }
 
-void OsdCompositor::setStatsVisibilityTap(StatsVisibilityFn tap)
-{
-    QMutexLocker locker(&m_mutex);
-    m_statsVisibilityTap = std::move(tap);
-}
-
 void OsdCompositor::setClock(ClockFn clock)
 {
     QMutexLocker locker(&m_mutex);
@@ -341,19 +335,6 @@ SDL_Surface* OsdCompositor::rasterizeInstance(Overlay::OverlayType type, const c
 
 SDL_Surface* OsdCompositor::rasterizeStats(const char* text, bool enabled) const
 {
-    {
-        // The engine's real Debug overlay state, reported before any early return so a hide
-        // (the hotkey, or the slot being disabled) reaches the freeze watchdog too.
-        StatsVisibilityFn visibility;
-        {
-            QMutexLocker locker(&m_mutex);
-            visibility = m_statsVisibilityTap;
-        }
-        if (visibility) {
-            visibility(enabled);
-        }
-    }
-
     if (!enabled) {
         // OD-04 (now SeatHub's own rule): a disabled slot draws nothing, whatever is ticked.
         return nullptr;

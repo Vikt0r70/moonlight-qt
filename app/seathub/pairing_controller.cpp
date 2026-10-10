@@ -247,21 +247,6 @@ void PairingController::handleAuthorization(quint64 attempt, const ControlPlaneR
         }
 
         if (result.statusCode == kHttpConflict) {
-            // V10 / ADR-0066 decision 8: a fourth PIN request in one reconnect episode answers
-            // 409 `session.pairing_limit`. New PIN-bearing handshakes stop for this episode; the
-            // facade keeps the reconnect screen until the server ends the session at grace expiry.
-            if (result.kind == QStringLiteral("session.pairing_limit")
-                || result.failure == QStringLiteral("session.pairing_limit")) {
-                qCInfo(seathubPairing) << "pairing limit reached for this episode";
-                m_pollTimer->stop();
-                m_deadlineTimer->stop();
-                m_finished = true;
-                m_clock.invalidate();
-                emit pairingLimited();
-                LogShipper::clearRedactions();
-                return;
-            }
-
             // No pairing target yet. This is the expected state for the first polls while the
             // host is still being prepared, so it is not logged as a problem.
             //

@@ -37,31 +37,6 @@ Item {
     readonly property string reference: root.client && root.client.reference
                                         ? String(root.client.reference) : ""
 
-    // 06.1-19/J-07: the Reconnecting state (`screens.md` §24, `copy.md` §Reconnect). Reuses this
-    // same column and stepper - no new screen, no new component, token or colour - because
-    // `appState` deliberately stays "connecting" throughout a reconnect (D-32/main.qml is not
-    // this plan's to edit); this property is the only thing that tells the two apart.
-    readonly property bool reconnecting: root.client && root.client.reconnecting === true
-    readonly property bool reconnectEnded: root.client && root.client.reconnectEnded === true
-    readonly property int reconnectCount: root.client && root.client.reconnectCount !== undefined
-                                          ? Number(root.client.reconnectCount) : 0
-    readonly property int graceMinutesLeft: root.client && root.client.graceMinutesLeft !== undefined
-                                            ? Number(root.client.graceMinutesLeft) : -1
-    readonly property bool reconnectStillTrying: root.client && root.client.reconnectStillTrying === true
-
-    // C-RECONNECT (`screens.md` §24, `copy.md` §Reconnect, ADR-0083 decision 12): `Connection
-    // lost.` above an in-flight `Reconnecting…` or a waiting `Trying again in {n} s`. The countdown
-    // lost.` above an in-flight `Reconnecting…` or a waiting `Trying again in {n} s`. The countdown
-    // is the held session's own next attempt (V-COUNTDOWN), published by the client once a second -
-    // shown only while a retry is actually scheduled. No attempt count and no server minutes.
-    readonly property int retrySeconds: root.client ? root.client.reconnectRetrySeconds : -1
-    readonly property string reconnectLineText: {
-        if (root.reconnectStillTrying && root.retrySeconds > 0) {
-            return qsTr("Trying again in %1 s").arg(root.retrySeconds)
-        }
-        return qsTr("Reconnecting…")
-    }
-
     Column {
         id: column
         anchors.centerIn: parent
@@ -76,33 +51,6 @@ Item {
             width: parent.width
             client: root.client
             failed: root.failed
-        }
-
-        // C-RECONNECT: `Connection lost.` sits above the reconnect lines (copy.md §Reconnect).
-        Text {
-            objectName: "connectionLostLine"
-            width: parent.width
-            wrapMode: Text.Wrap
-            visible: root.reconnecting
-            text: qsTr("Connection lost.")
-            color: Tokens.foregroundDefault
-            font.family: Tokens.fontSansDefault
-            font.pixelSize: Metrics.fontBody
-            lineHeight: 1.4
-        }
-
-        // C-RECONNECT: in-flight `Reconnecting…` or waiting `Trying again in {n} s`, from the
-        // app-scheduled retry only (V-COUNTDOWN).
-        Text {
-            objectName: "reconnectLine"
-            width: parent.width
-            wrapMode: Text.Wrap
-            visible: root.reconnecting
-            text: root.reconnectLineText
-            color: Tokens.foregroundDefault
-            font.family: Tokens.fontSansDefault
-            font.pixelSize: Metrics.fontBody
-            lineHeight: 1.4
         }
 
         // Where it stopped, and why, in the deck's words.
@@ -178,14 +126,11 @@ Item {
         }
 
         // Stopped: try again (the primary action), or go home. There is no other choice to make.
-        // 06.1-19/J-07: a reconnect the server gave up on is terminal - the session is over, so
-        // `Try again` (which would end THIS session and start
-        // a fresh one) is never offered for it; only `Back to home` is (screens.md §24).
         SeatHubButton {
             id: tryAgainButton
             objectName: "tryAgainButton"
             width: parent.width
-            visible: root.failed && !root.reconnectEnded
+            visible: root.failed
             // D-05/C4: Try again always ends the old, never-streamed session first and waits for
             // it before a fresh Play goes out - the busy state is exactly that wait, not a local
             // spinner of this screen's own (`retryBusy`, `seathub_client.h`).
@@ -206,42 +151,16 @@ Item {
             onClicked: root.client.dismissError()
         }
 
-        // While it is still going: the one way out of a wait. A real control (audit F3). Not
-        // offered during an automatic reconnect (screens.md §24) - `End session` below is.
+        // While it is still going: the one way out of a wait. A real control (audit F3).
         SeatHubButton {
             id: cancelButton
             objectName: "cancelButton"
             width: parent.width
             variant: "ghost"
-            visible: !root.failed && !root.reconnecting
+            visible: !root.failed
             text: qsTr("Cancel")
 
             onClicked: root.client.interrupt()
-        }
-
-        // C-RECONNECT: `Try now` starts the next attempt at once and shows `Reconnecting…` at once
-        // (copy.md §Reconnect). Offered only while a retry is actually waiting.
-        SeatHubButton {
-            id: tryNowButton
-            objectName: "tryNowButton"
-            width: parent.width
-            visible: root.reconnecting && root.reconnectStillTrying
-            text: qsTr("Try now")
-
-            onClicked: root.client.retryNow()
-        }
-
-        // 06.1-19/J-07: ends the held session at once, through the ordinary end - billing
-        // continues while it is held, so the customer can always stop it (screens.md §24).
-        SeatHubButton {
-            id: endSessionButton
-            objectName: "endSessionButton"
-            width: parent.width
-            variant: "ghost"
-            visible: root.reconnecting
-            text: qsTr("End session")
-
-            onClicked: root.client.endHeldSession()
         }
     }
 }

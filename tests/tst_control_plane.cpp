@@ -953,7 +953,7 @@ private slots:
     void livenessPayload_onlyTheThreeDocumentedStates()
     {
         QVERIFY(ControlPlaneClient::isValidLivenessState(QStringLiteral("streaming")));
-        QVERIFY(ControlPlaneClient::isValidLivenessState(QStringLiteral("reconnecting")));
+        QVERIFY(!ControlPlaneClient::isValidLivenessState(QStringLiteral("reconnecting")));
         QVERIFY(ControlPlaneClient::isValidLivenessState(QStringLiteral("ending")));
         QVERIFY(!ControlPlaneClient::isValidLivenessState(QStringLiteral("ACTIVE")));
         QVERIFY(!ControlPlaneClient::isValidLivenessState(QString()));

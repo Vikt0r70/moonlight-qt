@@ -322,12 +322,6 @@ class FakeShellClient : public QObject
     Q_PROPERTY(bool connectFailed READ connectFailed NOTIFY connectFailedChanged)
     Q_PROPERTY(QString stalledStepText READ stalledStepText NOTIFY connectFailedChanged)
     Q_PROPERTY(QString stalledReasonText READ stalledReasonText NOTIFY connectFailedChanged)
-    Q_PROPERTY(bool reconnecting READ reconnecting NOTIFY reconnectingChanged)
-    Q_PROPERTY(bool reconnectEnded READ reconnectEnded NOTIFY connectFailedChanged)
-    Q_PROPERTY(int reconnectCount READ reconnectCount NOTIFY reconnectingChanged)
-    Q_PROPERTY(int graceMinutesLeft READ graceMinutesLeft NOTIFY reconnectingChanged)
-    Q_PROPERTY(bool reconnectStillTrying READ reconnectStillTrying NOTIFY reconnectingChanged)
-    Q_PROPERTY(int reconnectRetrySeconds READ reconnectRetrySeconds NOTIFY retrySecondsChanged)
     Q_PROPERTY(int liveRetrySeconds READ liveRetrySeconds NOTIFY retrySecondsChanged)
     Q_PROPERTY(QVariantMap account READ account NOTIFY accountChanged)
     Q_PROPERTY(QString accountStatus READ accountStatus NOTIFY accountChanged)
@@ -429,20 +423,8 @@ public:
     Q_INVOKABLE void interrupt() { ++m_interrupts; }
     int interrupts() const { return m_interrupts; }
 
-    // 06.1-19/J-07: the reconnect state (screens.md §24).
-    bool reconnecting() const { return m_reconnecting; }
-    bool reconnectEnded() const { return m_reconnectEnded; }
-    int reconnectCount() const { return m_reconnectCount; }
-    int graceMinutesLeft() const { return m_graceMinutesLeft; }
-    bool reconnectStillTrying() const { return m_reconnectStillTrying; }
-    // C-RECONNECT / V-COUNTDOWN: the live retry countdown, and `Try now`.
-    Q_INVOKABLE int reconnectRetrySeconds() const { return m_reconnectRetrySeconds; }
+    // Home offline countdown and `Try now`.
     int liveRetrySeconds() const { return m_liveRetrySeconds; }
-    void setReconnectRetrySeconds(int seconds)
-    {
-        m_reconnectRetrySeconds = seconds;
-        emit retrySecondsChanged();
-    }
     void setLiveRetrySeconds(int seconds)
     {
         m_liveRetrySeconds = seconds;
@@ -450,23 +432,6 @@ public:
     }
     Q_INVOKABLE void retryNow() { ++m_retryNows; }
     int retryNows() const { return m_retryNows; }
-    void setReconnecting(int reconnectCount, bool stillTrying, int graceMinutesLeft)
-    {
-        m_reconnecting = true;
-        m_reconnectCount = reconnectCount;
-        m_reconnectStillTrying = stillTrying;
-        m_graceMinutesLeft = graceMinutesLeft;
-        emit reconnectingChanged();
-    }
-    void setReconnectEnded()
-    {
-        m_reconnecting = false;
-        m_reconnectEnded = true;
-        emit reconnectingChanged();
-        emit connectFailedChanged();
-    }
-    Q_INVOKABLE void endHeldSession() { ++m_endHeldSessions; }
-    int endHeldSessions() const { return m_endHeldSessions; }
     int connectStage() const { return m_connectStage; }
     void setConnectStage(int stage)
     {
@@ -613,7 +578,6 @@ signals:
     void diagnosticsNoticePendingChanged();
     void connectStageChanged();
     void connectFailedChanged();
-    void reconnectingChanged();
     void retrySecondsChanged();
     void liveSessionChanged();
     void homeStatusChanged();
@@ -665,13 +629,6 @@ private:
     int m_signOuts = 0;
     int m_retries = 0;
     int m_dismissals = 0;
-    bool m_reconnecting = false;
-    bool m_reconnectEnded = false;
-    int m_reconnectCount = 0;
-    int m_graceMinutesLeft = -1;
-    bool m_reconnectStillTrying = false;
-    int m_endHeldSessions = 0;
-    int m_reconnectRetrySeconds = -1;
     int m_liveRetrySeconds = -1;
     int m_retryNows = 0;
 };
@@ -805,7 +762,6 @@ private slots:
     void homeScreenRendersEachHomeState();
     void homePlayNeverReadsResumeSessionWhateverTheFacadeClaims();
     void noCustomerResumeAfterRestart();
-    void theReconnectCountdownClearsWhenTheAttemptStarts();
     void homeShowsTheServersRefusalVerbatimWithAQuietTopUpBeneathPlay();
     void noHomeStateRendersACountAQueuePositionOrANotifyControl();
     void homeWrapsLongSentencesAndNeverBreaksAReference();
@@ -885,8 +841,6 @@ private slots:
     void theStepperDrawsThreeStagesFromTheFacadesStageAndNothingElse();
     void theStepperMarksTheStageThatWasActiveFailedWithAMarkOfItsOwn();
     void connectingShowsCancelWhileItGoesAndTheNamedStallWhenItStops();
-    void theReconnectingScreenShowsConnectionLostAndTryNow();
-    void theReconnectingScreenShowsTheRetryCountdown();
     void aStalledConnectOffersTryAgainAndBackToHomeAndNoOtherRig();
     void aStalledConnectWrapsTheLongestSentenceAndNeverBreaksAReference();
     void theErrorViewShowsThreeKindsOfSentenceAsTheyAreAndDrawsNoBareReferenceLabel();
@@ -4440,107 +4394,6 @@ void TstUiScreens::connectingShowsCancelWhileItGoesAndTheNamedStallWhenItStops()
     QVERIFY(!effectivelyVisible(itemNamed(screen.data(), QStringLiteral("stalled"))));
 }
 
-void TstUiScreens::theReconnectingScreenShowsConnectionLostAndTryNow()
-{
-    QQuickStyle::setStyle(QStringLiteral("Basic"));
-    QQmlEngine engine;
-    registerTokenSingletons(&engine);
-    FakeShellClient client;
-
-    QString error;
-    QScopedPointer<QObject> screen(connectingScreen(&engine, &client, &error));
-    QVERIFY2(screen, qPrintable(error));
-
-    // The stream had already reached the third stage before it dropped.
-    client.setConnectStage(3);
-    client.setReconnecting(/*reconnectCount=*/1, /*stillTrying=*/false, /*graceMinutesLeft=*/-1);
-
-    // C-RECONNECT: `Connection lost.` above the in-flight `Reconnecting…`, and no attempt count.
-    QVERIFY(effectivelyVisible(itemNamed(screen.data(), QStringLiteral("connectionLostLine"))));
-    QCOMPARE(itemNamed(screen.data(), QStringLiteral("connectionLostLine"))->property("text").toString(),
-             QStringLiteral("Connection lost."));
-    QVERIFY(effectivelyVisible(itemNamed(screen.data(), QStringLiteral("reconnectLine"))));
-    QCOMPARE(itemNamed(screen.data(), QStringLiteral("reconnectLine"))->property("text").toString(),
-             QStringLiteral("Reconnecting…"));
-
-    // The third stage stays active (the breathing warn dot), not failed: this is not a failure.
-    QObject* stepper = itemNamed(screen.data(), QStringLiteral("stepper"));
-    QVERIFY(stepper);
-    QCOMPARE(stepperLooks(stepper),
-             (QStringList{QStringLiteral("done"), QStringLiteral("done"), QStringLiteral("active")}));
-
-    // The ghost `End session` is offered; `Cancel` is not (no attempt to cancel a retry).
-    QVERIFY(effectivelyVisible(buttonNamed(screen.data(), QStringLiteral("endSessionButton"))));
-    QVERIFY(!effectivelyVisible(buttonNamed(screen.data(), QStringLiteral("cancelButton"))));
-    QVERIFY(!effectivelyVisible(itemNamed(screen.data(), QStringLiteral("stalled"))));
-
-    QMetaObject::invokeMethod(buttonNamed(screen.data(), QStringLiteral("endSessionButton")),
-                              "clicked");
-    QCOMPARE(client.endHeldSessions(), 1);
-}
-
-void TstUiScreens::theReconnectingScreenShowsTheRetryCountdown()
-{
-    QQuickStyle::setStyle(QStringLiteral("Basic"));
-    QQmlEngine engine;
-    registerTokenSingletons(&engine);
-    FakeShellClient client;
-
-    QString error;
-    QScopedPointer<QObject> screen(connectingScreen(&engine, &client, &error));
-    QVERIFY2(screen, qPrintable(error));
-    client.setConnectStage(3);
-
-    // V-COUNTDOWN: while a retry is scheduled the waiting line counts down, and `Try now` is
-    // offered (C-RECONNECT).
-    client.setReconnecting(/*reconnectCount=*/1, /*stillTrying=*/true, /*graceMinutesLeft=*/-1);
-    client.setReconnectRetrySeconds(4);
-    QCOMPARE(itemNamed(screen.data(), QStringLiteral("reconnectLine"))->property("text").toString(),
-             QStringLiteral("Trying again in 4 s"));
-    QVERIFY(effectivelyVisible(buttonNamed(screen.data(), QStringLiteral("tryNowButton"))));
-
-    client.setReconnectRetrySeconds(2);
-    QCOMPARE(itemNamed(screen.data(), QStringLiteral("reconnectLine"))->property("text").toString(),
-             QStringLiteral("Trying again in 2 s"));
-
-    QMetaObject::invokeMethod(buttonNamed(screen.data(), QStringLiteral("tryNowButton")), "clicked");
-    QCOMPARE(client.retryNows(), 1);
-}
-
-// V-COUNTDOWN: the countdown is only for an app-scheduled retry - with none scheduled the line
-// falls back to the in-flight wording, and no attempt/minute counter is ever shown.
-void TstUiScreens::theReconnectCountdownClearsWhenTheAttemptStarts()
-{
-    QQuickStyle::setStyle(QStringLiteral("Basic"));
-    QQmlEngine engine;
-    registerTokenSingletons(&engine);
-    FakeShellClient client;
-
-    QString error;
-    QScopedPointer<QObject> screen(connectingScreen(&engine, &client, &error));
-    QVERIFY2(screen, qPrintable(error));
-    client.setConnectStage(3);
-    QObject* line = itemNamed(screen.data(), QStringLiteral("reconnectLine"));
-    QVERIFY(line);
-
-    // Waiting with a scheduled retry: the countdown.
-    client.setReconnecting(/*reconnectCount=*/1, /*stillTrying=*/true, /*graceMinutesLeft=*/-1);
-    client.setReconnectRetrySeconds(5);
-    QCOMPARE(line->property("text").toString(), QStringLiteral("Trying again in 5 s"));
-
-    // The attempt started (no retry scheduled): in-flight wording at once.
-    client.setReconnectRetrySeconds(-1);
-    QCOMPARE(line->property("text").toString(), QStringLiteral("Reconnecting…"));
-
-    // No `of 5` and no server minutes anywhere.
-    QVERIFY(!line->property("text").toString().contains(QStringLiteral("of 5")));
-    QVERIFY(!line->property("text").toString().contains(QStringLiteral("minute")));
-
-    // Not yet trying (first attempt in flight): in-flight wording too.
-    client.setReconnecting(/*reconnectCount=*/0, /*stillTrying=*/false, /*graceMinutesLeft=*/-1);
-    QCOMPARE(line->property("text").toString(), QStringLiteral("Reconnecting…"));
-}
-
 void TstUiScreens::aStalledConnectOffersTryAgainAndBackToHomeAndNoOtherRig()
 {
     QQuickStyle::setStyle(QStringLiteral("Basic"));
@@ -6430,23 +6283,6 @@ void TstUiScreens::checkStartingAt(const QSize& size)
     QVERIFY2(!isShown(screen->findChild<QObject*>(QStringLiteral("stalledReferenceRow"))),
              qPrintable(where));
     client.clearStalled();
-
-    // Reconnecting: `Connection lost.` above the in-flight line, then the countdown + `Try now`,
-    // and `End session` always.
-    client.setReconnecting(0, false, -1);
-    QVERIFY2(seesText(screen.data(), QStringLiteral("Connection lost.")), qPrintable(where));
-    QVERIFY2(seesText(screen.data(), QStringLiteral("Reconnecting…")), qPrintable(where));
-    COMPARE_TABS( QStringList{ QStringLiteral("End session") });
-    client.setReconnecting(0, true, -1);
-    client.setReconnectRetrySeconds(12);
-    QVERIFY2(seesText(screen.data(), QStringLiteral("Trying again in 12 s")), qPrintable(where));
-    COMPARE_TABS( (QStringList{ QStringLiteral("Try now"), QStringLiteral("End session") }) );
-
-    // Error, grace expired / reconnect limit: Back to home only - the session is over.
-    client.setStalled(QStringLiteral("Stopped at: Streaming"),
-                      QStringLiteral("We couldn't reconnect, so the session ended."), QString());
-    client.setReconnectEnded();
-    COMPARE_TABS( QStringList{ QStringLiteral("Back to home") });
 
     QVERIFY2(unnamedControls(screen.data(), true).isEmpty(), qPrintable(where));
     expectNoQualitySelector(screen.data(), where);

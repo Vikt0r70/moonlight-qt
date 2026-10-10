@@ -50,7 +50,6 @@
 #include "session_lifecycle.h"
 #include "session_websocket.h"
 #include "sse_client.h"
-#include "stream_freeze_watchdog.h"
 #include "stream_stats.h"
 // Included rather than forward-declared: moc needs complete types for the `SettingsBridge*` and
 // `UpdateFeedClient*` properties below (a bare forward declaration fails the pointer-metatype
@@ -170,36 +169,7 @@ class SeatHubClient : public QObject
     /// client never reattaches an earlier one after a sign-in, restart, close or crash.
     Q_PROPERTY(bool retryBusy READ retryBusy NOTIFY retryBusyChanged)
 
-    /// 06.1-19/J-07: the reconnect state (D-03, `screens.md` §24). `appState` deliberately stays
-    /// "connecting" throughout - `main.qml`'s `componentForState`/`showsHeader` switches (not this
-    /// plan's to edit) know only the existing five values, so a genuinely new one would route to
-    /// the sign-in form and lose the header. The screen tells a reconnect apart from an ordinary
-    /// connect entirely through this property.
-    ///
-    /// True from the moment a connection-class engine code ends a stream that had started, until
-    /// the reconnect either succeeds (streaming again) or is given up on (`reconnectEnded`).
-    Q_PROPERTY(bool reconnecting READ reconnecting NOTIFY reconnectingChanged)
-
-    /// The server's own `reconnect_count` from the last session read, cached at read time - the
-    /// count of reconnects already committed. No screen shows this count any more (C-RECONNECT).
-    Q_PROPERTY(int reconnectCount READ reconnectCount NOTIFY reconnectCountChanged)
-
-    /// Whole minutes left in the server's grace, computed once at the moment each session read is
-    /// applied (never a client timer counting down on its own) from that read's own
-    /// `grace_deadline_at` against this client's clock. `-1` until a read has named one.
-    Q_PROPERTY(int graceMinutesLeft READ graceMinutesLeft NOTIFY graceMinutesLeftChanged)
-
-    /// True once this reconnect episode's first attempt has failed or timed out - the screen then
-    /// shows `Trying again in {n} s` rather than the in-flight `Reconnecting…`.
-    Q_PROPERTY(bool reconnectStillTrying READ reconnectStillTrying NOTIFY reconnectStillTryingChanged)
-    Q_PROPERTY(int reconnectRetrySeconds READ reconnectRetrySeconds NOTIFY reconnectRetrySecondsChanged)
     Q_PROPERTY(int liveRetrySeconds READ liveRetrySeconds NOTIFY liveRetrySecondsChanged)
-
-    /// True once a held session's reconnect has been given up on (the server's grace expired, or
-    /// the reconnect limit was reached) rather than succeeding or being ended by the customer -
-    /// the one case where the connecting failure view offers only `Back to home`, never
-    /// `Try again` (screens.md §24).
-    Q_PROPERTY(bool reconnectEnded READ reconnectEnded NOTIFY connectFailedChanged)
 
     /// The last session's end reason as the sentence `docs/spec/copy.md` §Session end reasons
     /// gives it, or empty. Styled text: the minute count in it is wrapped in the mono family,
@@ -327,12 +297,6 @@ public:
     /// The delivered-stream-time clock (ADR-0074 HI02), exposed the same way so a test can read the
     /// real object the facade binds and closes. Nothing in the app reads it through here.
     DeliveredStreamTime* streamTime() const { return m_streamTime.get(); }
-    /// The single-shot backoff timer between reconnect attempts. Exposed the same way: a test
-    /// reads `interval()` to check the doubling (2s, 4s, 8s, capped at 15s) without waiting for it
-    /// in real time, and restarts it at 0ms to drive the next attempt at once.
-    QTimer* reconnectTimer() const { return m_reconnectTimer; }
-    StreamFreezeWatchdog* freezeWatchdog() { return &m_freezeWatchdog; }
-    void setStatsOverlayVisible(bool visible);
     /// The control-plane session this facade is attached to now, or empty. Exposed the same way, so
     /// a test can say that a restart or a sign-in reattaches nothing and that a finished teardown
     /// detaches. Nothing in the app reads it through here, and nothing offers to resume it.
@@ -363,16 +327,6 @@ public:
     bool diagnosticsNoticePending() const { return m_diagnosticsNoticePending; }
     Q_INVOKABLE void acknowledgeDiagnosticsNotice();
     bool retryBusy() const { return m_retryBusy; }
-    bool reconnecting() const { return m_reconnecting; }
-    int reconnectCount() const { return m_reconnectCount; }
-    int graceMinutesLeft() const { return m_graceMinutesLeft; }
-    bool reconnectStillTrying() const { return m_reconnectStillTrying; }
-    bool reconnectEnded() const { return m_reconnectEnded; }
-    /// V-COUNTDOWN (ADR-0083 decision 7): whole seconds until the held reconnect's next attempt,
-    /// or -1 when none is armed. This is the held `m_reconnectTimer`'s own schedule - the value the
-    /// reconnect screen counts down. The facade republishes it once a second (NOTIFY) instead of QML
-    /// polling, so a wait that begins after a previous one ended still appears.
-    int reconnectRetrySeconds() const { return m_heldRetrySeconds; }
     /// V-COUNTDOWN: whole seconds to the sooner of the next live-updates retry and the next 10 s
     /// fallback read (the Home-offline and balance-pill countdown), or -1 when neither is pending.
     /// Published (NOTIFY) from the network thread's own schedule - never read across threads.
@@ -404,16 +358,11 @@ public:
     /// D-02: end the active stream immediately.
     Q_INVOKABLE void interrupt();
 
-    /// screens.md §24 Reconnecting's ghost `End session`: ends the held session at once through
-    /// the ordinary end (not `failed`), whether an attempt's own engine is currently running, mid
-    /// re-pairing, or waiting out a backoff. A no-op unless `reconnecting`.
-    Q_INVOKABLE void endHeldSession();
-
     /// V-WAKE (ADR-0083 decision 3): the platform network came back. A wake-up hint only - never a
     /// connectivity gate. Public so a test can drive it without a platform backend.
     Q_INVOKABLE void onNetworkBack();
 
-    /// C-RECONNECT: the customer pressed `Try now` - start the next reconnect attempt at once.
+    /// `Try now` on Home/offline: wake the live-updates stream, the fallback read and any unconfirmed End.
     Q_INVOKABLE void retryNow();
 
     /// Test seam: the jitter source for the reconnect/outbox backoff (defaults to 0-20% random).
@@ -570,11 +519,6 @@ signals:
     void signedOutNoticeChanged();
     void diagnosticsNoticePendingChanged();
     void retryBusyChanged();
-    void reconnectingChanged();
-    void reconnectCountChanged();
-    void graceMinutesLeftChanged();
-    void reconnectStillTryingChanged();
-    void reconnectRetrySecondsChanged();
     void liveRetrySecondsChanged();
     void inProfileChanged();
     void totalsChanged();
@@ -670,9 +614,6 @@ private slots:
     /// the server does.
     void handleCredentialRefused();
 
-    /// V10 (ADR-0066 decision 8): the episode's three PIN-bearing pairings are spent (409
-    /// `session.pairing_limit`). Stop arming new attempts; keep the reconnect screen until grace.
-    void handlePairingLimited();
     void handleTeardownEndAnswered(const QString& sessionId, int statusCode);
 
 private:
@@ -783,79 +724,6 @@ private:
     /// records the stage before the cancel (RESEARCH-FORK C2).
     void endAttachedSessionBeforeStream(bool failed);
 
-    // --- 06.1-19/J-07: the reconnect state -------------------------------------------------------
-
-    /// True for every engine termination code except the sentinel (no code known yet), the
-    /// graceful stop (`0`) and the three host-side codes (`-102`, `-103`, `-104`) a reconnect
-    /// cannot fix - the network-loss family FORK research 1.2 narrows this to.
-    static bool isReconnectEligible(int code);
-    /// A stream that had started (`m_streamStarted`) just ended on a reconnect-eligible code
-    /// (`handleDisplayLaunchError`'s not-connecting branch): keeps the session, starts the
-    /// reconnect state and the first backoff, and reports the stage at once (`LivenessTimer`
-    /// narrows its own immediate report to exactly this transition, Task 2). Does nothing for a
-    /// session that has ended (`m_sessionEnded`, T127): there is nothing to hold.
-    void enterReconnect();
-    /// Who ended the current stream (T126). The freeze watchdog fires on its own thread and the
-    /// engine's own Ctrl+Alt+Shift+Q is seen only as the engine's `Quit event received` log line,
-    /// so the stream's end is recorded as it is caused and decided once, afterwards, on the facade
-    /// thread (`applyWatchdogReconnect()`). `NotLive` is before the engine's connection started and
-    /// after the engine's loop returned; `Live` is a stream nobody has ended yet.
-    enum class StreamEnd
-    {
-        NotLive,
-        Live,
-        Watchdog,
-        AppEnd,
-        ServerTerminal,
-        Horizon,
-        HeldEnd,
-        EngineQuit,
-    };
-    /// Records `cause` as the end of the live stream by rank (T127) and stops the watchdog, so no
-    /// deadline can run out during the teardown that follows. `AppEnd` (the customer's own End)
-    /// outranks every recorded cause; `ServerTerminal`, `Horizon` and `HeldEnd` outrank `Live` and
-    /// `Watchdog` only and otherwise the first recorded stays; `EngineQuit` is recorded only on a
-    /// `Live` stream, so it never overrides the watchdog's own interrupt. Ignored when no stream
-    /// is live. Safe from any thread.
-    void noteStreamEnd(StreamEnd cause);
-    /// The one reconnect decision of a watchdog-ended stream (SC30, T126). The stream is
-    /// reconnected without an `/end` only when the recorded cause is the watchdog, the customer
-    /// has not quit (`m_customerQuit`), the session has not ended (`m_sessionEnded`) and the app
-    /// is still streaming; any other cause ends normally. `engineLoopReturned` is `handleSessionFinished()`: the engine's loop is over, so
-    /// the record is cleared whatever it held. The watchdog's fire path also queues it
-    /// (`engineLoopReturned` false) for a facade thread that is not inside the engine's loop. The
-    /// decision is consumed, so it runs at most once per stream.
-    void applyWatchdogReconnect(bool engineLoopReturned);
-    /// `m_reconnectTimer`'s own timeout: re-runs the full pairing handshake for `m_sessionId`
-    /// (STREAM-10 forbids anything cheaper), leaving `appState` at "connecting" and the stepper at
-    /// stage 3, and never restarting `m_liveness` (it never stopped across the drop). A no-op
-    /// once the episode is no longer `m_reconnecting` (superseded by a give-up or `endHeldSession()`
-    /// while this was already queued).
-    void resumeAfterReconnect();
-    /// This reconnect attempt's own failure (a pairing failure, a stage failure, or the retry's
-    /// own engine dropping again) - doubles the backoff (capped at 15 s) and fetches the session
-    /// once before scheduling the next attempt, so a server-side ending reached during the
-    /// backoff gap (no poll runs there) is caught between attempts rather than only on the next
-    /// successful pairing poll.
-    void retryReconnectOrGiveUp();
-    /// The server has already ended the held session (a terminal read, from the pairing poll or
-    /// `retryReconnectOrGiveUp()`'s own fetch): stops the attempts and shows `session`'s own end
-    /// reason the way any other connecting failure is shown - `GRACE_EXPIRED` or
-    /// `RECONNECT_LIMIT`, with only `Back to home` offered (`reconnectEnded`).
-    void handleReconnectEnded(const SessionInfo& session);
-    /// Locks or unlocks Settings and the update check for the duration of a reconnect episode,
-    /// exactly as `setAppState()` already does for an ordinary stream (T-06.1-57: a forced-update
-    /// modal must never cover the held session's `End session` control). Called explicitly because
-    /// `appState` itself never changes across a reconnect (`reconnecting` is the only signal of
-    /// it), so `setAppState()`'s own before/after comparison never fires here.
-    void setReconnectLock(bool locked);
-    /// The last session read's `reconnect_count` and `grace_deadline_at`, cached at the moment each
-    /// read is applied - never recomputed later against a live clock, so `graceMinutesLeft` is a
-    /// deterministic answer to "what did the last read say", not a client-owned countdown.
-    void applyReconnectSessionFields(const SessionInfo& session);
-    /// Whole minutes from now until `graceDeadlineAt`, floored, never negative; `-1` for an empty
-    /// or unparseable deadline.
-    static int computeGraceMinutesLeft(const QString& graceDeadlineAt);
 
     /// D-05/C4/C7: shared by `retry()` and `start()` - a session still attached here that never
     /// streamed is ended first (idempotent if C2 already started it), with `retryBusy` held until
@@ -1239,31 +1107,6 @@ private:
     /// load) from `handleDisplayLaunchError()` on the facade thread - the exact cross-thread read
     /// T-06.1-56 asks for an atomic rather than a plain getter. Reset in `beginSession()`.
     std::atomic<int> m_lastTerminationCode{kNoTerminationCode};
-    /// True from `enterReconnect()` until the reconnect succeeds, is given up on, or the customer
-    /// ends the held session (`endHeldSession()`).
-    bool m_reconnecting = false;
-    /// The next attempt's delay: 1 s initially, growing x1.6 with up to 20% jitter, capped at 5 s
-    /// (ADR-0066 decision 9, amended 2026-10-07).
-    int m_reconnectBackoffMs = 0;
-    /// Single-shot; its timeout re-enters `beginSession()`'s reconnect path for `m_sessionId`.
-    /// Lives on the facade's own thread (never moved, unlike `m_liveness`/`m_pairing`): no engine
-    /// runs between a drop and a successful reconnect, so this thread's event loop is never
-    /// suspended for the backoff to wait through.
-    QTimer* m_reconnectTimer = nullptr;
-    /// True once this reconnect episode's first attempt has failed or timed out
-    /// (`reconnectStillTrying`). Reset in `enterReconnect()`.
-    bool m_reconnectStillTrying = false;
-    /// True once a reconnect ended by being given up on rather than succeeding or being ended by
-    /// the customer (`reconnectEnded`). Reset wherever `beginSession()` starts a fresh, non-
-    /// reconnect session.
-    bool m_reconnectEnded = false;
-    /// The last session read's own count and grace deadline, cached at read time
-    /// (`applyReconnectSessionFields()`) - `reconnectCount`/`graceMinutesLeft`'s backing state.
-    int m_reconnectCount = 0;
-    int m_graceMinutesLeft = -1;
-    /// V10 (ADR-0066 decision 8): set when the episode's three PIN-bearing pairings are spent
-    /// (409 `session.pairing_limit`); stops new attempts until the grace ends.
-    bool m_pairingLimited = false;
     /// ADR-0066 decision 9: the jitter source for the reconnect/outbox backoff. Empty uses 0-20%
     /// random; tests set it for deterministic delays.
     std::function<double()> m_reconnectJitterProvider;
@@ -1271,10 +1114,9 @@ private:
     EndOutbox m_endOutbox;
     QTimer* m_endOutboxTimer = nullptr;
     int m_endOutboxBackoffMs = 1000;
-    /// V-COUNTDOWN: the published countdowns and their sources. `m_heldRetrySeconds` mirrors the
-    /// held `m_reconnectTimer` (facade thread); `m_liveSseRetrySeconds` is the value the SSE client
-    /// publishes from the network thread, combined with the fallback timer into `m_liveRetrySeconds`.
-    int m_heldRetrySeconds = -1;
+    /// V-COUNTDOWN: the published live countdown and its source. `m_liveSseRetrySeconds` is the value
+    /// the SSE client publishes from the network thread, combined with the fallback timer into
+    /// `m_liveRetrySeconds`.
     int m_liveRetrySeconds = -1;
     int m_liveSseRetrySeconds = -1;
     /// Repeating 1 s tick that keeps both countdowns moving; runs only while one is pending.
@@ -1304,15 +1146,5 @@ private:
     // reads it, because the HUD is not QML on this tier; the lifecycle drives it and the
     // publisher composites it.
     HudOverlay m_hud;
-    StreamFreezeWatchdog m_freezeWatchdog;
-    /// The record of who ended the current stream (`StreamEnd`), written by the watchdog thread,
-    /// the log sink and the facade thread, always under `m_freezeInterruptMutex`. The watchdog's
-    /// fire path calls `m_session->interrupt()` after releasing the lock (the interrupt can log,
-    /// and the log sink takes this lock). Reset to `Live` in `handleConnectionStarted()`.
-    std::mutex m_freezeInterruptMutex;
-    StreamEnd m_streamEnd = StreamEnd::NotLive;
-    /// The engine's `Quit event received` line (its Ctrl+Alt+Shift+Q hotkey), recorded as
-    /// `StreamEnd::EngineQuit`. Removed first in the destructor.
-    LogTee::SinkHandle m_engineQuitSinkHandle = 0;
     bool m_inSettings = false;
 };
