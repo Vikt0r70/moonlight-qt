@@ -798,8 +798,13 @@ private:
     /// own thread while this one is suspended inside the engine's SDL loop, so the fire path only
     /// raises `m_freezeReconnectPending` and interrupts the engine; this runs the reconnect once
     /// the facade thread is back - queued from the fire path, and again first thing in
-    /// `handleSessionFinished()` / `handleReadyForDeletion()`. Idempotent.
+    /// `handleSessionFinished()` / `handleReadyForDeletion()`. Idempotent. Refuses once the
+    /// customer has quit (`m_customerQuit`) or when the app is no longer streaming (T125).
     void applyPendingFreezeReconnect();
+    /// The first end signal of a stream (the customer's End, the control plane's terminal read,
+    /// the horizon): stops the watchdog, bars the fire path from interrupting or raising a stall,
+    /// and discards a stall it already raised (T125). Safe from any facade-thread path.
+    void disarmFreezeWatchdog();
     /// `m_reconnectTimer`'s own timeout: re-runs the full pairing handshake for `m_sessionId`
     /// (STREAM-10 forbids anything cheaper), leaving `appState` at "connecting" and the stepper at
     /// stage 3, and never restarting `m_liveness` (it never stopped across the drop). A no-op
