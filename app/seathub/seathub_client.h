@@ -140,6 +140,15 @@ class SeatHubClient : public QObject
     /// failure's own sentence, escaped. Empty unless `connectFailed`.
     Q_PROPERTY(QString stalledReasonText READ stalledReasonText NOTIFY connectFailedChanged)
 
+    /// True when `stalledReasonText` is Moonlight's own pre-stream text (ADR-0091): raw, to be drawn
+    /// as plain text. False when it is styled text (the deck's sentence, or an escaped one).
+    Q_PROPERTY(bool stalledReasonPlain READ stalledReasonPlain NOTIFY connectFailedChanged)
+
+    /// ADR-0091: Moonlight's own message for a started stream it ended, exactly as the engine gave
+    /// it. Home shows it above the end-reason line. Empty until such an end; cleared when the next
+    /// session starts and at sign-out.
+    Q_PROPERTY(QString engineEndMessage READ engineEndMessage NOTIFY engineEndMessageChanged)
+
     /// The mapped failure, or an empty map. `diagnostic` is never present here (D-51).
     Q_PROPERTY(QVariantMap failure READ failure NOTIFY failureChanged)
 
@@ -309,6 +318,8 @@ public:
     bool connectFailed() const { return m_connectFailed; }
     QString stalledStepText() const { return m_stalledStepText; }
     QString stalledReasonText() const { return m_stalledReasonText; }
+    bool stalledReasonPlain() const { return m_stalledReasonPlain; }
+    QString engineEndMessage() const { return m_engineEndMessage; }
     QVariantMap failure() const { return m_failure; }
     QString reference() const;
     QString identity() const { return m_identity; }
@@ -513,6 +524,7 @@ signals:
     void sessionWarningChanged();
     void homeStatusChanged();
     void endReasonTextChanged();
+    void engineEndMessageChanged();
     void balanceChanged();
     void signedInChanged();
     void liveUpdatesPausedChanged();
@@ -661,6 +673,7 @@ private:
     int jitteredReconnectDelay(int baseMs) const;
     double reconnectJitter() const;
     void setEndReasonText(const QString& text);
+    void setEngineEndMessage(const QString& text);
     void raiseFailure(const SeatHubFailure& failure);
     void clearFailure();
     void setInSettings(bool inSettings);
@@ -872,8 +885,10 @@ private:
     bool m_connectFailed = false;
     QString m_stalledStepText;
     QString m_stalledReasonText;
+    bool m_stalledReasonPlain = false;
     QString m_homeStatus;
     QString m_endReasonText;
+    QString m_engineEndMessage;
     QVariantMap m_failure;
     QString m_identity;
     QVariantMap m_account;

@@ -4186,9 +4186,8 @@ private slots:
             QCOMPARE(client.appState(), QStringLiteral("connecting"));
             QVERIFY(client.connectFailed());
             QCOMPARE(client.stalledStepText(), QStringLiteral("Stopped at: Preparing the stream"));
-            // The engine's own words are diagnostic only.
-            QCOMPARE(client.stalledReasonText(), QStringLiteral("Something went wrong on our side."));
-            verifyNoInternalNameIsShown(client);
+            // ADR-0091: the engine's own stage text is the sentence, as Moonlight composes it.
+            QCOMPARE(client.stalledReasonText(), QStringLiteral("Starting RTSP handshake failed: Error -1"));
 
             client.session()->attachSession(nullptr);
         }
@@ -4357,9 +4356,9 @@ private slots:
                      QStringLiteral("rtsp_handshake"));
             QCOMPARE(sent.value(QStringLiteral("attempt_step")).toString(),
                      QStringLiteral("engine_connect"));
-            // The engine's own stage name never becomes customer-facing copy (D-51) - it only
-            // rides the diagnostic end body the server sees.
-            verifyNoInternalNameIsShown(client);
+            // ADR-0091 supersedes D-51 for the sentence: Moonlight's own stage text is shown as
+            // given, and the stage name also rides the diagnostic end body the server sees.
+            QVERIFY(client.stalledReasonPlain());
 
             client.session()->attachSession(nullptr);
         }
@@ -7729,20 +7728,186 @@ private slots:
 
     void moonlightsOwnEndMessageIsNotReplacedBySeatHubText()
     {
+        const QString text = QStringLiteral(
+            "Your network connection isn't performing well. Reduce your video bitrate setting or "
+            "try a faster connection.");
         auto* engine = new FakeEngineSession;
         SeatHubClient client;
         WalletTicks ticks;
         beginStreaming(client, engine, &ticks, 90, 80);
         QVERIFY(!QTest::currentTestFailed());
+        client.teardown()->setVerifyIntervalMs(1);
+        m_fake->answerSession(QStringLiteral("s-live"), QStringLiteral("COMPLETED"),
+                              QStringLiteral("HOST_LOST"));
+        const QString endPath = QStringLiteral("/api/sessions/s-live/end");
+        const QString outboxFile =
+            QDir(m_dir->path()).filePath(QStringLiteral("end-outbox/s-live.json"));
+        m_fake->setEndProbe([outboxFile]() { return QFile::exists(outboxFile); });
 
         emitConnectionTerminated(-101); // ML_ERROR_NO_VIDEO_FRAME
-        emit engine->displayLaunchError(QStringLiteral("Your network connection isn't performing well."));
+        emit engine->displayLaunchError(text);
 
-        // The engine's own message is on screen; SeatHub raises no error view and no failure text.
-        QCOMPARE(client.appState(), QStringLiteral("streaming"));
+        // SeatHub raises no error view and no failure text of its own; Moonlight's message is held.
         QVERIFY(client.failure().isEmpty());
         QVERIFY(!client.connectFailed());
+        QCOMPARE(client.engineEndMessage(), text);
         emit engine->readyForDeletion();
+
+        QTRY_VERIFY_WITH_TIMEOUT(m_fake->requestPaths().contains(endPath), 15000);
+        QTRY_COMPARE_WITH_TIMEOUT(client.appState(), QStringLiteral("home"), 15000);
+        QCOMPARE(m_fake->requestPaths().count(endPath), 1);
+        QVERIFY(m_fake->endOutboxExistedAtFirstEnd());
+        QCOMPARE(client.engineEndMessage(), text);
+        QVERIFY(client.failure().isEmpty());
+    }
+
+    void aStartOfStreamNoVideoAfterConnectionStartedShowsMoonlightsTextAndQueuesOneEnd()
+    {
+        auto* engine = new FakeEngineSession;
+        SeatHubClient client;
+        WalletTicks ticks;
+        beginStreaming(client, engine, &ticks, 90, 80);
+        QVERIFY(!QTest::currentTestFailed());
+        client.teardown()->setVerifyIntervalMs(1);
+        m_fake->answerSession(QStringLiteral("s-live"), QStringLiteral("COMPLETED"),
+                              QStringLiteral("HOST_LOST"));
+
+        emitConnectionTerminated(-100); // ML_ERROR_NO_VIDEO_TRAFFIC
+        emit engine->displayLaunchError(QStringLiteral("No video received from host."));
+        emit engine->readyForDeletion();
+
+        QTRY_COMPARE_WITH_TIMEOUT(client.appState(), QStringLiteral("home"), 15000);
+        QCOMPARE(client.engineEndMessage(), QStringLiteral("No video received from host."));
+        QCOMPARE(m_fake->requestPaths().count(QStringLiteral("/api/sessions/s-live/end")), 1);
+    }
+
+    void aPortTestResultDoesNotReplaceMoonlightsEndMessage()
+    {
+        auto* engine = new FakeEngineSession;
+        SeatHubClient client;
+        WalletTicks ticks;
+        beginStreaming(client, engine, &ticks, 90, 80);
+        QVERIFY(!QTest::currentTestFailed());
+        client.teardown()->setVerifyIntervalMs(1);
+        m_fake->answerSession(QStringLiteral("s-live"), QStringLiteral("COMPLETED"),
+                              QStringLiteral("HOST_LOST"));
+
+        emitConnectionTerminated(-100);
+        emit engine->displayLaunchError(QStringLiteral("No video received from host."));
+        emit engine->sessionFinished(1); // the engine's port test found a blocked port
+        emit engine->readyForDeletion();
+
+        QTRY_COMPARE_WITH_TIMEOUT(client.appState(), QStringLiteral("home"), 15000);
+        QVERIFY(client.failure().isEmpty());
+        QCOMPARE(client.engineEndMessage(), QStringLiteral("No video received from host."));
+    }
+
+    void aDeliberateQuitShowsNoEngineEndMessage()
+    {
+        auto* engine = new FakeEngineSession;
+        SeatHubClient client;
+        WalletTicks ticks;
+        beginStreaming(client, engine, &ticks, 90, 80);
+        QVERIFY(!QTest::currentTestFailed());
+        client.teardown()->setVerifyIntervalMs(1);
+        m_fake->answerSession(QStringLiteral("s-live"), QStringLiteral("COMPLETED"),
+                              QStringLiteral("CUSTOMER_ENDED"));
+
+        emitConnectionTerminated(0);
+        emit engine->readyForDeletion();
+
+        QTRY_COMPARE_WITH_TIMEOUT(client.appState(), QStringLiteral("home"), 15000);
+        QVERIFY(client.engineEndMessage().isEmpty());
+    }
+
+    void aNewSessionClearsTheEngineEndMessage()
+    {
+        auto* engine = new FakeEngineSession;
+        SeatHubClient client;
+        WalletTicks ticks;
+        beginStreaming(client, engine, &ticks, 90, 80);
+        QVERIFY(!QTest::currentTestFailed());
+        client.teardown()->setVerifyIntervalMs(1);
+        m_fake->answerSession(QStringLiteral("s-live"), QStringLiteral("COMPLETED"),
+                              QStringLiteral("HOST_LOST"));
+        emitConnectionTerminated(-100);
+        emit engine->displayLaunchError(QStringLiteral("No video received from host."));
+        emit engine->readyForDeletion();
+        QTRY_COMPARE_WITH_TIMEOUT(client.appState(), QStringLiteral("home"), 15000);
+        QVERIFY(!client.engineEndMessage().isEmpty());
+
+        client.beginSession(QStringLiteral("s-next"));
+        QVERIFY(client.engineEndMessage().isEmpty());
+    }
+
+    void aPreStreamEngineLaunchErrorShowsMoonlightsTextVerbatim()
+    {
+        auto* engine = new FakeEngineSession;
+        SeatHubClient client;
+        client.session()->attachSession(engine);
+        beginStagedSession(client);
+        QVERIFY(!QTest::currentTestFailed());
+        client.teardown()->setVerifyIntervalMs(1);
+        m_fake->answerSession(QStringLiteral("s-stages"), QStringLiteral("CANCELLED"),
+                              QStringLiteral("CONNECT_FAILED"), 0, QStringLiteral("connection"),
+                              QStringLiteral("SH-4F7KQ2"));
+
+        emit engine->displayLaunchError(QStringLiteral("Host returned error: 503"));
+
+        QVERIFY(client.connectFailed());
+        QCOMPARE(client.stalledReasonText(), QStringLiteral("Host returned error: 503"));
+        QVERIFY(client.stalledReasonPlain());
+        QTRY_COMPARE_WITH_TIMEOUT(client.reference(), QStringLiteral("SH-4F7KQ2"), 15000);
+        // The server's verdict supplied the reference only; the sentence is still Moonlight's.
+        QCOMPARE(client.stalledReasonText(), QStringLiteral("Host returned error: 503"));
+        QTRY_VERIFY_WITH_TIMEOUT(
+            m_fake->requestPaths().contains(QStringLiteral("/api/sessions/s-stages/end")), 15000);
+        QCOMPARE(m_fake->requestPaths().count(QStringLiteral("/api/sessions/s-stages/end")), 1);
+        client.session()->attachSession(nullptr);
+        delete engine;
+    }
+
+    void aPreStreamEngineStageFailureShowsMoonlightsStageText()
+    {
+        auto* engine = new FakeEngineSession;
+        SeatHubClient client;
+        client.session()->attachSession(engine);
+        beginStagedSession(client);
+        QVERIFY(!QTest::currentTestFailed());
+        client.teardown()->setVerifyIntervalMs(1);
+        m_fake->answerSession(QStringLiteral("s-stages"), QStringLiteral("CANCELLED"));
+
+        emit engine->stageStarting(QStringLiteral("RTSP handshake"));
+        emit engine->stageFailed(QStringLiteral("RTSP handshake"), 10060, QStringLiteral("TCP 48010"));
+
+        QVERIFY(client.connectFailed());
+        QCOMPARE(client.stalledReasonText(),
+                 QStringLiteral("Starting RTSP handshake failed: Error 10060\n\nCheck your firewall "
+                                "and port forwarding rules for port(s): TCP 48010"));
+        QVERIFY(client.stalledReasonPlain());
+        client.session()->attachSession(nullptr);
+        delete engine;
+    }
+
+    void aSeatHubOwnPreStreamFailureKeepsSeatHubCopy()
+    {
+        SeatHubClient client;
+        beginStagedSession(client);
+        QVERIFY(!QTest::currentTestFailed());
+        client.teardown()->setVerifyIntervalMs(1);
+
+        emit client.pairing()->pairingFailed(
+            SeatHubFailure::local(QStringLiteral("The rig didn't finish connecting. Try again.")));
+        QVERIFY(client.connectFailed());
+        QVERIFY(!client.stalledReasonPlain());
+        QVERIFY(!client.stalledReasonText().isEmpty());
+
+        m_fake->answerSession(QStringLiteral("s-stages"), QStringLiteral("CANCELLED"),
+                              QStringLiteral("CONNECT_FAILED"), 0, QStringLiteral("rig"),
+                              QStringLiteral("SH-4F7KQ2"));
+        const QString rigSentence = mapEndBlame(QStringLiteral("rig"), QString()).error;
+        QTRY_COMPARE_WITH_TIMEOUT(client.stalledReasonText(), rigSentence.toHtmlEscaped(), 15000);
+        QVERIFY(!client.stalledReasonPlain());
     }
 
     void aDeliberateQuitStillEndsWithoutAnError()

@@ -82,8 +82,9 @@ Item {
     }
 
     function displayLaunchError(text) {
-        // Never rendered verbatim (T-03-05). Log only; the client maps it to SeatHub copy.
-        console.debug("SeatHub: engine launch error intercepted (not shown to the customer)")
+        // The facade carries Moonlight's text verbatim to the screen (ADR-0091): the connect-failure
+        // view before the stream starts, Home after a started stream. Nothing is drawn from here.
+        console.debug("SeatHub: engine launch error", text)
     }
 
     function quitStarting() {

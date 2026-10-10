@@ -322,6 +322,8 @@ class FakeShellClient : public QObject
     Q_PROPERTY(bool connectFailed READ connectFailed NOTIFY connectFailedChanged)
     Q_PROPERTY(QString stalledStepText READ stalledStepText NOTIFY connectFailedChanged)
     Q_PROPERTY(QString stalledReasonText READ stalledReasonText NOTIFY connectFailedChanged)
+    Q_PROPERTY(bool stalledReasonPlain READ stalledReasonPlain NOTIFY connectFailedChanged)
+    Q_PROPERTY(QString engineEndMessage READ engineEndMessage NOTIFY engineEndMessageChanged)
     Q_PROPERTY(int liveRetrySeconds READ liveRetrySeconds NOTIFY retrySecondsChanged)
     Q_PROPERTY(QVariantMap account READ account NOTIFY accountChanged)
     Q_PROPERTY(QString accountStatus READ accountStatus NOTIFY accountChanged)
@@ -401,6 +403,20 @@ public:
     bool connectFailed() const { return m_connectFailed; }
     QString stalledStepText() const { return m_stalledStepText; }
     QString stalledReasonText() const { return m_stalledReasonText; }
+    bool stalledReasonPlain() const { return m_stalledReasonPlain; }
+    QString engineEndMessage() const { return m_engineEndMessage; }
+    void setEngineEndMessage(const QString& text)
+    {
+        m_engineEndMessage = text;
+        emit engineEndMessageChanged();
+    }
+    /// Moonlight's own pre-stream text (ADR-0091): raw, drawn as plain text.
+    void setStalledPlain(const QString& step, const QString& reasonPlain)
+    {
+        setStalled(step, reasonPlain, QString());
+        m_stalledReasonPlain = true;
+        emit connectFailedChanged();
+    }
     /// A connect that stopped, as the facade reports it: where, and why in the deck's words.
     void setStalled(const QString& step, const QString& reasonStyled, const QString& reference)
     {
@@ -416,6 +432,7 @@ public:
         m_connectFailed = false;
         m_stalledStepText.clear();
         m_stalledReasonText.clear();
+        m_stalledReasonPlain = false;
         m_reference.clear();
         emit failureChanged();
         emit connectFailedChanged();
@@ -582,6 +599,7 @@ signals:
     void liveSessionChanged();
     void homeStatusChanged();
     void endReasonTextChanged();
+    void engineEndMessageChanged();
     void identityChanged();
     void failureChanged();
     void passwordSignInRejected(const QString& message, const QString& reference, bool noAccount);
@@ -609,6 +627,8 @@ private:
     bool m_connectFailed = false;
     QString m_stalledStepText;
     QString m_stalledReasonText;
+    bool m_stalledReasonPlain = false;
+    QString m_engineEndMessage;
     QVariantMap m_account;
     QString m_accountStatus = QStringLiteral("loading");
     QString m_accountError;
@@ -766,6 +786,9 @@ private slots:
     void noHomeStateRendersACountAQueuePositionOrANotifyControl();
     void homeWrapsLongSentencesAndNeverBreaksAReference();
     void homeScreenRendersTheSessionEndReason();
+    void homeShowsMoonlightsEndMessageVerbatim();
+    void homeHidesTheEngineEndMessageLineWhenEmpty();
+    void connectFailureShowsMoonlightsTextVerbatim();
     void theClientRaisesNoNotificationOfAnyKind();
     void homeNoLongerCarriesTheBalanceElement();
     void appHeaderCarriesTheWordmarkTheBalanceAndTheMenuInThatOrder();
@@ -4333,6 +4356,74 @@ QObject* buttonNamed(QObject* screen, const QString& name)
 }
 
 } // namespace
+
+void TstUiScreens::homeShowsMoonlightsEndMessageVerbatim()
+{
+    QQuickStyle::setStyle(QStringLiteral("Basic"));
+    QQmlEngine engine;
+    registerTokenSingletons(&engine);
+
+    FakeShellClient client;
+    QString error;
+    QScopedPointer<QObject> screen(instantiate(&engine, QStringLiteral("HomeScreen.qml"), &error));
+    QVERIFY2(screen, qPrintable(error));
+    QVERIFY(screen->setProperty("client", QVariant::fromValue(static_cast<QObject*>(&client))));
+
+    // Engine wording is drawn exactly as given, as plain text: markup in it stays literal.
+    const QString text = QStringLiteral("Your network connection isn't performing well. "
+                                        "Reduce your video bitrate setting <b>or</b> try a faster connection.");
+    client.setEngineEndMessage(text);
+    QObject* line = itemNamed(screen.data(), QStringLiteral("engineEndMessageLine"));
+    QVERIFY(line);
+    QVERIFY(effectivelyVisible(line));
+    QCOMPARE(line->property("text").toString(), text);
+    QCOMPARE(line->property("textFormat").toInt(), 0); // Text.PlainText
+    QVERIFY(line->property("wrapMode").toInt() != 0);
+}
+
+void TstUiScreens::homeHidesTheEngineEndMessageLineWhenEmpty()
+{
+    QQuickStyle::setStyle(QStringLiteral("Basic"));
+    QQmlEngine engine;
+    registerTokenSingletons(&engine);
+
+    FakeShellClient client;
+    QString error;
+    QScopedPointer<QObject> screen(instantiate(&engine, QStringLiteral("HomeScreen.qml"), &error));
+    QVERIFY2(screen, qPrintable(error));
+    QVERIFY(screen->setProperty("client", QVariant::fromValue(static_cast<QObject*>(&client))));
+
+    QObject* line = itemNamed(screen.data(), QStringLiteral("engineEndMessageLine"));
+    QVERIFY(line);
+    QVERIFY(!effectivelyVisible(line));
+
+    client.setEngineEndMessage(QStringLiteral("No video received from host."));
+    QVERIFY(effectivelyVisible(line));
+    client.setEngineEndMessage(QString());
+    QVERIFY(!effectivelyVisible(line));
+}
+
+void TstUiScreens::connectFailureShowsMoonlightsTextVerbatim()
+{
+    QQuickStyle::setStyle(QStringLiteral("Basic"));
+    QQmlEngine engine;
+    registerTokenSingletons(&engine);
+    FakeShellClient client;
+
+    QString error;
+    QScopedPointer<QObject> screen(connectingScreen(&engine, &client, &error));
+    QVERIFY2(screen, qPrintable(error));
+
+    const QString text = QStringLiteral("Host returned error: 503 <b>x</b>");
+    client.setConnectStage(1);
+    client.setStalledPlain(QStringLiteral("Stopped at: Preparing the stream"), text);
+    QVERIFY(effectivelyVisible(itemNamed(screen.data(), QStringLiteral("stalled"))));
+    QCOMPARE(itemNamed(screen.data(), QStringLiteral("stalledStep"))->property("text").toString(),
+             QStringLiteral("Stopped at: Preparing the stream"));
+    QObject* reason = itemNamed(screen.data(), QStringLiteral("stalledReason"));
+    QCOMPARE(reason->property("text").toString(), text);
+    QCOMPARE(reason->property("textFormat").toInt(), 0); // Text.PlainText: the <b> renders literally
+}
 
 void TstUiScreens::connectingShowsCancelWhileItGoesAndTheNamedStallWhenItStops()
 {

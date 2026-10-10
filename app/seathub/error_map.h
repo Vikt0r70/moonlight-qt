@@ -42,7 +42,7 @@ enum class FailureKind
 struct SeatHubFailure
 {
     FailureKind kind = FailureKind::Engine;
-    /// Customer-facing. Sourced from `docs/spec/copy.md`, never from the engine.
+    /// Customer-facing. Sourced from `docs/spec/copy.md`, except when `verbatim` is set (ADR-0091).
     QString error;
     /// `SH-XXXXXX` (ADR-0008) when the control plane supplied one; empty when it did not.
     /// The client never generates one.
@@ -53,6 +53,9 @@ struct SeatHubFailure
     QString failure;
     /// Diagnostics only - raw engine text kept for the log/support, never shown.
     QString diagnostic;
+    /// ADR-0091: `error` is Moonlight's own text for a failure before the stream started, shown
+    /// exactly as the engine wrote it and drawn as plain text. Set only by `engineTextFailure()`.
+    bool verbatim = false;
 
     static SeatHubFailure network(const QString& message);
     static SeatHubFailure auth(const QString& message);
@@ -108,9 +111,19 @@ SeatHubFailure mapStageFailure(const QString& stage, int errorCode, const QStrin
 /// (ADR-0008). An empty `blame` returns today's plain `CONNECT_FAILED` sentence with no reference.
 SeatHubFailure mapEndBlame(const QString& blame, const QString& reference);
 
-/// Maps `Session::displayLaunchError(text)` to a SeatHub failure. The raw `text` is
-/// retained in `diagnostic` only - it must never reach the customer (T-03-05).
+/// Maps `Session::displayLaunchError(text)` to a SeatHub failure for a failure after the stream
+/// started. The raw `text` is retained in `diagnostic` only (T-03-05). Before the stream starts
+/// the engine's text is shown instead, through `engineTextFailure()` (ADR-0091).
 SeatHubFailure mapLaunchError(const QString& text);
+
+/// ADR-0091: the text upstream `StreamSegue.qml` shows for `stageFailed(stage, errorCode, ports)`,
+/// composed the same way: "Starting {stage} failed: Error {code}" and, when ports are named, a
+/// blank line and "Check your firewall and port forwarding rules for port(s): {ports}".
+QString engineStageMessage(const QString& stage, int errorCode, const QString& failingPorts);
+
+/// ADR-0091: a failure before the stream started whose sentence is Moonlight's own `text`, verbatim.
+/// An empty `text` yields the generic sentence, since there is nothing of Moonlight's to show.
+SeatHubFailure engineTextFailure(const QString& text);
 
 /// Maps a `Session::sessionFinished(portTestResult)` non-zero port-test result.
 SeatHubFailure mapPortTestFailure(int portTestResult);

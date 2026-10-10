@@ -903,8 +903,10 @@ void SeatHubClient::beginSession(const QString& sessionId)
     SeatHubTelemetry::maybeTestCrash();
 
     // A new session clears the previous one's end reason: the home screen shows the outcome of
-    // the session that just ended, never a stale one (audit E10).
+    // the session that just ended, never a stale one (audit E10). Moonlight's own end message
+    // follows the same rule (ADR-0091).
     setEndReasonText(QString());
+    setEngineEndMessage(QString());
     setHomeStatus(QString::fromLatin1(kHomeReady));
 
     clearFailure();
@@ -1411,6 +1413,7 @@ void SeatHubClient::clearStall()
     m_connectFailed = false;
     m_stalledStepText.clear();
     m_stalledReasonText.clear();
+    m_stalledReasonPlain = false;
     emit connectFailedChanged();
 }
 
@@ -1437,7 +1440,12 @@ void SeatHubClient::raiseConnectFailure(const SeatHubFailure& failure, const QSt
     SeatHubFailure shown = failure;
     QString reasonText;
     const QString deckSentence = endReasonSentence(endReason, minutesBilled, true);
-    if (!deckSentence.isEmpty()) {
+    if (failure.verbatim) {
+        // ADR-0091: Moonlight's own text for a failure before the stream started, as given and
+        // drawn as plain text; the deck's sentence does not replace it.
+        reasonText = shown.error;
+    }
+    else if (!deckSentence.isEmpty()) {
         shown.error = endReasonSentence(endReason, minutesBilled, false);
         reasonText = deckSentence;
     }
@@ -1453,6 +1461,7 @@ void SeatHubClient::raiseConnectFailure(const SeatHubFailure& failure, const QSt
     // where a session that exists begins.
     m_stalledStepText = QStringLiteral("Stopped at: %1").arg(stageLine(qMax(m_connectStage, kStageRig)));
     m_stalledReasonText = reasonText;
+    m_stalledReasonPlain = failure.verbatim;
     m_connectFailed = true;
     qCInfo(seathubClient) << "connecting stopped at stage" << m_connectStage;
 
@@ -1490,6 +1499,15 @@ void SeatHubClient::setEndReasonText(const QString& text)
     }
     m_endReasonText = text;
     emit endReasonTextChanged();
+}
+
+void SeatHubClient::setEngineEndMessage(const QString& text)
+{
+    if (m_engineEndMessage == text) {
+        return;
+    }
+    m_engineEndMessage = text;
+    emit engineEndMessageChanged();
 }
 
 void SeatHubClient::raiseFailure(const SeatHubFailure& failure)
@@ -1622,6 +1640,7 @@ void SeatHubClient::beginLocalAttempt()
     SeatHubTelemetry::setTrace(m_samplerPlayId);
     clearFailure();
     setEndReasonText(QString());
+    setEngineEndMessage(QString());
     setHomeStatus(QString::fromLatin1(kHomeReady));
     resetConnecting();
     // D-25/T-05-45: same correction as `beginSession()`, before the local engine starts.
@@ -1637,6 +1656,7 @@ void SeatHubClient::beginPlayRequest()
 {
     clearFailure();
     setEndReasonText(QString());
+    setEngineEndMessage(QString());
     // The loading state belongs to the home view, so appState stays `home` until the control
     // plane answers: the customer sees the named loading line, not a connection screen for a
     // session that may never exist (`screens.md` §23, audit F1).
@@ -2221,6 +2241,7 @@ void SeatHubClient::signOut()
     resetProfileData();
     setHomeStatus(QString::fromLatin1(kHomeReady));
     setEndReasonText(QString());
+    setEngineEndMessage(QString());
     setAppState(QString::fromLatin1(kStateSignedOut));
 }
 
@@ -2618,7 +2639,8 @@ void SeatHubClient::handleStageFailed(const QString& stage, int errorCode, const
     // Before the stream started the customer is on the connecting view: it stopped there, at the stage
     // the engine was in, and says so in the deck's words rather than sending them to the error view.
     if (connectingSession()) {
-        raiseConnectFailure(mapStageFailure(stage, errorCode, failingPorts));
+        // ADR-0091: Moonlight's own stage text, composed as upstream StreamSegue.qml composes it.
+        raiseConnectFailure(engineTextFailure(engineStageMessage(stage, errorCode, failingPorts)));
         // 06.1's ADR item 4 / J-22: the server needs what the engine just told us, now - not only
         // at `handleReadyForDeletion()`'s later, report-less teardown - so it can attribute blame.
         // `report.stage` is `connecting` (D-11: this is a stage failure inside stage 2, never
@@ -2728,7 +2750,7 @@ void SeatHubClient::handleDisplayLaunchError(const QString& text)
     // O01: the engine named a failure for this attempt, so its end is not a quit.
     m_engineFailed = true;
 
-    // Never shown verbatim (T-03-05). `mapLaunchError` keeps `text` as diagnostic only.
+    // Before the stream starts the engine's text is the connect-failure sentence, verbatim (ADR-0091).
     if (connectingSession()) {
         m_lastFailedStep = QStringLiteral("engine_connect");
         noteStepOutcome(m_lastFailedStep, QStringLiteral("failed"),
@@ -2743,15 +2765,16 @@ void SeatHubClient::handleDisplayLaunchError(const QString& text)
             endPreStreamSessionWithReport(m_teardownGuard, m_teardown, m_sessionId,
                                           m_clientUuid, report);
         }
-        raiseConnectFailure(mapLaunchError(text));
+        raiseConnectFailure(engineTextFailure(text));
         return;
     }
 
-    // ADR-0090: Moonlight ended a started stream on its own termination code. No reconnect and no
-    // SeatHub text over Moonlight's message: the ordinary end path (`handleReadyForDeletion()`)
-    // queues the one End and returns Home.
+    // ADR-0090/ADR-0091: Moonlight ended a started stream on its own termination code. No reconnect
+    // and no SeatHub text over Moonlight's message: it is held verbatim for Home, and the ordinary
+    // end path (`handleReadyForDeletion()`) queues the one End and returns Home.
     const int terminationCode = m_lastTerminationCode.load(std::memory_order_relaxed);
     if (m_streamStarted) {
+        setEngineEndMessage(text);
         m_lastFailedStep = QStringLiteral("stream");
         noteStepOutcome(m_lastFailedStep, QStringLiteral("failed"),
                         classForStreamError(terminationCode),
@@ -2794,7 +2817,9 @@ void SeatHubClient::handleSessionFinished(int portTestResult)
     m_hud.endSession();
     m_hud.compositor().showStartHint(false);
 
-    if (portTestResult != 0 && portTestResult != -1 && m_failure.isEmpty()) {
+    // Moonlight's own message for this stream, when held, is the only text (ADR-0091).
+    if (portTestResult != 0 && portTestResult != -1 && m_failure.isEmpty()
+        && m_engineEndMessage.isEmpty()) {
         raiseFailure(mapPortTestFailure(portTestResult));
     }
 }
@@ -4006,8 +4031,14 @@ void SeatHubClient::handleTeardownCompleted(const SessionInfo& finalSession,
     // `raiseConnectFailure()` already showed.
     if (m_connectFailed && finalSession.endReason == QLatin1String("CONNECT_FAILED")) {
         const SeatHubFailure blamed = mapEndBlame(finalSession.endBlame, finalSession.endReference);
-        m_failure = blamed.toVariantMap();
-        m_stalledReasonText = blamed.error.toHtmlEscaped();
+        if (m_stalledReasonPlain) {
+            // ADR-0091: the sentence stays Moonlight's; only the server's reference is taken.
+            m_failure.insert(QStringLiteral("reference"), blamed.reference);
+        }
+        else {
+            m_failure = blamed.toVariantMap();
+            m_stalledReasonText = blamed.error.toHtmlEscaped();
+        }
         emit failureChanged();
         emit connectFailedChanged();
     }

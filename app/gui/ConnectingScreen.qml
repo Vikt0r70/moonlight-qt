@@ -34,6 +34,8 @@ Item {
                                           ? String(root.client.stalledStepText) : ""
     readonly property string stalledReason: root.client && root.client.stalledReasonText
                                             ? String(root.client.stalledReasonText) : ""
+    // Moonlight's own pre-stream text (ADR-0091) is engine wording: drawn as plain text, never markup.
+    readonly property bool stalledReasonPlain: root.client && root.client.stalledReasonPlain === true
     readonly property string reference: root.client && root.client.reference
                                         ? String(root.client.reference) : ""
 
@@ -94,7 +96,7 @@ Item {
                 objectName: "stalledReason"
                 width: parent.width
                 text: root.stalledReason
-                textFormat: Text.StyledText
+                textFormat: root.stalledReasonPlain ? Text.PlainText : Text.StyledText
                 wrapMode: Text.Wrap
                 color: Tokens.foregroundDefault
                 font.family: Tokens.fontSansDefault

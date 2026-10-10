@@ -76,6 +76,20 @@ Item {
         spacing: Metrics.s6
         width: Math.min(parent.width - Metrics.s16, 420)
 
+        // Moonlight's own message for a stream it ended (ADR-0091), exactly as the engine wrote it.
+        // Plain text: it is engine wording, never markup. Hidden when there is none.
+        Text {
+            objectName: "engineEndMessageLine"
+            width: parent.width
+            visible: text.length > 0
+            text: root.client && root.client.engineEndMessage ? String(root.client.engineEndMessage) : ""
+            textFormat: Text.PlainText
+            wrapMode: Text.Wrap
+            color: Tokens.foregroundMutedDefault
+            font.family: Tokens.fontSansDefault
+            font.pixelSize: Metrics.fontBody
+        }
+
         // The last session's end reason, from copy.md §Session end reasons (audit E10). One quiet
         // sentence that wraps, so it reflows instead of clipping at 960x640, and it clears the moment
         // the next session starts.

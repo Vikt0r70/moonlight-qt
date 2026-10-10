@@ -141,7 +141,9 @@ QVariantMap SeatHubFailure::toVariantMap() const
 // three client-minted reference codes. Neither sentence is in `docs/spec/copy.md` and the spec
 // forbids editing it to make a build pass, so every mapped failure now takes the deck's own
 // generic sentence and the stage detail survives only in `diagnostic` - which is logged and never
-// rendered (D-51, Pitfall 7).
+// rendered (D-51, Pitfall 7). ADR-0091 supersedes that for a failure before the stream starts: the
+// facade shows Moonlight's own text there (`engineTextFailure()`); these two mappers now serve only
+// a failure after the stream started.
 // ---------------------------------------------------------------------------
 
 SeatHubFailure mapStageFailure(const QString& stage, int errorCode, const QString& failingPorts)
@@ -160,11 +162,34 @@ SeatHubFailure mapStageFailure(const QString& stage, int errorCode, const QStrin
 
 SeatHubFailure mapLaunchError(const QString& text)
 {
-    // T-03-05 / D-51: the engine's own text is intercepted and never rendered. It is
-    // kept in `diagnostic` only, so the streaming diagnostic survives for support
-    // (Pitfall 7) without showing a customer anything of Moonlight's.
+    // A failure after the stream started: the engine's own text is not rendered here (it is held
+    // by the facade as the end message instead, ADR-0091). It is kept in `diagnostic` only, so
+    // the streaming diagnostic survives for support (Pitfall 7).
     SeatHubFailure f = SeatHubFailure::generic();
     f.diagnostic = text;
+    return f;
+}
+
+QString engineStageMessage(const QString& stage, int errorCode, const QString& failingPorts)
+{
+    // Upstream `app/gui/StreamSegue.qml` `stageFailed()`, word for word.
+    QString text = QStringLiteral("Starting %1 failed: Error %2").arg(stage).arg(errorCode);
+    if (!failingPorts.isEmpty()) {
+        text += QStringLiteral("\n\nCheck your firewall and port forwarding rules for port(s): %1")
+                    .arg(failingPorts);
+    }
+    return text;
+}
+
+SeatHubFailure engineTextFailure(const QString& text)
+{
+    if (text.isEmpty()) {
+        return SeatHubFailure::generic();
+    }
+    SeatHubFailure f;
+    f.kind = FailureKind::Engine;
+    f.error = text;
+    f.verbatim = true;
     return f;
 }
 
