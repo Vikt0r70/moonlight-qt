@@ -794,17 +794,34 @@ private:
     /// reconnect state and the first backoff, and reports the stage at once (`LivenessTimer`
     /// narrows its own immediate report to exactly this transition, Task 2).
     void enterReconnect();
-    /// The facade-thread half of the freeze watchdog's reconnect (SC30). The watchdog fires on its
-    /// own thread while this one is suspended inside the engine's SDL loop, so the fire path only
-    /// raises `m_freezeReconnectPending` and interrupts the engine; this runs the reconnect once
-    /// the facade thread is back - queued from the fire path, and again first thing in
-    /// `handleSessionFinished()` / `handleReadyForDeletion()`. Idempotent. Refuses once the
-    /// customer has quit (`m_customerQuit`) or when the app is no longer streaming (T125).
-    void applyPendingFreezeReconnect();
-    /// The first end signal of a stream (the customer's End, the control plane's terminal read,
-    /// the horizon): stops the watchdog, bars the fire path from interrupting or raising a stall,
-    /// and discards a stall it already raised (T125). Safe from any facade-thread path.
-    void disarmFreezeWatchdog();
+    /// Who ended the current stream (T126). The freeze watchdog fires on its own thread and the
+    /// engine's own Ctrl+Alt+Shift+Q is seen only as the engine's `Quit event received` log line,
+    /// so the stream's end is recorded as it is caused and decided once, afterwards, on the facade
+    /// thread (`applyWatchdogReconnect()`). `NotLive` is before the engine's connection started and
+    /// after the engine's loop returned; `Live` is a stream nobody has ended yet.
+    enum class StreamEnd
+    {
+        NotLive,
+        Live,
+        Watchdog,
+        AppEnd,
+        ServerTerminal,
+        Horizon,
+        HeldEnd,
+        EngineQuit,
+    };
+    /// Records `cause` as the end of the live stream (first cause wins; the customer's own End
+    /// outranks any cause already recorded) and stops the watchdog, so no deadline can run out
+    /// during the teardown that follows. Ignored when no stream is live. Safe from any thread.
+    void noteStreamEnd(StreamEnd cause);
+    /// The one reconnect decision of a watchdog-ended stream (SC30, T126). The stream is
+    /// reconnected without an `/end` only when the recorded cause is the watchdog, the customer
+    /// has not quit (`m_customerQuit`) and the app is still streaming; any other cause ends
+    /// normally. `engineLoopReturned` is `handleSessionFinished()`: the engine's loop is over, so
+    /// the record is cleared whatever it held. The watchdog's fire path also queues it
+    /// (`engineLoopReturned` false) for a facade thread that is not inside the engine's loop. The
+    /// decision is consumed, so it runs at most once per stream.
+    void applyWatchdogReconnect(bool engineLoopReturned);
     /// `m_reconnectTimer`'s own timeout: re-runs the full pairing handshake for `m_sessionId`
     /// (STREAM-10 forbids anything cheaper), leaving `appState` at "connecting" and the stepper at
     /// stage 3, and never restarting `m_liveness` (it never stopped across the drop). A no-op
@@ -1284,10 +1301,14 @@ private:
     // publisher composites it.
     HudOverlay m_hud;
     StreamFreezeWatchdog m_freezeWatchdog;
-    std::atomic<bool> m_freezeReconnectPending{false};
-    /// True while a started engine may be interrupted from the watchdog thread; guards the
-    /// `m_session->interrupt()` call there against the engine going away.
+    /// The record of who ended the current stream (`StreamEnd`), written by the watchdog thread,
+    /// the log sink and the facade thread, always under `m_freezeInterruptMutex`; the same lock
+    /// guards the `m_session->interrupt()` call in the watchdog's fire path against the engine
+    /// going away. Reset to `Live` in `handleConnectionStarted()`.
     std::mutex m_freezeInterruptMutex;
-    bool m_freezeInterruptLive = false;
+    StreamEnd m_streamEnd = StreamEnd::NotLive;
+    /// The engine's `Quit event received` line (its Ctrl+Alt+Shift+Q hotkey), recorded as
+    /// `StreamEnd::EngineQuit`. Removed first in the destructor.
+    LogTee::SinkHandle m_engineQuitSinkHandle = 0;
     bool m_inSettings = false;
 };

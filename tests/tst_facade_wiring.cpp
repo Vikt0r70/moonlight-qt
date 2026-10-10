@@ -8576,6 +8576,164 @@ private slots:
         delete engine;
     }
 
+    // --- who ended the stream (T126, owner design ruling of the 2026-10-10 design review) ---------
+    // The watchdog records that IT ended the stream; every other end records its own cause; the one
+    // reconnect decision is taken in `handleSessionFinished()`, where every end signal has arrived.
+    // The engine's own Ctrl+Alt+Shift+Q never reaches the facade - it is seen only as the engine's
+    // `Quit event received` line, fed here through the real LogTee.
+
+    void aHotkeyQuitBeforeTheFreezeDeadlineEndsTheStreamWithEnd()
+    {
+        StreamingPreferences::get()->showPerformanceOverlay = true;
+        auto* engine = new FakeEngineSession;
+        SeatHubClient client;
+        WalletTicks ticks;
+        client.freezeWatchdog()->setTimeoutMs(500);
+        beginStreaming(client, engine, &ticks, 90, 80);
+        QVERIFY(!QTest::currentTestFailed());
+        QVERIFY(client.session()->start(nullptr)); // as in production: the engine is running
+        m_fake->answerSession(QStringLiteral("s-live"), QStringLiteral("CANCELLED"),
+                              QStringLiteral("CUSTOMER_ENDED"));
+
+        // The customer presses the engine's own quit combination: the facade is told nothing but
+        // the engine's log line. The teardown over the dead link then outlasts the deadline.
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Quit event received");
+        QVERIFY2(!waitWithoutTheEventLoop([&]() { return engine->interrupts.load() >= 1; }, 1500),
+                 "the freeze watchdog interrupted a stream the customer's hotkey had ended");
+        QCOMPARE(engine->interrupts.load(), 0);
+
+        emit engine->sessionFinished(0);
+        QVERIFY2(!client.reconnecting(), "the hotkey end was decided as a reconnect");
+        emit engine->readyForDeletion();
+        QTest::qWait(100);
+        QVERIFY2(!client.reconnecting(), "the customer's hotkey End became a reconnect");
+        QCOMPARE(client.appState(), QStringLiteral("home"));
+        QCOMPARE(engine->interrupts.load(), 0);
+        QTRY_VERIFY_WITH_TIMEOUT(
+            m_fake->requestPaths().contains(QStringLiteral("/api/sessions/s-live/end")), 15000);
+
+        client.session()->attachSession(nullptr);
+        delete engine;
+    }
+
+    void aFreezeThatTheWatchdogEndedStillReconnectsWithoutEndAfterItsOwnQuitLine()
+    {
+        StreamingPreferences::get()->showPerformanceOverlay = true;
+        auto* engine = new FakeEngineSession;
+        SeatHubClient client;
+        WalletTicks ticks;
+        client.freezeWatchdog()->setTimeoutMs(300);
+        beginStreaming(client, engine, &ticks, 90, 80);
+        QVERIFY(!QTest::currentTestFailed());
+        QVERIFY(client.session()->start(nullptr));
+
+        QVERIFY(waitWithoutTheEventLoop([&]() { return engine->interrupts.load() >= 1; }, 5000));
+        // The watchdog's own interrupt makes the engine log the same line the hotkey does; it is
+        // told apart by order alone (the watchdog's cause was recorded before it interrupted).
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Quit event received");
+
+        // The decision is taken here, where the engine's loop has returned - not by the queued hop.
+        emit engine->sessionFinished(0);
+        QVERIFY2(client.reconnecting(), "the watchdog's own end was not decided as a reconnect");
+        QCOMPARE(client.appState(), QStringLiteral("connecting"));
+        emit engine->readyForDeletion();
+        QTest::qWait(100);
+        QVERIFY(client.reconnecting());
+        QCOMPARE(engine->interrupts.load(), 1);
+        QVERIFY(!m_fake->requestPaths().contains(QStringLiteral("/api/sessions/s-live/end")));
+
+        client.session()->attachSession(nullptr);
+        delete engine;
+    }
+
+    void anAppEndBeforeTheWatchdogFiredEndsWithEndAndNeverReconnects()
+    {
+        StreamingPreferences::get()->showPerformanceOverlay = true;
+        auto* engine = new FakeEngineSession;
+        SeatHubClient client;
+        WalletTicks ticks;
+        client.freezeWatchdog()->setTimeoutMs(300);
+        beginStreaming(client, engine, &ticks, 90, 80);
+        QVERIFY(!QTest::currentTestFailed());
+        QVERIFY(client.session()->start(nullptr));
+        m_fake->answerSession(QStringLiteral("s-live"), QStringLiteral("CANCELLED"),
+                              QStringLiteral("CUSTOMER_ENDED"));
+
+        client.interrupt();
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Quit event received"); // the engine's reaction
+        QCOMPARE(engine->interrupts.load(), 1);
+        QVERIFY2(!waitWithoutTheEventLoop([&]() { return engine->interrupts.load() >= 2; }, 1000),
+                 "the freeze watchdog fired during the customer's own End");
+
+        emit engine->sessionFinished(0);
+        emit engine->readyForDeletion();
+        QTest::qWait(100);
+        QVERIFY2(!client.reconnecting(), "the customer's End became a reconnect");
+        QTRY_VERIFY_WITH_TIMEOUT(
+            m_fake->requestPaths().contains(QStringLiteral("/api/sessions/s-live/end")), 15000);
+
+        client.session()->attachSession(nullptr);
+        delete engine;
+    }
+
+    void anAppEndAfterTheWatchdogFiredStillWinsOverTheWatchdog()
+    {
+        StreamingPreferences::get()->showPerformanceOverlay = true;
+        auto* engine = new FakeEngineSession;
+        SeatHubClient client;
+        WalletTicks ticks;
+        client.freezeWatchdog()->setTimeoutMs(300);
+        beginStreaming(client, engine, &ticks, 90, 80);
+        QVERIFY(!QTest::currentTestFailed());
+        QVERIFY(client.session()->start(nullptr));
+        m_fake->answerSession(QStringLiteral("s-live"), QStringLiteral("CANCELLED"),
+                              QStringLiteral("CUSTOMER_ENDED"));
+
+        // The watchdog ended the stream first; the customer then presses End before the engine's
+        // loop has returned. The explicit End outranks the recorded watchdog cause.
+        QVERIFY(waitWithoutTheEventLoop([&]() { return engine->interrupts.load() >= 1; }, 5000));
+        client.interrupt();
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Quit event received");
+
+        emit engine->sessionFinished(0);
+        emit engine->readyForDeletion();
+        QTest::qWait(100);
+        QVERIFY2(!client.reconnecting(), "the customer's End lost to the watchdog's reconnect");
+        QTRY_VERIFY_WITH_TIMEOUT(
+            m_fake->requestPaths().contains(QStringLiteral("/api/sessions/s-live/end")), 15000);
+
+        client.session()->attachSession(nullptr);
+        delete engine;
+    }
+
+    void aNormalEndThenTheDeadlinePassingNeverInterruptsOrReconnects()
+    {
+        StreamingPreferences::get()->showPerformanceOverlay = true;
+        auto* engine = new FakeEngineSession;
+        SeatHubClient client;
+        WalletTicks ticks;
+        client.freezeWatchdog()->setTimeoutMs(300);
+        beginStreaming(client, engine, &ticks, 90, 80);
+        QVERIFY(!QTest::currentTestFailed());
+        QVERIFY(client.session()->start(nullptr));
+        m_fake->answerSession(QStringLiteral("s-live"), QStringLiteral("CANCELLED"),
+                              QStringLiteral("CUSTOMER_ENDED"));
+
+        emit engine->sessionFinished(0);
+        QVERIFY2(!waitWithoutTheEventLoop([&]() { return engine->interrupts.load() >= 1; }, 1000),
+                 "the freeze watchdog interrupted a stream that had already ended");
+        emit engine->readyForDeletion();
+        QTest::qWait(100);
+        QCOMPARE(engine->interrupts.load(), 0);
+        QVERIFY(!client.reconnecting());
+        QCOMPARE(client.appState(), QStringLiteral("home"));
+        QTRY_VERIFY_WITH_TIMEOUT(
+            m_fake->requestPaths().contains(QStringLiteral("/api/sessions/s-live/end")), 15000);
+
+        client.session()->attachSession(nullptr);
+        delete engine;
+    }
+
     // --- the start-of-stream hint (SC13) ---------------------------------------------------------
 
     void theStartHintShowsFromConnectionStartedAndExpiresThroughTheHud()

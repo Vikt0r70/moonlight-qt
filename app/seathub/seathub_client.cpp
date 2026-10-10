@@ -568,20 +568,35 @@ SeatHubClient::SeatHubClient(QObject* parent)
         // interrupt (an SDL_PushEvent) is what ends it, and the reconnect itself is applied on
         // the facade thread - at once when this already is it, else as soon as it is back.
         //
-        // T125: the stall counts only while the stream is live. Once an end signal has been
-        // seen (`disarmFreezeWatchdog()`: the customer's End, the control plane's terminal read,
-        // the engine's loop returning) a deadline that runs out during the teardown sets nothing,
-        // so it can never turn that end into a reconnect.
+        // T126: the watchdog records that IT ended the stream, and only when nobody else has -
+        // the customer's End, the control plane's terminal read, the horizon, the held-session
+        // End and the engine's own quit hotkey each record their cause first (`noteStreamEnd()`),
+        // and a deadline that runs out during their teardown then does nothing. The cause is
+        // recorded before the interrupt, so the engine's own `Quit event received` line for this
+        // interrupt finds it taken.
         {
             std::lock_guard<std::mutex> lock(m_freezeInterruptMutex);
-            if (!m_freezeInterruptLive || !m_session) {
+            if (m_streamEnd != StreamEnd::Live || !m_session) {
                 return;
             }
-            m_freezeReconnectPending.store(true);
+            m_streamEnd = StreamEnd::Watchdog;
             m_session->interrupt();
         }
-        QMetaObject::invokeMethod(this, [this]() { applyPendingFreezeReconnect(); },
+        QMetaObject::invokeMethod(this, [this]() { applyWatchdogReconnect(false); },
                                   Qt::AutoConnection);
+    });
+
+    // T126: the engine's own Ctrl+Alt+Shift+Q never reaches the facade; its only trace is the
+    // `Quit event received` line it logs. Recorded only while the stream is live and unended, so
+    // the line the watchdog's own interrupt makes (its cause is already recorded) is not read as
+    // a hotkey. The sink only takes the record's lock and stops the watchdog - it never blocks.
+    m_engineQuitSinkHandle = LogTee::addSink([this](LogLevel, int category, int priority,
+                                                    const QString& message) {
+        if (category != SDL_LOG_CATEGORY_APPLICATION || priority != SDL_LOG_PRIORITY_INFO
+                || message.trimmed() != QLatin1String("Quit event received")) {
+            return;
+        }
+        noteStreamEnd(StreamEnd::EngineQuit);
     });
 
     // ---------------------------------------------------------------- the control-plane bridge
@@ -730,6 +745,9 @@ SeatHubClient::SeatHubClient(QObject* parent)
 SeatHubClient::~SeatHubClient()
 {
     const bool summarisedAtQuit = m_playSummaryPending;
+    // The engine-quit sink captures `this`: unregistered before anything else is destroyed.
+    LogTee::removeSink(m_engineQuitSinkHandle);
+    m_engineQuitSinkHandle = 0;
     m_freezeWatchdog.shutdown();
     finishPlay(QStringLiteral("app_quit"), QStringLiteral("cancelled"));
     m_hud.compositor().setStatsTap(nullptr);
@@ -1661,6 +1679,7 @@ void SeatHubClient::endHeldSession()
     }
     // O01: the customer's own End session press, never a reported failure.
     m_customerQuit = true;
+    noteStreamEnd(StreamEnd::HeldEnd);
     finishPlay(QStringLiteral("ended_held"), QStringLiteral("cancelled"), QStringLiteral("reconnect"));
     m_reconnectTimer->stop();
     m_reconnecting = false;
@@ -2211,9 +2230,9 @@ void SeatHubClient::interrupt()
     // O01: whichever branch runs, this is the customer's own quit. It is remembered for the
     // attempt, so the end that follows (the engine's, below) is never reported as a failure.
     m_customerQuit = true;
-    // T125: the customer's End outranks a freeze that fired a moment ago, and a freeze deadline
+    // T126: the customer's End outranks a freeze that fired a moment ago, and a freeze deadline
     // that runs out while the engine tears down must not turn it into a reconnect.
-    disarmFreezeWatchdog();
+    noteStreamEnd(StreamEnd::AppEnd);
     if (!m_session->active()) {
         finishPlay(QStringLiteral("cancelled"), QStringLiteral("cancelled"), m_lastFailedStep);
         onClientThread(m_pairing, [this]() { m_pairing->cancel(); });
@@ -3026,7 +3045,7 @@ void SeatHubClient::handleConnectionStarted()
     m_freezeWatchdog.setStreaming(true);
     {
         std::lock_guard<std::mutex> lock(m_freezeInterruptMutex);
-        m_freezeInterruptLive = true;
+        m_streamEnd = StreamEnd::Live;
     }
     // The engine's real Debug overlay state (shown or hidden, hotkey included) on every
     // notification, so a hidden overlay disarms the watchdog and a shown one re-arms it.
@@ -3208,15 +3227,12 @@ void SeatHubClient::handleSessionFinished(int portTestResult)
     // the app is quit after the session) - same fallback, same unreduced close, no-op normally.
     m_streamTime->closeOpenSegment();
 
-    // The engine's loop has returned: nothing is left to interrupt, and a freeze that fired during
-    // the stream is applied now that this thread is back (before the port-test check below). From
-    // here a deadline that runs out sets nothing (T125): the watchdog is disarmed once the freeze
-    // is applied, because the teardown that follows is not a frozen stream.
-    {
-        std::lock_guard<std::mutex> lock(m_freezeInterruptMutex);
-        m_freezeInterruptLive = false;
-    }
-    applyPendingFreezeReconnect();
+    // The engine's loop has returned: nothing is left to interrupt, and every end signal of the
+    // stream has arrived. This is the one reconnect decision (T126): a stream the watchdog ended
+    // is reconnected now that this thread is back (before the port-test check below), any other
+    // cause ends normally. From here a deadline that runs out sets nothing: the teardown that
+    // follows is not a frozen stream.
+    applyWatchdogReconnect(true);
     m_freezeWatchdog.setStreaming(false);
     m_hud.compositor().setStatsTap(nullptr);
     m_hud.compositor().setStatsVisibilityTap(nullptr);
@@ -3240,20 +3256,34 @@ void SeatHubClient::setStatsOverlayVisible(bool visible)
     m_freezeWatchdog.setStatsVisible(visible);
 }
 
-void SeatHubClient::disarmFreezeWatchdog()
+void SeatHubClient::noteStreamEnd(StreamEnd cause)
 {
+    {
+        std::lock_guard<std::mutex> lock(m_freezeInterruptMutex);
+        if (m_streamEnd == StreamEnd::Live
+                || (cause == StreamEnd::AppEnd && m_streamEnd != StreamEnd::NotLive)) {
+            m_streamEnd = cause;
+        }
+    }
+    // Outside the record's lock: a deadline that runs out during the teardown that follows must
+    // not raise a stall. Harmless when no stream is live.
     m_freezeWatchdog.setStreaming(false);
-    std::lock_guard<std::mutex> lock(m_freezeInterruptMutex);
-    m_freezeInterruptLive = false;
-    m_freezeReconnectPending.store(false);
 }
 
-void SeatHubClient::applyPendingFreezeReconnect()
+void SeatHubClient::applyWatchdogReconnect(bool engineLoopReturned)
 {
-    if (!m_freezeReconnectPending.exchange(false)) {
+    StreamEnd cause;
+    {
+        std::lock_guard<std::mutex> lock(m_freezeInterruptMutex);
+        cause = m_streamEnd;
+        if (cause == StreamEnd::Watchdog || engineLoopReturned) {
+            m_streamEnd = StreamEnd::NotLive;
+        }
+    }
+    if (cause != StreamEnd::Watchdog) {
         return;
     }
-    // T125: only a stream that is still streaming and was not ended by the customer reconnects.
+    // Only a stream that is still streaming and was not ended by the customer reconnects.
     // `endIsCustomerQuit()` is not the test here: its second arm is also true for the quit the
     // watchdog itself causes.
     if (m_customerQuit || m_reconnecting
@@ -3265,7 +3295,6 @@ void SeatHubClient::applyPendingFreezeReconnect()
 
 void SeatHubClient::handleReadyForDeletion()
 {
-    applyPendingFreezeReconnect();
     m_freezeWatchdog.setStreaming(false);
     if (m_reconnecting) {
         // 06.1-19/J-07: the engine that just tore itself down was this reconnect's own attempt
@@ -3683,7 +3712,7 @@ void SeatHubClient::handleSessionState(const SessionInfo& session)
                 emit reconnectingChanged();
             }
             // The engine is running: it stops it, and its own end path carries the customer home.
-            disarmFreezeWatchdog();
+            noteStreamEnd(StreamEnd::ServerTerminal);
             m_session->interrupt();
         }
         else if (m_reconnecting) {
@@ -4026,7 +4055,7 @@ void SeatHubClient::handleHorizonReached()
                m_streamStarted ? QStringLiteral("stream") : m_lastFailedStep);
     m_liveness->stop();
     m_sessionChannel->close();
-    disarmFreezeWatchdog();
+    noteStreamEnd(StreamEnd::Horizon);
     m_session->interrupt();
 }
 
