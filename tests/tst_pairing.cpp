@@ -19,6 +19,8 @@
 #include <QFile>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QMutex>
+#include <QMutexLocker>
 #include <QNetworkAccessManager>
 #include <QNetworkReply>
 #include <QNetworkRequest>
@@ -28,18 +30,136 @@
 #include <QSignalSpy>
 #include <QTcpServer>
 #include <QTcpSocket>
+#include <QTemporaryDir>
 #include <QThreadPool>
 #include <QTimer>
 
 #include <atomic>
 #include <type_traits>
 
+#define SDL_MAIN_HANDLED
+#include <SDL.h>
+
 #include "seathub/attempt_vocab.h"
+#include "seathub/log_shipper.h"
+#include "seathub/log_tee.h"
 #include "seathub/pairing_controller.h"
 #include "seathub/pairing_recovery.h"
 #include "seathub/pairing_seam.h"
 
 namespace {
+
+class StubHandOff
+{
+public:
+    explicit StubHandOff(bool answer = true)
+        : m_answer(answer)
+    {
+    }
+
+    bool operator()(const ShippedLine& line)
+    {
+        QMutexLocker locker(&m_mutex);
+        m_received.append(line);
+        return m_answer;
+    }
+
+    QVector<ShippedLine> received() const
+    {
+        QMutexLocker locker(&m_mutex);
+        return m_received;
+    }
+
+    int countMatching(const QString& marker) const
+    {
+        QMutexLocker locker(&m_mutex);
+        int count = 0;
+        for (const ShippedLine& line : m_received) {
+            if (line.body.contains(marker)) {
+                ++count;
+            }
+        }
+        return count;
+    }
+
+    QVector<ShippedLine> matching(const QString& marker) const
+    {
+        QMutexLocker locker(&m_mutex);
+        QVector<ShippedLine> result;
+        for (const ShippedLine& line : m_received) {
+            if (line.body.contains(marker)) {
+                result.append(line);
+            }
+        }
+        return result;
+    }
+
+    void setAnswer(bool answer)
+    {
+        QMutexLocker locker(&m_mutex);
+        m_answer = answer;
+    }
+
+private:
+    mutable QMutex m_mutex;
+    QVector<ShippedLine> m_received;
+    bool m_answer;
+};
+
+struct StopShipperOnScopeExit
+{
+    ~StopShipperOnScopeExit()
+    {
+        LogShipper::instance().stop();
+        LogShipper::instance().publishIds(QString(), QString(), QString());
+        LogShipper::instance().setCanShip(false);
+    }
+};
+
+QString ownSpoolFilePath(const QString& directory)
+{
+    return QDir(directory).filePath(
+        QStringLiteral("spool-%1.jsonl").arg(QCoreApplication::applicationPid()));
+}
+
+class RawTeeCapture
+{
+public:
+    RawTeeCapture()
+    {
+        m_handle = LogTee::addSink([this](LogLevel, int, int, const QString& text) {
+            if (text.contains(QLatin1String("pairing_instrumentation"))) {
+                QMutexLocker locker(&m_mutex);
+                m_lines.append(text);
+            }
+        });
+    }
+
+    ~RawTeeCapture()
+    {
+        if (m_handle != 0) {
+            LogTee::removeSink(m_handle);
+            m_handle = 0;
+        }
+    }
+
+    QStringList lines() const
+    {
+        QMutexLocker locker(&m_mutex);
+        return m_lines;
+    }
+
+    int count() const
+    {
+        QMutexLocker locker(&m_mutex);
+        return m_lines.size();
+    }
+
+private:
+    LogTee::SinkHandle m_handle{0};
+    mutable QMutex m_mutex;
+    QStringList m_lines;
+};
 
 const char* kSessionId = "aaaabbbb-cccc-dddd-eeee-ffff00001111";
 const char* kPin = "4821";
@@ -354,6 +474,7 @@ private slots:
     void initTestCase()
     {
         qRegisterMetaType<SeatHubFailure>("SeatHubFailure");
+        LogTee::install();
     }
 
     void theDefaultsAre30sAnd1s()
@@ -2289,6 +2410,542 @@ private slots:
         QTRY_COMPARE_WITH_TIMEOUT(failed.count(), 1, 2000);
         QCOMPARE(controller.state(), QStringLiteral("failed"));
         QCOMPARE(seam->calls, 0);
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // SC18, ADR-0098: Client pairing instrumentation.
+    // -----------------------------------------------------------------------------------------
+
+    void pairingInstrumentation_startAndSuccessResultShapesAndOmissions()
+    {
+        QTemporaryDir spoolDir;
+        QVERIFY(spoolDir.isValid());
+        StubHandOff stub;
+        StopShipperOnScopeExit stopGuard;
+
+        LogShipper::instance().setSpoolDirectoryForTests(spoolDir.path());
+        LogShipper::instance().start([&stub](const ShippedLine& l) { return stub(l); });
+        LogShipper::instance().setCanShip(true);
+
+        ProductionPairingSeam seam;
+        seam.setHandshake([](const PairingTarget&) {
+            PairingHandshakeResult res = handshakeResult(true, QStringLiteral("fingerprint-sha256-hex"));
+            res.host = std::make_shared<PairedHost>();
+            res.attempts = 1;
+            res.attemptStep = QStringLiteral("pair_handshake");
+            res.stepClass = QStringLiteral("ok");
+            return res;
+        });
+
+        PairingTarget target = pairingTarget();
+        const QString testSessionId = QStringLiteral("c0a80101-0000-4000-8000-000000000001");
+        target.sessionId = testSessionId;
+
+        SeamReport report;
+        seam.pair(target, recordInto(&report));
+
+        QTRY_COMPARE_WITH_TIMEOUT(report.count(), 1, 5000);
+        QTRY_COMPARE_WITH_TIMEOUT(stub.countMatching(QStringLiteral("pairing_instrumentation")), 2, 5000);
+
+        const QVector<ShippedLine> lines = stub.matching(QStringLiteral("pairing_instrumentation"));
+        QCOMPARE(lines.size(), 2);
+
+        // Stage: start
+        const ShippedLine& startLine = lines.at(0);
+        QCOMPARE(startLine.level, LogLevel::Info);
+        QCOMPARE(startLine.body,
+                 QStringLiteral("pairing_instrumentation writer=client stage=start session_id=%1 client_attempt=1")
+                     .arg(testSessionId));
+
+        // Stage: result
+        const ShippedLine& resultLine = lines.at(1);
+        QCOMPARE(resultLine.level, LogLevel::Info);
+        QCOMPARE(resultLine.body,
+                 QStringLiteral("pairing_instrumentation writer=client stage=result session_id=%1 client_attempt=1 outcome=success warm=false attempts=1 engine_step=pair_handshake engine_class=ok")
+                     .arg(testSessionId));
+
+        // Strict omission of server-only fields and secrets across all emitted lines
+        const QStringList serverOnlyFields = {
+            QStringLiteral("pending_pairings_at_submit"),
+            QStringLiteral("pairing_id"),
+            QStringLiteral("pin_ack_session"),
+            QStringLiteral("pin_ack_age_ms"),
+            QStringLiteral("since_sunshine_start_ms"),
+            QStringLiteral("pin_salt_match")
+        };
+
+        for (const ShippedLine& line : lines) {
+            for (const QString& field : serverOnlyFields) {
+                QVERIFY2(!line.body.contains(field), qPrintable(field));
+            }
+            QVERIFY(!line.body.contains(QString::fromLatin1(kPin)));
+            QVERIFY(!line.body.contains(QStringLiteral("salt")));
+            QVERIFY(!line.body.contains(QStringLiteral("hash")));
+        }
+    }
+
+    void pairingInstrumentation_failureAndPinRejected()
+    {
+        QTemporaryDir spoolDir;
+        QVERIFY(spoolDir.isValid());
+        StubHandOff stub;
+        StopShipperOnScopeExit stopGuard;
+
+        LogShipper::instance().setSpoolDirectoryForTests(spoolDir.path());
+        LogShipper::instance().start([&stub](const ShippedLine& l) { return stub(l); });
+        LogShipper::instance().setCanShip(true);
+
+        const QString secretDiagnostic = QStringLiteral("SECRET_INTERNAL_ENGINE_ERROR_STATE");
+
+        ProductionPairingSeam seam;
+        seam.setHandshake([&secretDiagnostic](const PairingTarget&) {
+            PairingHandshakeResult res = handshakeResult(false, QString(), secretDiagnostic);
+            res.attempts = 2;
+            res.attemptStep = QStringLiteral("pair_handshake");
+            res.stepClass = QStringLiteral("pin_rejected");
+            return res;
+        });
+
+        PairingTarget target = pairingTarget();
+        const QString testSessionId = QStringLiteral("c0a80101-0000-4000-8000-000000000002");
+        target.sessionId = testSessionId;
+
+        SeamReport report;
+        seam.pair(target, recordInto(&report));
+
+        QTRY_COMPARE_WITH_TIMEOUT(report.count(), 1, 5000);
+        QCOMPARE(report.outcomes.first(), false);
+        QTRY_COMPARE_WITH_TIMEOUT(stub.countMatching(QStringLiteral("pairing_instrumentation")), 2, 5000);
+
+        const QVector<ShippedLine> lines = stub.matching(QStringLiteral("pairing_instrumentation"));
+        QCOMPARE(lines.size(), 2);
+
+        const ShippedLine& resultLine = lines.at(1);
+        QCOMPARE(resultLine.level, LogLevel::Info);
+        QCOMPARE(resultLine.body,
+                 QStringLiteral("pairing_instrumentation writer=client stage=result session_id=%1 client_attempt=1 outcome=failure warm=false attempts=2 engine_step=pair_handshake engine_class=pin_rejected")
+                     .arg(testSessionId));
+        QVERIFY(!resultLine.body.contains(secretDiagnostic));
+    }
+
+    void pairingInstrumentation_warmSuccess()
+    {
+        QTemporaryDir spoolDir;
+        QVERIFY(spoolDir.isValid());
+        StubHandOff stub;
+        StopShipperOnScopeExit stopGuard;
+
+        LogShipper::instance().setSpoolDirectoryForTests(spoolDir.path());
+        LogShipper::instance().start([&stub](const ShippedLine& l) { return stub(l); });
+        LogShipper::instance().setCanShip(true);
+
+        ProductionPairingSeam seam;
+        seam.setHandshake([](const PairingTarget&) {
+            PairingHandshakeResult res = handshakeResult(true, QStringLiteral("warm-fingerprint"));
+            res.host = std::make_shared<PairedHost>();
+            res.attempts = 1;
+            res.warm = true;
+            return res;
+        });
+
+        PairingTarget target = pairingTarget();
+        const QString testSessionId = QStringLiteral("c0a80101-0000-4000-8000-000000000003");
+        target.sessionId = testSessionId;
+        target.warmReturn = true;
+
+        SeamReport report;
+        seam.pair(target, recordInto(&report));
+
+        QTRY_COMPARE_WITH_TIMEOUT(report.count(), 1, 5000);
+        QCOMPARE(report.outcomes.first(), true);
+        QTRY_COMPARE_WITH_TIMEOUT(stub.countMatching(QStringLiteral("pairing_instrumentation")), 2, 5000);
+
+        const QVector<ShippedLine> lines = stub.matching(QStringLiteral("pairing_instrumentation"));
+        QCOMPARE(lines.size(), 2);
+
+        const ShippedLine& resultLine = lines.at(1);
+        QCOMPARE(resultLine.level, LogLevel::Info);
+        QCOMPARE(resultLine.body,
+                 QStringLiteral("pairing_instrumentation writer=client stage=result session_id=%1 client_attempt=1 outcome=success warm=true attempts=1")
+                     .arg(testSessionId));
+    }
+
+    void pairingInstrumentation_emptyIdentityFailsClosedAsFailure()
+    {
+        QTemporaryDir spoolDir;
+        QVERIFY(spoolDir.isValid());
+        StubHandOff stub;
+        StopShipperOnScopeExit stopGuard;
+
+        LogShipper::instance().setSpoolDirectoryForTests(spoolDir.path());
+        LogShipper::instance().start([&stub](const ShippedLine& l) { return stub(l); });
+        LogShipper::instance().setCanShip(true);
+
+        ProductionPairingSeam seam;
+        seam.setHandshake([](const PairingTarget&) {
+            PairingHandshakeResult res = handshakeResult(true, QString());
+            res.attempts = 1;
+            return res;
+        });
+
+        PairingTarget target = pairingTarget();
+        const QString testSessionId = QStringLiteral("c0a80101-0000-4000-8000-000000000004");
+        target.sessionId = testSessionId;
+
+        SeamReport report;
+        seam.pair(target, recordInto(&report));
+
+        QTRY_COMPARE_WITH_TIMEOUT(report.count(), 1, 5000);
+        QCOMPARE(report.outcomes.first(), false);
+        QTRY_COMPARE_WITH_TIMEOUT(stub.countMatching(QStringLiteral("pairing_instrumentation")), 2, 5000);
+
+        const QVector<ShippedLine> lines = stub.matching(QStringLiteral("pairing_instrumentation"));
+        QCOMPARE(lines.size(), 2);
+
+        const ShippedLine& resultLine = lines.at(1);
+        QCOMPARE(resultLine.level, LogLevel::Info);
+        QCOMPARE(resultLine.body,
+                 QStringLiteral("pairing_instrumentation writer=client stage=result session_id=%1 client_attempt=1 outcome=failure warm=false attempts=1")
+                     .arg(testSessionId));
+    }
+
+    void pairingInstrumentation_unclassifiedTimeoutFailsClosed()
+    {
+        QTemporaryDir spoolDir;
+        QVERIFY(spoolDir.isValid());
+        StubHandOff stub;
+        StopShipperOnScopeExit stopGuard;
+
+        LogShipper::instance().setSpoolDirectoryForTests(spoolDir.path());
+        LogShipper::instance().start([&stub](const ShippedLine& l) { return stub(l); });
+        LogShipper::instance().setCanShip(true);
+
+        ProductionPairingSeam seam;
+        seam.setDeadlineMs(20);
+        seam.setHandshake([](const PairingTarget&) {
+            QThread::msleep(200);
+            return handshakeResult(true, QStringLiteral("too-late"));
+        });
+
+        PairingTarget target = pairingTarget();
+        const QString testSessionId = QStringLiteral("c0a80101-0000-4000-8000-000000000005");
+        target.sessionId = testSessionId;
+
+        SeamReport report;
+        seam.pair(target, recordInto(&report));
+
+        QTRY_COMPARE_WITH_TIMEOUT(report.count(), 1, 5000);
+        QCOMPARE(report.outcomes.first(), false);
+        QTRY_COMPARE_WITH_TIMEOUT(stub.countMatching(QStringLiteral("pairing_instrumentation")), 2, 5000);
+
+        const QVector<ShippedLine> lines = stub.matching(QStringLiteral("pairing_instrumentation"));
+        QCOMPARE(lines.size(), 2);
+
+        const ShippedLine& resultLine = lines.at(1);
+        QCOMPARE(resultLine.level, LogLevel::Info);
+        QCOMPARE(resultLine.body,
+                 QStringLiteral("pairing_instrumentation writer=client stage=result session_id=%1 client_attempt=1 outcome=failure warm=false attempts=1")
+                     .arg(testSessionId));
+        QVERIFY(!resultLine.body.contains(QStringLiteral("engine_step=")));
+        QVERIFY(!resultLine.body.contains(QStringLiteral("engine_class=")));
+    }
+
+    void pairingInstrumentation_cancelledAndSupersededStartsLackResult()
+    {
+        QTemporaryDir spoolDir;
+        QVERIFY(spoolDir.isValid());
+        StubHandOff stub;
+        StopShipperOnScopeExit stopGuard;
+
+        LogShipper::instance().setSpoolDirectoryForTests(spoolDir.path());
+        LogShipper::instance().start([&stub](const ShippedLine& l) { return stub(l); });
+        LogShipper::instance().setCanShip(true);
+
+        // --- 1. Direct cancellation via clearPendingPairing while worker is held ---
+        {
+            QSemaphore blockCancel;
+            const auto cancelGuard = qScopeGuard([&blockCancel]() { blockCancel.release(10); });
+
+            ProductionPairingSeam seamCancel;
+            std::atomic<int> cancelsCalled{0};
+            seamCancel.setCancelRequest([&cancelsCalled](const QString&, int) {
+                ++cancelsCalled;
+                return true;
+            });
+            seamCancel.setHandshake([&blockCancel](const PairingTarget& target) {
+                if (target.sessionId == QLatin1String("session-cancel")) {
+                    blockCancel.acquire();
+                    return handshakeResult(false, QString(), QStringLiteral("cancelled-late-result"));
+                }
+                return handshakeResult(true, QStringLiteral("identity-subsequent"));
+            });
+
+            PairingTarget targetCancel = pairingTarget();
+            targetCancel.sessionId = QStringLiteral("session-cancel");
+            SeamReport reportCancel;
+
+            seamCancel.pair(targetCancel, recordInto(&reportCancel));
+            QTRY_COMPARE_WITH_TIMEOUT(stub.countMatching(QStringLiteral("stage=start session_id=session-cancel")), 1, 5000);
+
+            // While worker is held in blockCancel, cancel the pending pairing:
+            seamCancel.clearPendingPairing(targetCancel);
+
+            // Release the held worker:
+            blockCancel.release();
+            QTest::qWait(100);
+
+            // Assert honest unmatched start: no result, no callback:
+            QCOMPARE(reportCancel.count(), 0);
+            QCOMPARE(stub.countMatching(QStringLiteral("stage=result session_id=session-cancel")), 0);
+            QCOMPARE(stub.countMatching(QStringLiteral("stage=result")), 0);
+
+            // Now start a subsequent attempt and prove no record from the cancelled worker was attributed to later generation:
+            PairingTarget targetSubsequent = pairingTarget();
+            targetSubsequent.sessionId = QStringLiteral("session-subsequent");
+            SeamReport reportSubsequent;
+
+            seamCancel.pair(targetSubsequent, recordInto(&reportSubsequent));
+            QTRY_COMPARE_WITH_TIMEOUT(reportSubsequent.count(), 1, 5000);
+            QCOMPARE(reportSubsequent.outcomes.first(), true);
+            QTRY_COMPARE_WITH_TIMEOUT(stub.countMatching(QStringLiteral("stage=result session_id=session-subsequent")), 1, 5000);
+
+            const QVector<ShippedLine> cancelSuiteLines = stub.matching(QStringLiteral("pairing_instrumentation"));
+            // We expect:
+            // 1) start session-cancel client_attempt=1
+            // 2) start session-subsequent client_attempt=3 (clearPendingPairing incremented to 2, pair() incremented to 3)
+            // 3) result session-subsequent client_attempt=3 outcome=success
+            QCOMPARE(cancelSuiteLines.size(), 3);
+            QCOMPARE(cancelSuiteLines.at(0).body, QStringLiteral("pairing_instrumentation writer=client stage=start session_id=session-cancel client_attempt=1"));
+            QCOMPARE(cancelSuiteLines.at(1).body, QStringLiteral("pairing_instrumentation writer=client stage=start session_id=session-subsequent client_attempt=3"));
+            QCOMPARE(cancelSuiteLines.at(2).body, QStringLiteral("pairing_instrumentation writer=client stage=result session_id=session-subsequent client_attempt=3 outcome=success warm=false attempts=1"));
+            QCOMPARE(stub.countMatching(QStringLiteral("session-cancel")), 1);
+        }
+
+        // --- 2. Superseded start (targetA superseded by targetB while targetA is held in worker) ---
+        {
+            QSemaphore blockA;
+            const auto cleanupGuard = qScopeGuard([&blockA]() { blockA.release(10); });
+
+            ProductionPairingSeam seam;
+            seam.setHandshake([&blockA](const PairingTarget& target) {
+                if (target.sessionId == QLatin1String("session-a")) {
+                    blockA.acquire();
+                    return handshakeResult(false, QString(), QStringLiteral("stale-a"));
+                }
+                return handshakeResult(true, QStringLiteral("identity-b"));
+            });
+
+            PairingTarget targetA = pairingTarget();
+            targetA.sessionId = QStringLiteral("session-a");
+            PairingTarget targetB = pairingTarget();
+            targetB.sessionId = QStringLiteral("session-b");
+
+            SeamReport reportA;
+            SeamReport reportB;
+
+            seam.pair(targetA, recordInto(&reportA));
+            QTRY_COMPARE_WITH_TIMEOUT(stub.countMatching(QStringLiteral("stage=start session_id=session-a")), 1, 5000);
+
+            seam.pair(targetB, recordInto(&reportB));
+            QTRY_COMPARE_WITH_TIMEOUT(stub.countMatching(QStringLiteral("stage=start session_id=session-b")), 1, 5000);
+            QTRY_COMPARE_WITH_TIMEOUT(stub.countMatching(QStringLiteral("stage=result session_id=session-b")), 1, 5000);
+            QCOMPARE(reportB.count(), 1);
+            QCOMPARE(reportB.outcomes.first(), true);
+
+            blockA.release();
+            QTest::qWait(100);
+
+            QCOMPARE(reportA.count(), 0);
+            QCOMPARE(stub.countMatching(QStringLiteral("stage=result session_id=session-a")), 0);
+            QCOMPARE(stub.countMatching(QStringLiteral("stage=result session_id=session-b")), 1);
+
+            const QVector<ShippedLine> bLines = stub.matching(QStringLiteral("session-b"));
+            QCOMPARE(bLines.size(), 2);
+            QCOMPARE(bLines.at(0).body, QStringLiteral("pairing_instrumentation writer=client stage=start session_id=session-b client_attempt=2"));
+            QCOMPARE(bLines.at(1).body, QStringLiteral("pairing_instrumentation writer=client stage=result session_id=session-b client_attempt=2 outcome=success warm=false attempts=1"));
+        }
+    }
+
+    void pairingInstrumentation_metadataSwitchBeforeDrainAndAmbientPublication()
+    {
+        QTemporaryDir spoolDir;
+        QVERIFY(spoolDir.isValid());
+        StubHandOff stub;
+        StopShipperOnScopeExit stopGuard;
+
+        LogShipper::instance().setSpoolDirectoryForTests(spoolDir.path());
+        LogShipper::instance().start([&stub](const ShippedLine& l) { return stub(l); });
+        // Hold captured lines in queue/spool initially
+        LogShipper::instance().setCanShip(false);
+
+        const QString sessionOld = QStringLiteral("c0a80101-0000-4000-8000-000000000010");
+        const QString sessionNew = QStringLiteral("c0a80101-0000-4000-8000-000000000020");
+        const QString hostNew = QStringLiteral("host-rig-20");
+        const QString traceOld = QStringLiteral("trace-10");
+        const QString traceNew = QStringLiteral("trace-20");
+
+        LogShipper::instance().publishIds(sessionOld, QString(), traceOld);
+
+        QSemaphore inHandshakeOld;
+        QSemaphore releaseHandshakeOld;
+        const auto cleanupGuard = qScopeGuard([&]() { releaseHandshakeOld.release(10); });
+
+        ProductionPairingSeam seam;
+        seam.setHandshake([&](const PairingTarget& target) {
+            if (target.sessionId == sessionOld) {
+                inHandshakeOld.release();
+                releaseHandshakeOld.acquire();
+                return handshakeResult(true, QStringLiteral("identity-old"));
+            }
+            return handshakeResult(true, QStringLiteral("identity-new"));
+        });
+
+        PairingTarget targetOld = pairingTarget();
+        targetOld.sessionId = sessionOld;
+
+        SeamReport reportOld;
+        seam.pair(targetOld, recordInto(&reportOld));
+
+        // Wait until handshake worker starts executing (meaning pair() has emitted stage=start)
+        inHandshakeOld.acquire();
+
+        // Observable verification that start line has been spooled or enqueued while canShip is false
+        QTRY_VERIFY_WITH_TIMEOUT(LogShipper::instance().backlogSpoolLines() >= 1 || QFileInfo::exists(ownSpoolFilePath(spoolDir.path())), 5000);
+        // Assert no instrumentation handed off yet
+        QCOMPARE(stub.countMatching(QStringLiteral("pairing_instrumentation")), 0);
+
+        // Switch published identity BEFORE queue/spool drain:
+        LogShipper::instance().publishIds(sessionNew, hostNew, traceNew);
+
+        // Now drain the spool:
+        LogShipper::instance().setCanShip(true);
+
+        // Assert old start was drained and still retains its capture-time envelope (sessionOld, traceOld, absent host) and explicit body
+        QTRY_COMPARE_WITH_TIMEOUT(stub.countMatching(QStringLiteral("stage=start session_id=%1").arg(sessionOld)), 1, 5000);
+        const QVector<ShippedLine> startLines = stub.matching(QStringLiteral("stage=start session_id=%1").arg(sessionOld));
+        QCOMPARE(startLines.size(), 1);
+
+        const ShippedLine& oldStart = startLines.first();
+        QCOMPARE(oldStart.sessionId, sessionOld);
+        QCOMPARE(oldStart.traceId, traceOld);
+        QVERIFY(oldStart.hostId.isEmpty());
+        QVERIFY(oldStart.body.contains(QStringLiteral("session_id=%1").arg(sessionOld)));
+        QVERIFY(!oldStart.body.contains(QStringLiteral("session_id=%1").arg(sessionNew)));
+
+        // Release old handshake: its stage=result is emitted NOW, after ambient identity changed to sessionNew
+        releaseHandshakeOld.release();
+        QTRY_COMPARE_WITH_TIMEOUT(reportOld.count(), 1, 5000);
+        QTRY_COMPARE_WITH_TIMEOUT(stub.countMatching(QStringLiteral("stage=result session_id=%1").arg(sessionOld)), 1, 5000);
+
+        const QVector<ShippedLine> oldResultLines = stub.matching(QStringLiteral("stage=result session_id=%1").arg(sessionOld));
+        QCOMPARE(oldResultLines.size(), 1);
+
+        const ShippedLine& oldResult = oldResultLines.first();
+        // Envelope reflects ambient published IDs at result emission time:
+        QCOMPARE(oldResult.sessionId, sessionNew);
+        QCOMPARE(oldResult.hostId, hostNew);
+        QCOMPARE(oldResult.traceId, traceNew);
+        // But explicit body is NOT relabeled - retains original target sessionOld:
+        QVERIFY(oldResult.body.contains(QStringLiteral("session_id=%1").arg(sessionOld)));
+        QVERIFY(!oldResult.body.contains(QStringLiteral("session_id=%1").arg(sessionNew)));
+        QCOMPARE(oldResult.body,
+                 QStringLiteral("pairing_instrumentation writer=client stage=result session_id=%1 client_attempt=1 outcome=success warm=false attempts=1")
+                     .arg(sessionOld));
+
+        // Now replacement seam pair with targetNew:
+        PairingTarget targetNew = pairingTarget();
+        targetNew.sessionId = sessionNew;
+        SeamReport reportNew;
+        seam.pair(targetNew, recordInto(&reportNew));
+
+        QTRY_COMPARE_WITH_TIMEOUT(reportNew.count(), 1, 5000);
+        QTRY_COMPARE_WITH_TIMEOUT(stub.countMatching(QStringLiteral("session_id=%1").arg(sessionNew)), 2, 5000);
+
+        const QVector<ShippedLine> newLines = stub.matching(QStringLiteral("session_id=%1").arg(sessionNew));
+        QCOMPARE(newLines.size(), 2);
+        QCOMPARE(newLines.at(0).sessionId, sessionNew);
+        QCOMPARE(newLines.at(0).hostId, hostNew);
+        QCOMPARE(newLines.at(0).traceId, traceNew);
+        QCOMPARE(newLines.at(0).body,
+                 QStringLiteral("pairing_instrumentation writer=client stage=start session_id=%1 client_attempt=2")
+                     .arg(sessionNew));
+        QCOMPARE(newLines.at(1).sessionId, sessionNew);
+        QCOMPARE(newLines.at(1).hostId, hostNew);
+        QCOMPARE(newLines.at(1).traceId, traceNew);
+        QCOMPARE(newLines.at(1).body,
+                 QStringLiteral("pairing_instrumentation writer=client stage=result session_id=%1 client_attempt=2 outcome=success warm=false attempts=1")
+                     .arg(sessionNew));
+    }
+
+    void pairingInstrumentation_secretSentinelsAbsentBeforeScrubAndAfterHandoff()
+    {
+        QTemporaryDir spoolDir;
+        QVERIFY(spoolDir.isValid());
+        StubHandOff stub;
+        StopShipperOnScopeExit stopGuard;
+        RawTeeCapture rawCapture;
+
+        LogShipper::instance().setSpoolDirectoryForTests(spoolDir.path());
+        LogShipper::instance().start([&stub](const ShippedLine& l) { return stub(l); });
+        LogShipper::instance().setCanShip(true);
+
+        const QString secretPin = QStringLiteral("SECRET_PIN_9876");
+        const QString secretDiagnostic = QStringLiteral("SECRET_RAW_ENGINE_DIAGNOSTIC_CONTAINING_KEY_AND_TARGET_DUMP");
+        const QString secretTargetCredential = QStringLiteral("SECRET_TARGET_CREDENTIAL_DATA");
+
+        ProductionPairingSeam seam;
+        seam.setHandshake([&secretDiagnostic](const PairingTarget&) {
+            PairingHandshakeResult res = handshakeResult(false, QString(), secretDiagnostic);
+            res.attempts = 1;
+            res.attemptStep = QStringLiteral("pair_handshake");
+            res.stepClass = QStringLiteral("pin_rejected");
+            return res;
+        });
+
+        PairingTarget target = pairingTarget();
+        target.sessionId = QStringLiteral("c0a80101-0000-4000-8000-000000000099");
+        target.pairingPin = secretPin;
+
+        SeamReport report;
+        seam.pair(target, recordInto(&report));
+
+        QTRY_COMPARE_WITH_TIMEOUT(report.count(), 1, 5000);
+        QTRY_COMPARE_WITH_TIMEOUT(stub.countMatching(QStringLiteral("pairing_instrumentation")), 2, 5000);
+        QTRY_COMPARE_WITH_TIMEOUT(rawCapture.count(), 2, 5000);
+
+        const QStringList rawLines = rawCapture.lines();
+        QCOMPARE(rawLines.size(), 2);
+        for (const QString& line : rawLines) {
+            QVERIFY2(!line.contains(secretPin), "PIN must never appear in raw pairing_instrumentation");
+            QVERIFY2(!line.contains(secretDiagnostic), "raw engine error must never appear in raw pairing_instrumentation");
+            QVERIFY2(!line.contains(secretTargetCredential), "target credential must never appear in raw pairing_instrumentation");
+            QVERIFY2(!line.contains(QStringLiteral("pin=")), "PIN parameter must not appear in raw pairing_instrumentation");
+            QVERIFY2(!line.contains(QStringLiteral("salt")), "salt must not appear in raw pairing_instrumentation");
+            QVERIFY2(!line.contains(QStringLiteral("hash")), "hash must not appear in raw pairing_instrumentation");
+            QVERIFY2(!line.contains(QStringLiteral("pending_pairings_at_submit")), "server field must not appear in raw pairing_instrumentation");
+            QVERIFY2(!line.contains(QStringLiteral("pairing_id")), "server field must not appear in raw pairing_instrumentation");
+            QVERIFY2(!line.contains(QStringLiteral("pin_ack_session")), "server field must not appear in raw pairing_instrumentation");
+            QVERIFY2(!line.contains(QStringLiteral("pin_ack_age_ms")), "server field must not appear in raw pairing_instrumentation");
+            QVERIFY2(!line.contains(QStringLiteral("since_sunshine_start_ms")), "server field must not appear in raw pairing_instrumentation");
+            QVERIFY2(!line.contains(QStringLiteral("pin_salt_match")), "server field must not appear in raw pairing_instrumentation");
+        }
+
+        const QVector<ShippedLine> handedOffLines = stub.matching(QStringLiteral("pairing_instrumentation"));
+        QCOMPARE(handedOffLines.size(), 2);
+        for (const ShippedLine& line : handedOffLines) {
+            QVERIFY2(!line.body.contains(secretPin), "PIN must never appear in handed-off pairing_instrumentation");
+            QVERIFY2(!line.body.contains(secretDiagnostic), "raw engine error must never appear in handed-off pairing_instrumentation");
+            QVERIFY2(!line.body.contains(secretTargetCredential), "target credential must never appear in handed-off pairing_instrumentation");
+            QVERIFY2(!line.body.contains(QStringLiteral("pin=")), "PIN parameter must not appear in handed-off pairing_instrumentation");
+            QVERIFY2(!line.body.contains(QStringLiteral("salt")), "salt must not appear in handed-off pairing_instrumentation");
+            QVERIFY2(!line.body.contains(QStringLiteral("hash")), "hash must not appear in handed-off pairing_instrumentation");
+            QVERIFY2(!line.body.contains(QStringLiteral("pending_pairings_at_submit")), "server field must not appear in handed-off pairing_instrumentation");
+            QVERIFY2(!line.body.contains(QStringLiteral("pairing_id")), "server field must not appear in handed-off pairing_instrumentation");
+            QVERIFY2(!line.body.contains(QStringLiteral("pin_ack_session")), "server field must not appear in handed-off pairing_instrumentation");
+            QVERIFY2(!line.body.contains(QStringLiteral("pin_ack_age_ms")), "server field must not appear in handed-off pairing_instrumentation");
+            QVERIFY2(!line.body.contains(QStringLiteral("since_sunshine_start_ms")), "server field must not appear in handed-off pairing_instrumentation");
+            QVERIFY2(!line.body.contains(QStringLiteral("pin_salt_match")), "server field must not appear in handed-off pairing_instrumentation");
+        }
     }
 };
 

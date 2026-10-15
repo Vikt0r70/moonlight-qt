@@ -273,6 +273,11 @@ void ProductionPairingSeam::pair(const PairingTarget& target,
     // it now counts down 90 s from THIS `pair()` call, not from whatever remained of the old one.
     m_deadline->start(m_deadlineMs);
 
+    qCInfo(seathubPairingSeam).noquote()
+        << QStringLiteral("pairing_instrumentation writer=client stage=start session_id=%1 client_attempt=%2")
+            .arg(target.sessionId)
+            .arg(generation);
+
     HandshakeTask* task = new HandshakeTask(m_handshake, m_warmCheck, m_cancelRequest, target,
                                             generation, m_currentGeneration);
     connect(task, &HandshakeTask::finished, this, &ProductionPairingSeam::handleHandshakeResult);
@@ -340,6 +345,21 @@ void ProductionPairingSeam::finish(quint64 generation, const PairingHandshakeRes
 
     m_pending = false;
     m_deadline->stop();
+
+    const bool effectiveSuccess = result.ok && !result.clientIdentity.isEmpty();
+    QString record = QStringLiteral("pairing_instrumentation writer=client stage=result session_id=%1 client_attempt=%2 outcome=%3 warm=%4 attempts=%5")
+        .arg(m_sessionId)
+        .arg(generation)
+        .arg(effectiveSuccess ? QStringLiteral("success") : QStringLiteral("failure"))
+        .arg(result.warm ? QStringLiteral("true") : QStringLiteral("false"))
+        .arg(result.attempts);
+    if (!result.attemptStep.isEmpty()) {
+        record += QStringLiteral(" engine_step=%1").arg(result.attemptStep);
+    }
+    if (!result.stepClass.isEmpty()) {
+        record += QStringLiteral(" engine_class=%1").arg(result.stepClass);
+    }
+    qCInfo(seathubPairingSeam).noquote() << record;
 
     std::function<void(bool, const QString&, const QString&)> done = std::move(m_done);
     m_done = nullptr;
