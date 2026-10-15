@@ -55,7 +55,7 @@ Item {
                     Text {
                         id: title
                         width: parent.width
-                        text: qsTr("What SeatHub sends us")
+                        text: qsTr("What RentaPC sends us")
                         wrapMode: Text.Wrap
                         color: Tokens.foregroundDefault
                         font.family: Tokens.fontDisplayDefault
@@ -65,7 +65,7 @@ Item {
                     Text {
                         id: body
                         width: parent.width
-                        text: qsTr("While you play, SeatHub sends SevenHills how the stream is running: frame rate, delay, lost frames and picture size. If an update fails, it also sends a short note about what went wrong. It never sends your PIN, password, email or phone number, or the address of the PC you rent.")
+                        text: qsTr("While you play, RentaPC sends us how the stream is running: frame rate, delay, lost frames and picture size. If an update fails, it also sends a short note about what went wrong. It never sends your PIN, password, email or phone number, or the address of the PC you rent.")
                         wrapMode: Text.Wrap
                         color: Tokens.foregroundMutedDefault
                         font.family: Tokens.fontSansDefault

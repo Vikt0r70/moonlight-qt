@@ -25,7 +25,7 @@ ApplicationWindow {
     minimumWidth: 960
     minimumHeight: 640
     visible: true
-    title: qsTr("SeatHub")
+    title: qsTr("RentaPC")
     color: Tokens.backgroundDefault
 
     // The single object the QML layer talks to (D-35).

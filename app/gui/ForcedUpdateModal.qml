@@ -109,7 +109,7 @@ Item {
 
             Text {
                 width: parent.width
-                text: qsTr("Update SeatHub")
+                text: qsTr("Update RentaPC")
                 wrapMode: Text.Wrap
                 color: Tokens.foregroundDefault
                 font.family: Tokens.fontDisplayDefault
@@ -125,10 +125,10 @@ Item {
                 text: {
                     // Exact frozen copy: copy.md §Update window, ADR-0070 item 9, ADR-0077.
                     if (modal.exhausted)
-                        return qsTr("SeatHub could not update itself. Download the new version and install it to keep playing.")
+                        return qsTr("RentaPC could not update itself. Download the new version and install it to keep playing.")
                     if (updates && updates.state === "failed")
-                        return qsTr("SeatHub could not finish updating, so playing is paused until it does. It will try again %1.").arg(updates.nextAttemptText)
-                    return qsTr("Version %1 is available. SeatHub has to restart to finish updating.").arg(modal.offeredVersion)
+                        return qsTr("RentaPC could not finish updating, so playing is paused until it does. It will try again %1.").arg(updates.nextAttemptText)
+                    return qsTr("Version %1 is available. RentaPC has to restart to finish updating.").arg(modal.offeredVersion)
                 }
                 color: Tokens.foregroundMutedDefault
                 font.family: Tokens.fontSansDefault

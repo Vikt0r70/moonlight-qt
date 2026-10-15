@@ -1,9 +1,9 @@
 # Packs the SeatHub deploy folder into the Velopack release (ADR-0086, I-SEATHUB).
 #
 # Input is the folder scripts\build-seathub.ps1 deploys. Output, in build\velopack-x64-release\:
-#     <packId>-win-Setup.exe             the one-click, per-user, no-administrator installer. It shows one
+#     <packId>-Setup.exe                 the one-click, per-user, no-administrator installer. It shows one
 #                                        small window with Velopack's splash and progress bar and opens
-#                                        SeatHub when it finishes. Its SHA-256 is the release row's `sha256`
+#                                        RentaPC when it finishes. Its SHA-256 is the release row's `sha256`
 #                                        (D-43) and is also written to setup-sha256.txt.
 #     <packId>-<version>-full.nupkg      the full package - Velopack's update payload, uploaded whole,
 #                                        never repacked
@@ -26,7 +26,7 @@
 # Branding is exactly the pack title, the icon, the splash image and the progress-bar colour. The bar
 # colour is the design system's own primary token (app\gui\Tokens.qml `primaryDefault`), never a colour
 # invented here. No splash image is checked into the fork; pass one with -SplashImage, otherwise Velopack's
-# default splash is used. Velopack's own dialog wording is the vendor's, not SevenHills copy.
+# default splash is used. Velopack's own dialog wording is the vendor's, not RentaPC copy.
 
 [CmdletBinding()]
 param(
@@ -40,12 +40,12 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
-# What docs/evidence/m001/velopack-proof.md recorded (VP-VERDICT: use exactly these). The packId is never
+# The packId is RentaPC (ADR-0092, amending ADR-0086; docs/evidence/m001/velopack-proof.md proved the mechanism under a proof ID). It is never
 # `SeatHub`: that is the retired Tauri client's own %LOCALAPPDATA% folder.
-$PackId = 'SeatHubVelopackProof'
+$PackId = 'RentaPC'
 $VpkVersion = '1.2.161'
-$PackTitle = 'SeatHub'
-$PackAuthors = 'Seven Hills'
+$PackTitle = 'RentaPC'
+$PackAuthors = 'RentaPC'
 $MainExe = 'SeatHub.exe'
 $Runtime = 'win-x64'
 
@@ -139,10 +139,12 @@ $packArgs = @(
 if ($SplashImage) { $packArgs += @('--splashImage', $SplashImage) }
 & $Vpk @packArgs
 if ($LASTEXITCODE -ne 0) { throw "vpk pack failed with exit code $LASTEXITCODE" }
+# vpk names its installer <packId>-win-Setup.exe and no vpk input changes that (installer-fields.md), so rename it to the published name.
+Move-Item -LiteralPath (Join-Path $OutputDir "$PackId-win-Setup.exe") -Destination (Join-Path $OutputDir "$PackId-Setup.exe")
 
 # ---------------------------------------------------------------- verify the release
 Step 'Verify the release'
-$setup = Join-Path $OutputDir "$PackId-win-Setup.exe"
+$setup = Join-Path $OutputDir "$PackId-Setup.exe"
 $full = Join-Path $OutputDir "$PackId-$Version-full.nupkg"
 $manifest = Join-Path $OutputDir 'releases.win.json'
 Require $setup 'Setup.exe'

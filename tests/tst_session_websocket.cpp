@@ -55,9 +55,9 @@ private slots:
 
     void endpoint_mapsHttpsToWss()
     {
-        QCOMPARE(SessionWebSocket::endpoint(QStringLiteral("https://api-sevenhills.damra.co"),
+        QCOMPARE(SessionWebSocket::endpoint(QStringLiteral("https://api.rentapc.online"),
                                             QStringLiteral("abc")),
-                 QStringLiteral("wss://api-sevenhills.damra.co/ws/session/abc"));
+                 QStringLiteral("wss://api.rentapc.online/ws/session/abc"));
     }
 
     void endpoint_mapsHttpToWs()
@@ -71,7 +71,7 @@ private slots:
     {
         // Sunshine would be at :47989. The client's channel is the control plane's, and the
         // port in the URL is the one it was given.
-        const QString url = SessionWebSocket::endpoint(QStringLiteral("https://api-sevenhills.damra.co"),
+        const QString url = SessionWebSocket::endpoint(QStringLiteral("https://api.rentapc.online"),
                                                        QStringLiteral("abc"));
         QVERIFY2(!url.contains(QStringLiteral("47989")), qPrintable(url));
     }

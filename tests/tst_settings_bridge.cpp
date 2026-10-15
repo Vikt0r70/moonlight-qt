@@ -122,11 +122,11 @@ void TstSettingsBridge::catalogueMatchesUpstreamInventoryRowForRow()
     QCOMPARE(m_bridge->labelOf(QStringLiteral("hostaudio")),
              QStringLiteral("Mute host PC speakers while streaming"));
     QCOMPARE(m_bridge->labelOf(QStringLiteral("muteonfocusloss")),
-             QStringLiteral("Mute audio stream when SeatHub is not the active window"));
+             QStringLiteral("Mute audio stream when RentaPC is not the active window"));
     QCOMPARE(m_bridge->labelOf(QStringLiteral("uidisplaymode")),
              QStringLiteral("GUI display mode"));
     QCOMPARE(m_bridge->labelOf(QStringLiteral("backgroundgamepad")),
-             QStringLiteral("Process gamepad input when SeatHub is in the background"));
+             QStringLiteral("Process gamepad input when RentaPC is in the background"));
     QCOMPARE(m_bridge->labelOf(QStringLiteral("hdr")),
              QStringLiteral("Enable HDR (Experimental)"));
 

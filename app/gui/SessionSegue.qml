@@ -65,13 +65,13 @@ Item {
     function stageStarting(stage) {
         // Nothing to do at the window level. The client turns the stage into a
         // docs/spec/copy.md §Play flow line for the connecting view.
-        console.debug("SeatHub: stream stage started -", stage)
+        console.debug("RentaPC: stream stage started -", stage)
     }
 
     function stageFailed(stage, errorCode, failingPorts) {
         // The engine's stage name, error code and failing ports are diagnostics. They are
         // never rendered; the client maps them to SeatHub copy plus an ADR-0008 reference.
-        console.debug("SeatHub: stream stage failed -", stage, errorCode, failingPorts)
+        console.debug("RentaPC: stream stage failed -", stage, errorCode, failingPorts)
     }
 
     function connectionStarted() {
@@ -84,7 +84,7 @@ Item {
     function displayLaunchError(text) {
         // The facade carries Moonlight's text verbatim to the screen (ADR-0091): the connect-failure
         // view before the stream starts, Home after a started stream. Nothing is drawn from here.
-        console.debug("SeatHub: engine launch error", text)
+        console.debug("RentaPC: engine launch error", text)
     }
 
     function quitStarting() {
@@ -95,7 +95,7 @@ Item {
 
     function sessionFinished(portTestResult) {
         // The engine has stopped; SDL destruction is still pending. Still no restore.
-        console.debug("SeatHub: session finished, port test result", portTestResult)
+        console.debug("RentaPC: session finished, port test result", portTestResult)
     }
 
     function sessionReadyForDeletion() {

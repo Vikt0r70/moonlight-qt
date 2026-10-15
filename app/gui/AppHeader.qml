@@ -36,7 +36,7 @@ Item {
         anchors.left: parent.left
         anchors.leftMargin: Metrics.s8
         anchors.verticalCenter: parent.verticalCenter
-        text: qsTr("SeatHub")
+        text: qsTr("RentaPC")
         color: Tokens.foregroundDefault
         font.family: Tokens.fontDisplayDefault
         font.pixelSize: Metrics.fontH3

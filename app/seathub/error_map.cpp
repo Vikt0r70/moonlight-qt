@@ -18,7 +18,7 @@ const char* kReferencePattern = "^SH-[0-9A-HJ-KM-NP-TV-Z]{6}$";
 // this file used to carry were removed rather than re-shaped).
 const char* kGenericSentence = "Something went wrong on our side.";
 // copy.md §Support & errors, "Offline", in full. Home shows the same sentence; the two must not drift.
-const char* kOfflineSentence = "Can't reach SevenHills right now. Showing the last known balance.";
+const char* kOfflineSentence = "Can't reach RentaPC right now. Showing the last known balance.";
 
 // copy.md §Session end reasons, the `CONNECT_FAILED` row (06.1's ADR item 4, J-22) - the three
 // blame-carrying sentences, and the row's own "no blame (an older server)" fallback. None of the

@@ -1089,7 +1089,7 @@ void TstUiScreens::homeScreenRendersEachHomeState()
     // offline: copy.md section Support & errors, the full sentence, verbatim. Play stays pressable
     // so a customer whose Wi-Fi came back can just press it.
     const QString offline =
-        QStringLiteral("Can't reach SevenHills right now. Showing the last known balance.");
+        QStringLiteral("Can't reach RentaPC right now. Showing the last known balance.");
     client.setHomeStatus(QStringLiteral("offline"));
     QVERIFY2(findVisibleTextItem(screen.data(), offline),
              "Home must render the whole offline sentence from copy.md");
@@ -1456,7 +1456,7 @@ void TstUiScreens::appHeaderCarriesTheWordmarkTheBalanceAndTheMenuInThatOrder()
 
     // Wordmark, then balance, then menu, left to right, each measured in the header's own
     // coordinates.
-    QObject* wordmark = findVisibleTextItem(header.data(), QStringLiteral("SeatHub"));
+    QObject* wordmark = findVisibleTextItem(header.data(), QStringLiteral("RentaPC"));
     QVERIFY2(wordmark, "the header must carry the wordmark");
     auto xIn = [&](QObject* object) {
         double x = 0;
@@ -1670,21 +1670,21 @@ void TstUiScreens::theBalancePillShowsTheLiveUpdatesIndicatorWhilePaused()
     client.setBalance(135, QStringLiteral("2 h 15 min"), false);
 
     QVERIFY2(!pill->property("paused").toBool(), "hidden by default");
-    QVERIFY(!findVisibleTextItem(pill.data(), QStringLiteral("Reconnecting to SevenHills…")));
+    QVERIFY(!findVisibleTextItem(pill.data(), QStringLiteral("Reconnecting to RentaPC…")));
     QObject* dot = pill->findChild<QObject*>(QStringLiteral("liveUpdatesDot"));
     QVERIFY(dot);
     QVERIFY2(!effectivelyVisible(dot), "the warn dot must be hidden by default too");
 
     client.setLiveUpdatesPaused(true);
     QVERIFY(pill->property("paused").toBool());
-    QVERIFY2(findVisibleTextItem(pill.data(), QStringLiteral("Reconnecting to SevenHills…")),
+    QVERIFY2(findVisibleTextItem(pill.data(), QStringLiteral("Reconnecting to RentaPC…")),
              "the indicator's own sentence must show while paused");
     QVERIFY2(effectivelyVisible(dot), "a warn dot must show beside it - colour is never alone (§9)");
     QCOMPARE(dot->property("color").value<QColor>(), QColor(QStringLiteral("#f59e0b")));
 
     client.setLiveUpdatesPaused(false);
     QVERIFY2(!pill->property("paused").toBool(), "gone the moment it is live again");
-    QVERIFY(!findVisibleTextItem(pill.data(), QStringLiteral("Reconnecting to SevenHills…")));
+    QVERIFY(!findVisibleTextItem(pill.data(), QStringLiteral("Reconnecting to RentaPC…")));
     QVERIFY(!effectivelyVisible(dot));
 }
 
@@ -2747,7 +2747,7 @@ void TstUiScreens::signInShowsARefusalVerbatimAndClearsThePassword()
     QVERIFY(!fx.sees(QStringLiteral("Create an account on the website")));
 
     // The offline sentence is a refusal like any other.
-    const QString offline = QStringLiteral("We couldn't reach SevenHills. Try again in a moment.");
+    const QString offline = QStringLiteral("We couldn't reach RentaPC. Try again in a moment.");
     fx.client.deliverPasswordRejected(offline, QString());
     QVERIFY(fx.sees(offline));
     QVERIFY(!fx.sees(sentence));
@@ -2995,21 +2995,21 @@ void TstUiScreens::updateWindowShowsTheFrozenVariantsInARealWindow()
     QVERIFY(modal->setProperty("updates", QVariant::fromValue(static_cast<QObject*>(&updates))));
     window.show(); QVERIFY(QTest::qWaitForWindowExposed(&window));
     window.requestActivate(); QVERIFY(QTest::qWaitForWindowActive(&window));
-    QVERIFY(findVisibleTextItem(modal.data(), "Version 9.9.9 is available. SeatHub has to restart to finish updating."));
-    for (const auto& when : QStringList{"the next time you open SeatHub", "in about 90 minutes", "in about 3 hours"}) {
+    QVERIFY(findVisibleTextItem(modal.data(), "Version 9.9.9 is available. RentaPC has to restart to finish updating."));
+    for (const auto& when : QStringList{"the next time you open RentaPC", "in about 90 minutes", "in about 3 hours"}) {
         updates.variant(true, false, "failed", when);
-        QVERIFY(findVisibleTextItem(modal.data(), QString("SeatHub could not finish updating, so playing is paused until it does. It will try again %1.").arg(when)));
+        QVERIFY(findVisibleTextItem(modal.data(), QString("RentaPC could not finish updating, so playing is paused until it does. It will try again %1.").arg(when)));
         QVERIFY(findVisibleTextItem(modal.data(), "SUPPORT-REF"));
         QTest::keyClick(&window, Qt::Key_Escape); QVERIFY(item->isVisible());
     }
     updates.variant(true, true, "failed");
-    QVERIFY(findVisibleTextItem(modal.data(), "SeatHub could not update itself. Download the new version and install it to keep playing."));
+    QVERIFY(findVisibleTextItem(modal.data(), "RentaPC could not update itself. Download the new version and install it to keep playing."));
     QTRY_VERIFY(modal->findChild<QObject*>("downloadAction"));
     QVERIFY(modal->findChild<QObject*>("updateAction"));
     // ADR-0077: every offer is required, so a variant that reports it as not mandatory still
     // shows the single Update action, never a Not now action, and cannot be dismissed.
     updates.variant(false, false, "available");
-    QVERIFY(findVisibleTextItem(modal.data(), "Version 9.9.9 is available. SeatHub has to restart to finish updating."));
+    QVERIFY(findVisibleTextItem(modal.data(), "Version 9.9.9 is available. RentaPC has to restart to finish updating."));
     QTRY_VERIFY(modal->findChild<QQuickItem*>("updateAction"));
     QVERIFY(!modal->findChild<QObject*>("notNowAction"));
     QTest::keyClick(&window, Qt::Key_Escape); QVERIFY(item->isVisible());
@@ -3650,7 +3650,7 @@ void TstUiScreens::theSettingsPageShowsTheLogsQualityAndCrashReportsDisclosureSe
     for (QObject* item : textItems(root.data())) {
         if (item->property("text").toString()
             == QStringLiteral(
-                "SeatHub sends diagnostic logs, stream quality numbers and crash reports to SevenHills so we can fix problems.")) {
+                "RentaPC sends diagnostic logs, stream quality numbers and crash reports to us so we can fix problems.")) {
             ++found;
         }
         oldFound |= item->property("text").toString() == QStringLiteral(
@@ -3699,8 +3699,8 @@ void TstUiScreens::theNoticeShowsItsTextAndOneOK()
     QVERIFY2(notice, qPrintable(error));
     QVERIFY(notice->setProperty("client", QVariant::fromValue(static_cast<QObject*>(&client))));
     client.setDiagnosticsNoticePending(true);
-    QVERIFY(findVisibleTextItem(notice.data(), "What SeatHub sends us"));
-    QVERIFY(findVisibleTextItem(notice.data(), "While you play, SeatHub sends SevenHills how the stream is running: frame rate, delay, lost frames and picture size. If an update fails, it also sends a short note about what went wrong. It never sends your PIN, password, email or phone number, or the address of the PC you rent."));
+    QVERIFY(findVisibleTextItem(notice.data(), "What RentaPC sends us"));
+    QVERIFY(findVisibleTextItem(notice.data(), "While you play, RentaPC sends us how the stream is running: frame rate, delay, lost frames and picture size. If an update fails, it also sends a short note about what went wrong. It never sends your PIN, password, email or phone number, or the address of the PC you rent."));
     int buttons = 0;
     for (QObject* child : notice->findChildren<QObject*>()) {
         if (child->inherits("QQuickButton")) {
@@ -4027,7 +4027,7 @@ void TstUiScreens::agentConfigPanelMasksTheTokenAndNeverRendersIt()
         QVERIFY(file.open(QIODevice::WriteOnly | QIODevice::Truncate));
         file.write(QStringLiteral("{\"host_id\":\"4d5e6f70-1111-2222-3333-444455556666\","
                                   "\"token\":\"%1\","
-                                  "\"base_url\":\"https://api-sevenhills.damra.co\"}")
+                                  "\"base_url\":\"https://api.rentapc.online\"}")
                        .arg(token)
                        .toUtf8());
     }
@@ -4583,7 +4583,7 @@ void TstUiScreens::theErrorViewShowsThreeKindsOfSentenceAsTheyAreAndDrawsNoBareR
         // The server's own sentence, verbatim, with the reference it named.
         {QStringLiteral("The server's own sentence, exactly as written."), QStringLiteral("SH-4F7KQ2")},
         // The deck's offline sentence in full: the request never arrived, so no reference exists.
-        {QStringLiteral("Can't reach SevenHills right now. Showing the last known balance."), QString()},
+        {QStringLiteral("Can't reach RentaPC right now. Showing the last known balance."), QString()},
         // The deck's generic sentence for something that began on this machine: no reference either.
         {QStringLiteral("Something went wrong on our side."), QString()},
     };
@@ -4992,7 +4992,7 @@ void TstUiScreens::theIdentityBlockHasItsOwnLoadingAndErrorStates()
     QVERIFY(fx.client.calls().contains(QStringLiteral("reloadAccount")));
 
     // An error with no reference draws no reference.
-    fx.client.setAccountState(QStringLiteral("error"), QStringLiteral("We couldn't reach SevenHills."));
+    fx.client.setAccountState(QStringLiteral("error"), QStringLiteral("We couldn't reach RentaPC."));
     QVERIFY(!fx.visible("identityErrorReference"));
 
     // Back to the rows once the identity is read.
@@ -5291,7 +5291,7 @@ void TstUiScreens::aListDrawsEachOfItsStates()
     QCOMPARE(retry.count(), 2);
 
     // An error with no reference draws no reference.
-    fx.list.setState(QStringLiteral("error"), false, false, false, QStringLiteral("We couldn't reach SevenHills."));
+    fx.list.setState(QStringLiteral("error"), false, false, false, QStringLiteral("We couldn't reach RentaPC."));
     QVERIFY(!fx.visible("errorReference"));
 
     // Overflow: a long word in a row wraps to a second line inside the 44px row, never off the region.
@@ -5990,7 +5990,7 @@ void TstUiScreens::checkHomeAt(const QSize& size)
     // Offline: the full sentence, Play still pressable.
     client.setHomeStatus(QStringLiteral("offline"));
     QVERIFY2(seesText(screen.data(),
-                      QStringLiteral("Can't reach SevenHills right now. Showing the last known balance.")),
+                      QStringLiteral("Can't reach RentaPC right now. Showing the last known balance.")),
              qPrintable(where));
     // C-RECONNECT: the offline state carries `Try now` beside Play.
     COMPARE_TABS( (QStringList{ QStringLiteral("Try now"), QStringLiteral("Play") }) );
@@ -6218,9 +6218,9 @@ void TstUiScreens::checkSignInAt(const QSize& size)
     QVERIFY2(!sees(QStringLiteral("Create an account on the website")), qPrintable(where));
 
     // Offline: the deck's sentence above the button, and no reference row (none exists for it).
-    client.deliverPasswordRejected(QStringLiteral("We couldn't reach SevenHills. Try again in a moment."),
+    client.deliverPasswordRejected(QStringLiteral("We couldn't reach RentaPC. Try again in a moment."),
                                    QString());
-    QVERIFY2(sees(QStringLiteral("We couldn't reach SevenHills. Try again in a moment.")),
+    QVERIFY2(sees(QStringLiteral("We couldn't reach RentaPC. Try again in a moment.")),
              qPrintable(where));
     QVERIFY2(!findVisibleTextItem(screen.data(), QStringLiteral("SH-4F7KQ2")), qPrintable(where));
 
@@ -6305,7 +6305,7 @@ void TstUiScreens::checkRestoreSplashAt(const QSize& size)
 
     // The wordmark and `Signing you in…`: never the form, and nothing to press or tab to.
     QVERIFY2(seesText(screen.data(), QStringLiteral("Signing you in…")), qPrintable(where));
-    QVERIFY2(seesText(screen.data(), QStringLiteral("SeatHub")), qPrintable(where));
+    QVERIFY2(seesText(screen.data(), QStringLiteral("RentaPC")), qPrintable(where));
     QVERIFY2(!seesText(screen.data(), QStringLiteral("Sign in")), qPrintable(where));
     QVERIFY2(!seesText(screen.data(), QStringLiteral("Continue")), qPrintable(where));
     QVERIFY2(controlsUnder(screen.data(), false).isEmpty(), qPrintable(where));
@@ -6495,7 +6495,7 @@ void TstUiScreens::checkProfileAt(const QSize& size)
                                      QStringLiteral("No top-ups yet.") };
     const QStringList emptyActions = { QStringLiteral("Back to home"), QStringLiteral("Top up"),
                                        QStringLiteral("Top up") };
-    const QString sentence = QStringLiteral("We couldn't reach SevenHills. Try again in a moment.");
+    const QString sentence = QStringLiteral("We couldn't reach RentaPC. Try again in a moment.");
 
     // Loading: every part loads on its own - skeletons and the named lines, the page not blank.
     QVERIFY2(sees(QStringLiteral("Profile")), qPrintable(where));
@@ -6713,8 +6713,8 @@ void TstUiScreens::checkSettingsAt(const QSize& size)
     // the page says only what screens.md §27 allows under its title - the one disclosure sentence.
     QVERIFY2(seesText(screen.data(), QStringLiteral("Settings")), qPrintable(where));
     QVERIFY2(seesText(screen.data(),
-                      QStringLiteral("SeatHub sends diagnostic logs, stream quality numbers and crash reports "
-                                     "to SevenHills so we can fix problems.")),
+                      QStringLiteral("RentaPC sends diagnostic logs, stream quality numbers and crash reports "
+                                     "to us so we can fix problems.")),
              qPrintable(where));
     QVERIFY2(!seesText(screen.data(), QStringLiteral("Changes are saved immediately and apply to your next stream.")),
              "§27 allows no line of the page's own under the title besides the disclosure");
@@ -6845,7 +6845,7 @@ void TstUiScreens::everyCustomerScreenHasSpecStates()
 
     // The window title and size: `SeatHub` on a fixed 1100x720 window, 960x640 at the smallest; the
     // stream window is `Playing - SeatHub` (copy.md C9, the fixed neutral word).
-    QVERIFY(main.contains(QStringLiteral("title: qsTr(\"SeatHub\")")));
+    QVERIFY(main.contains(QStringLiteral("title: qsTr(\"RentaPC\")")));
     QVERIFY(main.contains(QStringLiteral("width: 1100")));
     QVERIFY(main.contains(QStringLiteral("height: 720")));
     QVERIFY(main.contains(QStringLiteral("minimumWidth: 960")));

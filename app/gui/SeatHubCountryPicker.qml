@@ -2,7 +2,7 @@ import QtQuick
 import QtQuick.Controls
 import SeatHub.Tokens 1.0
 
-// The country list behind the sign-in field's tag (`docs/spec/screens.md` §22, 05-UI-SPEC "SeatHubCountryPicker").
+// The country list behind the sign-in field's tag (`docs/spec/screens.md` §22, 05-UI-SPEC SeatHubCountryPicker).
 //
 // The panel a popup wraps: a search box at the top and a scrolling list under it, each row the
 // country's name with its dial code to the right, the current country marked, a sentence when

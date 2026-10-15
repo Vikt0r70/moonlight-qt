@@ -637,9 +637,9 @@ unix:!macx: {
 }
 win32 {
     RC_ICONS = seathub.ico
-    QMAKE_TARGET_COMPANY = Seven Hills
-    QMAKE_TARGET_DESCRIPTION = SeatHub Streaming Client
-    QMAKE_TARGET_PRODUCT = SeatHub
+    QMAKE_TARGET_COMPANY = RentaPC
+    QMAKE_TARGET_DESCRIPTION = RentaPC Streaming Client
+    QMAKE_TARGET_PRODUCT = RentaPC
     CONFIG -= embed_manifest_exe
     QMAKE_LFLAGS += /MANIFEST:embed /MANIFESTINPUT:$${PWD}/SeatHub.exe.manifest
 }

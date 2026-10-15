@@ -77,7 +77,7 @@ const char* kIdentifierMissing = "Enter your email or phone number.";
 const char* kPasswordMissing = "Enter your password.";
 // `docs/spec/copy.md` § Signup code errors: "When the server cannot be reached at all". Shown by
 // every sign-in step when the request never reached the control plane.
-const char* kOfflineSentence = "We couldn't reach SevenHills. Try again in a moment.";
+const char* kOfflineSentence = "We couldn't reach RentaPC. Try again in a moment.";
 
 // homeStatus values (audit F1). Five states of the one home view, from `screens.md` §23 and the
 // copy deck: the populated state, the named loading state, the "no rig" empty state, the offline

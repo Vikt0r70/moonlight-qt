@@ -34,14 +34,14 @@ const char* kStateInstalling = "installing";
 const char* kStateFailed = "failed";
 
 const char* kNoChecksum =
-    "This build doesn't have a verified checksum for the new version yet, so SeatHub won't "
-    "install it automatically. Download it from the SevenHills website in the meantime.";
+    "This build doesn't have a verified checksum for the new version yet, so RentaPC won't "
+    "install it automatically. Download it from the RentaPC website in the meantime.";
 
 // copy.md § Support & errors: the customer sentence for an unreachable control plane.
-const char* kUnreachable = "We couldn't reach SevenHills. Try again in a moment.";
+const char* kUnreachable = "We couldn't reach RentaPC. Try again in a moment.";
 
 const char* kWhileStreaming =
-    "SeatHub doesn't change its own files while a stream is running. The update will be offered "
+    "RentaPC doesn't change its own files while a stream is running. The update will be offered "
     "when the session ends.";
 
 // Mirrors the retired Tauri client's `numeric_parts` exactly (`src-tauri/src/updater.rs`): a
@@ -132,8 +132,8 @@ UpdateFeedClient::~UpdateFeedClient()
 QString UpdateFeedClient::defaultBaseUrl()
 {
     // `docs/spec/openapi.yaml` `servers[0].url`, frozen by ADR-0015 and moved to this host by
-    // ADR-0018 (`api-sevenhills.damra.co`, one label deep under the wildcard certificate).
-    return QStringLiteral("https://api-sevenhills.damra.co");
+    // ADR-0018 (`api.rentapc.online`, one label deep under the wildcard certificate).
+    return QStringLiteral("https://api.rentapc.online");
 }
 
 QString UpdateFeedClient::feedPath(const QString& app)
@@ -286,7 +286,7 @@ bool UpdateFeedClient::mandatory() const
 QString UpdateFeedClient::nextAttemptText() const
 {
     const auto seconds = m_retry.now().secsTo(m_retry.nextAllowedAt);
-    if (m_retry.attemptsFailed <= 1 || seconds <= 0) return tr("the next time you open SeatHub");
+    if (m_retry.attemptsFailed <= 1 || seconds <= 0) return tr("the next time you open RentaPC");
     if (seconds < 7200) return tr("in about %1 minutes").arg(qRound(double(seconds) / 60));
     return tr("in about %1 hours").arg(qRound(double(seconds) / 3600));
 }

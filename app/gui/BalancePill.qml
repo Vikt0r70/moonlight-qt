@@ -214,8 +214,8 @@ Rectangle {
             Text {
                 anchors.verticalCenter: parent.verticalCenter
                 text: root.retrySeconds > 0
-                    ? qsTr("Reconnecting to SevenHills… trying again in %1 s").arg(root.retrySeconds)
-                    : qsTr("Reconnecting to SevenHills…")
+                    ? qsTr("Reconnecting to RentaPC… trying again in %1 s").arg(root.retrySeconds)
+                    : qsTr("Reconnecting to RentaPC…")
                 color: Tokens.foregroundMutedDefault
                 font.family: Tokens.fontSansDefault
                 font.pixelSize: Metrics.fontCaption

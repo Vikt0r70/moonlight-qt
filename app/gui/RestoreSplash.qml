@@ -22,7 +22,7 @@ Item {
         Text {
             width: parent.width
             horizontalAlignment: Text.AlignHCenter
-            text: qsTr("SeatHub")
+            text: qsTr("RentaPC")
             color: Tokens.foregroundDefault
             font.family: Tokens.fontDisplayDefault
             font.pixelSize: Metrics.fontH1

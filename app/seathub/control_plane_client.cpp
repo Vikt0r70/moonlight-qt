@@ -77,7 +77,7 @@ QString routeClassForPath(const QString& path)
 }
 
 // Where a call lands when nothing else is known. One place names the control plane.
-const char* kProductionBaseUrl = "https://api-sevenhills.damra.co";
+const char* kProductionBaseUrl = "https://api.rentapc.online";
 
 // `docs/spec/openapi.yaml` `SessionState`. The four terminal states are what teardown waits
 // for; the other six are in flight.

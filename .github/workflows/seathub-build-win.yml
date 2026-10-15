@@ -340,7 +340,7 @@ jobs:
         with:
           name: SeatHub-Velopack
           path: |
-            build\velopack-x64-release\*-win-Setup.exe
+            build\velopack-x64-release\*-Setup.exe
             build\velopack-x64-release\*-full.nupkg
             build\velopack-x64-release\releases.win.json
           if-no-files-found: error
@@ -407,13 +407,14 @@ jobs:
         if: steps.creds.outputs.ok == 'true'
         run: |
           set -euo pipefail
-          file=$(ls dist/*-win-Setup.exe | head -1 || true)
-          [ -n "$file" ] || { echo "::error::No *-win-Setup.exe in the build artifact"; exit 1; }
+          file=$(ls dist/*-Setup.exe | head -1 || true)
+          [ -n "$file" ] || { echo "::error::No *-Setup.exe in the build artifact"; exit 1; }
           base=$(basename "$file")
-          packid="${base%-win-Setup.exe}"
+          [ -f dist/releases.win.json ] || { echo "::error::No releases.win.json in the build artifact"; exit 1; }
+          [ "$(jq '[.Assets[] | select(.Type=="Full")] | length' dist/releases.win.json)" = 1 ] || { echo "::error::releases.win.json must list exactly one Full package"; exit 1; }
+          packid=$(jq -r '.Assets[] | select(.Type=="Full") | .PackageId' dist/releases.win.json)
           full=$(ls dist/"$packid"-*-full.nupkg | head -1 || true)
           [ -n "$full" ] || { echo "::error::No $packid-*-full.nupkg in the build artifact"; exit 1; }
-          [ -f dist/releases.win.json ] || { echo "::error::No releases.win.json in the build artifact"; exit 1; }
           fullbase=$(basename "$full")
           version=$(echo "$fullbase" | sed -E "s/^${packid}-(.+)-full\.nupkg$/\1/")
           echo "installer=$base" >> "$GITHUB_OUTPUT"

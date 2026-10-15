@@ -112,7 +112,7 @@ const Setting kSettings[] = {
     // checkbox is the inverse of the stored key, exactly as upstream renders it.
     { "hostaudio", "audio", "Mute host PC speakers while streaming", KindBool, nullptr, 0,
       nullptr, true, false, nullptr },
-    { "muteonfocusloss", "audio", "Mute audio stream when SeatHub is not the active window",
+    { "muteonfocusloss", "audio", "Mute audio stream when RentaPC is not the active window",
       KindBool, nullptr, 0, nullptr, false, false, nullptr },
 
     // ---- Host Settings ------------------------------------------------------------------------
@@ -122,7 +122,7 @@ const Setting kSettings[] = {
     // session per launch and closes the host app as part of its own teardown.
     { "quitAppAfter", "host", "Quit app on host PC after ending stream", KindFixed, nullptr, 0,
       nullptr, false, true,
-      "SeatHub owns one session per launch and closes the host app as part of that teardown, so "
+      "RentaPC owns one session per launch and closes the host app as part of that teardown, so "
       "this is not a customer-facing choice. Forced off on every load (D-25(c))." },
 
     // ---- UI Settings --------------------------------------------------------------------------
@@ -142,7 +142,7 @@ const Setting kSettings[] = {
     // D-25(b): forced off. SeatHub has no external presence surface for this to act on.
     { "richpresence", "ui", "Discord Rich Presence integration", KindFixed, nullptr, 0, nullptr,
       false, true,
-      "SeatHub has no external presence surface; the setting has nothing to act on. Forced off "
+      "RentaPC has no external presence surface; the setting has nothing to act on. Forced off "
       "on every load (D-25(b))." },
     { "keepawake", "ui", "Keep the display awake while streaming", KindBool, nullptr, 0, nullptr,
       false, false, nullptr },
@@ -174,7 +174,7 @@ const Setting kSettings[] = {
       nullptr, true, false, nullptr },
     { "gamepadmouse", "gamepad", "Enable mouse control with gamepads by holding the 'Start' "
       "button", KindBool, nullptr, 0, nullptr, false, false, nullptr },
-    { "backgroundgamepad", "gamepad", "Process gamepad input when SeatHub is in the background",
+    { "backgroundgamepad", "gamepad", "Process gamepad input when RentaPC is in the background",
       KindBool, nullptr, 0, nullptr, false, false, nullptr },
 
     // ---- Advanced Settings --------------------------------------------------------------------
@@ -192,12 +192,12 @@ const Setting kSettings[] = {
     // local discovery.
     { "mdns", "advanced", "Automatically find PCs on the local network (Recommended)", KindFixed,
       nullptr, 0, nullptr, false, true,
-      "SeatHub reaches the host through the session the control plane allocated, so local "
+      "RentaPC reaches the host through the session the control plane allocated, so local "
       "discovery is not part of the session path. Forced off on every load (D-25(b))." },
     // D-25(c): forced off - it raises the engine's own dialogs, which never reach a customer.
     { "detectnetblocking", "advanced", "Automatically detect blocked connections (Recommended)",
       KindFixed, nullptr, 0, nullptr, false, true,
-      "This check raises the engine's own dialogs, which SeatHub never shows a customer. Forced "
+      "This check raises the engine's own dialogs, which RentaPC never shows a customer. Forced "
       "off on every load (D-25(c))." },
     // D-23/CUST-17: not a customer control any more. The eleven `statsToggle*` keys below are
     // the customer's actual choice; this value is derived from them (recomputeShowPerfOverlay).
@@ -215,13 +215,13 @@ const Setting kSettings[] = {
     // STREAM_CFG_LOCAL with 1392 instead of remote-mode 1024-byte capping.
     { "packetsize", "advanced", "Packet size (bytes)", KindInt, nullptr, 0, nullptr, false, true,
       "Not on the engine's own stock settings page (`moonlight stream` CLI only). The owner "
-      "dropped this row (OD-06). Forced to SeatHub's fixed transport value on every load (D-09/"
+      "dropped this row (OD-06). Forced to RentaPC's fixed transport value on every load (D-09/"
       "D-10): no exposed control can set it, and a hand-edited store or a stray upstream writer "
       "must not silently cap the stream at remote-mode 1024 bytes (A-68: quality settings decide "
       "the stream; this hidden transport value is not one of them)." },
     { "defaultver", "advanced", "Preference-format version", KindFixed, nullptr, 0, nullptr,
       false, false,
-      "Internal upstream migration marker, never on the engine's own settings page. SeatHub "
+      "Internal upstream migration marker, never on the engine's own settings page. RentaPC "
       "preserves the migration behavior and never presents a version-control setting." },
 };
 

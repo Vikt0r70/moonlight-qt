@@ -214,7 +214,7 @@ private slots:
         const SeatHubFailure failure = result.toFailure();
         QCOMPARE(failure.kind, FailureKind::Network);
         QCOMPARE(failure.error,
-                 QStringLiteral("Can't reach SevenHills right now. Showing the last known balance."));
+                 QStringLiteral("Can't reach RentaPC right now. Showing the last known balance."));
         QCOMPARE(failure.error, SeatHubFailure::offlineSentence());
         QVERIFY(failure.reference.isEmpty());
     }
@@ -404,17 +404,17 @@ private slots:
 
     void webOrigin_holdsTheSpecsAddressesAndNothingElse()
     {
-        QCOMPARE(QString::fromLatin1(SeatHubWeb::kOrigin), QStringLiteral("https://sevenhills.damra.co"));
+        QCOMPARE(QString::fromLatin1(SeatHubWeb::kOrigin), QStringLiteral("https://rentapc.online"));
         QCOMPARE(SeatHubWeb::url(SeatHubWeb::kTopUpPath).toString(),
-                 QStringLiteral("https://sevenhills.damra.co/topup"));
+                 QStringLiteral("https://rentapc.online/topup"));
         QCOMPARE(SeatHubWeb::url(SeatHubWeb::kSignUpPath).toString(),
-                 QStringLiteral("https://sevenhills.damra.co/login?mode=signup"));
+                 QStringLiteral("https://rentapc.online/login?mode=signup"));
         QCOMPARE(SeatHubWeb::url(SeatHubWeb::kResetPasswordPath).toString(),
-                 QStringLiteral("https://sevenhills.damra.co/forgot-password"));
+                 QStringLiteral("https://rentapc.online/forgot-password"));
         // A path the spec does not record yields no address at all.
         QVERIFY(SeatHubWeb::url("/somewhere-else").isEmpty());
         // The profile's `Open the website` link is the origin itself (OD-11), nothing after it.
-        QCOMPARE(SeatHubWeb::homeUrl().toString(), QStringLiteral("https://sevenhills.damra.co"));
+        QCOMPARE(SeatHubWeb::homeUrl().toString(), QStringLiteral("https://rentapc.online"));
         QVERIFY(SeatHubWeb::homeUrl().path().isEmpty());
         QVERIFY(SeatHubWeb::homeUrl().query().isEmpty());
     }
@@ -1909,7 +1909,7 @@ private slots:
     void baseUrl_isTheSameHostTheReleaseFeedUses()
     {
         QCOMPARE(ControlPlaneClient::defaultBaseUrl(),
-                 QStringLiteral("https://api-sevenhills.damra.co"));
+                 QStringLiteral("https://api.rentapc.online"));
         QCOMPARE(ControlPlaneClient::localBaseUrl(), QStringLiteral("http://127.0.0.1:8000"));
     }
 

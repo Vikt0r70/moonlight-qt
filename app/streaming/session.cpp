@@ -1816,7 +1816,7 @@ void Session::execInternal()
     std::string windowName = QString(m_Computer->name).toStdString();
 #else
     // SeatHub: D-28 exception, see ADR-0046
-    std::string windowName = QString(m_Computer->name + " - SeatHub").toStdString();
+    std::string windowName = QString(m_Computer->name + " - RentaPC").toStdString(); // D-28 exception, see ADR-0046
 #endif
 
     m_Window = SDL_CreateWindow(windowName.c_str(),

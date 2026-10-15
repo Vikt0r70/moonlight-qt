@@ -1925,7 +1925,7 @@ private slots:
         });
         QVERIFY(client.openWebsite(QStringLiteral("signup")));
         QCOMPARE(opened.size(), 1);
-        QCOMPARE(opened.first().toString(), QStringLiteral("https://sevenhills.damra.co/login?mode=signup"));
+        QCOMPARE(opened.first().toString(), QStringLiteral("https://rentapc.online/login?mode=signup"));
         QVERIFY(opened.first().userInfo().isEmpty());
 
         // Nothing was signed in and no route that makes an account was asked.
@@ -1992,7 +1992,7 @@ private slots:
         QTRY_COMPARE_WITH_TIMEOUT(rejected.count(), 1, 15000);
 
         QCOMPARE(rejected.first().at(0).toString(),
-                 QStringLiteral("We couldn't reach SevenHills. Try again in a moment."));
+                 QStringLiteral("We couldn't reach RentaPC. Try again in a moment."));
         QVERIFY(rejected.first().at(1).toString().isEmpty());
         QVERIFY(!client.credentialStore()->hasToken(TokenStore::accessTokenName()));
     }
@@ -2027,11 +2027,11 @@ private slots:
         QTRY_COMPARE_WITH_TIMEOUT(client.appState(), QStringLiteral("home"), 15000);
 
         QCOMPARE(client.websiteUrl(QStringLiteral("signup")),
-                 QStringLiteral("https://sevenhills.damra.co/login?mode=signup"));
+                 QStringLiteral("https://rentapc.online/login?mode=signup"));
         QCOMPARE(client.websiteUrl(QStringLiteral("reset")),
-                 QStringLiteral("https://sevenhills.damra.co/forgot-password"));
+                 QStringLiteral("https://rentapc.online/forgot-password"));
         QCOMPARE(client.websiteUrl(QStringLiteral("topup")),
-                 QStringLiteral("https://sevenhills.damra.co/topup"));
+                 QStringLiteral("https://rentapc.online/topup"));
         QVERIFY(client.websiteUrl(QStringLiteral("anywhere-else")).isEmpty());
 
         // What would open is recorded, not launched.
@@ -2082,7 +2082,7 @@ private slots:
 
         QVERIFY(client.openTopUp());
         QCOMPARE(opened.size(), 1);
-        QCOMPARE(opened.at(0).toString(), QStringLiteral("https://sevenhills.damra.co/topup"));
+        QCOMPARE(opened.at(0).toString(), QStringLiteral("https://rentapc.online/topup"));
 
         // Signed in, with a credential in memory and on disk, and the address carries none of it: no
         // query, no fragment, no identity, no token.
@@ -6115,7 +6115,7 @@ private slots:
         SeatHubClient client;
         reachHome(client, 10);
 
-        QCOMPARE(client.websiteUrl(QStringLiteral("home")), QStringLiteral("https://sevenhills.damra.co"));
+        QCOMPARE(client.websiteUrl(QStringLiteral("home")), QStringLiteral("https://rentapc.online"));
 
         QList<QUrl> opened;
         client.setUrlOpener([&opened](const QUrl& url) {
@@ -6124,7 +6124,7 @@ private slots:
         });
         QVERIFY(client.openWebsite(QStringLiteral("home")));
         QCOMPARE(opened.size(), 1);
-        QCOMPARE(opened.at(0).toString(), QStringLiteral("https://sevenhills.damra.co"));
+        QCOMPARE(opened.at(0).toString(), QStringLiteral("https://rentapc.online"));
         QVERIFY(opened.at(0).path().isEmpty());
         QVERIFY(opened.at(0).query().isEmpty());
         const QString text = opened.at(0).toString();

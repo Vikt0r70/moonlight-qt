@@ -76,7 +76,7 @@ SessionWebSocket::SessionWebSocket(QObject* parent)
     connect(m_socket, &QWebSocket::sslErrors, this,
             [this](const QList<QSslError>& errors) {
                 // Deliberately not ignored. The control plane presents a publicly-trusted
-                // certificate (`api-sevenhills.damra.co`); a certificate we cannot verify is
+                // certificate (`api.rentapc.online`); a certificate we cannot verify is
                 // a reason to stop, not to proceed. Sunshine's self-signed certificate is a
                 // different problem on a different socket this client never opens.
                 QStringList messages;

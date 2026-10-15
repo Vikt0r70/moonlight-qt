@@ -61,7 +61,7 @@ Item {
         if (root.status === "busy")
             return qsTr("None available right now.")
         if (root.status === "offline")
-            return qsTr("Can't reach SevenHills right now. Showing the last known balance.")
+            return qsTr("Can't reach RentaPC right now. Showing the last known balance.")
         return ""
     }
 
@@ -126,7 +126,7 @@ Item {
             objectName: "endingLine"
             width: parent.width
             visible: root.ending
-            text: qsTr("Ending your session. It keeps running until SevenHills confirms the end.")
+            text: qsTr("Ending your session. It keeps running until RentaPC confirms the end.")
             wrapMode: Text.Wrap
             color: Tokens.foregroundDefault
             font.family: Tokens.fontSansDefault

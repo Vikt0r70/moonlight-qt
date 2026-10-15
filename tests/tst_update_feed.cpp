@@ -53,7 +53,7 @@ QString guiDir()
         .absolutePath();
 }
 
-QByteArray feedRow(const QString& version, const QString& url = QStringLiteral("https://example.invalid/SeatHub-0.2.0.exe"),
+QByteArray feedRow(const QString& version, const QString& url = QStringLiteral("https://example.invalid/RentaPC-0.2.0.exe"),
                    const QString& notes = QString())
 {
     return QStringLiteral("{\"app\":\"client\",\"platform\":\"windows-x86_64\",\"version\":\"%1\","
@@ -85,8 +85,8 @@ const char* const kAbcSha256 = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9c
 
 // The release row the tests publish: Setup.exe sits in a folder on the control plane's host, and the
 // Velopack feed (releases.win.json and the full package) is the folder beside it.
-const char* const kSetupUrl = "https://api-sevenhills.damra.co/releases/client/SeatHub-Setup-0.2.0.exe";
-const char* const kSetupFolder = "https://api-sevenhills.damra.co/releases/client/";
+const char* const kSetupUrl = "https://api.rentapc.online/releases/client/RentaPC-Setup-0.2.0.exe";
+const char* const kSetupFolder = "https://api.rentapc.online/releases/client/";
 
 // The Velopack seam, scripted. `download` runs on the client's worker thread exactly as the real one
 // does; `hold` lets a test keep a download in flight.
@@ -210,7 +210,7 @@ public:
     bool mandatory() const { return true; }
     bool optionalOffer() const { return false; }
     bool exhausted() const { return false; }
-    QString nextAttemptText() const { return "the next time you open SeatHub"; }
+    QString nextAttemptText() const { return "the next time you open RentaPC"; }
     Q_INVOKABLE bool tryAgain() { return m_readyToInstall ? installDownloaded() : downloadUpdate(); }
 
 signals:
@@ -270,7 +270,7 @@ private:
 void TstUpdateFeed::feedAddressesAreTheFrozenOnes()
 {
     // ADR-0015/ADR-0018: the control plane's public API host, and ADR-0026's one route.
-    QCOMPARE(UpdateFeedClient::defaultBaseUrl(), QStringLiteral("https://api-sevenhills.damra.co"));
+    QCOMPARE(UpdateFeedClient::defaultBaseUrl(), QStringLiteral("https://api.rentapc.online"));
     QCOMPARE(UpdateFeedClient::feedPath(QStringLiteral("client")),
              QStringLiteral("/api/releases/client"));
     QCOMPARE(UpdateFeedClient::appName(), QStringLiteral("client"));
@@ -710,8 +710,8 @@ QString writeLocalFeed(const QString& folder, const QString& url, const QString&
 }
 }
 namespace {
-const char* const kTrustedOld = "https://api-sevenhills.damra.co/releases/client/SeatHub-Setup-OLD.exe";
-const char* const kTrustedNew = "https://api-sevenhills.damra.co/releases/client/new/SeatHub-Setup-NEW.exe";
+const char* const kTrustedOld = "https://api.rentapc.online/releases/client/RentaPC-Setup-OLD.exe";
+const char* const kTrustedNew = "https://api.rentapc.online/releases/client/new/RentaPC-Setup-NEW.exe";
 // A client whose four automatic attempts are spent on 0.2.0, with a stale cached address.
 void exhaustedState(const QString& path)
 {
@@ -743,8 +743,8 @@ void TstUpdateFeed::persistentFailureReReadsTheFeedForReinstall()
     QCOMPARE(client.retryState().attemptsFailed, 4); // opening a page spends nothing
 
     // The address is still checked after the read: hostile rows open nothing.
-    for (const auto& hostile : QStringList{"http://api-sevenhills.damra.co/a", "file:///C:/private",
-                                         "https://evil.invalid/a", "https://api-sevenhills.damra.co.evil.invalid/a"}) {
+    for (const auto& hostile : QStringList{"http://api.rentapc.online/a", "file:///C:/private",
+                                         "https://evil.invalid/a", "https://api.rentapc.online.evil.invalid/a"}) {
         client.setBaseUrl(writeLocalFeed(dir.path(), hostile, "0.1.0"));
         QVERIFY(client.openManualDownload()); QTRY_VERIFY(client.state() != "checking");
         QVERIFY(client.manualDownloadUrl().isEmpty());
@@ -756,7 +756,7 @@ void TstUpdateFeed::persistentFailureReReadsTheFeedForReinstall()
     QVERIFY(client.openManualDownload());
     QTRY_COMPARE(client.state(), QString("failed"));
     QCOMPARE(opened.size(), 1);
-    QCOMPARE(client.failure().value("error").toString(), QString("We couldn't reach SevenHills. Try again in a moment."));
+    QCOMPARE(client.failure().value("error").toString(), QString("We couldn't reach RentaPC. Try again in a moment."));
     QCOMPARE(client.retryState().attemptsFailed, 4);
     QVERIFY(client.mandatory()); // the window stays: a failed update never unblocks Play
 }
@@ -779,7 +779,7 @@ void TstUpdateFeed::tryAgainDownloadsTheRowJustRead()
     client.setBaseUrl(writeLocalFeed(dir.path(), QString::fromLatin1(kTrustedNew), "0.1.0"));
     QVERIFY(client.tryAgain());
     QTRY_COMPARE(applier->applies.load(), 1);
-    QCOMPARE(applier->seenFolders(), QStringList{QStringLiteral("https://api-sevenhills.damra.co/releases/client/new/")});
+    QCOMPARE(applier->seenFolders(), QStringList{QStringLiteral("https://api.rentapc.online/releases/client/new/")});
     QCOMPARE(client.retryState().attemptsFailed, 4); // a manual Try again is free
     QTRY_COMPARE(exits, 1);
 }
@@ -823,7 +823,7 @@ void TstUpdateFeed::aCachedOfferIsReReadBeforeUpdateDownloads()
     QTRY_COMPARE(client.state(), QString("failed"));
     QTest::qWait(100);
     QCOMPARE(applier->downloads.load(), 0); QVERIFY(!client.readyToInstall());
-    QCOMPARE(client.failure().value("error").toString(), QString("We couldn't reach SevenHills. Try again in a moment."));
+    QCOMPARE(client.failure().value("error").toString(), QString("We couldn't reach RentaPC. Try again in a moment."));
     QCOMPARE(client.retryState().attemptsFailed, 0);
     // Online: the same press downloads what the feed says now, whatever the cache said.
     client.setBaseUrl(writeLocalFeed(dir.path(), QString::fromLatin1(kSetupUrl), "0.1.0"));
@@ -1135,14 +1135,14 @@ void TstUpdateFeed::theReleaseFolderIsTheOneBesideSetupAndMustBeTrusted()
     using namespace VelopackUpdater;
     const QString host = QUrl(UpdateFeedClient::defaultBaseUrl()).host();
     QCOMPARE(feedFolderOf(QUrl(QString::fromLatin1(kSetupUrl))).toString(), QString::fromLatin1(kSetupFolder));
-    QCOMPARE(feedFolderOf(QUrl(QStringLiteral("https://api-sevenhills.damra.co/downloads/Setup.exe?x=1#frag"))).toString(),
-             QStringLiteral("https://api-sevenhills.damra.co/downloads/"));
+    QCOMPARE(feedFolderOf(QUrl(QStringLiteral("https://api.rentapc.online/downloads/Setup.exe?x=1#frag"))).toString(),
+             QStringLiteral("https://api.rentapc.online/downloads/"));
     QVERIFY(isTrustedFeedFolder(QUrl(QString::fromLatin1(kSetupFolder)), host));
     // Only https on the control plane's own host: a hostile feed row points the updater nowhere else.
-    for (const QString& hostile : {QStringLiteral("http://api-sevenhills.damra.co/releases/"),
+    for (const QString& hostile : {QStringLiteral("http://api.rentapc.online/releases/"),
                                    QStringLiteral("https://evil.invalid/releases/"),
-                                   QStringLiteral("https://api-sevenhills.damra.co.evil.invalid/releases/"),
-                                   QStringLiteral("https://user:pass@api-sevenhills.damra.co/releases/"),
+                                   QStringLiteral("https://api.rentapc.online.evil.invalid/releases/"),
+                                   QStringLiteral("https://user:pass@api.rentapc.online/releases/"),
                                    QStringLiteral("file:///C:/private/"), QStringLiteral("C:/private/"), QString()})
         QVERIFY2(!isTrustedFeedFolder(QUrl(hostile), host), qPrintable(hostile));
     QVERIFY(!isTrustedFeedFolder(QUrl(QString::fromLatin1(kSetupFolder)), QString()));
@@ -1177,7 +1177,7 @@ void TstUpdateFeed::theUninstallHookRemovesExactlyTheD45State()
         roaming + "/Seven Hills/HostHub/keep.txt", roaming + "/Other/keep.txt",
         localApp + "/qmlcache/keep.bin", localApp + "/keep.log",
         local + "/Seven Hills/HostHub/keep.txt", local + "/SeatHub/keep.txt",
-        local + "/SeatHubVelopackProof/current/SeatHub.exe", local + "/SeatHubVelopackProof/Update.exe"};
+        local + "/RentaPC/current/SeatHub.exe", local + "/RentaPC/Update.exe"};
     for (const QString& file : removed + kept) { touch(file); QVERIFY(!QTest::currentTestFailed()); }
 
     const VelopackUpdater::D45Roots roots{roaming, local};

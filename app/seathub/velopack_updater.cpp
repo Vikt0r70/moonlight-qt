@@ -158,7 +158,7 @@ public:
         release();
         const QUrl folder(feedFolderUrl, QUrl::StrictMode);
         if (!isTrustedFeedFolder(folder, m_host)) {
-            *error = QStringLiteral("The update folder is not on the SevenHills host.");
+            *error = QStringLiteral("The update folder is not on the RentaPC host.");
             return false;
         }
         const std::string url = folder.toString(QUrl::StripTrailingSlash).toStdString();

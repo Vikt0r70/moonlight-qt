@@ -5,8 +5,8 @@
 // website address by hand; these are the only strings, and `SeatHubClient::websiteUrl()` is the
 // only place that joins them.
 //
-// The values are `docs/spec/client.md` § Website links, which records them from `ADR-0053` (the
-// apex the website has been live on since 2026-09-20). No address here carries a credential, an
+// The values are `docs/spec/client.md` § Website links, which records them from `ADR-0092` (the
+// apex, superseding the `ADR-0053` hostname). No address here carries a credential, an
 // account identifier or a session token: there is no browser-to-app handoff this milestone (D-08).
 
 #include <QString>
@@ -14,8 +14,8 @@
 
 namespace SeatHubWeb {
 
-// ADR-0053: the website's apex.
-inline constexpr const char* kOrigin = "https://sevenhills.damra.co";
+// ADR-0092: the website's apex.
+inline constexpr const char* kOrigin = "https://rentapc.online";
 
 // docs/spec/client.md § Website links.
 inline constexpr const char* kTopUpPath = "/topup";

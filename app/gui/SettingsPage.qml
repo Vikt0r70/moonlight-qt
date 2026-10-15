@@ -129,7 +129,7 @@ Item {
             // no second line: the page adds nothing else of its own under the title.
             Text {
                 width: parent.width
-                text: qsTr("SeatHub sends diagnostic logs, stream quality numbers and crash reports to SevenHills so we can fix problems.")
+                text: qsTr("RentaPC sends diagnostic logs, stream quality numbers and crash reports to us so we can fix problems.")
                 wrapMode: Text.Wrap
                 color: Tokens.foregroundMutedDefault
                 font.family: Tokens.fontSansDefault
@@ -405,7 +405,7 @@ Item {
                         NamedToggle {
                             settingKey: "muteonfocusloss"
                             bridge: page.prefs
-                            title: qsTr("Mute audio stream when SeatHub is not the active window")
+                            title: qsTr("Mute audio stream when RentaPC is not the active window")
                             description: qsTr("Mutes the stream's audio when you switch away.")
                         }
                     }
@@ -539,7 +539,7 @@ Item {
                                         width: parent.width
                                         wrapMode: Text.Wrap
                                         text: qsTr("This enables the capture of system-wide keyboard shortcuts like Alt+Tab that would normally be handled by the client OS while streaming.") + " " +
-                                              qsTr("NOTE: Certain keyboard shortcuts like Ctrl+Alt+Del on Windows cannot be intercepted by any application, including SeatHub.")
+                                              qsTr("NOTE: Certain keyboard shortcuts like Ctrl+Alt+Del on Windows cannot be intercepted by any application, including RentaPC.")
                                         color: Tokens.foregroundMutedDefault
                                         font.family: Tokens.fontSansDefault
                                         font.pixelSize: Metrics.fontSm
@@ -732,8 +732,8 @@ Item {
                         NamedToggle {
                             settingKey: "backgroundgamepad"
                             bridge: page.prefs
-                            title: qsTr("Process gamepad input when SeatHub is in the background")
-                            description: qsTr("Captures gamepad input even when SeatHub isn't focused.")
+                            title: qsTr("Process gamepad input when RentaPC is in the background")
+                            description: qsTr("Captures gamepad input even when RentaPC isn't focused.")
                         }
                     }
 
