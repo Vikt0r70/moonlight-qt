@@ -21,6 +21,8 @@ namespace {
 
 const char* kAccountIdKey = "account_id";
 const char* kReportKey = "report";
+// ADR-0101 / T024: Quality report payload schema carries nullable received_fps, decoded_fps,
+// host_latency_min_ms, host_latency_max_ms, host_latency_avg_ms, and rtt_ms rounded half-up.
 
 // Session ids are UUIDs (`docs/spec/schema.sql`, every `sessions.id` column). Checked before a
 // session id is ever turned into a filename or a directory entry, so a malformed or hostile
@@ -109,6 +111,14 @@ void QualityOutbox::put(const QString& sessionId, const QString& accountId, cons
     if (!file.open(QIODevice::WriteOnly) || file.write(bytes) != bytes.size() || !file.commit()) {
         qCWarning(seathubQualityOutbox) << "could not write the quality outbox for" << sessionId;
     }
+}
+
+void QualityOutbox::remove(const QString& sessionId)
+{
+    if (sessionId.isEmpty() || !isUuidShaped(sessionId)) {
+        return;
+    }
+    QFile::remove(pathFor(sessionId));
 }
 
 bool QualityOutbox::hasQueuedReports() const

@@ -538,6 +538,56 @@ private slots:
         sampler.finish();
     }
 
+    void samplerPassivelyCarriesReceivedDecodedRatesAndRecentObservations()
+    {
+        rollupLogs.clear();
+        StreamQualitySampler sampler;
+        sampler.setWindowMs(40);
+        sampler.start(QStringLiteral("sess-test-rates"));
+
+        VideoStats stats;
+        stats.renderedFps = OptionalMetric::of(59.9);
+        stats.receivedFps = OptionalMetric::of(60.0);
+        stats.decodedFps = OptionalMetric::of(59.8);
+
+        // Feed 3 samples with known rates
+        sampler.feed(stats);
+        sampler.feed(stats);
+        sampler.feed(stats);
+
+        QTRY_COMPARE(sampler.rollups(), 1);
+        QVERIFY(!rollupLogs.isEmpty());
+        const QJsonObject log = rollupLogs.last();
+
+        // Rates are passively aggregated
+        QCOMPARE(log.value(QStringLiteral("fps_avg")).toDouble(), 59.9);
+        QCOMPARE(log.value(QStringLiteral("incoming_fps_avg")).toDouble(), 60.0);
+        QCOMPARE(log.value(QStringLiteral("decoded_fps_avg")).toDouble(), 59.8);
+
+        // Recent observations are captured in bounded order (up to 10)
+        QCOMPARE(log.value(QStringLiteral("recent_n")).toInt(), 3);
+        QCOMPARE(log.value(QStringLiteral("recent_0_rendered_fps")).toDouble(), 59.9);
+        QCOMPARE(log.value(QStringLiteral("recent_0_incoming_fps")).toDouble(), 60.0);
+        QCOMPARE(log.value(QStringLiteral("recent_0_decoded_fps")).toDouble(), 59.8);
+        QVERIFY(log.contains(QStringLiteral("recent_0_elapsed_ms")));
+        QVERIFY(log.contains(QStringLiteral("elapsed_ms")));
+        QVERIFY(log.contains(QStringLiteral("last_sample_age_ms")));
+
+        // Empty / unpopulated rates are NOT fabricated as zero
+        VideoStats emptyRatesStats;
+        emptyRatesStats.rttMs = OptionalMetric::of(12.0); // only RTT, no FPS fields
+        sampler.feed(emptyRatesStats);
+        sampler.finish();
+
+        QVERIFY(rollupLogs.size() >= 2);
+        const QJsonObject finishLog = rollupLogs.last();
+        // Since finishLog had recent samples with some missing rates, missing ones are omitted, not 0
+        QVERIFY(finishLog.value(QStringLiteral("recent_n")).toInt() > 0);
+        int lastIdx = finishLog.value(QStringLiteral("recent_n")).toInt() - 1;
+        // Last sample has no rendered_fps, so recent_<lastIdx>_rendered_fps must be absent/omitted
+        QVERIFY(!finishLog.contains(QStringLiteral("recent_%1_rendered_fps").arg(lastIdx)));
+    }
+
     void theWindowIsAThreadSafeNonBlockingFeed()
     {
         StreamQualitySampler sampler;
@@ -802,13 +852,24 @@ private slots:
     {
         VideoStats stats;
         stats.renderedFps = OptionalMetric::of(59.94);
-        stats.rttMs = OptionalMetric::of(23.0);
+        stats.rttMs = OptionalMetric::of(23.4);
+        stats.receivedFps = OptionalMetric::of(60.0);
+        stats.decodedFps = OptionalMetric::of(59.8);
+        stats.hostProcessingMinMs = OptionalMetric::of(1.1);
+        stats.hostProcessingMaxMs = OptionalMetric::of(3.5);
+        stats.hostProcessingAvgMs = OptionalMetric::of(2.2);
         // Every other field left absent.
 
         const QJsonObject report = toQualityReport(stats);
 
         QCOMPARE(report.value(QStringLiteral("rendered_fps")).toDouble(), 59.94);
-        QCOMPARE(report.value(QStringLiteral("rtt_ms")).toDouble(), 23.0);
+        // ADR-0101: rtt_ms rounded half-up to int
+        QCOMPARE(report.value(QStringLiteral("rtt_ms")).toInt(), 23);
+        QCOMPARE(report.value(QStringLiteral("received_fps")).toDouble(), 60.0);
+        QCOMPARE(report.value(QStringLiteral("decoded_fps")).toDouble(), 59.8);
+        QCOMPARE(report.value(QStringLiteral("host_latency_min_ms")).toDouble(), 1.1);
+        QCOMPARE(report.value(QStringLiteral("host_latency_max_ms")).toDouble(), 3.5);
+        QCOMPARE(report.value(QStringLiteral("host_latency_avg_ms")).toDouble(), 2.2);
         QVERIFY(report.value(QStringLiteral("network_dropped_frame_pct")).isNull());
         QVERIFY(report.value(QStringLiteral("jitter_dropped_frame_pct")).isNull());
         QVERIFY(report.value(QStringLiteral("rtt_variance_ms")).isNull());
@@ -885,9 +946,8 @@ private slots:
         QVERIFY(!totalLatencyMs(stats).present);
     }
 
-    // The three new parse-only fields are parse-only in fact, not just in name: the quality
-    // report the client sends to the control plane is byte-for-byte unchanged (contract 3.1.0's
-    // eight fields, nothing more).
+    // Plan 16 / ADR-0101: videoWidth/videoHeight remain parse-only; host latency min/max/avg
+    // and received_fps/decoded_fps are sent in the quality report (contract 3.25.0's 13 fields).
     void toQualityReportSendsNoNewField()
     {
         VideoStats stats;
@@ -897,7 +957,7 @@ private slots:
 
         const QJsonObject report = toQualityReport(stats);
 
-        QCOMPARE(report.size(), 8);
+        QCOMPARE(report.size(), 13);
         QVERIFY(!report.contains(QStringLiteral("host_processing_avg_ms")));
         QVERIFY(!report.contains(QStringLiteral("video_width")));
         QVERIFY(!report.contains(QStringLiteral("video_height")));
@@ -1657,6 +1717,74 @@ private slots:
 
         outbox.put(QString::fromLatin1(kSessionA), QStringLiteral("acct-1"), sampleReport());
         QVERIFY(outbox.hasQueuedReports());
+    }
+
+    void remove_deletesTheFile()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        QualityOutbox outbox(dir.path());
+
+        outbox.put(QString::fromLatin1(kSessionA), QStringLiteral("acct-1"), sampleReport());
+        QVERIFY(QFile::exists(dir.filePath(QString::fromLatin1(kSessionA) + QStringLiteral(".json"))));
+
+        outbox.remove(QString::fromLatin1(kSessionA));
+        QVERIFY(!QFile::exists(dir.filePath(QString::fromLatin1(kSessionA) + QStringLiteral(".json"))));
+    }
+
+    void killedStream_preservesWriteAheadReport_andDrainsOnceOnRelaunch()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+
+        // Phase 1: active session writes report ahead before a simulated crash/kill.
+        {
+            QualityOutbox activeOutbox(dir.path());
+            activeOutbox.put(QString::fromLatin1(kSessionA), QStringLiteral("acct-1"), sampleReport());
+            QVERIFY(QFile::exists(dir.filePath(QString::fromLatin1(kSessionA) + QStringLiteral(".json"))));
+        }
+
+        // Phase 2: process relaunches. Different account signs in first. Report must NOT be sent.
+        {
+            QualityOutbox relaunchOutbox(dir.path());
+            int sentOther = 0;
+            relaunchOutbox.drain(QStringLiteral("gen-other"), QStringLiteral("acct-OTHER"),
+                                 [&](const QString&, const QJsonObject&, ControlPlaneClient::Callback) {
+                                     ++sentOther;
+                                 });
+            QCOMPARE(sentOther, 0);
+            QVERIFY(!QFile::exists(dir.filePath(QString::fromLatin1(kSessionA) + QStringLiteral(".json"))));
+        }
+
+        // Put a fresh write-ahead report for original account to verify drain once.
+        {
+            QualityOutbox activeOutbox(dir.path());
+            activeOutbox.put(QString::fromLatin1(kSessionB), QStringLiteral("acct-1"), sampleReport());
+            QVERIFY(QFile::exists(dir.filePath(QString::fromLatin1(kSessionB) + QStringLiteral(".json"))));
+        }
+
+        // Phase 3: original account signs in. Drains and delivers exactly once.
+        {
+            QualityOutbox relaunchOutbox(dir.path());
+            int sentAcct1 = 0;
+            relaunchOutbox.drain(QStringLiteral("gen-1"), QStringLiteral("acct-1"),
+                                 [&](const QString& sessionId, const QJsonObject& report, ControlPlaneClient::Callback callback) {
+                                     ++sentAcct1;
+                                     QCOMPARE(sessionId, QString::fromLatin1(kSessionB));
+                                     QCOMPARE(report.value(QStringLiteral("rendered_fps")).toDouble(), 59.94);
+                                     callback(resultWithStatus(200, true));
+                                 });
+            QCOMPARE(sentAcct1, 1);
+            QVERIFY(!QFile::exists(dir.filePath(QString::fromLatin1(kSessionB) + QStringLiteral(".json"))));
+
+            // Subsequent drain does not deliver again.
+            int sentAgain = 0;
+            relaunchOutbox.drain(QStringLiteral("gen-2"), QStringLiteral("acct-1"),
+                                 [&](const QString&, const QJsonObject&, ControlPlaneClient::Callback) {
+                                     ++sentAgain;
+                                 });
+            QCOMPARE(sentAgain, 0);
+        }
     }
 
     // --- ADR-0074 HI02 / HI06: delivered stream time, reported by the app ---------------------

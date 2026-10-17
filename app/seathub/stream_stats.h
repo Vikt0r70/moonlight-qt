@@ -71,10 +71,10 @@ struct VideoStats
     OptionalMetric decodedFps;
 
     /// D-10 (Plan 16, `06.6-16-PLAN.md`): parse-only fields for the in-stream stats overlay's
-    /// HOST row and total-latency sum, and the RES row's resolution - like `receivedFps` above,
-    /// never sent on the wire (`toQualityReport()` does not reference any of the three). Parsed
-    /// from the "Host processing latency min/max/average: ... ms" line's own average figure and
-    /// the "Video stream: WxH ..." line's own dimensions (`ffmpeg.cpp:778-848`, read-only).
+    /// HOST row and total-latency sum, and the RES row's resolution.
+    /// ADR-0101 (T024/T025): host latency min, max, and avg are also sent in SessionQualityReport.
+    OptionalMetric hostProcessingMinMs;
+    OptionalMetric hostProcessingMaxMs;
     OptionalMetric hostProcessingAvgMs;
     OptionalMetric videoWidth;
     OptionalMetric videoHeight;

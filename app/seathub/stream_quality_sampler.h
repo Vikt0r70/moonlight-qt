@@ -57,7 +57,11 @@ private:
     std::atomic<qint64> m_windowStartMs{0};
     QMutex m_mutex;
     QVector<VideoStats> m_buffer;
-    QVector<VideoStats> m_recent;
+    struct SampleWithTime {
+        VideoStats stats;
+        qint64 elapsedMs = 0;
+    };
+    QVector<SampleWithTime> m_recent;
     int m_rttIn = 0;
     int m_rttOut = 0;
     bool m_feedRttPoor = false;

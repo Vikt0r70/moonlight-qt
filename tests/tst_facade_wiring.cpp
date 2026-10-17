@@ -4654,9 +4654,15 @@ private slots:
         // C2's own end attempt cannot reach the server (C7): the session stays attached and its
         // teardown claim is released, ready for the next attempt to ask again.
         m_fake->answerEnd(0);
+        QSignalSpy failed(client.teardown(), &TeardownController::teardownFailed);
         emit client.pairing()->pairingFailed(SeatHubFailure::local(QStringLiteral("failed")));
         QTRY_VERIFY_WITH_TIMEOUT(
             m_fake->requestPaths().contains(QStringLiteral("/api/sessions/s-stages/end")), 15000);
+        // The claim is released by the facade's handler of this failure on this thread. That
+        // connection is older than the spy's, so its queued call is posted before the spy counts;
+        // run it, or `start()` below can find the claim still spent and never ask a second time.
+        QTRY_COMPARE_WITH_TIMEOUT(failed.count(), 1, 15000);
+        QCoreApplication::processEvents();
         QCOMPARE(m_fake->requestPaths().count(QStringLiteral("/api/sessions/s-stages/end")), 1);
         QVERIFY(!client.retryBusy());
 
@@ -7388,6 +7394,8 @@ private slots:
 
         QJsonObject ports;
         ports.insert(QStringLiteral("https"), 47984);
+        ports.insert(QStringLiteral("control"), 47989);
+        ports.insert(QStringLiteral("rtsp"), 48010);
         QJsonObject authBody;
         authBody.insert(QStringLiteral("session_id"), QStringLiteral("s-cold"));
         authBody.insert(QStringLiteral("pairing_pin"), QStringLiteral("4821"));
@@ -7638,8 +7646,9 @@ private slots:
         QVERIFY2(!m_fake->requestPaths().contains(newQuality),
                  "a late teardown of an ended session posted the newer attempt's quality report");
         QVERIFY(!m_fake->requestPaths().contains(oldQuality));
+        // The old session has no report left behind, and the old teardown did not drain newSession's write-ahead report
         QVERIFY(!QFile::exists(QDir(m_dir->path()).filePath(
-            QStringLiteral("quality-outbox/%1.json").arg(newSession))));
+            QStringLiteral("quality-outbox/%1.json").arg(oldSession))));
 
         // The newer attempt's own teardown still posts it, once.
         SessionInfo current = sessionIn(QStringLiteral("COMPLETED"), newSession);
@@ -7776,6 +7785,10 @@ private slots:
         emit engine->displayLaunchError(QStringLiteral("No video received from host."));
         emit engine->readyForDeletion();
 
+        // Home is set synchronously on readyForDeletion, while the End is posted from the network
+        // thread, so wait for the request before counting it (as the sibling test above does).
+        QTRY_VERIFY_WITH_TIMEOUT(
+            m_fake->requestPaths().contains(QStringLiteral("/api/sessions/s-live/end")), 15000);
         QTRY_COMPARE_WITH_TIMEOUT(client.appState(), QStringLiteral("home"), 15000);
         QCOMPARE(client.engineEndMessage(), QStringLiteral("No video received from host."));
         QCOMPARE(m_fake->requestPaths().count(QStringLiteral("/api/sessions/s-live/end")), 1);

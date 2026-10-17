@@ -88,10 +88,11 @@ public:
 
     /// Writes (or overwrites) `<sessionId>.json`: the report body and `accountId`, the account
     /// this report belongs to. A no-op with no WARN for an empty `sessionId` (nothing to hold it
-    /// against); the caller is responsible for never calling this with an empty `accountId` (an
-    /// untagged file could never be proven to belong to anyone, and `drain()` would have to send
-    /// it to nobody or everybody - `SeatHubClient` logs and drops instead of ever writing one).
+    /// against). Untagged reports (empty `accountId`) are stored ahead until `accountId` is known.
     void put(const QString& sessionId, const QString& accountId, const QJsonObject& report);
+
+    /// Removes `<sessionId>.json` from disk, e.g. after delivery.
+    void remove(const QString& sessionId);
 
     /// True when at least one report is currently stored, whichever account it is tagged for.
     /// Lets a caller that does not yet know the signed-in account's id (a fresh sign-in, before

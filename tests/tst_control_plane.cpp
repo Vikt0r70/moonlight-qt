@@ -554,6 +554,58 @@ private slots:
         QVERIFY2(authWithoutKey.qualityProfile.isEmpty(), "an absent quality_profile parses as empty");
     }
 
+    void authorization_parsesSignedPortsWithNonDefaultBasePort()
+    {
+        // ADR-0093 / SC7: Sunshine base port P = 20000.
+        // TCP: [P-5, P, P+21] = [19995, 20000, 20021]
+        // UDP: [P+9, P+10, P+11] = [20009, 20010, 20011]
+        QJsonObject ports;
+        ports.insert(QStringLiteral("https"), 19995);
+        ports.insert(QStringLiteral("control"), 20000);
+        ports.insert(QStringLiteral("rtsp"), 20021);
+        QJsonArray tcp;
+        tcp.append(19995);
+        tcp.append(20000);
+        tcp.append(20021);
+        ports.insert(QStringLiteral("tcp"), tcp);
+        QJsonArray udp;
+        udp.append(20009);
+        udp.append(20010);
+        udp.append(20011);
+        ports.insert(QStringLiteral("udp"), udp);
+
+        QJsonObject body;
+        body.insert(QStringLiteral("session_id"), QStringLiteral("aaaabbbb-cccc-dddd-eeee-ffff00001111"));
+        body.insert(QStringLiteral("pairing_pin"), QStringLiteral("4821"));
+        body.insert(QStringLiteral("host_address"), QStringLiteral("203.0.113.7"));
+        body.insert(QStringLiteral("ports"), ports);
+
+        SessionAuthorization auth;
+        QVERIFY(SessionAuthorization::parse(body, &auth));
+        QCOMPARE(auth.controlPort, 20000);
+        QCOMPARE(auth.httpsPort, 19995);
+        QCOMPARE(auth.rtspPort, 20021);
+        QCOMPARE(auth.tcpPorts, QList<int>({19995, 20000, 20021}));
+        QCOMPARE(auth.udpPorts, QList<int>({20009, 20010, 20011}));
+        QVERIFY(auth.isReady());
+    }
+
+    void authorization_absentPortsYieldsNotReadyAuthorization()
+    {
+        // 0 ports rejected, no fallback to 47989.
+        QJsonObject body;
+        body.insert(QStringLiteral("session_id"), QStringLiteral("aaaabbbb-cccc-dddd-eeee-ffff00001111"));
+        body.insert(QStringLiteral("pairing_pin"), QStringLiteral("4821"));
+        body.insert(QStringLiteral("host_address"), QStringLiteral("203.0.113.7"));
+
+        SessionAuthorization auth;
+        QVERIFY(SessionAuthorization::parse(body, &auth));
+        QCOMPARE(auth.controlPort, 0);
+        QCOMPARE(auth.httpsPort, 0);
+        QCOMPARE(auth.rtspPort, 0);
+        QVERIFY(!auth.isReady());
+    }
+
     void liveness_postsToTheDocumentedRouteWithStateAndErrorCode()
     {
         ControlPlaneClient client;

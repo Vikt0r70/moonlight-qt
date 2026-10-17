@@ -355,7 +355,8 @@ PairingTarget pairingTarget()
     PairingTarget target;
     target.sessionId = QString::fromLatin1(kSessionId);
     target.hostAddress = QStringLiteral("203.0.113.7");
-    target.httpsPort = 47984;
+    target.httpsPort = 19995;
+    target.controlPort = 20000;
     target.pairingPin = QString::fromLatin1(kPin);
     return target;
 }
@@ -1164,6 +1165,13 @@ private slots:
         seam.pair(noPin, recordInto(&pinReport));
         QCOMPARE(pinReport.count(), 1);
         QCOMPARE(pinReport.outcomes.first(), false);
+
+        PairingTarget noControlPort = pairingTarget();
+        noControlPort.controlPort = 0;
+        SeamReport portReport;
+        seam.pair(noControlPort, recordInto(&portReport));
+        QCOMPARE(portReport.count(), 1);
+        QCOMPARE(portReport.outcomes.first(), false);
 
         QCOMPARE(handshakes, 0);
     }

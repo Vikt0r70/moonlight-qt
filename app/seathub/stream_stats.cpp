@@ -93,13 +93,12 @@ const QRegularExpression& networkLatencyPattern()
     return re;
 }
 
-// D-10 (Plan 16): "Host processing latency min/max/average: %.1f/%.1f/%.1f ms" (`ffmpeg.cpp:811-
-// 819`, gated on `stats.framesWithHostProcessingLatency > 0`) - only the third (average) figure
-// is captured; min/max have no OSD row of their own.
-const QRegularExpression& hostProcessingAvgPattern()
+// D-10 (Plan 16), ADR-0101 (T024/T025): "Host processing latency min/max/average: %.1f/%.1f/%.1f ms"
+// (`ffmpeg.cpp:811-819`, gated on `stats.framesWithHostProcessingLatency > 0`). Captures min, max, avg.
+const QRegularExpression& hostProcessingLatencyPattern()
 {
     static const QRegularExpression re(
-        QStringLiteral("^Host processing latency min/max/average: \\d+(?:\\.\\d+)?/\\d+(?:\\.\\d+)?/"
+        QStringLiteral("^Host processing latency min/max/average: (\\d+(?:\\.\\d+)?)/(\\d+(?:\\.\\d+)?)/"
                        "(\\d+(?:\\.\\d+)?) ms$"),
         QRegularExpression::MultilineOption);
     return re;
@@ -196,9 +195,11 @@ bool parseVideoStatsBlock(const QString& block, VideoStats* out)
         // stay absent, matched but not filled.
     }
 
-    m = hostProcessingAvgPattern().match(block);
+    m = hostProcessingLatencyPattern().match(block);
     if (m.hasMatch()) {
-        out->hostProcessingAvgMs = OptionalMetric::of(m.captured(1).toDouble());
+        out->hostProcessingMinMs = OptionalMetric::of(m.captured(1).toDouble());
+        out->hostProcessingMaxMs = OptionalMetric::of(m.captured(2).toDouble());
+        out->hostProcessingAvgMs = OptionalMetric::of(m.captured(3).toDouble());
         matchedAnyLine = true;
     }
 
@@ -229,11 +230,19 @@ QJsonObject toQualityReport(const VideoStats& stats)
     object.insert(QStringLiteral("rendered_fps"), metricValue(stats.renderedFps));
     object.insert(QStringLiteral("network_dropped_frame_pct"), metricValue(stats.networkDroppedFramePct));
     object.insert(QStringLiteral("jitter_dropped_frame_pct"), metricValue(stats.jitterDroppedFramePct));
-    object.insert(QStringLiteral("rtt_ms"), metricValue(stats.rttMs));
+    // ADR-0101 / T024: rtt_ms is integer, rounded half-up
+    object.insert(QStringLiteral("rtt_ms"), stats.rttMs.present
+                                                ? QJsonValue(static_cast<qint64>(qRound(stats.rttMs.value)))
+                                                : QJsonValue(QJsonValue::Null));
     object.insert(QStringLiteral("rtt_variance_ms"), metricValue(stats.rttVarianceMs));
     object.insert(QStringLiteral("decode_time_ms"), metricValue(stats.decodeTimeMs));
     object.insert(QStringLiteral("queue_time_ms"), metricValue(stats.queueTimeMs));
     object.insert(QStringLiteral("render_time_ms"), metricValue(stats.renderTimeMs));
+    object.insert(QStringLiteral("received_fps"), metricValue(stats.receivedFps));
+    object.insert(QStringLiteral("decoded_fps"), metricValue(stats.decodedFps));
+    object.insert(QStringLiteral("host_latency_min_ms"), metricValue(stats.hostProcessingMinMs));
+    object.insert(QStringLiteral("host_latency_max_ms"), metricValue(stats.hostProcessingMaxMs));
+    object.insert(QStringLiteral("host_latency_avg_ms"), metricValue(stats.hostProcessingAvgMs));
     return object;
 }
 
@@ -388,6 +397,8 @@ VideoStats VideoStatsAggregator::aggregate() const
     // the matching printed rate x this segment's duration instead - see
     // `frameWeightedAverage()`'s own comment.
     out.renderedFps = weightedAverage(m_segments, &VideoStats::renderedFps);
+    out.receivedFps = weightedAverage(m_segments, &VideoStats::receivedFps);
+    out.decodedFps = weightedAverage(m_segments, &VideoStats::decodedFps);
     out.networkDroppedFramePct =
         frameWeightedAverage(m_segments, &VideoStats::networkDroppedFramePct, &VideoStats::receivedFps);
     out.jitterDroppedFramePct =
@@ -398,6 +409,34 @@ VideoStats VideoStatsAggregator::aggregate() const
         frameWeightedAverage(m_segments, &VideoStats::queueTimeMs, &VideoStats::renderedFps);
     out.renderTimeMs =
         frameWeightedAverage(m_segments, &VideoStats::renderTimeMs, &VideoStats::renderedFps);
+
+    // Host processing latency (min/max/avg) across segments
+    out.hostProcessingAvgMs =
+        frameWeightedAverage(m_segments, &VideoStats::hostProcessingAvgMs, &VideoStats::decodedFps);
+    bool hasHostMin = false;
+    bool hasHostMax = false;
+    double minHost = 0.0;
+    double maxHost = 0.0;
+    for (const Segment& segment : m_segments) {
+        if (segment.stats.hostProcessingMinMs.present) {
+            if (!hasHostMin || segment.stats.hostProcessingMinMs.value < minHost) {
+                minHost = segment.stats.hostProcessingMinMs.value;
+                hasHostMin = true;
+            }
+        }
+        if (segment.stats.hostProcessingMaxMs.present) {
+            if (!hasHostMax || segment.stats.hostProcessingMaxMs.value > maxHost) {
+                maxHost = segment.stats.hostProcessingMaxMs.value;
+                hasHostMax = true;
+            }
+        }
+    }
+    if (hasHostMin) {
+        out.hostProcessingMinMs = OptionalMetric::of(minHost);
+    }
+    if (hasHostMax) {
+        out.hostProcessingMaxMs = OptionalMetric::of(maxHost);
+    }
 
     // rtt_ms / rtt_variance_ms: a point sample, not a real average (see `aggregate()`'s own
     // header comment) - taken from the longest segment that actually held one, not combined. A

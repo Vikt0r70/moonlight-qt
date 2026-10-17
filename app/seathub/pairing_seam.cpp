@@ -96,7 +96,7 @@ public:
         // run could cancel the very session that superseded it. The atomic is read and written
         // without touching `this`, which the worker outlives.
         if (!result.ok && m_generation == m_currentGeneration->load()) {
-            m_cancelRequest(m_target.hostAddress, kPairingControlPort);
+            m_cancelRequest(m_target.hostAddress, m_target.controlPort);
             if (result.pairingConflict && m_generation == m_currentGeneration->load()) {
                 result = m_handshake(m_target);
                 // A second try of the same step in this Play is attempt 2 (ADR-0072 item 2).
@@ -240,7 +240,7 @@ void ProductionPairingSeam::setCancelRequest(PairingCancelRequest cancel)
 void ProductionPairingSeam::pair(const PairingTarget& target,
                                  std::function<void(bool, const QString&, const QString&)> done)
 {
-    if (target.hostAddress.isEmpty() || target.pairingPin.isEmpty()) {
+    if (target.hostAddress.isEmpty() || target.pairingPin.isEmpty() || target.controlPort <= 0) {
         // Nothing to pair against, or nothing to pair with. The controller already refuses an
         // empty PIN before it calls this seam, so this is a boundary check on a public entry
         // point, not a second copy of that rule.
@@ -312,7 +312,7 @@ void ProductionPairingSeam::clearPendingPairing(const PairingTarget& target)
     // PF15-b: the clear belongs to the attempt that asked for it, named by the generation read
     // here. It runs later on a pool thread, and by then a newer `pair()` may have started its own
     // handshake against the same rig: the rig's pending-pairing session is one shared slot
-    // (`kPairingControlPort`, one uniqueid), so a clear aimed by the older attempt would cancel the
+    // (`target.controlPort`, one uniqueid), so a clear aimed by the older attempt would cancel the
     // newer one's pairing. The same atomic the handshake worker's recovery loop reads gates it: a
     // clear whose generation is no longer current is dropped without touching the rig.
     const quint64 generation = m_generation;
@@ -324,7 +324,7 @@ void ProductionPairingSeam::clearPendingPairing(const PairingTarget& target)
                     << "dropping a pairing clear that belongs to a superseded attempt";
                 return;
             }
-            cancelRequest(target.hostAddress, kPairingControlPort);
+            cancelRequest(target.hostAddress, target.controlPort);
         });
 }
 

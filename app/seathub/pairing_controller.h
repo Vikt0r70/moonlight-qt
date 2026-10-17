@@ -23,6 +23,7 @@ struct PairingTarget {
     QString sessionId;
     QString hostAddress;
     int httpsPort = 0;
+    int controlPort = 0;
     /// Dies at the end of the launch. Never persisted (D-30, D-37).
     QString pairingPin;
     /// ADR-0074 W03 / L07: the authorization's own `warm_return` indication for this session (true

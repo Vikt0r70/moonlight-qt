@@ -142,6 +142,8 @@ struct SessionAuthorization
     int httpsPort = 0;
     int controlPort = 0;
     int rtspPort = 0;
+    QList<int> tcpPorts;
+    QList<int> udpPorts;
     /// `1080p60` | `1080p75` | `1080p120` (ADR-0011, matched by equality), or empty/absent.
     /// Parsed for completeness only - nothing reads this field (A-68, D-06 reversal: the
     /// customer's saved Settings are the only decider of stream quality now).
@@ -158,6 +160,11 @@ struct SessionAuthorization
     /// Advisory only - the rig's own certificate check is what admits the stream, a PIN is still
     /// issued, and a warm attempt that fails falls back to the PIN handshake (L07).
     bool warmReturn = false;
+
+    bool isReady() const
+    {
+        return controlPort > 0 && httpsPort > 0 && rtspPort > 0;
+    }
 
     static bool parse(const QJsonObject& body, SessionAuthorization* out);
 };

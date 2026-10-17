@@ -3865,6 +3865,12 @@ void SeatHubClient::handleVideoStatsParsed(VideoStats stats)
     m_pendingQualitySessionId = m_sessionId;
     m_pendingQualityReport = toQualityReport(m_statsAggregator.aggregate());
     m_hasPendingQualityReport = true;
+
+    // SC19 / ADR-0101 (T025): write-ahead quality outbox.
+    // Store ahead to disk as soon as stats are parsed so that an unexpected process termination
+    // or ungraceful exit preserves the parsed quality metrics for recovery and drain.
+    m_qualityOutbox.setDirectory(qualityOutboxDirectory());
+    m_qualityOutbox.put(m_pendingQualitySessionId, m_accountId, m_pendingQualityReport);
 }
 
 void SeatHubClient::postOrStoreQualityReport(const QString& onlyForSession)
@@ -3902,10 +3908,14 @@ void SeatHubClient::postOrStoreQualityReport(const QString& onlyForSession)
             onClientThread(this, [this, sessionId, report, accountId, epochAtPost, result]() {
                 switch (QualityOutbox::classify(result)) {
                 case QualityOutbox::Outcome::Delivered:
+                    m_qualityOutbox.setDirectory(qualityOutboxDirectory());
+                    m_qualityOutbox.remove(sessionId);
                     break;
                 case QualityOutbox::Outcome::Refused:
                     qCWarning(seathubClient) << "quality report for" << sessionId
                                               << "refused" << result.statusCode;
+                    m_qualityOutbox.setDirectory(qualityOutboxDirectory());
+                    m_qualityOutbox.remove(sessionId);
                     break;
                 case QualityOutbox::Outcome::AuthFailed:
                 case QualityOutbox::Outcome::Retryable:

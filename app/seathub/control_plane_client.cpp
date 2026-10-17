@@ -160,6 +160,14 @@ bool SessionAuthorization::parse(const QJsonObject& body, SessionAuthorization* 
     auth.httpsPort = ports.value(QStringLiteral("https")).toInt();
     auth.controlPort = ports.value(QStringLiteral("control")).toInt();
     auth.rtspPort = ports.value(QStringLiteral("rtsp")).toInt();
+    const QJsonArray tcp = ports.value(QStringLiteral("tcp")).toArray();
+    for (const QJsonValue& v : tcp) {
+        auth.tcpPorts.append(v.toInt());
+    }
+    const QJsonArray udp = ports.value(QStringLiteral("udp")).toArray();
+    for (const QJsonValue& v : udp) {
+        auth.udpPorts.append(v.toInt());
+    }
 
     // `quality_profile` is `type: [string, "null"]` and optional (contract 3.3.0, ADR-0064).
     // `toString()` already answers empty for both null and absent - parsed for completeness only,
