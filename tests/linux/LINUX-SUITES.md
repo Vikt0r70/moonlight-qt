@@ -7,7 +7,7 @@ what happened, not what was expected.
 
 LINUX-QT-CORE-SUITES: buildable
 LINUX-QT-VERSION: 6.4.2
-LINUX-SUITES: tst_attempt_vocab tst_update_retry
+LINUX-SUITES: tst_attempt_vocab tst_update_retry tst_pairing_retry tst_port_test_result tst_evidence_journal
 LINUX-DATE: 2026-10-17
 LINUX-OS: Ubuntu 24.04.5 LTS (qt6-base-dev 6.4.2+dfsg-21.1build5)
 
