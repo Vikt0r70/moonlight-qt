@@ -1255,6 +1255,14 @@ void ControlPlaneClient::postSessionQuality(const QString& sessionId, const QJso
          body, true, callback);
 }
 
+void ControlPlaneClient::postEvidence(const QString& sessionId, const QByteArray& body,
+                                      Callback callback)
+{
+    send(QStringLiteral("POST"), QStringLiteral("/api/sessions/") + encodedPathSegment(sessionId)
+             + QStringLiteral("/evidence"),
+         body, true, callback);
+}
+
 void ControlPlaneClient::postStreamTime(const QString& sessionId, int segmentNo, qint64 deliveredMs,
                                         bool closed, Callback callback)
 {

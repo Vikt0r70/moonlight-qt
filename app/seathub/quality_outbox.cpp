@@ -36,6 +36,23 @@ bool isUuidShaped(const QString& value)
     return pattern.match(value).hasMatch();
 }
 
+// The closed answer vocabulary of `EvidenceJournal::outbox`. Local rather than shared with
+// `EndOutbox::answerToken` so this file keeps linking on its own (tst_stream_stats builds it alone).
+QString answerToken(const ControlPlaneResult& result)
+{
+    const int status = result.statusCode;
+    if (status >= 200 && status < 300) {
+        return QStringLiteral("2xx");
+    }
+    if (status >= 500 && status < 600) {
+        return QStringLiteral("5xx");
+    }
+    if (status == 400 || status == 401 || status == 403 || status == 404 || status == 422) {
+        return QString::number(status);
+    }
+    return status <= 0 ? QStringLiteral("transport") : QStringLiteral("none");
+}
+
 } // namespace
 
 QString QualityOutbox::defaultDirectory()
@@ -90,6 +107,24 @@ QualityOutbox::Outcome QualityOutbox::classify(const ControlPlaneResult& result)
     }
 }
 
+void QualityOutbox::setObserver(Observer observer)
+{
+    m_observer = std::move(observer);
+}
+
+void QualityOutbox::noteEvent(const QString& event, const QString& sessionId, const QString& answer,
+                              int count) const
+{
+    // Closed tokens and a count only - never a path, a token or a report body.
+    qCInfo(seathubQualityOutbox).noquote()
+        << QStringLiteral("quality_outbox event=%1 answer=%2 session=%3 count=%4")
+               .arg(event, answer, sessionId.isEmpty() ? QStringLiteral("none") : sessionId)
+               .arg(count);
+    if (m_observer) {
+        m_observer(event, answer, count);
+    }
+}
+
 void QualityOutbox::put(const QString& sessionId, const QString& accountId, const QJsonObject& report)
 {
     if (sessionId.isEmpty() || !isUuidShaped(sessionId)) {
@@ -110,7 +145,10 @@ void QualityOutbox::put(const QString& sessionId, const QString& accountId, cons
     QSaveFile file(pathFor(sessionId));
     if (!file.open(QIODevice::WriteOnly) || file.write(bytes) != bytes.size() || !file.commit()) {
         qCWarning(seathubQualityOutbox) << "could not write the quality outbox for" << sessionId;
+        noteEvent(QStringLiteral("dropped"), sessionId, QStringLiteral("none"), 1);
+        return;
     }
+    noteEvent(QStringLiteral("put"), sessionId, QStringLiteral("none"), 1);
 }
 
 void QualityOutbox::remove(const QString& sessionId)
@@ -153,6 +191,7 @@ void QualityOutbox::drain(const QString& tokenGeneration, const QString& account
 
     m_draining = true;
     const quint64 generation = ++m_drainGeneration;
+    noteEvent(QStringLiteral("drain"), QString(), QStringLiteral("none"), static_cast<int>(files.size()));
     drainFiles(files, 0, tokenGeneration, accountId, postFn, generation);
 }
 
@@ -181,6 +220,7 @@ void QualityOutbox::drainFiles(const QStringList& files, int index, const QStrin
     if (!file.open(QIODevice::ReadOnly)) {
         // Could not even read it (removed from under us, or a permissions error): leave it and
         // move on - nothing was sent, and nothing was lost.
+        noteEvent(QStringLiteral("unreadable"), sessionId, QStringLiteral("none"), 1);
         drainFiles(files, index + 1, tokenGeneration, accountId, postFn, generation);
         return;
     }
@@ -191,6 +231,7 @@ void QualityOutbox::drainFiles(const QStringList& files, int index, const QStrin
     const QJsonDocument doc = QJsonDocument::fromJson(bytes, &parseError);
     if (parseError.error != QJsonParseError::NoError || !doc.isObject()) {
         // Not a report this outbox wrote - never trusted, never sent.
+        noteEvent(QStringLiteral("unreadable"), sessionId, QStringLiteral("none"), 1);
         QFile::remove(path);
         drainFiles(files, index + 1, tokenGeneration, accountId, postFn, generation);
         return;
@@ -202,6 +243,7 @@ void QualityOutbox::drainFiles(const QStringList& files, int index, const QStrin
     if (storedAccountId != accountId) {
         qCWarning(seathubQualityOutbox)
             << "quality report for" << sessionId << "belongs to another account; dropped";
+        noteEvent(QStringLiteral("dropped"), sessionId, QStringLiteral("none"), 1);
         QFile::remove(path);
         drainFiles(files, index + 1, tokenGeneration, accountId, postFn, generation);
         return;
@@ -211,6 +253,14 @@ void QualityOutbox::drainFiles(const QStringList& files, int index, const QStrin
            [this, files, index, tokenGeneration, accountId, postFn, path, sessionId,
             generation](const ControlPlaneResult& result) {
                const Outcome outcome = classify(result);
+               {
+                   const QString token = answerToken(result);
+                   const bool dropped = outcome == Outcome::Refused;
+                   const QString event = outcome == Outcome::Delivered
+                       ? QStringLiteral("delivered")
+                       : (dropped ? QStringLiteral("dropped") : QStringLiteral("kept"));
+                   noteEvent(event, sessionId, token, 1);
+               }
                // File-side effects reflect real server truth (or a real local decision, like an
                // aborted send) whatever `drain()` call asked for them, so they always run -
                // CR-03's generation check below gates only this call's own loop continuation and

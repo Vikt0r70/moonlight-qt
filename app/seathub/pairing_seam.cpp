@@ -287,6 +287,11 @@ void ProductionPairingSeam::setCancelRequest(PairingCancelRequest cancel)
     m_cancelRequest = std::move(cancel);
 }
 
+void ProductionPairingSeam::setAttemptSink(AttemptSink sink)
+{
+    m_attemptSink = std::move(sink);
+}
+
 void ProductionPairingSeam::pair(const PairingTarget& target,
                                  std::function<void(bool, const QString&, const QString&)> done)
 {
@@ -431,6 +436,9 @@ void ProductionPairingSeam::finish(quint64 generation, const PairingHandshakeRes
                   .arg(result.pinShapeOk ? QStringLiteral("true") : QStringLiteral("false"))
                   .arg(result.handshakeMs);
     qCInfo(seathubPairingSeam).noquote() << record;
+    if (m_attemptSink) {
+        m_attemptSink(result);
+    }
 
     std::function<void(bool, const QString&, const QString&)> done = std::move(m_done);
     m_done = nullptr;

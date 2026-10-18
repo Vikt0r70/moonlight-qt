@@ -468,13 +468,42 @@ SeatHubClient::SeatHubClient(QObject* parent)
         if (QNetworkInformation* info = QNetworkInformation::instance()) {
             connect(info, &QNetworkInformation::reachabilityChanged, this,
                     [this](QNetworkInformation::Reachability reachability) {
+                        ++m_networkTransitions;
+                        noteNetworkChange();
                         if (reachability == QNetworkInformation::Reachability::Online
                                 || reachability == QNetworkInformation::Reachability::Site) {
                             onNetworkBack();
                         }
                     });
+            // ADR-0105: the rest of the timeline - medium, captive portal, metered. Each is a
+            // change record only; none gates anything. A feature the backend does not support
+            // reads as `unknown` / false.
+            connect(info, &QNetworkInformation::transportMediumChanged, this,
+                    [this](QNetworkInformation::TransportMedium) {
+                        ++m_networkTransitions;
+                        noteNetworkChange();
+                    });
+            connect(info, &QNetworkInformation::isBehindCaptivePortalChanged, this, [this](bool) {
+                ++m_networkTransitions;
+                noteNetworkChange();
+            });
+            connect(info, &QNetworkInformation::isMeteredChanged, this, [this](bool) {
+                ++m_networkTransitions;
+                noteNetworkChange();
+            });
         }
     }
+
+    // ADR-0105: the per-Play evidence capsule and the outbox events it records. The observers
+    // record only closed event/answer tokens; a capsule is open only while a Play runs.
+    m_journal.setDirectory(EvidenceJournal::defaultDirectory());
+    m_endOutbox.setObserver([this](const QString& event, const QString& answer, int count) {
+        recordEvidence(EvidenceJournal::outbox(QStringLiteral("end_outbox"), event, answer, count));
+    });
+    m_qualityOutbox.setObserver([this](const QString& event, const QString& answer, int count) {
+        recordEvidence(
+            EvidenceJournal::outbox(QStringLiteral("quality_outbox"), event, answer, count));
+    });
 
     // 06.4/ADR-0067, D-04/D-06: the paused-fallback read (L5). Repeating, parented to `this` for
     // the same reason `m_retryTickTimer` is.
@@ -511,6 +540,18 @@ SeatHubClient::SeatHubClient(QObject* parent)
             QMetaObject::invokeMethod(sampler, [sampler, status]() {
                 sampler->noteConnectionStatus(status);
             }, Qt::QueuedConnection);
+        }
+    });
+    // ADR-0105: a stall is a run of full 60 s windows with no samples and no drops. The sampler is
+    // the CONTEXT object, so both slots run on the network thread it is moved to - the main
+    // thread is inside the SDL loop during a stream and would not run them until the stream ended.
+    // Consecutive empty windows coalesce into one pending stall that the first non-empty roll-up
+    // (or the Play's end, in `finishPlay()`) records.
+    connect(m_sampler, &StreamQualitySampler::emptyWindowEmitted, m_sampler,
+            [this](qint64 windowMs) { noteEmptyWindow(windowMs); });
+    connect(m_sampler, &StreamQualitySampler::rollupEmitted, m_sampler, [this]() {
+        if (flushPendingStall()) {
+            deliverEvidence();
         }
     });
 
@@ -659,6 +700,35 @@ SeatHubClient::SeatHubClient(QObject* parent)
             [this](const PairingHandshakeResult& result) {
                 m_pairingClassification = result;
             });
+
+    // ADR-0105: the same result, as a closed-value evidence entry. It is called once per reported
+    // result on the seam's thread, read-only: retry, guards and callbacks are untouched. A retried
+    // attempt that recovered is a success, whose class is empty (the first failure's class is in
+    // `firstStepClass`, recorded as its own entry).
+    m_pairingSeam->setAttemptSink([this](const PairingHandshakeResult& result) {
+        const bool success = result.ok && !result.clientIdentity.isEmpty();
+        if (result.retried && !result.firstStepClass.isEmpty() && !result.firstAttemptStep.isEmpty()) {
+            const QJsonObject first = EvidenceJournal::pairingAttempt(
+                1, false, result.firstAttemptStep, result.firstStepClass, true, result.retryReason,
+                result.pinShapeOk, 0);
+            if (!first.isEmpty()) {
+                recordEvidence(first);
+            }
+        }
+        recordEvidence(EvidenceJournal::pairingAttempt(
+            result.attempts, success, result.attemptStep, success ? QString() : result.stepClass,
+            result.retried, result.retryReason, result.pinShapeOk, result.handshakeMs));
+        if (!success) {
+            deliverEvidence();
+        }
+    });
+
+    // ADR-0105: the server's clock at `stream.hello`, kept with the local time it arrived at; the
+    // skew bucket is recorded once per Play at `openEvidenceJournal()`. Evidence only.
+    connect(m_sse, &SseClient::serverTime, this, [this](const QDateTime& serverUtc) {
+        m_helloServerUtc = serverUtc;
+        m_helloLocalUtc = QDateTime::currentDateTimeUtc();
+    });
 
     connect(m_teardown, &TeardownController::teardownCompleted,
             this, &SeatHubClient::handleTeardownCompleted);
@@ -882,6 +952,9 @@ void SeatHubClient::beginSession(const QString& sessionId)
         m_controlPlane->setTraceId(m_samplerPlayId);
         SeatHubTelemetry::setTrace(m_samplerPlayId);
     }
+    // ADR-0105: the Play's evidence capsule opens now that the session id exists; it closes in
+    // `finishPlay()`. When the account is not yet known the open is retried from `setAccountId()`.
+    openEvidenceJournal(sessionId);
     m_playConfiguration = {
         {"cfg_res", QStringLiteral("%1x%2").arg(m_settings->getValue(QStringLiteral("width")).toInt())
                                             .arg(m_settings->getValue(QStringLiteral("height")).toInt())},
@@ -1194,6 +1267,9 @@ void SeatHubClient::onNetworkBack()
         m_endOutboxBackoffMs = kEndOutboxInitialBackoffMs;
         drainEndOutbox();
     }
+    // ADR-0105: a returned network also sends any waiting evidence capsule and quality report.
+    deliverEvidence();
+    drainQualityOutbox();
 }
 
 void SeatHubClient::retryNow()
@@ -1213,6 +1289,7 @@ void SeatHubClient::retryNow()
         m_endOutboxBackoffMs = kEndOutboxInitialBackoffMs;
         drainEndOutbox();
     }
+    deliverEvidence();
 }
 
 void SeatHubClient::handleTeardownEndAnswered(const QString& sessionId, int statusCode)
@@ -1298,6 +1375,12 @@ void SeatHubClient::scheduleEndOutboxRetry()
 
 void SeatHubClient::drainEndOutbox()
 {
+    // ADR-0105: every End-outbox trigger (launch, sign-in, before the next Play, the paced retry
+    // timer) also sends waiting evidence capsules; it has its own one-at-a-time guard and never
+    // waits on the End drain below. The quality outbox rides the same triggers (network return,
+    // retry timer, before the next Play); its own guards keep a second drain from doubling a send.
+    deliverEvidence();
+    drainQualityOutbox();
     // One drain at a time: launch, sign-in, network-back, before-Play and the retry timer can all
     // ask at once, and a second concurrent drain would post every record twice.
     if (m_endOutboxInFlight) {
@@ -1334,6 +1417,8 @@ void SeatHubClient::drainEndOutbox()
     updateHomeStatusForEndOutbox();
     m_endOutboxInFlight = true;
     m_endOutboxPending = entries.size();
+    m_endOutbox.noteEvent(QStringLiteral("drain"), QString(), QStringLiteral("none"),
+                          int(entries.size()));
     for (const EndOutbox::Entry& entry : entries) {
         const QString sessionId = entry.sessionId;
         m_controlPlane->endSession(sessionId, entry.failed, entry.report,
@@ -1342,10 +1427,17 @@ void SeatHubClient::drainEndOutbox()
                 if (m_endOutboxPending > 0 && --m_endOutboxPending == 0) {
                     m_endOutboxInFlight = false;
                 }
+                const QString answer = EndOutbox::answerToken(result);
                 switch (EndOutbox::classify(result)) {
                 case EndOutbox::Delivered:
+                    m_endOutbox.noteEvent(QStringLiteral("delivered"), sessionId, answer, 1);
+                    // 2xx confirms - the record is dropped.
+                    m_endOutbox.remove(sessionId);
+                    clearUnconfirmedEnd(sessionId);
+                    break;
                 case EndOutbox::Refused:
-                    // 2xx confirms; 404 means the session is already gone - both drop the record.
+                    // 404 means the session is already gone - the record is dropped.
+                    m_endOutbox.noteEvent(QStringLiteral("dropped"), sessionId, answer, 1);
                     m_endOutbox.remove(sessionId);
                     clearUnconfirmedEnd(sessionId);
                     break;
@@ -1353,6 +1445,7 @@ void SeatHubClient::drainEndOutbox()
                 case EndOutbox::Retryable:
                 case EndOutbox::Aborted:
                     // Any other answer (0/5xx/401) keeps the record and re-sends later.
+                    m_endOutbox.noteEvent(QStringLiteral("kept"), sessionId, answer, 1);
                     scheduleEndOutboxRetry();
                     break;
                 }
@@ -1371,6 +1464,192 @@ void SeatHubClient::drainEndOutbox()
 void SeatHubClient::setEndOutboxDirectory(const QString& directory)
 {
     m_endOutbox.setDirectory(directory);
+}
+
+void SeatHubClient::setEvidenceJournalDirectory(const QString& directory)
+{
+    m_journal.setDirectory(directory);
+}
+
+void SeatHubClient::setSamplerWindowMsForTests(int windowMs)
+{
+    if (m_sampler->thread() == QThread::currentThread()) {
+        m_sampler->setWindowMs(windowMs);
+        return;
+    }
+    QMetaObject::invokeMethod(m_sampler, [this, windowMs]() { m_sampler->setWindowMs(windowMs); },
+                              Qt::BlockingQueuedConnection);
+}
+
+void SeatHubClient::openEvidenceJournal(const QString& sessionId)
+{
+    {
+        std::lock_guard<std::mutex> lock(m_evidenceMutex);
+        m_evidenceAccountId = m_accountId;
+    }
+    // A new generation first, so a stall left over from an earlier Play is never matched to this
+    // capsule.
+    m_journalOpen.store(false);
+    m_journalGeneration.fetch_add(1);
+    if (!m_journal.open(sessionId, m_accountId)) {
+        return;
+    }
+    m_journalOpen.store(true);
+    // One clock-skew bucket per Play, from the last `stream.hello`: evidence only, nothing reads it.
+    recordEvidence(EvidenceJournal::clockSkew(m_helloServerUtc, m_helloLocalUtc));
+}
+
+void SeatHubClient::closeEvidenceJournal()
+{
+    m_journalOpen.store(false);
+    m_journal.close();
+}
+
+void SeatHubClient::recordEvidence(const QJsonObject& entry)
+{
+    // A no-op while no Play is open: nothing is written while the app is idle.
+    m_journal.record(entry);
+}
+
+void SeatHubClient::deliverEvidence()
+{
+    QString accountId;
+    {
+        std::lock_guard<std::mutex> lock(m_evidenceMutex);
+        if (QThread::currentThread() == thread() && !m_accountId.isEmpty()) {
+            m_evidenceAccountId = m_accountId;
+        }
+        if (m_evidenceAccountId.isEmpty() || m_evidencePending > 0) {
+            return;
+        }
+        accountId = m_evidenceAccountId;
+    }
+    const QList<EvidenceJournal::PendingCapsule> capsules = m_journal.deliverable(accountId);
+    if (capsules.isEmpty()) {
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(m_evidenceMutex);
+        m_evidencePending += capsules.size();
+        m_evidenceProgress = false;
+    }
+    for (const EvidenceJournal::PendingCapsule& capsule : capsules) {
+        m_controlPlane->postEvidence(capsule.sessionId, capsule.body,
+                                     [this, sessionId = capsule.sessionId, runId = capsule.runId](
+                                         const ControlPlaneResult& result) {
+            // The journal is mutex-guarded, so the answer is applied on whichever thread it lands.
+            const int status = result.statusCode > 0 ? result.statusCode : -1;
+            m_journal.applyAnswer(sessionId, runId, status);
+            bool again = false;
+            {
+                std::lock_guard<std::mutex> lock(m_evidenceMutex);
+                if (m_evidencePending > 0) {
+                    --m_evidencePending;
+                }
+                if (status >= 200 && status < 300) {
+                    m_evidenceProgress = true;
+                }
+                again = m_evidencePending == 0 && m_evidenceProgress;
+            }
+            // 401/403 wait for the next sign-in; a transport or 5xx failure re-sends on the
+            // End outbox's own paced timer. That timer lives on the main thread.
+            if (status == -1 || status >= 500) {
+                QMetaObject::invokeMethod(this, [this]() { scheduleEndOutboxRetry(); },
+                                          Qt::QueuedConnection);
+            }
+            if (again) {
+                // Entries recorded while this batch was in flight go out now.
+                deliverEvidence();
+            }
+        });
+    }
+}
+
+void SeatHubClient::noteEmptyWindow(qint64 windowMs)
+{
+    if (!m_journalOpen.load()) {
+        return;
+    }
+    const quint64 generation = m_journalGeneration.load();
+    if (m_stallWindows > 0 && m_stallGeneration != generation) {
+        // Left over from an earlier Play: dropped, never attached to this one.
+        m_stallWindows = 0;
+        m_stallDurationMs = 0;
+    }
+    m_stallGeneration = generation;
+    ++m_stallWindows;
+    m_stallDurationMs += windowMs;
+}
+
+bool SeatHubClient::flushPendingStall()
+{
+    if (m_stallWindows <= 0) {
+        return false;
+    }
+    const int windows = m_stallWindows;
+    const qint64 durationMs = m_stallDurationMs;
+    const quint64 generation = m_stallGeneration;
+    m_stallWindows = 0;
+    m_stallDurationMs = 0;
+    if (!m_journalOpen.load() || generation != m_journalGeneration.load()) {
+        return false;
+    }
+    m_journal.record(EvidenceJournal::stallWindow(windows, durationMs));
+    return true;
+}
+
+void SeatHubClient::noteNetworkChange()
+{
+    QString medium = QStringLiteral("unknown");
+    QString reachability = QStringLiteral("unknown");
+    bool captivePortal = false;
+    bool metered = false;
+    if (QNetworkInformation* info = QNetworkInformation::instance()) {
+        if (info->supports(QNetworkInformation::Feature::TransportMedium)) {
+            switch (info->transportMedium()) {
+            case QNetworkInformation::TransportMedium::Ethernet:
+                medium = QStringLiteral("ethernet");
+                break;
+            case QNetworkInformation::TransportMedium::WiFi:
+                medium = QStringLiteral("wifi");
+                break;
+            case QNetworkInformation::TransportMedium::Cellular:
+                medium = QStringLiteral("cellular");
+                break;
+            case QNetworkInformation::TransportMedium::Bluetooth:
+                medium = QStringLiteral("bluetooth");
+                break;
+            case QNetworkInformation::TransportMedium::Unknown:
+                break;
+            }
+        }
+        if (info->supports(QNetworkInformation::Feature::Reachability)) {
+            switch (info->reachability()) {
+            case QNetworkInformation::Reachability::Online:
+                reachability = QStringLiteral("online");
+                break;
+            case QNetworkInformation::Reachability::Site:
+                reachability = QStringLiteral("site");
+                break;
+            case QNetworkInformation::Reachability::Local:
+                reachability = QStringLiteral("local");
+                break;
+            case QNetworkInformation::Reachability::Disconnected:
+                reachability = QStringLiteral("disconnected");
+                break;
+            case QNetworkInformation::Reachability::Unknown:
+                break;
+            }
+        }
+        if (info->supports(QNetworkInformation::Feature::CaptivePortal)) {
+            captivePortal = info->isBehindCaptivePortal();
+        }
+        if (info->supports(QNetworkInformation::Feature::Metered)) {
+            metered = info->isMetered();
+        }
+    }
+    recordEvidence(EvidenceJournal::networkChange(medium, reachability, captivePortal, metered,
+                                                  m_networkTransitions));
 }
 
 bool SeatHubClient::hasSavedEnd() const
@@ -2078,6 +2357,10 @@ bool SeatHubClient::adoptSignIn(const AuthTokenPair& pair, const QString& identi
                 // that the account is known - to their own session ids and this account only.
                 m_streamTime->setAccountId(m_accountId);
                 drainStreamTimeOutbox();
+                // ADR-0105: a Play that began before the account was known gets its capsule now.
+                if (m_playSummaryPending && !m_journalOpen.load() && !m_sessionId.isEmpty()) {
+                    openEvidenceJournal(m_sessionId);
+                }
                 // V-OUTBOX (L06): the same for an End an earlier run could not confirm.
                 drainEndOutbox();
             }
@@ -2479,6 +2762,10 @@ void SeatHubClient::setAccount(const AccountInfo& account)
     // replayed after the relaunch, to the same session and the same account only.
     m_streamTime->setAccountId(m_accountId);
     drainStreamTimeOutbox();
+    // ADR-0105: a Play that began before the account was known gets its capsule now.
+    if (m_playSummaryPending && !m_journalOpen.load() && !m_sessionId.isEmpty()) {
+        openEvidenceJournal(m_sessionId);
+    }
     // V-OUTBOX (L06): an End an earlier run could not confirm is re-sent now the account is known.
     drainEndOutbox();
 }
@@ -2710,6 +2997,18 @@ void SeatHubClient::handleStageFailed(const QString& stage, int errorCode, const
     // stops - the engine's own stage, its code and the ports it named, whether this failure is
     // pre-stream or (rarely) mid-stream.
     m_liveness->reportFailure(stage, errorCode, failingPorts, portTestObject);
+
+    // ADR-0105: the port-test result and the engine failure, as closed tokens plus the integer
+    // code, recorded for this Play and sent at once (a failure-class event).
+    const bool midStream = m_appState == QLatin1String(kStateStreaming);
+    const QJsonObject portTestEntry = EvidenceJournal::portTest(portTest);
+    if (!portTestEntry.isEmpty()) {
+        recordEvidence(portTestEntry);
+    }
+    recordEvidence(EvidenceJournal::engineFailure(
+        midStream ? QStringLiteral("stream") : QStringLiteral("engine_connect"),
+        midStream ? classForStreamError(errorCode) : classForEngineStageName(stage), errorCode));
+    deliverEvidence();
 
     if (m_appState == QLatin1String(kStateStreaming)) {
         m_lastFailedStep = QStringLiteral("stream");
@@ -3433,6 +3732,10 @@ void SeatHubClient::finishPlay(const QString& exitPath, const QString& outcome,
     if (firstFrame >= 0) attributes.insert("t_first_frame_ms", static_cast<double>(firstFrame));
     auto finishSampler = [this, &attributes]() {
         m_sampler->finish();
+        // ADR-0105: a stall still pending (the Play ended after empty windows only) lands in THIS
+        // Play's capsule, before it closes below. Runs on the sampler's own thread, where the
+        // pending stall lives.
+        flushPendingStall();
         if (m_streamStartMs < 0) return;
         attributes.insert("rollups", m_sampler->rollups());
         attributes.insert("bad_episodes", m_sampler->badEpisodes());
@@ -3441,6 +3744,13 @@ void SeatHubClient::finishPlay(const QString& exitPath, const QString& outcome,
     };
     if (m_sampler->thread() == QThread::currentThread()) finishSampler();
     else QMetaObject::invokeMethod(m_sampler, finishSampler, Qt::BlockingQueuedConnection);
+    // ADR-0105: the Play is over, so its capsule closes (after the sampler's step above, which
+    // may add the last stall) and is sent without waiting for anything. A quitting app leaves
+    // it on disk for the next launch.
+    closeEvidenceJournal();
+    if (exitPath != QLatin1String("app_quit")) {
+        deliverEvidence();
+    }
     if (m_streamStartMs >= 0) {
         attributes.insert("stream_s", (m_playElapsed.elapsed() - m_streamStartMs) / 1000.0);
         if (m_statsAggregator.hasSegments()) {

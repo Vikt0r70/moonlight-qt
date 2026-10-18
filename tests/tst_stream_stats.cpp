@@ -634,6 +634,55 @@ private slots:
         QCOMPARE(sampler.rollups(), 2);
     }
 
+    // ADR-0105: a full window with no samples and no drops is a stall the evidence journal
+    // records. The signal carries that window's length and is raised once per elapsed window.
+    void emptyFullWindowRaisesTheStallSignalOncePerWindow()
+    {
+        StreamQualitySampler sampler;
+        QList<qint64> empties;
+        int rollups = 0;
+        connect(&sampler, &StreamQualitySampler::emptyWindowEmitted, &sampler,
+                [&](qint64 ms) { empties.append(ms); });
+        connect(&sampler, &StreamQualitySampler::rollupEmitted, &sampler, [&]() { ++rollups; });
+        sampler.setWindowMs(30);
+        sampler.start(QStringLiteral("stall-empty"));
+        QTRY_VERIFY_WITH_TIMEOUT(empties.size() >= 3, 5000);
+        for (const qint64 ms : empties) QCOMPARE(ms, qint64(30));
+        QCOMPARE(rollups, 0);
+        QCOMPARE(sampler.rollups(), 0);
+        sampler.finish();
+    }
+
+    void aWindowWithASampleNeverRaisesTheStallSignal()
+    {
+        StreamQualitySampler sampler;
+        int empties = 0;
+        connect(&sampler, &StreamQualitySampler::emptyWindowEmitted, &sampler,
+                [&](qint64) { ++empties; });
+        sampler.setWindowMs(40);
+        sampler.start(QStringLiteral("stall-sample"));
+        VideoStats stats; stats.renderedFps = OptionalMetric::of(60);
+        sampler.feed(stats);
+        QTRY_COMPARE(sampler.rollups(), 1);
+        // The window that carried the sample is a rollup, never a stall.
+        QCOMPARE(empties, 0);
+        sampler.finish();
+    }
+
+    void finishOfAnEmptyPartialWindowRaisesNeitherSignal()
+    {
+        StreamQualitySampler sampler;
+        int empties = 0, rollups = 0;
+        connect(&sampler, &StreamQualitySampler::emptyWindowEmitted, &sampler,
+                [&](qint64) { ++empties; });
+        connect(&sampler, &StreamQualitySampler::rollupEmitted, &sampler, [&]() { ++rollups; });
+        sampler.start(QStringLiteral("stall-partial")); // default 60 s window never elapses here
+        sampler.finish();
+        QCOMPARE(empties, 0);
+        QCOMPARE(rollups, 0);
+        QCOMPARE(sampler.rollups(), 0);
+    }
+
     void rollupTimerRunsOnTheSamplerWorker()
     {
         QThread worker;

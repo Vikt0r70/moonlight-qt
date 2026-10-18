@@ -622,6 +622,13 @@ public:
     /// Plan 30 adds the outbox that keeps it.
     void postSessionQuality(const QString& sessionId, const QJsonObject& report, Callback callback);
 
+    /// `POST /api/sessions/{session_id}/evidence` (ADR-0105): one `EvidenceCapsule` per call.
+    /// `body` is the compact JSON the evidence journal built (`EvidenceJournal::deliverable`); this
+    /// client sends it as given. Authenticated with the customer token. The caller applies the
+    /// answer with `EvidenceJournal::applyAnswer`, which owns the keep and drop policy, so nothing
+    /// here retries.
+    void postEvidence(const QString& sessionId, const QByteArray& body, Callback callback);
+
     /// `POST /api/sessions/{session_id}/stream-time` (ADR-0074 W04, contract 3.11.0): one stream
     /// segment of the caller's own session per call, authenticated with the customer token and
     /// bound to `sessionId` by the server's ownership check (another customer's session answers

@@ -228,7 +228,13 @@ void StreamQualitySampler::tick()
 void StreamQualitySampler::emitWindow(bool partial)
 {
     auto attrs = takeWindow(partial);
-    if (attrs.value("n").toInt() == 0) return;
+    if (attrs.value("n").toInt() == 0) {
+        // ADR-0105: a FULL window that ended with no samples and no drops is a stall window. A
+        // partial window (finish) and a drops-only window are not; nothing is logged or counted
+        // here, the facade turns the signal into an evidence entry.
+        if (!partial && attrs.isEmpty()) emit emptyWindowEmitted(m_windowMs);
+        return;
+    }
 
     const auto now = nowMs();
     attrs.insert("elapsed_ms", now);

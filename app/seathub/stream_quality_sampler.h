@@ -37,6 +37,9 @@ public:
     double samplingGapS() const;
 signals:
     void rollupEmitted();
+    /// ADR-0105: a FULL window ended with no samples and no drops; `windowMs` is that window's
+    /// length. Not raised for a partial window (finish), a window with samples, or drops only.
+    void emptyWindowEmitted(qint64 windowMs);
 private:
     bool onOwnThread() const;
     void tick();

@@ -27,6 +27,8 @@
 #include <QWindow>
 
 #include <atomic>
+#include <QDateTime>
+#include <QSet>
 #include <functional>
 #include <limits>
 #include <memory>
@@ -41,6 +43,7 @@
 #include "liveness_timer.h"
 #include "engine_status.h"
 #include "end_outbox.h"
+#include "evidence_journal.h"
 #include "stream_quality_sampler.h"
 #include "log_tee.h"
 #include "moonlight_engine_session.h"
@@ -382,6 +385,13 @@ public:
     /// Test seam: point the durable End outbox at a temporary directory.
     void setEndOutboxDirectory(const QString& directory);
 
+    /// Test seam: point the per-Play evidence journal (ADR-0105) at a temporary directory.
+    void setEvidenceJournalDirectory(const QString& directory);
+
+    /// Test seam: the length of one quality-sampler window, so a test sees full empty windows in
+    /// milliseconds instead of minutes. Set before the stream starts.
+    void setSamplerWindowMsForTests(int windowMs);
+
     /// C-ENDING: is an End saved on disk for the signed-in account?
     bool hasSavedEnd() const;
 
@@ -669,6 +679,22 @@ private:
     void drainEndOutbox();
     /// V-OUTBOX (V42): 1 s doubling with jitter to a 10 s cap.
     void scheduleEndOutboxRetry();
+
+    /// ADR-0105: open the Play's evidence capsule (also records the clock-skew bucket), close it
+    /// at the Play's end, record one closed entry, and send what is waiting. None of them blocks
+    /// Play, a stream or teardown, and none shows anything to the customer.
+    void openEvidenceJournal(const QString& sessionId);
+    void closeEvidenceJournal();
+    void recordEvidence(const QJsonObject& entry);
+    /// Callable from the main thread or the network thread. At most one send per capsule at a time.
+    void deliverEvidence();
+    /// Network thread: a full 60 s window ended with no samples and no drops.
+    void noteEmptyWindow(qint64 windowMs);
+    /// Network thread: a non-empty roll-up follows; the pending stall (if any) is recorded now.
+    /// Returns true when an entry was recorded.
+    bool flushPendingStall();
+    /// Record the network timeline entry for the current QNetworkInformation state.
+    void noteNetworkChange();
     /// ADR-0066 decision 9 / V42: the jittered delay for `baseMs` (up to 20%).
     int jitteredReconnectDelay(int baseMs) const;
     double reconnectJitter() const;
@@ -1139,6 +1165,29 @@ private:
     std::function<double()> m_reconnectJitterProvider;
     /// V-OUTBOX (L06): the durable End outbox, and its own re-send pace (V42).
     EndOutbox m_endOutbox;
+    /// ADR-0105: the per-Play evidence capsule (mutex-guarded; written from the main thread and
+    /// the network thread). `m_journalGeneration` counts opens and `m_journalOpen` says whether one
+    /// is open now, so the network thread can tell a stall that belongs to another Play.
+    EvidenceJournal m_journal;
+    std::atomic<quint64> m_journalGeneration{0};
+    std::atomic<bool> m_journalOpen{false};
+    /// Network-thread-readable copy of the signed-in account, guarded by `m_evidenceMutex`, along
+    /// with how many sends are outstanding. No new batch is taken while any is in flight, because
+    /// `EvidenceJournal::deliverable()` marks what it hands out and an answer removes up to that mark.
+    std::mutex m_evidenceMutex;
+    QString m_evidenceAccountId;
+    int m_evidencePending = 0;
+    bool m_evidenceProgress = false;
+    /// Pending stall: consecutive empty windows of one Play coalesce here. Owned by the network
+    /// thread only (the sampler's context), including `flushPendingStall()` from `finishPlay`.
+    int m_stallWindows = 0;
+    qint64 m_stallDurationMs = 0;
+    quint64 m_stallGeneration = 0;
+    /// The last `stream.hello` server time and when it arrived locally (main thread).
+    QDateTime m_helloServerUtc;
+    QDateTime m_helloLocalUtc;
+    /// Network timeline (main thread): coalesced change count and the last reported state.
+    int m_networkTransitions = 0;
     QTimer* m_endOutboxTimer = nullptr;
     int m_endOutboxBackoffMs = 1000;
     /// V-COUNTDOWN: the published live countdown and its source. `m_liveSseRetrySeconds` is the value

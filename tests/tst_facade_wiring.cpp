@@ -50,6 +50,7 @@
 #include <QNetworkAccessManager>
 #include <QNetworkReply>
 #include <QNetworkRequest>
+#include <QRegularExpression>
 #include <QScopeGuard>
 #include <QScopedPointer>
 #include <QSignalSpy>
@@ -69,6 +70,7 @@
 #include "seathub/countries.h"
 #include "seathub/duration_text.h"
 #include "seathub/engine_session.h"
+#include "seathub/evidence_journal.h"
 #include "seathub/jordan_time.h"
 #include "seathub/moonlight_engine_session.h"
 #include "seathub/pairing_handshake.h"
@@ -396,6 +398,16 @@ public:
         m_qualityStatus = status;
         m_qualityBody = body;
     }
+    /// What `POST /api/sessions/{id}/evidence` (ADR-0105) answers. The default (never called) is 200
+    /// with the documented stored/duplicates/rejected counts.
+    void answerEvidence(int status,
+                        const QByteArray& body = QByteArrayLiteral(
+                            "{\"stored\":1,\"duplicates\":0,\"rejected\":0}"))
+    {
+        QMutexLocker lock(&m_mutex);
+        m_evidenceStatus = status;
+        m_evidenceBody = body;
+    }
     /// CR-03: every `/quality` reply arrives this many milliseconds after it was asked for, so a
     /// test can sign out (and a different account sign in) while an earlier account's send is
     /// still in flight.
@@ -521,10 +533,10 @@ protected:
         const QString cursor = QUrlQuery(request.url()).queryItemValue(
             QStringLiteral("cursor"), QUrl::FullyDecoded);
         int meStatus, walletStatus, logoutStatus, loginStatus, playStatus;
-        int pairingStatus, endStatus, qualityStatus, qualityDelay;
+        int pairingStatus, endStatus, qualityStatus, qualityDelay, evidenceStatus;
         bool pairingCustom;
         QByteArray meBody, walletBody, loginBody, playBody, pairingBody, sessionBody, endBody,
-            qualityBody;
+            qualityBody, evidenceBody;
         {
             QMutexLocker lock(&m_mutex);
             m_paths.append(path);
@@ -563,6 +575,8 @@ protected:
             qualityStatus = m_qualityStatus;
             qualityBody = m_qualityBody;
             qualityDelay = m_qualityDelay;
+            evidenceStatus = m_evidenceStatus;
+            evidenceBody = m_evidenceBody;
         }
 
         if (isList) {
@@ -626,6 +640,9 @@ protected:
                 }
             }
             return new FakeReply(endStatus, endBody, this);
+        }
+        if (path.endsWith(QLatin1String("/evidence"))) {
+            return new FakeReply(evidenceStatus, evidenceBody, this);
         }
         if (path.endsWith(QLatin1String("/quality"))) {
             return new FakeReply(qualityStatus, qualityBody, this, qualityDelay);
@@ -698,6 +715,8 @@ private:
     std::function<bool()> m_endProbe;
     bool m_endOutboxExistedAtFirstEnd = false;
     int m_endRequests = 0;
+    int m_evidenceStatus = 200;
+    QByteArray m_evidenceBody = QByteArrayLiteral("{\"stored\":1,\"duplicates\":0,\"rejected\":0}");
     int m_qualityStatus = 200;
     QByteArray m_qualityBody = QByteArrayLiteral("{\"status\":true}");
     int m_qualityDelay = 0;
@@ -819,6 +838,75 @@ private:
     QList<ShippedLine> m_records;
 };
 
+/// T063: collects every line the `seathub.*` logging categories write while it lives, from any
+/// thread (the outbox lines are written on the network thread and the facade's thread), and puts the
+/// previous message handler back. It records the message text only - the same string a log sink sees.
+class LogLineCapture
+{
+public:
+    struct Line
+    {
+        QString category;
+        QString text;
+    };
+
+    LogLineCapture()
+    {
+        State& s = state();
+        QMutexLocker lock(&s.mutex);
+        s.active = this;
+        s.previous = qInstallMessageHandler(&LogLineCapture::handle);
+    }
+    ~LogLineCapture()
+    {
+        State& s = state();
+        QMutexLocker lock(&s.mutex);
+        qInstallMessageHandler(s.previous);
+        s.active = nullptr;
+    }
+
+    QStringList texts(const QString& category) const
+    {
+        QMutexLocker lock(&m_mutex);
+        QStringList found;
+        for (const Line& line : m_lines) {
+            if (line.category == category) found.append(line.text);
+        }
+        return found;
+    }
+    QList<Line> all() const
+    {
+        QMutexLocker lock(&m_mutex);
+        return m_lines;
+    }
+
+private:
+    struct State
+    {
+        QMutex mutex;
+        LogLineCapture* active = nullptr;
+        QtMessageHandler previous = nullptr;
+    };
+    static State& state()
+    {
+        static State s;
+        return s;
+    }
+    static void handle(QtMsgType type, const QMessageLogContext& context, const QString& message)
+    {
+        State& s = state();
+        QMutexLocker lock(&s.mutex);
+        if (s.active && context.category) {
+            QMutexLocker mine(&s.active->m_mutex);
+            s.active->m_lines.append({QString::fromLatin1(context.category), message});
+        }
+        if (s.previous) s.previous(type, context, message);
+    }
+
+    mutable QMutex m_mutex;
+    QList<Line> m_lines;
+};
+
 } // namespace
 
 class TstFacadeWiring : public QObject
@@ -829,6 +917,10 @@ private:
     QScopedPointer<QTemporaryDir> m_dir;
     QScopedPointer<QTemporaryDir> m_backupRoot;
     FakeControlPlane* m_fake = nullptr;
+    /// T063: the status `/evidence` answers once the fake exists (0 = the fake's own default). The
+    /// fake is only created inside `reachHome()`, so a test that must keep its capsules on disk
+    /// states the answer here first.
+    int m_evidenceStatusAtArm = 0;
 
     /// The control-plane client only lives on the network thread the facade moves it to, so the
     /// fake answers from there. A blocking invocation keeps the main thread from racing it.
@@ -838,6 +930,7 @@ private:
         if (plane->thread() == QThread::currentThread()) {
             m_fake = new FakeControlPlane(plane);
             plane->setNetworkAccessManager(m_fake);
+            if (m_evidenceStatusAtArm != 0) m_fake->answerEvidence(m_evidenceStatusAtArm);
             return;
         }
         QMetaObject::invokeMethod(
@@ -845,6 +938,7 @@ private:
             [this, plane]() {
                 m_fake = new FakeControlPlane(plane);
                 plane->setNetworkAccessManager(m_fake);
+                if (m_evidenceStatusAtArm != 0) m_fake->answerEvidence(m_evidenceStatusAtArm);
             },
             Qt::BlockingQueuedConnection);
     }
@@ -874,6 +968,78 @@ private:
         client.credentialStore()->setDirectory(m_dir->path());
         client.credentialStore()->setBackupRoot(m_backupRoot->path());
         client.setEndOutboxDirectory(m_dir->path() + QStringLiteral("/end-outbox"));
+        client.setEvidenceJournalDirectory(m_dir->path() + QStringLiteral("/evidence-journal"));
+    }
+
+    /// Every evidence entry (ADR-0105) on disk for this test, across every capsule, in capsule order.
+    QList<QJsonObject> evidenceEntries(const QString& kind = QString()) const
+    {
+        QList<QJsonObject> found;
+        const QDir dir(m_dir->path() + QStringLiteral("/evidence-journal"));
+        const QStringList names = dir.entryList({QStringLiteral("evj-*.json")}, QDir::Files, QDir::Name);
+        for (const QString& name : names) {
+            QFile file(dir.filePath(name));
+            if (!file.open(QIODevice::ReadOnly)) continue;
+            const QJsonArray entries = QJsonDocument::fromJson(file.readAll()).object()
+                                           .value(QStringLiteral("entries")).toArray();
+            for (const QJsonValue& value : entries) {
+                const QJsonObject entry = value.toObject();
+                if (kind.isEmpty() || entry.value(QStringLiteral("kind")).toString() == kind) {
+                    found.append(entry);
+                }
+            }
+        }
+        return found;
+    }
+
+    /// Feeds one real stats sample through the compositor's stats tap, the same route the engine's
+    /// video-stats overlay takes, so the facade's sampler receives it from this (the render) thread.
+    static void feedOneSample(SeatHubClient& client)
+    {
+        SDL_Surface* surface = OsdCompositor::rasterize(
+            Overlay::OverlayDebug,
+            "Rendering frame rate: 59.00 FPS\nAverage network latency: 23 ms (variance: 1 ms)",
+            true, SDL_Color{255, 255, 255, 255}, &client.hud()->compositor());
+        if (surface) SDL_FreeSurface(surface);
+    }
+
+    /// T063: the two accounts these tests sign in as (the first is what `accountBody()` answers).
+    static QString accountAId() { return QStringLiteral("6f1c6f5e-3a1e-4b1e-9f2e-0f1a2b3c4d5e"); }
+    static QString accountBId() { return QStringLiteral("77777777-7777-7777-7777-777777777777"); }
+
+    /// Leaves one closed evidence capsule on disk for `accountId`, the way an earlier run that died
+    /// before the server had it would. It is written by a second journal on the same folder, so the
+    /// file is the product's own format.
+    void plantCapsule(const QString& sessionId, const QString& accountId)
+    {
+        EvidenceJournal earlier(m_dir->path() + QStringLiteral("/evidence-journal"));
+        QVERIFY(earlier.open(sessionId, accountId));
+        earlier.record(EvidenceJournal::stallWindow(2, 120000));
+        earlier.close();
+    }
+
+    bool capsuleOnDisk(const QString& sessionId) const
+    {
+        const QDir dir(m_dir->path() + QStringLiteral("/evidence-journal"));
+        for (const QString& name : dir.entryList({QStringLiteral("evj-*.json")}, QDir::Files)) {
+            QFile file(dir.filePath(name));
+            if (!file.open(QIODevice::ReadOnly)) continue;
+            if (QJsonDocument::fromJson(file.readAll()).object()
+                    .value(QStringLiteral("session_id")).toString() == sessionId) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// One outbox log line is `<prefix> event=<closed> answer=<closed> session=<id|-|none> count=<n>`.
+    static bool outboxLineIsClosed(const QString& prefix, const QString& text)
+    {
+        const QRegularExpression pattern(QStringLiteral(
+            "^%1 event=(put|drain|delivered|kept|dropped|unreadable) "
+            "answer=(2xx|400|401|403|404|422|5xx|transport|none) session=[A-Za-z0-9_-]+ "
+            "count=[1-9][0-9]*$").arg(prefix));
+        return pattern.match(text).hasMatch();
     }
 
     /// The account and wallet the control plane answers for a signed-in customer.
@@ -1297,6 +1463,7 @@ private slots:
         m_backupRoot.reset(new QTemporaryDir);
         QVERIFY(m_backupRoot->isValid());
         m_fake = nullptr;
+        m_evidenceStatusAtArm = 0;
 
         // Plan 15: SeatHubTelemetry's identity is process-global state (this suite never calls
         // start(), so there is no SDK scope to reset instead) - clear it before every test so an
@@ -5060,6 +5227,13 @@ private slots:
         // no end - a session route would show here, and none does.
         QCOMPARE(m_fake->requestPaths().count(QStringLiteral("/api/sessions")), 1);
         for (const QString& path : m_fake->requestPaths()) {
+            // T063 / ADR-0105: the dead process left its evidence capsule on disk, and the next
+            // sign-in delivers it. That upload only hands the server the earlier run's record; it
+            // addresses no pairing, read or end of the session and attaches nothing. It is the one
+            // session route allowed here, and only for exactly that session.
+            if (path == QStringLiteral("/api/sessions/s-stages/evidence")) {
+                continue;
+            }
             QVERIFY2(!path.startsWith(QStringLiteral("/api/sessions/")), qPrintable(path));
         }
         QVERIFY(second.attachedSessionId().isEmpty());
@@ -8507,6 +8681,444 @@ private slots:
         delete engine;
     }
 
+    // -----------------------------------------------------------------------------------------
+    // T063 / ADR-0105: the stall window rides the sampler's thread, never the facade's.
+    // -----------------------------------------------------------------------------------------
+
+    void emptyWindowsThenARollupRecordOneStallWhileTheMainThreadIsHeld()
+    {
+        // 503 keeps the capsule on disk, so the entry can be read back after the delivery attempt.
+        m_evidenceStatusAtArm = 503;
+        auto* engine = new FakeEngineSession;
+        SeatHubClient client;
+        WalletTicks ticks;
+        client.setSamplerWindowMsForTests(40);
+        beginStreaming(client, engine, &ticks, 90, 80);
+        QVERIFY(!QTest::currentTestFailed());
+        QVERIFY(settleIntoTheStream(client, &ticks));
+        const int before = m_fake->countOfPathEndingWith(QStringLiteral("/evidence"));
+
+        // From here this thread runs no event loop - the state it is in during a real stream - so
+        // only the sampler's own thread can record the stall and start the delivery.
+        QThread::msleep(220); // several full windows with no sample
+        feedOneSample(client); // the first non-empty rollup follows
+        QVERIFY2(waitWithoutTheEventLoop([&]() {
+                     return !evidenceEntries(QStringLiteral("stall_window")).isEmpty()
+                         && m_fake->countOfPathEndingWith(QStringLiteral("/evidence")) > before;
+                 }),
+                 "the stall must be on disk and delivered while the main thread is held");
+
+        const QList<QJsonObject> stalls = evidenceEntries(QStringLiteral("stall_window"));
+        QCOMPARE(stalls.size(), 1);
+        const int windows = stalls.first().value(QStringLiteral("windows")).toInt();
+        QVERIFY2(windows >= 2, "consecutive empty windows coalesce into one entry");
+        QCOMPARE(stalls.first().value(QStringLiteral("duration_ms")).toInt(), windows * 40);
+
+        QThread::msleep(100);
+        QCOMPARE(m_fake->countOfPathEndingWith(QStringLiteral("/evidence")), before + 1);
+        const QList<QByteArray> sent =
+            m_fake->bodiesFor(QStringLiteral("/api/sessions/s-live/evidence"));
+        QVERIFY(!sent.isEmpty());
+        QVERIFY(sent.last().contains("stall_window"));
+
+        endStreaming(client, engine);
+    }
+
+    void stoppingAfterEmptyWindowsOnlyKeepsThePendingStallInThatPlaysCapsule()
+    {
+        m_evidenceStatusAtArm = 503;
+        auto* engine = new FakeEngineSession;
+        SeatHubClient client;
+        WalletTicks ticks;
+        client.setSamplerWindowMsForTests(40);
+        beginStreaming(client, engine, &ticks, 90, 80);
+        QVERIFY(!QTest::currentTestFailed());
+        QVERIFY(settleIntoTheStream(client, &ticks));
+
+        QThread::msleep(220); // empty windows only: no non-empty rollup ever follows
+        QVERIFY(evidenceEntries(QStringLiteral("stall_window")).isEmpty());
+
+        emit engine->sessionFinished(0);
+        emit engine->readyForDeletion();
+
+        // finishPlay recorded the pending stall before it closed the capsule.
+        const QList<QJsonObject> stalls = evidenceEntries(QStringLiteral("stall_window"));
+        QCOMPARE(stalls.size(), 1);
+        const int windows = stalls.first().value(QStringLiteral("windows")).toInt();
+        QVERIFY(windows >= 2);
+        QCOMPARE(stalls.first().value(QStringLiteral("duration_ms")).toInt(), windows * 40);
+
+        endStreaming(client, engine);
+    }
+
+    void anEarlierPlaysStallNeverAppearsInALaterPlaysCapsule()
+    {
+        m_evidenceStatusAtArm = 503;
+        auto* first = new FakeEngineSession;
+        SeatHubClient client;
+        WalletTicks ticks;
+        client.setSamplerWindowMsForTests(40);
+        beginStreaming(client, first, &ticks, 90, 80);
+        QVERIFY(!QTest::currentTestFailed());
+        QVERIFY(settleIntoTheStream(client, &ticks));
+        QThread::msleep(220);
+        emit first->sessionFinished(0);
+        emit first->readyForDeletion();
+        QCOMPARE(evidenceEntries(QStringLiteral("stall_window")).size(), 1);
+        endStreaming(client, first);
+
+        // A second Play, with a window too long to end during the test: no empty window, no stall.
+        client.setSamplerWindowMsForTests(60000);
+        auto* second = new FakeEngineSession;
+        client.session()->attachSession(second);
+        client.beginSession(QStringLiteral("s-live-2"));
+        emit second->connectionStarted();
+        QCOMPARE(client.appState(), QStringLiteral("streaming"));
+        QThread::msleep(150);
+        emit second->sessionFinished(0);
+        emit second->readyForDeletion();
+
+        // Read each capsule apart: the stall is in the first Play's capsule and not in the second's.
+        QMap<QString, QStringList> kindsBySession;
+        const QDir dir(m_dir->path() + QStringLiteral("/evidence-journal"));
+        for (const QString& name : dir.entryList({QStringLiteral("evj-*.json")}, QDir::Files)) {
+            QFile file(dir.filePath(name));
+            QVERIFY(file.open(QIODevice::ReadOnly));
+            const QJsonObject capsule = QJsonDocument::fromJson(file.readAll()).object();
+            for (const QJsonValue& entry : capsule.value(QStringLiteral("entries")).toArray()) {
+                kindsBySession[capsule.value(QStringLiteral("session_id")).toString()]
+                    << entry.toObject().value(QStringLiteral("kind")).toString();
+            }
+        }
+        QVERIFY2(kindsBySession.contains(QStringLiteral("s-live-2")),
+                 "the later Play has a capsule, so the absence below is not vacuous");
+        QVERIFY(kindsBySession.value(QStringLiteral("s-live")).contains(QStringLiteral("stall_window")));
+        QVERIFY(!kindsBySession.value(QStringLiteral("s-live-2")).contains(QStringLiteral("stall_window")));
+
+        endStreaming(client, second);
+    }
+
+    // T063 / ADR-0105: a capsule exists only while a Play is open.
+    void nothingIsRecordedWhileIdle()
+    {
+        SeatHubClient client;
+        reachHome(client, 90);
+        QVERIFY(!QTest::currentTestFailed());
+        QThread::msleep(100);
+        const QDir dir(m_dir->path() + QStringLiteral("/evidence-journal"));
+        QVERIFY2(dir.entryList({QStringLiteral("evj-*.json")}, QDir::Files).isEmpty(),
+                 "no Play is open, so no capsule may exist");
+    }
+
+    // T063 / ADR-0105: a conclusive port test and the engine stage failure reach the capsule as
+    // closed values only; the address, port text and a sentinel path never do.
+    void aPreStreamFailureRecordsClosedEvidenceAndNoSentinel()
+    {
+        m_evidenceStatusAtArm = 503;
+        auto* engine = new FakeEngineSession;
+        SeatHubClient client;
+        client.session()->attachSession(engine);
+        beginStagedSession(client);
+        QVERIFY(!QTest::currentTestFailed());
+        client.teardown()->setVerifyIntervalMs(1);
+        m_fake->answerSession(QStringLiteral("s-stages"), QStringLiteral("CANCELLED"));
+
+        seathub::PortTestRelay::publish(1u, 0x10u);
+        emit engine->stageStarting(QStringLiteral("RTSP handshake"));
+        emit engine->stageFailed(QStringLiteral("RTSP handshake"), 10060,
+                                 QStringLiteral("TCP 48010 at 203.0.113.9 C:\\Users\\sentinel"));
+
+        QVERIFY(!evidenceEntries(QStringLiteral("engine_failure")).isEmpty());
+        QVERIFY(!evidenceEntries(QStringLiteral("port_test")).isEmpty());
+
+        const QDir dir(m_dir->path() + QStringLiteral("/evidence-journal"));
+        for (const QString& name : dir.entryList({QStringLiteral("evj-*.json")}, QDir::Files)) {
+            QFile file(dir.filePath(name));
+            QVERIFY(file.open(QIODevice::ReadOnly));
+            const QByteArray raw = file.readAll();
+            QVERIFY(!raw.contains("203.0.113.9"));
+            QVERIFY(!raw.contains("sentinel"));
+            QVERIFY(!raw.contains("48010"));
+        }
+        client.session()->attachSession(nullptr);
+        delete engine;
+    }
+
+    // T063 / ADR-0105: an offline delivery keeps the capsule; it never reaches the customer.
+    void anOfflineDeliveryKeepsTheCapsule()
+    {
+        m_evidenceStatusAtArm = 503;
+        auto* engine = new FakeEngineSession;
+        SeatHubClient client;
+        client.session()->attachSession(engine);
+        beginStagedSession(client);
+        QVERIFY(!QTest::currentTestFailed());
+        client.teardown()->setVerifyIntervalMs(1);
+        m_fake->answerSession(QStringLiteral("s-stages"), QStringLiteral("CANCELLED"));
+        emit engine->stageStarting(QStringLiteral("RTSP handshake"));
+        emit engine->stageFailed(QStringLiteral("RTSP handshake"), 10060, QString());
+
+        QTRY_VERIFY_WITH_TIMEOUT(m_fake->countOfPathEndingWith(QStringLiteral("/evidence")) >= 1, 10000);
+        QVERIFY2(!evidenceEntries().isEmpty(), "a 503 answer keeps the entries on disk");
+        client.session()->attachSession(nullptr);
+        delete engine;
+    }
+
+    // T063 / ADR-0105: a capsule belongs to the account that played it. Another account's capsule is
+    // neither sent nor dropped by the current account, and goes out when its own account is current.
+    void aCapsuleOfAnotherAccountWaitsForThatAccount()
+    {
+        SeatHubClient client;
+        reachHome(client, 90);
+        QVERIFY(!QTest::currentTestFailed());
+        plantCapsule(QStringLiteral("s-old-a"), accountAId());
+        plantCapsule(QStringLiteral("s-old-b"), accountBId());
+        QVERIFY(!QTest::currentTestFailed());
+        QVERIFY(capsuleOnDisk(QStringLiteral("s-old-a")));
+        QVERIFY(capsuleOnDisk(QStringLiteral("s-old-b")));
+
+        QMetaObject::invokeMethod(&client, "onNetworkBack");
+        QTRY_VERIFY_WITH_TIMEOUT(!capsuleOnDisk(QStringLiteral("s-old-a")), 15000);
+        QTest::qWait(500);
+        QVERIFY(m_fake->requestPaths().contains(QStringLiteral("/api/sessions/s-old-a/evidence")));
+        QVERIFY2(!m_fake->requestPaths().contains(QStringLiteral("/api/sessions/s-old-b/evidence")),
+                 "account A must never send account B's capsule");
+        QVERIFY2(capsuleOnDisk(QStringLiteral("s-old-b")), "account A must never drop B's capsule");
+        QCOMPARE(evidenceEntries(QStringLiteral("stall_window")).size(), 1);
+
+        // B signs in: its own capsule is now the one that goes out, under B's own token.
+        client.signOut();
+        QTRY_COMPARE_WITH_TIMEOUT(client.appState(), QStringLiteral("signed_out"), 15000);
+        m_fake->answerMe(200, QByteArrayLiteral(
+            "{\"id\":\"77777777-7777-7777-7777-777777777777\",\"display_name\":\"Omar\","
+            "\"username\":\"omar\",\"email\":\"omar@example.com\",\"phone_e164\":\"+962790000001\","
+            "\"role\":\"customer\",\"signup_stage\":\"complete\",\"email_verified\":true,"
+            "\"phone_verified\":true,\"created_at\":\"2026-09-01T00:00:00Z\"}"));
+        m_fake->answerWallet(200, walletBody(45));
+        m_fake->answerLogin(200, QByteArrayLiteral("{\"access_token\":\"sb_at_for_b\"}"));
+        client.signInWithPassword(QStringLiteral("omar@example.com"), QStringLiteral("irrelevant"));
+        QTRY_COMPARE_WITH_TIMEOUT(client.appState(), QStringLiteral("home"), 15000);
+
+        QTRY_VERIFY_WITH_TIMEOUT(!capsuleOnDisk(QStringLiteral("s-old-b")), 15000);
+        QVERIFY(m_fake->requestPaths().contains(QStringLiteral("/api/sessions/s-old-b/evidence")));
+        QCOMPARE(m_fake->authorizationFor(QStringLiteral("/api/sessions/s-old-b/evidence")),
+                 QByteArrayLiteral("Bearer sb_at_for_b"));
+    }
+
+    // T063 / ADR-0105: an offline delivery keeps the capsule; a network return then sends it once.
+    void aNetworkReturnDrainsAnOfflineCapsuleExactlyOnce()
+    {
+        const QString path = QStringLiteral("/api/sessions/s-offline/evidence");
+        SeatHubClient client;
+        client.setReconnectJitterProvider([]() { return 0.0; });
+        reachHome(client, 90);
+        QVERIFY(!QTest::currentTestFailed());
+        m_fake->answerEvidence(0, QByteArray()); // transport failure
+        plantCapsule(QStringLiteral("s-offline"), accountAId());
+        QVERIFY(!QTest::currentTestFailed());
+
+        QMetaObject::invokeMethod(&client, "onNetworkBack");
+        QTRY_VERIFY_WITH_TIMEOUT(m_fake->requestPaths().count(path) >= 1, 15000);
+        QTest::qWait(200);
+        QVERIFY2(capsuleOnDisk(QStringLiteral("s-offline")), "a transport failure keeps the capsule");
+
+        m_fake->answerEvidence(200);
+        QMetaObject::invokeMethod(&client, "onNetworkBack");
+        QTRY_VERIFY_WITH_TIMEOUT(!capsuleOnDisk(QStringLiteral("s-offline")), 15000);
+
+        // Delivered: nothing is sent again, not by a second trigger and not by the retry timer.
+        const int delivered = m_fake->requestPaths().count(path);
+        QMetaObject::invokeMethod(&client, "onNetworkBack");
+        QTest::qWait(3500);
+        QCOMPARE(m_fake->requestPaths().count(path), delivered);
+    }
+
+    // T063 / ADR-0105: with no network-return hint at all, the End outbox's paced timer drains it.
+    void theRetryTimerDrainsAnOfflineCapsuleExactlyOnce()
+    {
+        const QString path = QStringLiteral("/api/sessions/s-timer/evidence");
+        SeatHubClient client;
+        client.setReconnectJitterProvider([]() { return 0.0; });
+        reachHome(client, 90);
+        QVERIFY(!QTest::currentTestFailed());
+        m_fake->answerEvidence(503);
+        plantCapsule(QStringLiteral("s-timer"), accountAId());
+        QVERIFY(!QTest::currentTestFailed());
+
+        QMetaObject::invokeMethod(&client, "onNetworkBack");
+        QTRY_VERIFY_WITH_TIMEOUT(m_fake->requestPaths().count(path) >= 1, 15000);
+        QTest::qWait(200);
+        QVERIFY2(capsuleOnDisk(QStringLiteral("s-timer")), "a 5xx answer keeps the capsule");
+
+        m_fake->answerEvidence(200);
+        QTRY_VERIFY_WITH_TIMEOUT(!capsuleOnDisk(QStringLiteral("s-timer")), 20000);
+        const int delivered = m_fake->requestPaths().count(path);
+        QTest::qWait(3500);
+        QCOMPARE(m_fake->requestPaths().count(path), delivered);
+    }
+
+    // T063 / ADR-0105: every End-outbox step is one closed log line; the payload, the retry and the
+    // idempotence of the End itself are what they were.
+    void theEndOutboxLogsPutDrainKeptAndDroppedAsClosedLines()
+    {
+        LogLineCapture log;
+        const QString endPath = QStringLiteral("/api/sessions/s-stages/end");
+        SeatHubClient client;
+        client.setReconnectJitterProvider([]() { return 0.0; });
+        beginStagedSession(client);
+        QVERIFY(!QTest::currentTestFailed());
+        client.teardown()->setVerifyIntervalMs(1);
+        m_fake->answerSession(QStringLiteral("s-stages"), QStringLiteral("CANCELLED"));
+        m_fake->answerEnd(0);
+
+        emit client.pairing()->pairingFailed(
+            SeatHubFailure::local(QStringLiteral("The rig didn't finish connecting. Try again.")));
+        QTRY_VERIFY_WITH_TIMEOUT(m_fake->bodiesFor(endPath).size() >= 3, 30000);
+        QVERIFY(client.hasSavedEnd());
+
+        m_fake->answerEnd(404); // the server holds no such session: the record is done
+        QTRY_VERIFY_WITH_TIMEOUT(!client.hasSavedEnd(), 30000);
+        QTest::qWait(300);
+
+        const QStringList lines = log.texts(QStringLiteral("seathub.end_outbox"));
+        QVERIFY(!lines.isEmpty());
+        for (const QString& line : lines) {
+            QVERIFY2(outboxLineIsClosed(QStringLiteral("end_outbox"), line), qPrintable(line));
+        }
+        QVERIFY(lines.contains(QStringLiteral("end_outbox event=put answer=none session=s-stages count=1")));
+        QVERIFY(lines.contains(QStringLiteral("end_outbox event=drain answer=none session=- count=1")));
+        QVERIFY(lines.contains(
+            QStringLiteral("end_outbox event=kept answer=transport session=s-stages count=1")));
+        QVERIFY(lines.contains(
+            QStringLiteral("end_outbox event=dropped answer=404 session=s-stages count=1")));
+
+        // Unchanged: every attempt carried the identical payload, and a finished End is never re-sent.
+        const QList<QByteArray> bodies = m_fake->bodiesFor(endPath);
+        for (const QByteArray& body : bodies) {
+            QCOMPARE(body, bodies.first());
+        }
+        const int lineCount = lines.size();
+        const int sends = bodies.size();
+        QTest::qWait(3000);
+        QCOMPARE(m_fake->bodiesFor(endPath).size(), sends);
+        QCOMPARE(log.texts(QStringLiteral("seathub.end_outbox")).size(), lineCount);
+    }
+
+    void theEndOutboxLogsDeliveredAndAnUnreadableFileAsClosedLines()
+    {
+        LogLineCapture log;
+        const QString endPath = QStringLiteral("/api/sessions/s-live/end");
+        SeatHubClient client;
+        client.setReconnectJitterProvider([]() { return 0.0; });
+        reachHome(client, 90);
+        QVERIFY(!QTest::currentTestFailed());
+
+        const QString outboxDir = QDir(m_dir->path()).filePath(QStringLiteral("end-outbox"));
+        QVERIFY(QDir().mkpath(outboxDir));
+        {
+            QFile file(QDir(outboxDir).filePath(QStringLiteral("s-live.json")));
+            QVERIFY(file.open(QIODevice::WriteOnly | QIODevice::Truncate));
+            file.write(QJsonDocument(QJsonObject{
+                { QStringLiteral("account_id"), accountAId() },
+                { QStringLiteral("session_id"), QStringLiteral("s-live") },
+                { QStringLiteral("failed"), false },
+            }).toJson(QJsonDocument::Compact));
+        }
+        const QString junk = QDir(outboxDir).filePath(QStringLiteral("junk.json"));
+        {
+            QFile file(junk);
+            QVERIFY(file.open(QIODevice::WriteOnly | QIODevice::Truncate));
+            file.write("{not json");
+        }
+        m_fake->answerEnd(200);
+        QMetaObject::invokeMethod(&client, "onNetworkBack");
+        QTRY_VERIFY_WITH_TIMEOUT(!client.hasSavedEnd(), 15000);
+        QTRY_COMPARE_WITH_TIMEOUT(client.homeStatus(), QStringLiteral("ready"), 15000);
+        QTest::qWait(300);
+
+        const QStringList lines = log.texts(QStringLiteral("seathub.end_outbox"));
+        for (const QString& line : lines) {
+            QVERIFY2(outboxLineIsClosed(QStringLiteral("end_outbox"), line), qPrintable(line));
+        }
+        QVERIFY(lines.contains(
+            QStringLiteral("end_outbox event=delivered answer=2xx session=s-live count=1")));
+        QVERIFY(lines.contains(QStringLiteral("end_outbox event=unreadable answer=none session=- count=1")));
+        QVERIFY2(QFile::exists(junk), "an unreadable file is counted and logged, never deleted");
+        QCOMPARE(m_fake->bodiesFor(endPath).size(), 1);
+    }
+
+    // T063 / ADR-0105: no log line the outbox, the quality outbox, the live-updates stream or the
+    // facade writes carries an address, a Wi-Fi name, a path, a user name or a PIN, even when the
+    // engine's own failure text is full of them.
+    void noOutboxLogLineCarriesAnAddressNetworkNamePathUserOrPin()
+    {
+        LogLineCapture log;
+        const QString endPath = QStringLiteral("/api/sessions/s-stages/end");
+        m_evidenceStatusAtArm = 503;
+        auto* engine = new FakeEngineSession;
+        SeatHubClient client;
+        client.setReconnectJitterProvider([]() { return 0.0; });
+        client.session()->attachSession(engine);
+        beginStagedSession(client);
+        QVERIFY(!QTest::currentTestFailed());
+        client.teardown()->setVerifyIntervalMs(1);
+        m_fake->answerSession(QStringLiteral("s-stages"), QStringLiteral("CANCELLED"));
+        m_fake->answerEnd(0);
+        m_fake->answerQuality(503);
+
+        // A quality report and an unreadable file waiting in the quality outbox.
+        QVERIFY(QDir(m_dir->path()).mkpath(QStringLiteral("quality-outbox")));
+        {
+            QJsonObject envelope;
+            envelope.insert(QStringLiteral("account_id"), accountAId());
+            envelope.insert(QStringLiteral("report"), QJsonObject{{QStringLiteral("rendered_fps"), 30.0}});
+            QFile file(QDir(m_dir->path()).filePath(QStringLiteral("quality-outbox/s-q1.json")));
+            QVERIFY(file.open(QIODevice::WriteOnly));
+            file.write(QJsonDocument(envelope).toJson(QJsonDocument::Compact));
+        }
+        {
+            QFile file(QDir(m_dir->path()).filePath(QStringLiteral("quality-outbox/junk.json")));
+            QVERIFY(file.open(QIODevice::WriteOnly));
+            file.write("{not json");
+        }
+
+        seathub::PortTestRelay::publish(1u, 0x10u);
+        emit engine->stageStarting(QStringLiteral("RTSP handshake"));
+        emit engine->stageFailed(
+            QStringLiteral("RTSP handshake"), 10060,
+            QStringLiteral("TCP 48010 at 203.0.113.9 on SentinelWifi-5G C:\\Users\\sentinel-user "
+                           "PIN 4821 for lina lina@example.com +962790000000"));
+        QTRY_VERIFY_WITH_TIMEOUT(m_fake->bodiesFor(endPath).size() >= 2, 30000);
+        QMetaObject::invokeMethod(&client, "onNetworkBack");
+        QTRY_VERIFY_WITH_TIMEOUT(
+            m_fake->requestPaths().contains(QStringLiteral("/api/sessions/s-q1/quality")), 15000);
+        QTRY_VERIFY_WITH_TIMEOUT(m_fake->countOfPathEndingWith(QStringLiteral("/evidence")) >= 1, 15000);
+        QTest::qWait(300);
+
+        const QStringList quality = log.texts(QStringLiteral("seathub.quality_outbox"));
+        QVERIFY(!quality.isEmpty());
+        for (const QString& line : quality) {
+            QVERIFY2(outboxLineIsClosed(QStringLiteral("quality_outbox"), line), qPrintable(line));
+        }
+        const QStringList sentinels = {
+            QStringLiteral("203.0.113.9"), QStringLiteral("sentinelwifi"), QStringLiteral("c:\\users"),
+            QStringLiteral("sentinel"), QStringLiteral("4821"), QStringLiteral("48010"),
+            QStringLiteral("lina"), QStringLiteral("example.com"), QStringLiteral("962790000"),
+        };
+        int checked = 0;
+        for (const LogLineCapture::Line& line : log.all()) {
+            if (!line.category.startsWith(QLatin1String("seathub."))) continue;
+            ++checked;
+            for (const QString& sentinel : sentinels) {
+                QVERIFY2(!line.text.toLower().contains(sentinel),
+                         qPrintable(line.category + QLatin1String(": ") + line.text));
+            }
+        }
+        QVERIFY2(checked > 0, "the sentinel scan must have read log lines");
+
+        client.session()->attachSession(nullptr);
+        delete engine;
+    }
 };
 
 QTEST_MAIN(TstFacadeWiring)

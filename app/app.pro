@@ -259,6 +259,7 @@ SOURCES += \
     seathub/attempt_vocab.cpp \
     seathub/quality_outbox.cpp \
     seathub/end_outbox.cpp \
+    seathub/evidence_journal.cpp \
     seathub/stream_quality_sampler.cpp \
     seathub/telemetry.cpp \
     seathub/install_journal.cpp \
@@ -340,6 +341,7 @@ HEADERS += \
     seathub/attempt_vocab.h \
     seathub/quality_outbox.h \
     seathub/end_outbox.h \
+    seathub/evidence_journal.h \
     seathub/stream_quality_sampler.h \
     seathub/telemetry.h \
     seathub/install_journal.h \

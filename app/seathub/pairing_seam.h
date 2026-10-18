@@ -195,6 +195,11 @@ public:
     /// Test seam: the clear request the recovery loop (and `clearPendingPairing()`) runs.
     /// Defaults to `sendPairingCancelRequest` (`pairing_recovery.h`).
     void setCancelRequest(PairingCancelRequest cancel);
+    /// T063: a narrow, read-only sink called once per reported result, on this object's thread, right
+    /// after the `pairing_instrumentation` line - the facade journals the attempt from it. It takes
+    /// the result by const reference and cannot change the seam's retry, guards or callbacks.
+    using AttemptSink = std::function<void(const PairingHandshakeResult& result)>;
+    void setAttemptSink(AttemptSink sink);
 
     /// Start one handshake. `done` is called exactly once, on this object's thread, with
     /// `(ok, clientIdentity, engineError)`. See `pairing_controller.h` for what the identity is
@@ -258,6 +263,7 @@ private:
     PairingHandshake m_handshake;
     WarmReturnCheck m_warmCheck;
     PairingCancelRequest m_cancelRequest;
+    AttemptSink m_attemptSink;
     std::function<void(bool, const QString&, const QString&)> m_done;
     /// The generation token the pool thread reads without touching this object: bumped and
     /// stored here by every `pair()` call, captured by the worker as a `shared_ptr` copy, and

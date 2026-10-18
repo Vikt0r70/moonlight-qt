@@ -10,6 +10,7 @@
 #include <QFont>
 #include <QCursor>
 #include <QElapsedTimer>
+#include <QDateTime>
 #include <QTemporaryFile>
 #include <QRegularExpression>
 
@@ -165,7 +166,7 @@ void sdlLogToDiskHandler(void*, int category, SDL_LogPriority priority, const ch
     }
 
     QTime logTime = QTime::fromMSecsSinceStartOfDay(s_LoggerTime.elapsed());
-    QString txt = QString("%1 - SDL %2 (%3): %4\n").arg(logTime.toString()).arg(priorityTxt).arg(category).arg(message);
+    QString txt = QString("%1 - SDL %2 (%3): %4\n").arg(QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs) + " " + logTime.toString()).arg(priorityTxt).arg(category).arg(message);
 
     logToLoggerStream(txt);
 }
@@ -202,7 +203,7 @@ void qtLogToDiskHandler(QtMsgType type, const QMessageLogContext&, const QString
     }
 
     QTime logTime = QTime::fromMSecsSinceStartOfDay(s_LoggerTime.elapsed());
-    QString txt = QString("%1 - Qt %2: %3\n").arg(logTime.toString()).arg(typeTxt).arg(msg);
+    QString txt = QString("%1 - Qt %2: %3\n").arg(QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs) + " " + logTime.toString()).arg(typeTxt).arg(msg);
 
     logToLoggerStream(txt);
 }
@@ -230,7 +231,7 @@ void ffmpegLogToDiskHandler(void* ptr, int level, const char* fmt, va_list vl)
 
     if (shouldPrefixThisMessage) {
         QTime logTime = QTime::fromMSecsSinceStartOfDay(s_LoggerTime.elapsed());
-        QString txt = QString("%1 - FFmpeg: %2").arg(logTime.toString()).arg(lineBuffer);
+        QString txt = QString("%1 - FFmpeg: %2").arg(QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs) + " " + logTime.toString()).arg(lineBuffer);
         logToLoggerStream(txt);
     }
     else {
