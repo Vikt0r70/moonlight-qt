@@ -3,8 +3,9 @@
  *
  * The boundary is the phase's most safety-critical structural invariant: the streaming engine is
  * upstream's, unmodified, apart from two named exceptions with their own ADRs -
- * `app/streaming/video/overlaymanager.*` (ADR-0045, the HUD bitmap injection point) and one
- * window-title string literal in `app/streaming/session.cpp` (ADR-0046).
+ * `app/streaming/video/overlaymanager.*` (ADR-0045, the HUD bitmap injection point) and
+ * `app/streaming/session.cpp` (one window-title literal, ADR-0046, and the conntest server plus its
+ * port-test relay, ADR-0104).
  *
  * Until this suite, that invariant was measured by hand in each verification pass and by a CI job
  * that has never run and is not a required check (security F-2: the branch is unprotected and the
@@ -26,9 +27,10 @@
  *   2. Under `app/streaming/` the fork changes exactly the three documented files and nothing
  *      else, and nothing under `app/backend/` changes at all.
  *   3. The `session.cpp` exception is a title literal and nothing more: every added line carries
- *      the `SeatHub`/ADR-0046 marker, the single removed line is the upstream literal, and the
- *      diff is no larger than that. The CI gate allowlists the whole *file*; this allowlists the
- *      *scope* ADR-0046 actually grants.
+ *      the ADR-0046 title lines (2) or one of the four `SeatHub: ADR-0104` lines (the conntest
+ *      definition, its include and two relay calls), and exactly two upstream lines are removed
+ *      (the title literal and the conntest definition). The CI gate allowlists the whole *file*;
+ *      this allowlists the *scope* ADR-0046 and ADR-0104 actually grant.
  *   4. `FORK-CHANGES.md` enumerates every file under the fork that upstream also has - the other
  *      half of STREAM-06, previously verified by hand.
  *
@@ -248,6 +250,62 @@ private:
     mutable bool m_gitFailed = false;
 };
 
+/// Grades one `session.cpp` diff against the two grants that touch it (empty means it is within
+/// both): ADR-0046's window title (a marker comment and the literal, 2 added lines, 1 removed) and
+/// ADR-0104's conntest change (the `CONN_TEST_SERVER` definition, one include and two
+/// `PortTestRelay::publish` calls, 4 added lines marked `SeatHub: ADR-0104`, 1 removed). Counts are
+/// equalities, and every added line must belong to exactly one of the six named lines, so an
+/// unmarked line and a seventh marked line both fail.
+QString sessionCppExceptionProblem(const QStringList& added, const QStringList& removed)
+{
+    int title = 0, define = 0, include = 0, publish = 0;
+    for (const QString& line : added) {
+        const bool adr0104 = line.contains(QLatin1String("SeatHub: ADR-0104"));
+        const bool adr0046 = line.contains(QLatin1String("ADR-0046"));
+        if (adr0104 && !adr0046) {
+            if (line.contains(QLatin1String("#define CONN_TEST_SERVER"))
+                && line.contains(QLatin1String("\"conntest.rentapc.online\""))) {
+                ++define;
+            } else if (line.contains(QLatin1String("#include"))
+                       && line.contains(QLatin1String("seathub/port_test_relay.h"))) {
+                ++include;
+            } else if (line.contains(QLatin1String("seathub::PortTestRelay::publish("))) {
+                ++publish;
+            } else {
+                return QStringLiteral("an ADR-0104 line is not the conntest definition, its "
+                                      "include or a relay call: %1").arg(line.simplified());
+            }
+        } else if (adr0046 && !adr0104) {
+            ++title;
+        } else {
+            return QStringLiteral("an added line is neither an ADR-0046 title line nor a "
+                                  "`SeatHub: ADR-0104` line: %1").arg(line.simplified());
+        }
+    }
+    if (added.size() != 6 || title != 2 || define != 1 || include != 1 || publish != 2) {
+        return QStringLiteral("session.cpp adds %1 lines (title %2, define %3, include %4, publish "
+                              "%5); the grants cover exactly 6 (2, 1, 1, 2)")
+            .arg(added.size()).arg(title).arg(define).arg(include).arg(publish);
+    }
+
+    int oldTitle = 0, oldConntest = 0;
+    for (const QString& line : removed) {
+        if (line.contains(QLatin1String("#define CONN_TEST_SERVER"))
+            && line.contains(QLatin1String("qt.conntest.moonlight-stream.org"))) {
+            ++oldConntest;
+        } else if (line.contains(QLatin1String("Moonlight"))) {
+            ++oldTitle;
+        } else {
+            return QStringLiteral("a removed line is neither upstream's title literal nor its "
+                                  "conntest definition: %1").arg(line.simplified());
+        }
+    }
+    if (removed.size() != 2 || oldTitle != 1 || oldConntest != 1) {
+        return QStringLiteral("session.cpp removes %1 lines; the grants cover exactly 2").arg(removed.size());
+    }
+    return QString();
+}
+
 QString readAll(const QString& path)
 {
     QFile file(path);
@@ -412,31 +470,24 @@ private slots:
         const QString diff =
             check.diffText({ QString::fromLatin1(kSessionCpp) });
         QVERIFY2(!check.gitFailed(), "a git query against the pinned base failed");
-        QVERIFY2(!diff.trimmed().isEmpty(), "session.cpp is expected to carry the ADR-0046 title");
+        QVERIFY2(!diff.trimmed().isEmpty(),
+                 "session.cpp is expected to carry the ADR-0046 title and the ADR-0104 change");
 
         const QStringList added = BoundaryCheck::addedLines(diff);
         const QStringList removed = BoundaryCheck::removedLines(diff);
 
-        // ADR-0046 grants one string literal. Two changed lines are the marker comment and the
-        // literal; anything beyond that is code the ADR does not cover.
-        QVERIFY2(added.size() <= 3,
-                 qPrintable(QStringLiteral("session.cpp's diff adds %1 lines; the ADR-0046 "
-                                           "exception covers the window title only")
-                                .arg(added.size())));
+        // ADR-0046 grants the window title (marker comment + literal) and ADR-0104 the conntest
+        // change (definition, include, two relay calls): six added lines, two removed, nothing else.
+        const QString problem = sessionCppExceptionProblem(added, removed);
+        QVERIFY2(problem.isEmpty(), qPrintable(problem));
 
-        for (const QString& line : added) {
-            QVERIFY2(line.contains(QLatin1String("SeatHub"))
-                         || line.contains(QLatin1String("ADR-0046")),
-                     qPrintable(QStringLiteral("an added line in session.cpp is not the title "
-                                               "literal or its ADR marker: %1")
-                                    .arg(line.simplified())));
-        }
-
-        QCOMPARE(removed.size(), 1);
-        QVERIFY2(removed.first().contains(QLatin1String("Moonlight")),
-                 qPrintable(QStringLiteral("the single removed line is expected to be upstream's "
-                                           "title literal, not: %1")
-                                .arg(removed.first().simplified())));
+        // The same predicate must refuse a diff that is the authorised one plus one more line.
+        const QString unmarked = QStringLiteral("    int stray = 0;");
+        const QString extraMarked = QStringLiteral("    stray(); // SeatHub: ADR-0104");
+        QVERIFY2(!sessionCppExceptionProblem(added + QStringList { unmarked }, removed).isEmpty(),
+                 "an unmarked extra added line must be refused");
+        QVERIFY2(!sessionCppExceptionProblem(added + QStringList { extraMarked }, removed).isEmpty(),
+                 "an extra `SeatHub: ADR-0104` line must be refused");
     }
 
     // --- the other half of STREAM-06: every modified upstream file is enumerated ---------------

@@ -102,6 +102,10 @@ private slots:
     void endPresentation_isConnectionLostOnlyForAStartedStreamWithANativeFault();
     void endPresentation_isCancelledOnlyWhenNothingStartedAndNothingFailed();
     void endPresentation_keepsAnActualFailedStartUnknown();
+
+    // T062 / ADR-0104: the firewall sentence needs a conclusive failed port test.
+    void engineStageMessage_firewallSentenceOnlyForAConclusiveFailure();
+    void mapPortTestFailure_honoursItsArgument();
 };
 
 void TstErrorMap::initTestCase()
@@ -503,6 +507,53 @@ void TstErrorMap::endPresentation_keepsAnActualFailedStartUnknown()
     evidence.streamStarted = false;
     evidence.engineFailed = true;
     QCOMPARE(deriveEndPresentation(evidence), QStringLiteral("unknown"));
+}
+
+void TstErrorMap::engineStageMessage_firewallSentenceOnlyForAConclusiveFailure()
+{
+    const QString bare = QStringLiteral("Starting RTSP handshake failed: Error 10060");
+    const QString withSentence =
+        bare + QStringLiteral("\n\nCheck your firewall and port forwarding rules for port(s): "
+                              "TCP 48010");
+
+    PortTestResult failed;
+    failed.outcome = PortTestResult::Outcome::Failed;
+    failed.failedMask = 0x10;
+    QCOMPARE(engineStageMessage(QStringLiteral("RTSP handshake"), 10060,
+                                QStringLiteral("TCP 48010"), failed),
+             withSentence);
+
+    // A clean, an inconclusive and a not-run test must not blame the customer's firewall.
+    PortTestResult clean;
+    clean.outcome = PortTestResult::Outcome::Clean;
+    PortTestResult inconclusive;
+    inconclusive.outcome = PortTestResult::Outcome::Inconclusive;
+    const PortTestResult notRun;
+    for (const PortTestResult& result : { clean, inconclusive, notRun }) {
+        QCOMPARE(engineStageMessage(QStringLiteral("RTSP handshake"), 10060,
+                                    QStringLiteral("TCP 48010"), result),
+                 bare);
+    }
+
+    // A failed test with no failing ports names no ports, so there is nothing to append.
+    QCOMPARE(engineStageMessage(QStringLiteral("RTSP handshake"), 10060, QString(), failed), bare);
+}
+
+void TstErrorMap::mapPortTestFailure_honoursItsArgument()
+{
+    // The mapped failure stays the generic copy: this task adds no new string. The classified
+    // result travels only in the diagnostic, which never reaches the view model.
+    const SeatHubFailure failed = mapPortTestFailure(0x10);
+    const SeatHubFailure clean = mapPortTestFailure(0);
+    const SeatHubFailure inconclusive = mapPortTestFailure(static_cast<int>(0xFFFFFFFFu));
+    QCOMPARE(failed.error, SeatHubFailure::generic().error);
+    QCOMPARE(clean.error, SeatHubFailure::generic().error);
+    QCOMPARE(inconclusive.error, SeatHubFailure::generic().error);
+    QVERIFY(failed.diagnostic.contains(QStringLiteral("failed")));
+    QVERIFY(clean.diagnostic.contains(QStringLiteral("clean")));
+    QVERIFY(inconclusive.diagnostic.contains(QStringLiteral("inconclusive")));
+    QVERIFY(failed.diagnostic != clean.diagnostic);
+    QVERIFY(clean.diagnostic != inconclusive.diagnostic);
 }
 
 QTEST_MAIN(TstErrorMap)

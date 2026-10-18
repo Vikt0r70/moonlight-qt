@@ -54,7 +54,8 @@
 #include <QWindow>
 #include <QScreen>
 
-#define CONN_TEST_SERVER "qt.conntest.moonlight-stream.org"
+#include "seathub/port_test_relay.h" // SeatHub: ADR-0104
+#define CONN_TEST_SERVER "conntest.rentapc.online" // SeatHub: ADR-0104
 
 CONNECTION_LISTENER_CALLBACKS Session::k_ConnCallbacks = {
     Session::clStageStarting,
@@ -87,6 +88,7 @@ void Session::clStageFailed(int stage, int errorCode)
     // Perform the port test now, while we're on the async connection thread and not blocking the UI.
     unsigned int portFlags = LiGetPortFlagsFromStage(stage);
     s_ActiveSession->m_PortTestResults = LiTestClientConnectivity(CONN_TEST_SERVER, 443, portFlags);
+    seathub::PortTestRelay::publish(portFlags, s_ActiveSession->m_PortTestResults); // SeatHub: ADR-0104
 
     char failingPorts[128];
     LiStringifyPortFlags(portFlags, ", ", failingPorts, sizeof(failingPorts));
@@ -97,6 +99,7 @@ void Session::clConnectionTerminated(int errorCode)
 {
     unsigned int portFlags = LiGetPortFlagsFromTerminationErrorCode(errorCode);
     s_ActiveSession->m_PortTestResults = LiTestClientConnectivity(CONN_TEST_SERVER, 443, portFlags);
+    seathub::PortTestRelay::publish(portFlags, s_ActiveSession->m_PortTestResults); // SeatHub: ADR-0104
 
     // Display the termination dialog if this was not intended
     switch (errorCode) {

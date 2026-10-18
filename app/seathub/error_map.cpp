@@ -1,5 +1,6 @@
 #include "error_map.h"
 
+#include <QJsonDocument>
 #include <QRegularExpression>
 
 namespace {
@@ -170,11 +171,13 @@ SeatHubFailure mapLaunchError(const QString& text)
     return f;
 }
 
-QString engineStageMessage(const QString& stage, int errorCode, const QString& failingPorts)
+QString engineStageMessage(const QString& stage, int errorCode, const QString& failingPorts,
+                           const PortTestResult& portTest)
 {
-    // Upstream `app/gui/StreamSegue.qml` `stageFailed()`, word for word.
+    // Upstream `app/gui/StreamSegue.qml` `stageFailed()`, word for word, except that the firewall
+    // sentence waits for a conclusive port-test failure (ADR-0104).
     QString text = QStringLiteral("Starting %1 failed: Error %2").arg(stage).arg(errorCode);
-    if (!failingPorts.isEmpty()) {
+    if (!failingPorts.isEmpty() && showFirewallSentence(portTest)) {
         text += QStringLiteral("\n\nCheck your firewall and port forwarding rules for port(s): %1")
                     .arg(failingPorts);
     }
@@ -195,8 +198,14 @@ SeatHubFailure engineTextFailure(const QString& text)
 
 SeatHubFailure mapPortTestFailure(int portTestResult)
 {
-    Q_UNUSED(portTestResult);
-    return SeatHubFailure::generic();
+    // The int is `Session::sessionFinished`'s `m_PortTestResults`, which only exists because a test
+    // ran, so it classifies with any non-zero request. The customer sentence stays the generic one;
+    // the classified result is kept in `diagnostic` (never rendered) for the log and support.
+    const PortTestResult classified = classifyPortTest(
+        1u, static_cast<unsigned int>(portTestResult), 0xFFFFFFFFu);
+    SeatHubFailure f = SeatHubFailure::generic();
+    f.diagnostic = QString::fromUtf8(QJsonDocument(portTestJson(classified)).toJson(QJsonDocument::Compact));
+    return f;
 }
 
 // ---------------------------------------------------------------------------

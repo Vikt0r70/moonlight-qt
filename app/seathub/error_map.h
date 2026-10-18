@@ -25,6 +25,8 @@
 #include <QString>
 #include <QVariantMap>
 
+#include "port_test_result.h"
+
 enum class FailureKind
 {
     /// The control plane answered with `{status_code, status:false, error, reference}`.
@@ -119,7 +121,11 @@ SeatHubFailure mapLaunchError(const QString& text);
 /// ADR-0091: the text upstream `StreamSegue.qml` shows for `stageFailed(stage, errorCode, ports)`,
 /// composed the same way: "Starting {stage} failed: Error {code}" and, when ports are named, a
 /// blank line and "Check your firewall and port forwarding rules for port(s): {ports}".
-QString engineStageMessage(const QString& stage, int errorCode, const QString& failingPorts);
+/// ADR-0104: the firewall sentence is appended only when the port test the engine ran for this
+/// failure came back conclusive (`showFirewallSentence`); a clean, inconclusive or not-run test
+/// leaves the bare stage text, since the ports are then not shown to be blocked.
+QString engineStageMessage(const QString& stage, int errorCode, const QString& failingPorts,
+                           const PortTestResult& portTest);
 
 /// ADR-0091: a failure before the stream started whose sentence is Moonlight's own `text`, verbatim.
 /// An empty `text` yields the generic sentence, since there is nothing of Moonlight's to show.

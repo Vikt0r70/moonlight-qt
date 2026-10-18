@@ -1,5 +1,7 @@
 #include "seathub_client.h"
 
+#include "port_test_relay.h"
+
 #include <QDateTime>
 #include <QDesktopServices>
 #include <QDir>
@@ -428,6 +430,9 @@ SeatHubClient::SeatHubClient(QObject* parent)
             int code = 0;
             const QByteArray utf8 = text.toUtf8();
             if (parseConnectionTerminated(category, priority, utf8.constData(), &code)) {
+                // ADR-0104: the port test `clConnectionTerminated` ran just before this line was
+                // logged. Queued ahead of `noteTermination`, so the report it posts carries it.
+                m_liveness->setPortTest(portTestJson(seathub::PortTestRelay::peek()));
                 m_liveness->noteTermination(code);
                 // 06.1-19/J-07/T-06.1-56: the same line, the same call - no new thread crossing.
                 // `handleDisplayLaunchError()` reads this (relaxed load) on the facade thread to
@@ -895,6 +900,8 @@ void SeatHubClient::beginSession(const QString& sessionId)
     m_lastTerminationCode.store(kNoTerminationCode, std::memory_order_relaxed);
     m_firstNativeFaultCode.store(kNoTerminationCode, std::memory_order_relaxed);
     m_manualEndObserved.store(false, std::memory_order_relaxed);
+    // ADR-0104: nor does a port-test result an earlier Play published and never used.
+    seathub::PortTestRelay::reset();
 
     // D-09/D-13: `hostId` is not known yet at this call - only `handleSessionState()`'s own
     // `SessionInfo` names it, once the server answers - so this starts the tag/attribute with an
@@ -2694,10 +2701,15 @@ void SeatHubClient::handleStageFailed(const QString& stage, int errorCode, const
     // O01: the engine named a failure for this attempt, so its end is not a quit.
     m_engineFailed = true;
 
+    // ADR-0104: the port test the engine ran for this failure (published before it emitted
+    // `stageFailed`). One result belongs to one failure, so it is taken, not peeked.
+    const PortTestResult portTest = seathub::PortTestRelay::take();
+    const QJsonObject portTestObject = portTestJson(portTest);
+
     // D-11: the server sees exactly what the customer's screen is about to say, before liveness
     // stops - the engine's own stage, its code and the ports it named, whether this failure is
     // pre-stream or (rarely) mid-stream.
-    m_liveness->reportFailure(stage, errorCode, failingPorts);
+    m_liveness->reportFailure(stage, errorCode, failingPorts, portTestObject);
 
     if (m_appState == QLatin1String(kStateStreaming)) {
         m_lastFailedStep = QStringLiteral("stream");
@@ -2718,7 +2730,7 @@ void SeatHubClient::handleStageFailed(const QString& stage, int errorCode, const
     // the engine was in, and says so in the deck's words rather than sending them to the error view.
     if (connectingSession()) {
         // ADR-0091: Moonlight's own stage text, composed as upstream StreamSegue.qml composes it.
-        raiseConnectFailure(engineTextFailure(engineStageMessage(stage, errorCode, failingPorts)));
+        raiseConnectFailure(engineTextFailure(engineStageMessage(stage, errorCode, failingPorts, portTest)));
         // 06.1's ADR item 4 / J-22: the server needs what the engine just told us, now - not only
         // at `handleReadyForDeletion()`'s later, report-less teardown - so it can attribute blame.
         // `report.stage` is `connecting` (D-11: this is a stage failure inside stage 2, never
@@ -2734,6 +2746,7 @@ void SeatHubClient::handleStageFailed(const QString& stage, int errorCode, const
             report.hasEngineError = true;
             report.engineError = errorCode;
             report.failingPorts = failingPorts;
+            report.portTest = portTestObject;
             report.attemptStep = m_lastFailedStep;
             endPreStreamSessionWithReport(report);
         }
@@ -2945,6 +2958,8 @@ void SeatHubClient::handleReadyForDeletion()
         // progress markers such as `rig_wait`, which say where a session was, not that it failed.
         EndReport report = newEndReport();
         report.attemptStep = m_lastFailedStep;
+        // ADR-0104: a termination's port test (a stage failure's was taken in `handleStageFailed`).
+        report.portTest = portTestJson(seathub::PortTestRelay::take());
         const bool failed = !report.customerQuit && !report.attemptStep.isEmpty();
         // V-OUTBOX (L06): every End caller saves the End to disk before the first POST, tagged to
         // the account that pressed it. This is the ordinary in-stream quit path; the pre-engine

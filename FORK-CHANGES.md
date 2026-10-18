@@ -9,13 +9,15 @@ Upstream files are edited only where this file says so — every entry below cor
 named exception in `.github/workflows/seathub-build-win.yml`'s CI diff gate, and the gate fails
 any build where a modified file under `app/streaming/` is not listed here.
 
-No decoder, renderer, audio, or input file is ever modified. The only two categories of allowed
-exception are:
+No decoder, renderer, audio, or input file is ever modified. The only allowed exceptions are:
 
 1. **Overlay compositor** (`app/streaming/video/overlaymanager.*`) — gains a bitmap input,
    per-value visibility control and a pluggable text rasteriser (ADR-0045 amendment 2026-09-26).
 2. **`session.cpp`'s window title string literal** (non-Darwin `#else` branch, ~line 1829) — the
-   only other permitted engine-file edit (`ADR-0046`).
+   other permitted engine-file edit (`ADR-0046`).
+3. **`session.cpp`'s port-test server and relay** — the connectivity-test host and two one-line
+   calls that hand the port-test result to SeatHub (`ADR-0104`, owner-approved). Six added lines,
+   two removed, each added line marked `// SeatHub: ADR-0104`.
 
 ## Modified files
 
@@ -24,6 +26,7 @@ Added by each plan (Plan 03-02 onward) in the same commit that makes the change.
 | File | Category | Reason | Plan |
 |------|----------|--------|------|
 | `app/streaming/session.cpp` | engine (ADR-0046 exception) | SDL stream window title literal changed from `" - Moonlight"` to `" - RentaPC"` in the non-Darwin `#else` branch. The title is passed into `SDL_CreateWindow()` itself, so a runtime `SDL_SetWindowTitle()` could only rename the window after it already existed as "&lt;PC&gt; - Moonlight" — it cannot prevent the initial flash of the brand, and Phase 3 requires Moonlight never be visible. Marker comment `// SeatHub: D-28 exception, see ADR-0046` sits on the changed line for future upstream merges. | 03-02 |
+| `app/streaming/session.cpp` | engine (ADR-0104 exception) | `CONN_TEST_SERVER` changed from `qt.conntest.moonlight-stream.org` to `conntest.rentapc.online`, so the port test that runs when a stage fails or the connection terminates goes to our own server. One `#include "seathub/port_test_relay.h"` and one `seathub::PortTestRelay::publish(portFlags, m_PortTestResults)` after each of the two `LiTestClientConnectivity` assignments (`clStageFailed`, `clConnectionTerminated`), so the SeatHub facade can tell a blocked port from a clean or inconclusive test. Every added line carries `// SeatHub: ADR-0104`; `session.h` is unchanged. `tests/tst_d28_boundary.cpp` pins the exact six added and two removed lines. | T062 |
 | `app/main.cpp` | bridge | Register SeatHub types + SeatHub QML entrypoint + brand replacement per brand audit. `SeatHubClient` / `SessionLifecycle` registration, the `Tokens`/`Metrics` QML singletons, and every user-visible brand literal (`SDL_APP_NAME`, `SDL_AUDIO_DEVICE_APP_NAME`, application/organization name, crash-dump and log filenames, desktop file name, Wayland/X11 WMCLASS) changed to SeatHub. T010 (ADR-0092) changes the two SDL hints to RentaPC; the application and organization names stay SeatHub and Seven Hills, as the AppData keys. | 03-02 |
 | `app/main.cpp` | bridge | `SettingsBridge` and `UpdateFeedClient` registered as uncreatable QML types in the `SeatHub` module, so the QML layer can name the types it reaches through `SeatHubClient.settings` / `.updates` (D-35) and cannot construct them itself. | 03-04 |
 | `app/app.pro` | packaging | Brand replacement: `TARGET` (both branches), `QMAKE_TARGET_COMPANY` / `_DESCRIPTION` / `_PRODUCT`, `RC_ICONS` → `seathub.ico`, the embedded manifest path → `SeatHub.exe.manifest`, `APP_BUNDLE_RESOURCES.files` → `seathub.icns`, and the `unix:!macx` desktop/appstream asset paths → `com.seathub.SeatHub.*`. All `moonlight-common-c` submodule link and include lines are deliberately unchanged — that is the upstream library's name, not our brand. | 03-02 |

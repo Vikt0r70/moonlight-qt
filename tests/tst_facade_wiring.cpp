@@ -72,6 +72,7 @@
 #include "seathub/jordan_time.h"
 #include "seathub/moonlight_engine_session.h"
 #include "seathub/pairing_handshake.h"
+#include "seathub/port_test_relay.h"
 #include "seathub/seathub_client.h"
 #include "seathub/session_lifecycle.h"
 #include "seathub/teardown_controller.h"
@@ -1512,7 +1513,8 @@ private slots:
 
         QTRY_COMPARE_WITH_TIMEOUT(completed.count(), 1, 15000);
         QCOMPARE(failed.count(), 0);
-        QVERIFY2(client.attachedSessionId().isEmpty(), "a session that has been torn down is no longer attached");
+        QTRY_VERIFY2_WITH_TIMEOUT(client.attachedSessionId().isEmpty(),
+                                  "a session that has been torn down is no longer attached", 15000);
 
         // Step 1 went out on the documented route, for this session.
         QCOMPARE(m_fake->countOfPathEndingWith(QStringLiteral("/end")), 1);
@@ -4596,6 +4598,8 @@ private slots:
             QCOMPARE(sent.value(QStringLiteral("engine_error")).toInt(), -102);
             QCOMPARE(sent.value(QStringLiteral("failing_ports")).toString(),
                      QStringLiteral("UDP 47998"));
+            // ADR-0104: no port test was relayed for this Play, so the End carries no `port_test`.
+            QVERIFY(!sent.contains(QStringLiteral("port_test")));
             const auto playStepCount = [&captureMutex, &captured]() {
                 QMutexLocker lock(&captureMutex);
                 return std::count_if(captured.cbegin(), captured.cend(),
@@ -6911,9 +6915,10 @@ private slots:
         emit engine->readyForDeletion();
         QTRY_COMPARE_WITH_TIMEOUT(completed.count(), 1, 15000);
 
-        QVERIFY(SeatHubTelemetry::currentSessionId().isEmpty());
-        QVERIFY(SeatHubTelemetry::currentHostId().isEmpty());
-        QVERIFY(SeatHubTelemetry::currentTraceId().isEmpty());
+        // The clearing is an effect of the teardown finishing, not of the signal itself: wait on it.
+        QTRY_VERIFY_WITH_TIMEOUT(SeatHubTelemetry::currentSessionId().isEmpty(), 15000);
+        QTRY_VERIFY_WITH_TIMEOUT(SeatHubTelemetry::currentHostId().isEmpty(), 15000);
+        QTRY_VERIFY_WITH_TIMEOUT(SeatHubTelemetry::currentTraceId().isEmpty(), 15000);
     }
 
     // --- 06.1-19/J-07: a dropped stream comes back on the same session ---------------------------
@@ -8152,6 +8157,9 @@ private slots:
         client.teardown()->setVerifyIntervalMs(1);
         m_fake->answerSession(QStringLiteral("s-stages"), QStringLiteral("CANCELLED"));
 
+        // ADR-0104: the engine's connection thread relays the conclusive port-test result of this
+        // Play (flag 1 requested, mask 0x10 failed) before it emits the stage failure.
+        seathub::PortTestRelay::publish(1u, 0x10u);
         emit engine->stageStarting(QStringLiteral("RTSP handshake"));
         emit engine->stageFailed(QStringLiteral("RTSP handshake"), 10060, QStringLiteral("TCP 48010"));
 
@@ -8162,6 +8170,203 @@ private slots:
         QVERIFY(client.stalledReasonPlain());
         client.session()->attachSession(nullptr);
         delete engine;
+    }
+
+    void aPreStreamStageFailureWithoutAConclusiveTestShowsNoFirewallSentence()
+    {
+        // ADR-0104: a clean or inconclusive port test, or none at all, must not blame the firewall.
+        struct Case { const char* name; bool publish; unsigned flags; unsigned result; };
+        const Case cases[] = {
+            { "not run", false, 0u, 0u },
+            { "clean", true, 1u, 0u },
+            { "inconclusive", true, 1u, seathub::kPortTestInconclusive },
+        };
+        for (const Case& c : cases) {
+            QTest::qWait(0);
+            auto* engine = new FakeEngineSession;
+            SeatHubClient client;
+            client.session()->attachSession(engine);
+            beginStagedSession(client);
+            QVERIFY2(!QTest::currentTestFailed(), c.name);
+            client.teardown()->setVerifyIntervalMs(1);
+            m_fake->answerSession(QStringLiteral("s-stages"), QStringLiteral("CANCELLED"));
+            if (c.publish) {
+                seathub::PortTestRelay::publish(c.flags, c.result);
+            }
+            emit engine->stageFailed(QStringLiteral("RTSP handshake"), 10060,
+                                     QStringLiteral("TCP 48010"));
+            QVERIFY2(client.connectFailed(), c.name);
+            QCOMPARE(client.stalledReasonText(),
+                     QStringLiteral("Starting RTSP handshake failed: Error 10060"));
+            client.session()->attachSession(nullptr);
+            delete engine;
+        }
+    }
+
+    void aStageFailureSendsItsPlaysPortTestOnEndAndLiveness()
+    {
+        auto* engine = new FakeEngineSession;
+        SeatHubClient client;
+        client.session()->attachSession(engine);
+        beginStagedSession(client);
+        QVERIFY(!QTest::currentTestFailed());
+        client.teardown()->setVerifyIntervalMs(1);
+        m_fake->answerSession(QStringLiteral("s-stages"), QStringLiteral("CANCELLED"));
+
+        seathub::PortTestRelay::publish(1u, 0x10u);
+        emit engine->stageFailed(QStringLiteral("RTSP handshake"), 10060, QStringLiteral("TCP 48010"));
+
+        const QJsonObject expected {
+            { QStringLiteral("outcome"), QStringLiteral("failed") },
+            { QStringLiteral("failed_mask"), 16 },
+        };
+        QTRY_VERIFY_WITH_TIMEOUT(
+            m_fake->requestPaths().contains(QStringLiteral("/api/sessions/s-stages/end")), 15000);
+        const QJsonObject end = QJsonDocument::fromJson(
+            m_fake->bodyFor(QStringLiteral("/api/sessions/s-stages/end"))).object();
+        QCOMPARE(end.value(QStringLiteral("port_test")).toObject(), expected);
+        QCOMPARE(end.value(QStringLiteral("failing_ports")).toString(), QStringLiteral("TCP 48010"));
+
+        // The liveness failure report of the same Play carries the same result.
+        const QList<QByteArray> reports =
+            m_fake->bodiesFor(QStringLiteral("/api/sessions/s-stages/liveness"));
+        bool sawFailureReport = false;
+        for (const QByteArray& body : reports) {
+            const QJsonObject report = QJsonDocument::fromJson(body).object();
+            if (report.value(QStringLiteral("stage")).toString() == QLatin1String("failed")) {
+                sawFailureReport = true;
+                QCOMPARE(report.value(QStringLiteral("port_test")).toObject(), expected);
+            }
+        }
+        QVERIFY(sawFailureReport);
+        client.session()->attachSession(nullptr);
+        delete engine;
+    }
+
+    void anEarlierPlaysPortTestIsNeverAttachedToALaterPlay()
+    {
+        auto* engine = new FakeEngineSession;
+        SeatHubClient client;
+        client.session()->attachSession(engine);
+        // A result left behind by an earlier Play: beginSession of the next Play must discard it.
+        seathub::PortTestRelay::publish(1u, 0x10u);
+        beginStagedSession(client);
+        QVERIFY(!QTest::currentTestFailed());
+        client.teardown()->setVerifyIntervalMs(1);
+        m_fake->answerSession(QStringLiteral("s-stages"), QStringLiteral("CANCELLED"));
+
+        emit engine->stageFailed(QStringLiteral("RTSP handshake"), 10060, QStringLiteral("TCP 48010"));
+
+        QVERIFY(client.connectFailed());
+        QCOMPARE(client.stalledReasonText(),
+                 QStringLiteral("Starting RTSP handshake failed: Error 10060"));
+        QTRY_VERIFY_WITH_TIMEOUT(
+            m_fake->requestPaths().contains(QStringLiteral("/api/sessions/s-stages/end")), 15000);
+        const QJsonObject end = QJsonDocument::fromJson(
+            m_fake->bodyFor(QStringLiteral("/api/sessions/s-stages/end"))).object();
+        QVERIFY(!end.contains(QStringLiteral("port_test")));
+        client.session()->attachSession(nullptr);
+        delete engine;
+    }
+
+    void aRetriedPreStreamEndCarriesTheSamePortTest()
+    {
+        // ADR-0104: the End's first POST fails, so it is retried from the disk outbox - by the same
+        // client, and by a fresh client after a restart - and every attempt carries the same result.
+        const QString outboxFile =
+            QDir(m_dir->path()).filePath(QStringLiteral("end-outbox/s-stages.json"));
+        const QJsonObject expected {
+            { QStringLiteral("outcome"), QStringLiteral("failed") },
+            { QStringLiteral("failed_mask"), 16 },
+        };
+        const QString endPath = QStringLiteral("/api/sessions/s-stages/end");
+
+        auto* engine = new FakeEngineSession;
+        SeatHubClient client;
+        client.session()->attachSession(engine);
+        beginStagedSession(client);
+        QVERIFY(!QTest::currentTestFailed());
+        client.teardown()->setVerifyIntervalMs(1);
+        client.teardown()->setTeardownGraceMs(1);
+        // The server has not seen the session end, so only the saved End can confirm it.
+        m_fake->answerSession(QStringLiteral("s-stages"), QStringLiteral("ACTIVE"));
+        m_fake->answerEnd(0);  // the control plane is unreachable for every attempt below
+
+        seathub::PortTestRelay::publish(1u, 0x10u);
+        emit engine->stageFailed(QStringLiteral("RTSP handshake"), 10060,
+                                 QStringLiteral("TCP 48010"));
+
+        QTRY_VERIFY_WITH_TIMEOUT(QFile::exists(outboxFile), 15000);
+        // The same client retries it from the outbox: wait for a second attempt.
+        QTRY_VERIFY_WITH_TIMEOUT(m_fake->bodiesFor(endPath).size() >= 2, 20000);
+        QVERIFY(client.hasSavedEnd());
+        for (const QByteArray& body : m_fake->bodiesFor(endPath)) {
+            QCOMPARE(QJsonDocument::fromJson(body).object()
+                         .value(QStringLiteral("port_test")).toObject(),
+                     expected);
+        }
+        {
+            QFile file(outboxFile);
+            QVERIFY(file.open(QIODevice::ReadOnly));
+            const QJsonObject report = QJsonDocument::fromJson(file.readAll()).object()
+                                           .value(QStringLiteral("report")).toObject();
+            QCOMPARE(report.value(QStringLiteral("port_test")).toObject(), expected);
+        }
+
+        // The restart: a fresh client on the same outbox directory re-sends it with the same result.
+        // The first client stays alive so no retry is in flight against a destroyed object.
+        m_fake->answerEnd(200);
+        SeatHubClient restarted;
+        restarted.setReconnectJitterProvider([]() { return 0.0; });
+        reachHome(restarted, 90);
+        QVERIFY(!QTest::currentTestFailed());
+        QTRY_VERIFY_WITH_TIMEOUT(!QFile::exists(outboxFile), 15000);
+        const QList<QByteArray> bodies = m_fake->bodiesFor(endPath);
+        // reachHome() armed the restarted client with a fresh fake control plane, so this history
+        // holds only what the restarted client sent: the re-sent End.
+        QVERIFY(!bodies.isEmpty());
+        for (const QByteArray& body : bodies) {
+            QCOMPARE(QJsonDocument::fromJson(body).object()
+                         .value(QStringLiteral("port_test")).toObject(),
+                     expected);
+        }
+        client.session()->attachSession(nullptr);
+        delete engine;
+    }
+
+    void aRetriedEndWithoutAPortTestIsRetriedWithoutTheKey()
+    {
+        // An End whose Play ran no port test, and an old outbox entry written before ADR-0104, both
+        // read back and are re-sent with no `port_test` key at all.
+        const QString outboxDir = QDir(m_dir->path()).filePath(QStringLiteral("end-outbox"));
+        const QString outboxFile = QDir(outboxDir).filePath(QStringLiteral("s-old.json"));
+        QVERIFY(QDir().mkpath(outboxDir));
+        {
+            QFile file(outboxFile);
+            QVERIFY(file.open(QIODevice::WriteOnly | QIODevice::Truncate));
+            file.write(QJsonDocument(QJsonObject{
+                { QStringLiteral("account_id"),
+                  QStringLiteral("6f1c6f5e-3a1e-4b1e-9f2e-0f1a2b3c4d5e") },
+                { QStringLiteral("session_id"), QStringLiteral("s-old") },
+                { QStringLiteral("failed"), true },
+                { QStringLiteral("report"), QJsonObject{
+                    { QStringLiteral("stage"), QStringLiteral("connecting") },
+                    { QStringLiteral("failing_ports"), QStringLiteral("TCP 48010") },
+                    { QStringLiteral("attempt_step"), QStringLiteral("engine_connect") },
+                } },
+            }).toJson(QJsonDocument::Compact));
+        }
+
+        SeatHubClient client;
+        client.setReconnectJitterProvider([]() { return 0.0; });
+        reachHome(client, 90);
+        QVERIFY(!QTest::currentTestFailed());
+        QTRY_VERIFY_WITH_TIMEOUT(!QFile::exists(outboxFile), 15000);
+        const QJsonObject end = QJsonDocument::fromJson(
+            m_fake->bodyFor(QStringLiteral("/api/sessions/s-old/end"))).object();
+        QCOMPARE(end.value(QStringLiteral("failed")).toBool(), true);
+        QCOMPARE(end.value(QStringLiteral("failing_ports")).toString(), QStringLiteral("TCP 48010"));
+        QVERIFY(!end.contains(QStringLiteral("port_test")));
     }
 
     void aSeatHubOwnPreStreamFailureKeepsSeatHubCopy()

@@ -2,7 +2,8 @@ name: SeatHub build (Windows)
 
 # Adds SeatHub-specific jobs alongside upstream's existing CI (D-27) — upstream workflows are the
 # baseline and are not removed until SeatHub jobs fully cover them. This job's purpose is the
-# diff gate: it enforces the engine-untouched fork boundary (D-28, amended by ADR-0046).
+# diff gate: it enforces the engine-untouched fork boundary (D-28, amended by ADR-0046 and, for
+# session.cpp's conntest server and port-test relay, ADR-0104).
 #
 # Exception pattern: `overlaymanager|session\.cpp` is the single source of truth for what may be
 # modified under app/streaming/. It is deliberately mirrored (not referenced) in three other
@@ -18,7 +19,7 @@ on:
 
 jobs:
   diff-gate:
-    name: Engine-untouched diff gate (D-28, ADR-0046)
+    name: Engine-untouched diff gate (D-28, ADR-0046, ADR-0104)
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -67,6 +68,21 @@ jobs:
           done
           if [ -n "$MISSING" ]; then
             echo "::error::These exception-listed files changed but have no FORK-CHANGES.md entry:$MISSING"
+            exit 1
+          fi
+
+      - name: Fail if a line added to session.cpp has no SeatHub marker (ADR-0046, ADR-0104)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Every line the fork adds to session.cpp is marked, so a future upstream merge can find
+          # it: `SeatHub:` (ADR-0104's four lines) or the ADR-0046 title lines. The exact line set
+          # is pinned by tests/tst_d28_boundary.cpp; this step only refuses an unmarked addition.
+          UNMARKED=$(git diff -U0 v6.1.0..HEAD -- app/streaming/session.cpp \
+            | grep -E '^\+' | grep -Ev '^\+\+\+' | grep -Ev 'SeatHub:|ADR-0046' || true)
+          if [ -n "$UNMARKED" ]; then
+            echo "::error::session.cpp gained line(s) with no SeatHub marker:"
+            echo "$UNMARKED"
             exit 1
           fi
 

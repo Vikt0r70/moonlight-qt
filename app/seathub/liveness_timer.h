@@ -101,6 +101,9 @@ public:
     int engineError() const { return m_engineError; }
     /// D-11: the ports a stage failure named (`handleStageFailed`'s own string).
     void setFailingPorts(const QString& failingPorts);
+    /// ADR-0104: the `port_test` object (`portTestJson()`) of the stage failure or termination being
+    /// reported. An empty object (no port test ran) means the key is omitted from the payload.
+    void setPortTest(const QJsonObject& portTest);
     /// Test seams. The behaviour is identical at any interval; the real one is D-31's 10000.
     void setIntervalMs(int milliseconds);
     void setGraceMs(int milliseconds);
@@ -119,8 +122,10 @@ public:
     void reportFailure(const QString& engineStage);
     /// D-11: a stage failure, carrying the engine's own code and ports
     /// (`handleStageFailed(stage, errorCode, failingPorts)`). Same posting guarantee as the
-    /// one-argument overload.
-    void reportFailure(const QString& engineStage, int engineError, const QString& failingPorts);
+    /// one-argument overload. ADR-0104: `portTest` is the same failure's port-test result, sent as
+    /// `port_test` beside `failing_ports` (omitted when empty).
+    void reportFailure(const QString& engineStage, int engineError, const QString& failingPorts,
+                       const QJsonObject& portTest = QJsonObject());
 
     /// D-11/A-51: the engine's own termination code, as soon as it is known
     /// (`Session::clConnectionTerminated`, relayed through Plan 15's log-tee sink - no engine
@@ -181,6 +186,7 @@ private:
     int m_engineError = 0;
     bool m_hasEngineError = false;
     QString m_failingPorts;
+    QJsonObject m_portTest;
     int m_consecutiveFailures = 0;
     bool m_warned = false;
     int m_intervalMs = kIntervalMs;

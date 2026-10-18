@@ -724,6 +724,10 @@ QByteArray ControlPlaneClient::buildEndRequest(bool failed, const EndReport& rep
     if (!report.attemptStep.isEmpty()) {
         object.insert(QStringLiteral("attempt_step"), report.attemptStep);
     }
+    // ADR-0104: the real port-test result of the failed stage, beside the unchanged `failing_ports`.
+    if (!report.portTest.isEmpty()) {
+        object.insert(QStringLiteral("port_test"), report.portTest);
+    }
     return QJsonDocument(object).toJson(QJsonDocument::Compact);
 }
 

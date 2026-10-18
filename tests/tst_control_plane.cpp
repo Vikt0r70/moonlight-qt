@@ -778,6 +778,39 @@ private slots:
         QCOMPARE(posted.value(QStringLiteral("failed")).toBool(), true);
         QCOMPARE(posted.value(QStringLiteral("attempt_step")).toString(),
                  QStringLiteral("engine_connect"));
+        // No port test was relayed for this failure, so the key is omitted (ADR-0104).
+        QVERIFY(!posted.contains(QStringLiteral("port_test")));
+    }
+
+    void endBody_carriesPortTestExactlyWhenOneWasRun()
+    {
+        EndReport report;
+        report.stage = QStringLiteral("connecting");
+        report.attemptStep = QStringLiteral("engine_connect");
+        report.failingPorts = QStringLiteral("TCP 48010");
+
+        report.portTest = QJsonObject {
+            { QStringLiteral("outcome"), QStringLiteral("failed") },
+            { QStringLiteral("failed_mask"), 16 },
+        };
+        QJsonObject built =
+            QJsonDocument::fromJson(ControlPlaneClient::buildEndRequest(true, report)).object();
+        QCOMPARE(built.value(QStringLiteral("port_test")).toObject(), report.portTest);
+        QCOMPARE(built.value(QStringLiteral("failing_ports")).toString(),
+                 QStringLiteral("TCP 48010"));
+
+        report.portTest = QJsonObject { { QStringLiteral("outcome"), QStringLiteral("clean") } };
+        built = QJsonDocument::fromJson(ControlPlaneClient::buildEndRequest(true, report)).object();
+        QCOMPARE(built.value(QStringLiteral("port_test")).toObject(), report.portTest);
+        QVERIFY(!built.value(QStringLiteral("port_test")).toObject()
+                     .contains(QStringLiteral("failed_mask")));
+
+        // An empty object means the test was not run: the key must be absent, not `{}`.
+        report.portTest = QJsonObject();
+        built = QJsonDocument::fromJson(ControlPlaneClient::buildEndRequest(true, report)).object();
+        QVERIFY(!built.contains(QStringLiteral("port_test")));
+        QCOMPARE(built.value(QStringLiteral("failing_ports")).toString(),
+                 QStringLiteral("TCP 48010"));
     }
 
     void sessionFetch_parsesTheSessionSchema()

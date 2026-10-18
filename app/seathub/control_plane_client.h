@@ -116,6 +116,10 @@ struct EndReport
     /// Empty when unknown, and then the field is absent from the body like every other optional
     /// field here. `POST /api/sessions/{id}/end` carries it for every failed Play (contract 3.8.0).
     QString attemptStep;
+    /// ADR-0104 (T062): the `port_test` object (`portTestJson()`) of the stage failure this End
+    /// reports, `{"outcome", "failed_mask"?}`. Empty when no port test ran, and then the key is
+    /// absent from the body and from the outbox record, like every other optional field here.
+    QJsonObject portTest;
     /// UD-04 O01: the end is the customer's own quit (a Cancel, an End session press, or the
     /// in-stream quit shortcut). A deliberate quit is never a reported failure, so a report that
     /// carries this builds no `failed` body whatever else it holds: the server ends the session

@@ -47,6 +47,11 @@ QJsonObject reportToJson(const EndReport& report)
     if (!report.attemptStep.isEmpty()) {
         object.insert(QStringLiteral("attempt_step"), report.attemptStep);
     }
+    // ADR-0104: a retried End (same run, or after a restart) posts the same `port_test` as its
+    // first POST. Absent when none was recorded, so an entry from before this key reads back as none.
+    if (!report.portTest.isEmpty()) {
+        object.insert(QStringLiteral("port_test"), report.portTest);
+    }
     object.insert(QStringLiteral("customer_quit"), report.customerQuit);
     return object;
 }
@@ -61,6 +66,7 @@ EndReport reportFromJson(const QJsonObject& object)
     report.failingPorts = object.value(QStringLiteral("failing_ports")).toString();
     report.errorCode = object.value(QStringLiteral("error_code")).toString();
     report.attemptStep = object.value(QStringLiteral("attempt_step")).toString();
+    report.portTest = object.value(QStringLiteral("port_test")).toObject();
     report.customerQuit = object.value(QStringLiteral("customer_quit")).toBool(false);
     return report;
 }
