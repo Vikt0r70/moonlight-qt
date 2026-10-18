@@ -720,6 +720,12 @@ private:
     /// gracefully on its own: the stream had started, the engine named no failure for this
     /// attempt, and the connection was not terminated from the other side (no termination code).
     bool endIsCustomerQuit() const;
+    /// ADR-0096: what this attempt observed about how it ended, as `deriveEndPresentation()` takes
+    /// it. Read-only and passive: it feeds the neutral `CUSTOMER_ENDED` sentence and the
+    /// `play.summary` diagnostics, never the End request.
+    EndEvidence currentEndEvidence() const;
+    /// The sentence for an end reason; a `CUSTOMER_ENDED` one is keyed by `currentEndEvidence()`.
+    QString endSentence(const QString& endReason, int minutesBilled, bool styled = true) const;
     /// R06: true for a step that belongs to a session other than the one attached now: both are
     /// known and they differ. A step with no session id, or arriving with none attached, is not
     /// late. The caller drops it.
@@ -736,6 +742,9 @@ private:
     /// this queues are both marshalled onto the network thread in that order, so the server
     /// records the stage before the cancel (RESEARCH-FORK C2).
     void endAttachedSessionBeforeStream(bool failed);
+    /// The pre-stream End that carries a report (`failed: true`): outbox write, ending state, then
+    /// teardown - the in-stream End's own sequence, so a network blip is retried, not lost (E20).
+    void endPreStreamSessionWithReport(const EndReport& report);
 
 
     /// D-05/C4/C7: shared by `retry()` and `start()` - a session still attached here that never
@@ -965,7 +974,7 @@ private:
     bool m_pendingSignedOutNotice = false;
     int m_accountFallbackMs = kAccountFallbackMs;
     int m_signedOutNoticeMs = kSignedOutNoticeMs;
-    /// Facade-thread timers, like `m_reconnectTimer`: neither needs to run while an engine stream
+    /// Facade-thread timers, like `m_endOutboxTimer`: neither needs to run while an engine stream
     /// suspends this thread's event loop (D-33 - the balance element is not even shown then), and
     /// keeping them here means starting/stopping them needs no `onClientThread()` marshal.
     QTimer* m_accountFallbackTimer = nullptr;
@@ -998,9 +1007,6 @@ private:
     /// the seam reports from. Consumed - not merely read - by whichever handler runs next, so no
     /// later failure can inherit it. Empty until a result arrives.
     PairingHandshakeResult m_pairingClassification;
-    /// L07: the pairing that last completed skipped the PIN handshake (the warm return). A
-    /// reconnect attempt that then fails drops the held trust so the next attempt pairs with the PIN.
-    bool m_lastPairingWarm = false;
     EngineLaunchReason m_engineLaunchReason = EngineLaunchReason::Started;
     QString m_lastFailedStep;
     QElapsedTimer m_playElapsed;
@@ -1108,7 +1114,7 @@ private:
     quint64 m_playToken = 0;
     int m_playRepeatBackoffMs = 0;
 
-    // --- 06.1-19/J-07: the reconnect state --------------------------------------------------------
+    // --- 06.1-19/J-07: the engine's termination code and the End outbox's backoff ------------------
 
     /// A sentinel outside the engine's own range (`Limelight.h`'s `ML_ERROR_*` are `0` or negative,
     /// per `engine_termination.h`'s own parser comment) - "no termination code has been seen yet
@@ -1122,6 +1128,12 @@ private:
     /// load) from `handleDisplayLaunchError()` on the facade thread - the exact cross-thread read
     /// T-06.1-56 asks for an atomic rather than a plain getter. Reset in `beginSession()`.
     std::atomic<int> m_lastTerminationCode{kNoTerminationCode};
+    /// ADR-0096: the customer's own Cancel or End press was observed for this attempt (set only by
+    /// `interrupt()`; atomic because the termination sink reads it from the engine's thread).
+    std::atomic<bool> m_manualEndObserved{false};
+    /// ADR-0096: the FIRST termination code logged before any manual End was observed. Later
+    /// codes, a manual End and the cleanup cannot replace it. Reset in `beginSession()`.
+    std::atomic<int> m_firstNativeFaultCode{kNoTerminationCode};
     /// ADR-0066 decision 9: the jitter source for the reconnect/outbox backoff. Empty uses 0-20%
     /// random; tests set it for deterministic delays.
     std::function<double()> m_reconnectJitterProvider;

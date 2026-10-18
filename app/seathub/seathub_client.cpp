@@ -141,7 +141,13 @@ int connectStageForState(const QString& state)
 // internal key and never reaches a customer; these are the right column, which is what the home
 // screen renders after a session ends (audit E10). `%1` is the session's real `minutes_billed` -
 // copy.md: "the client substitutes the session's real `minutes_billed`".
-const char* kEndCustomerEnded = "You ended the session. Unused minutes stay in your account.";
+// `CUSTOMER_ENDED` is keyed by the end presentation (ADR-0096), never an unconditional claim of who
+// ended the session: copy.md's `unknown` line is the default, `connection_lost` and `cancelled` are
+// derived from what this client observed.
+const char* kEndCustomerEnded = "The session ended. Unused minutes stay in your account.";
+const char* kEndCustomerEndedConnectionLost =
+    "Your connection was lost, so the session ended. You were charged for %1.";
+const char* kEndCustomerEndedCancelled = "Cancelled. You were not charged.";
 const char* kEndConnectFailed = "The stream didn't start. You were not charged.";
 const char* kEndHostLost =
     "We lost contact with this rig, so the session ended. You were charged for %1.";
@@ -188,7 +194,8 @@ QString minutesPhrase(int minutesBilled, bool styled)
 // string for a reason the deck has no line for: `SESSION_LOST`, `LEASE_GUARD_LOST` and
 // `RECONNECT_LIMIT` are documented to "fall back to the client's generic ended-session string",
 // which copy.md never spells out - showing nothing is honest, inventing the sentence is not.
-QString endReasonSentence(const QString& endReason, int minutesBilled, bool styled = true)
+QString endReasonSentence(const QString& endReason, int minutesBilled, bool styled = true,
+                          const QString& presentation = QString())
 {
     struct ReasonLine {
         const char* reason;
@@ -215,7 +222,16 @@ QString endReasonSentence(const QString& endReason, int minutesBilled, bool styl
 
     for (const ReasonLine& line : kLines) {
         if (endReason == QLatin1String(line.reason)) {
-            QString sentence = QString::fromUtf8(line.sentence);
+            const char* text = line.sentence;
+            if (endReason == QLatin1String("CUSTOMER_ENDED")) {
+                if (presentation == QLatin1String("connection_lost")) {
+                    text = kEndCustomerEndedConnectionLost;
+                }
+                else if (presentation == QLatin1String("cancelled")) {
+                    text = kEndCustomerEndedCancelled;
+                }
+            }
+            QString sentence = QString::fromUtf8(text);
             if (sentence.contains(QLatin1String("%1"))) {
                 sentence = sentence.arg(minutesPhrase(minutesBilled, styled));
             }
@@ -301,25 +317,6 @@ bool isClosedEndReason(const QString& endReason)
         QStringLiteral("TEARDOWN_TIMEOUT"), QStringLiteral("CONNECT_FAILED"),
         QStringLiteral("CLIENT_ABSENT")};
     return closedEndReasons.contains(endReason);
-}
-
-// 06.1's ADR item 4 / J-22: the guard-claim-and-teardown sequence
-// `SeatHubClient::endAttachedSessionBeforeStream()` already runs for a pre-stream failure with no
-// report to add, now carrying one - shared by `handlePairingFailed()`, the no-engine branch of
-// `handlePairingCompleted()`, and `handleStageFailed()`'s pre-stream branch. A free function taking
-// the exact pieces `endAttachedSessionBeforeStream()` itself reads (`seathub_client.h` is not part
-// of this plan's touched files, so this is not a new declared member): `TeardownController` and
-// `SessionTeardownGuard` already expose the public API this needs.
-void endPreStreamSessionWithReport(SessionTeardownGuard& guard, TeardownController* teardown,
-                                   const QString& sessionId, const QString& clientUuid,
-                                   const EndReport& report)
-{
-    if (guard.markStarted()) {
-        teardown->teardown(sessionId, clientUuid, true, report);
-    }
-    // else: this session's teardown was already claimed - by `handleReadyForDeletion()` or by an
-    // earlier call here for the same session - and is already running (T-06.6-50); see
-    // `endAttachedSessionBeforeStream()`'s own comment.
 }
 
 // ADR-0074 HI06: the one stream-time checkpoint, as a function that depends on nothing but the
@@ -438,6 +435,13 @@ SeatHubClient::SeatHubClient(QObject* parent)
                 // `m_liveness` from a different thread than the one that owns it is exactly the
                 // unsynchronised cross-thread read WR-01 already fixed once elsewhere.
                 m_lastTerminationCode.store(code, std::memory_order_relaxed);
+                // ADR-0096: the earliest native evidence wins, and only while no manual End has
+                // been observed - a code the customer's own quit provoked is not a lost connection.
+                if (!m_manualEndObserved.load(std::memory_order_relaxed)) {
+                    int none = kNoTerminationCode;
+                    m_firstNativeFaultCode.compare_exchange_strong(none, code,
+                                                                   std::memory_order_relaxed);
+                }
             }
         });
 
@@ -649,9 +653,6 @@ SeatHubClient::SeatHubClient(QObject* parent)
     connect(m_pairingSeam, &ProductionPairingSeam::handshakeClassified, this,
             [this](const PairingHandshakeResult& result) {
                 m_pairingClassification = result;
-                // L07: whether the attempt that just paired skipped the PIN. Kept apart from the
-                // classification, which the completion handlers consume.
-                m_lastPairingWarm = result.ok && result.warm;
             });
 
     connect(m_teardown, &TeardownController::teardownCompleted,
@@ -892,6 +893,8 @@ void SeatHubClient::beginSession(const QString& sessionId)
     // reconnect) left over from whatever this client streamed before must never leak into this
     // one's own first `handleDisplayLaunchError()`.
     m_lastTerminationCode.store(kNoTerminationCode, std::memory_order_relaxed);
+    m_firstNativeFaultCode.store(kNoTerminationCode, std::memory_order_relaxed);
+    m_manualEndObserved.store(false, std::memory_order_relaxed);
 
     // D-09/D-13: `hostId` is not known yet at this call - only `handleSessionState()`'s own
     // `SessionInfo` names it, once the server answers - so this starts the tag/attribute with an
@@ -1060,6 +1063,26 @@ bool SeatHubClient::endIsCustomerQuit() const
         && m_lastTerminationCode.load(std::memory_order_relaxed) == kNoTerminationCode;
 }
 
+EndEvidence SeatHubClient::currentEndEvidence() const
+{
+    EndEvidence evidence;
+    evidence.streamStarted = m_streamStarted;
+    evidence.engineFailed = m_engineFailed;
+    const int first = m_firstNativeFaultCode.load(std::memory_order_relaxed);
+    evidence.nativeFault = first != kNoTerminationCode;
+    evidence.nativeFaultCode = evidence.nativeFault ? first : 0;
+    return evidence;
+}
+
+QString SeatHubClient::endSentence(const QString& endReason, int minutesBilled, bool styled) const
+{
+    // Only a `CUSTOMER_ENDED` line depends on how this client saw the end; every other reason keeps
+    // the sentence copy.md gives it.
+    const QString presentation = endReason == QLatin1String("CUSTOMER_ENDED")
+        ? deriveEndPresentation(currentEndEvidence()) : QString();
+    return endReasonSentence(endReason, minutesBilled, styled, presentation);
+}
+
 void SeatHubClient::setRetryBusy(bool busy)
 {
     if (m_retryBusy == busy) {
@@ -1095,6 +1118,34 @@ void SeatHubClient::endAttachedSessionBeforeStream(bool failed)
     // else: this session's teardown was already claimed - by `handleReadyForDeletion()` or by an
     // earlier call here for the same session - and is already running. A second failure while it
     // is in flight must not start a second one (T-06.6-50).
+}
+
+// 06.1's ADR item 4 / J-22: the same guard-claim-and-teardown sequence as
+// `endAttachedSessionBeforeStream()`, carrying the report the engine or the server just produced,
+// shared by `handlePairingFailed()`, the no-engine branch of `handlePairingCompleted()`,
+// `handleStageFailed()`'s and `handleDisplayLaunchError()`'s pre-stream branches and the server-ended
+// connecting branch of `handleSessionState()`.
+//
+// T026 / E20: it writes the End to the outbox first, exactly as the in-stream `handleReadyForDeletion()`
+// does. Before this, a pre-stream End that met a network blip was posted once and lost: nothing durable
+// backed it, so the server kept the session until its own timeout. Now the same `drainEndOutbox()` retry,
+// the same restart re-send and the same "ending" Home state apply until the server confirms; the payload
+// (`failed: true` plus this report) and the idempotent End endpoint are unchanged.
+void SeatHubClient::endPreStreamSessionWithReport(const EndReport& report)
+{
+    if (!m_teardownGuard.markStarted()) {
+        // This session's teardown was already claimed - by `handleReadyForDeletion()` or by an
+        // earlier call here for the same session - and is already running (T-06.6-50).
+        return;
+    }
+    const bool durable = m_endOutbox.put(m_sessionId, m_accountId, true, report);
+    if (!durable) {
+        qCWarning(seathubClient)
+            << "end outbox write failed - this End has no durable record:" << m_sessionId;
+        rememberUnconfirmedEnd(m_sessionId, true, report);
+    }
+    setHomeStatus(QString::fromLatin1(kHomeEnding));
+    m_teardown->teardown(m_sessionId, m_clientUuid, true, report);
 }
 
 // ---------------------------------------------------------------------------
@@ -1439,14 +1490,14 @@ void SeatHubClient::raiseConnectFailure(const SeatHubFailure& failure, const QSt
     // sentence is drawn as styled text (the minute count is mono), so anything else is escaped.
     SeatHubFailure shown = failure;
     QString reasonText;
-    const QString deckSentence = endReasonSentence(endReason, minutesBilled, true);
+    const QString deckSentence = endSentence(endReason, minutesBilled, true);
     if (failure.verbatim) {
         // ADR-0091: Moonlight's own text for a failure before the stream started, as given and
         // drawn as plain text; the deck's sentence does not replace it.
         reasonText = shown.error;
     }
     else if (!deckSentence.isEmpty()) {
-        shown.error = endReasonSentence(endReason, minutesBilled, false);
+        shown.error = endSentence(endReason, minutesBilled, false);
         reasonText = deckSentence;
     }
     else {
@@ -1577,8 +1628,15 @@ void SeatHubClient::start()
     // customer" refusal (409 `USER_HAS_NONTERMINAL_SESSION`, `openapi.yaml`).
     // V-OUTBOX (L06): a saved End is re-sent before any Play, so the server sees the end before
     // the new allocation.
-    drainEndOutbox();
-    if (hasSavedEnd() || hasUnconfirmedEndForAccount()) {
+    // T026 / E20: the attached never-streamed session's own End is already saved (a pre-stream End
+    // keeps its record until the server confirms). That End is the one waited on below, so it is
+    // neither drained here (a second post of the same End) nor treated as someone else's pending End.
+    const bool ownEndSaved = !m_sessionId.isEmpty() && !m_streamStarted
+        && (m_endOutbox.hasQueued(m_sessionId) || hasUnconfirmedEnd(m_sessionId));
+    if (!ownEndSaved) {
+        drainEndOutbox();
+    }
+    if (!ownEndSaved && (hasSavedEnd() || hasUnconfirmedEndForAccount())) {
         // C-ENDING (screens.md §23): an End for this account is still unconfirmed, so the server may
         // still hold the session. Play must not start a new one until the server confirms the end.
         updateHomeStatusForEndOutbox();
@@ -1602,6 +1660,25 @@ bool SeatHubClient::endAttachedSessionBeforePlay()
     }
     setRetryBusy(true);
     if (m_teardownGuard.markStarted()) {
+        // T026 / E20: a pre-stream End already saved for this session is asked again exactly as it
+        // was saved (`failed: true` plus its report); `put()` would overwrite it with this
+        // Play's own End and change what the server was told.
+        bool savedFailed = false;
+        EndReport savedReport;
+        bool haveSaved = false;
+        for (const EndOutbox::Entry& entry : m_endOutbox.entriesForAccount(m_accountId)) {
+            if (entry.sessionId == m_sessionId) {
+                savedFailed = entry.failed;
+                savedReport = entry.report;
+                haveSaved = true;
+                break;
+            }
+        }
+        if (haveSaved) {
+            setHomeStatus(QString::fromLatin1(kHomeEnding));
+            m_teardown->teardown(m_sessionId, m_clientUuid, savedFailed, savedReport);
+            return true;
+        }
         // V-OUTBOX (L06): every first End is saved before it is sent, this pre-Play one included,
         // so a crash or restart between here and the server's answer still re-sends it.
         const bool durable = m_endOutbox.put(m_sessionId, m_accountId, false, newEndReport());
@@ -1893,6 +1970,7 @@ void SeatHubClient::interrupt()
     // O01: whichever branch runs, this is the customer's own quit. It is remembered for the
     // attempt, so the end that follows (the engine's, below) is never reported as a failure.
     m_customerQuit = true;
+    m_manualEndObserved.store(true, std::memory_order_relaxed);
     if (!m_session->active()) {
         finishPlay(QStringLiteral("cancelled"), QStringLiteral("cancelled"), m_lastFailedStep);
         onClientThread(m_pairing, [this]() { m_pairing->cancel(); });
@@ -2657,8 +2735,7 @@ void SeatHubClient::handleStageFailed(const QString& stage, int errorCode, const
             report.engineError = errorCode;
             report.failingPorts = failingPorts;
             report.attemptStep = m_lastFailedStep;
-            endPreStreamSessionWithReport(m_teardownGuard, m_teardown, m_sessionId, m_clientUuid,
-                                          report);
+            endPreStreamSessionWithReport(report);
         }
         return;
     }
@@ -2762,8 +2839,7 @@ void SeatHubClient::handleDisplayLaunchError(const QString& text)
             EndReport report = newEndReport();
             report.stage = QStringLiteral("connecting");
             report.attemptStep = m_lastFailedStep;
-            endPreStreamSessionWithReport(m_teardownGuard, m_teardown, m_sessionId,
-                                          m_clientUuid, report);
+            endPreStreamSessionWithReport(report);
         }
         raiseConnectFailure(engineTextFailure(text));
         return;
@@ -3212,20 +3288,37 @@ void SeatHubClient::handleSessionState(const SessionInfo& session)
             // stepper that looks alive for a session that is over. Connecting stops here, at the stage
             // it had reached, in the server's own words for why.
             onClientThread(m_pairing, [this]() { m_pairing->cancel(); });
+            // ADR-0096: a `CUSTOMER_ENDED` start that the engine never named a failure for is an
+            // outside cancel, a neutral outcome rather than a failed start (E16).
+            const bool outsideCancel = session.endReason == QLatin1String("CUSTOMER_ENDED")
+                && !m_engineFailed;
             if (!wasAlreadyEnded && inControlPlaneSession()) {
                 m_lastFailedStep = QStringLiteral("rig_wait");
-                noteStepOutcome(m_lastFailedStep, QStringLiteral("failed"),
-                                QStringLiteral("server_ended"), m_playElapsed.elapsed(), 0,
-                                session.endReason);
-                finishPlay(QStringLiteral("server_ended_pre"), QStringLiteral("failed"),
-                           m_lastFailedStep, QStringLiteral("server_ended"));
+                const QString outcome = outsideCancel ? QStringLiteral("cancelled")
+                                                      : QStringLiteral("failed");
+                const QString failureClass = outsideCancel ? QString()
+                                                           : QStringLiteral("server_ended");
+                noteStepOutcome(m_lastFailedStep, outcome, failureClass,
+                                m_playElapsed.elapsed(), 0, session.endReason);
+                finishPlay(QStringLiteral("server_ended_pre"), outcome,
+                           m_lastFailedStep, failureClass);
                 EndReport report;
                 report.stage = QStringLiteral("connecting");
                 report.attemptStep = m_lastFailedStep;
-                endPreStreamSessionWithReport(m_teardownGuard, m_teardown, m_sessionId,
-                                              m_clientUuid, report);
+                endPreStreamSessionWithReport(report);
             }
-            raiseConnectFailure(SeatHubFailure::generic(), session.endReason, session.minutesBilled);
+            if (outsideCancel) {
+                // Neutral, like the customer's own Cancel: no failure view, straight Home with the
+                // session's own words on it (set below).
+                m_sessionChannel->close();
+                resetConnecting();
+                setAppState(!m_signedIn ? QString::fromLatin1(kStateSignedOut)
+                                        : QString::fromLatin1(kStateHome));
+            }
+            else {
+                raiseConnectFailure(SeatHubFailure::generic(), session.endReason,
+                                    session.minutesBilled);
+            }
         }
     }
 
@@ -3233,7 +3326,7 @@ void SeatHubClient::handleSessionState(const SessionInfo& session)
         // The session's own outcome, in the deck's words, ready for the home screen the customer
         // lands on once teardown finishes (audit E10). The minute count is the server's own
         // `minutes_billed`, never arithmetic done here.
-        setEndReasonText(endReasonSentence(session.endReason, session.minutesBilled));
+        setEndReasonText(endSentence(session.endReason, session.minutesBilled));
     }
 }
 
@@ -3350,6 +3443,14 @@ void SeatHubClient::finishPlay(const QString& exitPath, const QString& outcome,
             }
         }
     }
+    // ADR-0096: passive evidence for this Play, scalar and read once here. A failed start is not
+    // given a presentation; a manual End and a native code are recorded only when observed.
+    const EndEvidence evidence = currentEndEvidence();
+    if (outcome != QLatin1String("failed") || evidence.streamStarted) {
+        attributes.insert("end_presentation", deriveEndPresentation(evidence));
+    }
+    if (m_manualEndObserved.load(std::memory_order_relaxed)) attributes.insert("manual_end_observed", true);
+    if (evidence.nativeFault) attributes.insert("native_fault_code", evidence.nativeFaultCode);
     SeatHubTelemetry::emitDiagnostic(QStringLiteral("play.summary"),
                                      outcome == QLatin1String("failed") ? LogLevel::Warning : LogLevel::Info,
                                      attributes);
@@ -3616,8 +3717,7 @@ void SeatHubClient::handlePairingCompleted(const QString& clientUuid)
             EndReport report;
             report.stage = QStringLiteral("connecting");
             report.attemptStep = m_lastFailedStep;
-            endPreStreamSessionWithReport(m_teardownGuard, m_teardown, m_sessionId, m_clientUuid,
-                                          report);
+            endPreStreamSessionWithReport(report);
         }
         // WR-01: this Play is over here, at the start refusal - the next one mints its own id.
         // `reportFailure()` above re-invoked itself onto `m_liveness`'s own (network) thread,
@@ -3807,8 +3907,7 @@ void SeatHubClient::handlePairingFailed(const SeatHubFailure& failure)
         // control-plane refusal) leaves this empty and the field absent from the body, because a
         // step the client never classified is a step it must not invent.
         report.attemptStep = m_lastFailedStep;
-        endPreStreamSessionWithReport(m_teardownGuard, m_teardown, m_sessionId, m_clientUuid,
-                                      report);
+        endPreStreamSessionWithReport(report);
     }
     // WR-01: this Play is over here, at the pairing failure - the next one mints its own id. See
     // `clearThisPlaysTraceIdAfterAnyQueuedLivenessReport()`'s own comment for why this is not a
@@ -4027,7 +4126,7 @@ void SeatHubClient::handleTeardownCompleted(const SessionInfo& finalSession,
     // server gave no reason for leaves the line empty: showing nothing is honest, inventing a sentence
     // is not.
     if (!finalSession.endReason.isEmpty()) {
-        setEndReasonText(endReasonSentence(finalSession.endReason, finalSession.minutesBilled));
+        setEndReasonText(endSentence(finalSession.endReason, finalSession.minutesBilled));
     }
 
     // 06.1's ADR item 4 / J-22: the connecting view already showed the client's own best guess the

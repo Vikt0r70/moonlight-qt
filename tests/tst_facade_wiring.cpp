@@ -45,6 +45,7 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QMutex>
+#include <limits>
 #include <QMutexLocker>
 #include <QNetworkAccessManager>
 #include <QNetworkReply>
@@ -782,6 +783,41 @@ void emitConnectionTerminated(int code)
     SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "Connection terminated: %d", code);
 }
 
+/// Collects every line the process-wide `LogShipper` hands out for the lifetime of one test, and
+/// stops the shipper before the collected list goes away (the worker must not outlive it).
+class PlayCapture
+{
+public:
+    PlayCapture()
+    {
+        LogShipper::instance().setSpoolDirectoryForTests(m_spool.path());
+        LogShipper::instance().start([this](const ShippedLine& line) {
+            QMutexLocker lock(&m_mutex);
+            m_records.append(line);
+            return true;
+        });
+        LogShipper::instance().setCanShip(true);
+    }
+    ~PlayCapture() { LogShipper::instance().stop(); }
+
+    QList<ShippedLine> named(const QString& body) const
+    {
+        QMutexLocker lock(&m_mutex);
+        QList<ShippedLine> result;
+        for (const ShippedLine& line : m_records) {
+            if (line.body == body) {
+                result.append(line);
+            }
+        }
+        return result;
+    }
+
+private:
+    QTemporaryDir m_spool;
+    mutable QMutex m_mutex;
+    QList<ShippedLine> m_records;
+};
+
 } // namespace
 
 class TstFacadeWiring : public QObject
@@ -1087,8 +1123,10 @@ private slots:
             "start_refused", "cancelled", "server_ended_pre", "ended", "terminated",
             "server_ended", "horizon", "signed_out", "app_quit"};
         for (int i = 0; i < 13; ++i) {
-            const QString outcome = i < 5 || i == 6 || i == 8
-                ? QStringLiteral("failed") : (i == 5 || i >= 11 ? QStringLiteral("cancelled")
+            // E7 (server_ended_pre): an outside CUSTOMER_ENDED while connecting is a cancel, not a
+            // failed start (E16), so its outcome is neutral; the End the facade sends is unchanged.
+            const QString outcome = i < 5 || i == 8
+                ? QStringLiteral("failed") : (i == 5 || i == 6 || i >= 11 ? QStringLiteral("cancelled")
                                                                        : QStringLiteral("ok"));
             QTest::newRow(qPrintable(QStringLiteral("E%1-%2").arg(i + 1).arg(tokens[i])))
                 << i + 1 << QString::fromLatin1(tokens[i]) << outcome << false;
@@ -4293,6 +4331,229 @@ private slots:
         QCOMPARE(sent.value(QStringLiteral("stage")).toString(), QStringLiteral("pairing"));
     }
 
+    // --- T026 / E20: a pre-stream End that the network drops is retried, not lost -------------------
+
+    void aPreStreamEndIsRetriedUntilTheServerConfirmsIt()
+    {
+        const QString endPath = QStringLiteral("/api/sessions/s-stages/end");
+        SeatHubClient client;
+        beginStagedSession(client);
+        QVERIFY(!QTest::currentTestFailed());
+        client.teardown()->setVerifyIntervalMs(1);
+        m_fake->answerSession(QStringLiteral("s-stages"), QStringLiteral("CANCELLED"));
+        m_fake->answerEnd(0);
+
+        emit client.pairing()->pairingFailed(
+            SeatHubFailure::local(QStringLiteral("The rig didn't finish connecting. Try again.")));
+
+        // The blip: every attempt fails, and the End stays on disk and is posted again.
+        QTRY_VERIFY_WITH_TIMEOUT(m_fake->bodiesFor(endPath).size() >= 2, 30000);
+        QVERIFY(client.hasSavedEnd());
+
+        m_fake->answerEnd(200);
+        QTRY_VERIFY_WITH_TIMEOUT(!client.hasSavedEnd(), 30000);
+
+        // Every attempt carried the identical payload: a retry is a re-send, never a new End.
+        const QList<QByteArray> bodies = m_fake->bodiesFor(endPath);
+        for (const QByteArray& body : bodies) {
+            QCOMPARE(body, bodies.first());
+        }
+        const QJsonObject sent = QJsonDocument::fromJson(bodies.first()).object();
+        QCOMPARE(sent.value(QStringLiteral("failed")).toBool(), true);
+        QCOMPARE(sent.value(QStringLiteral("stage")).toString(), QStringLiteral("pairing"));
+
+        // Confirmed: nothing is posted again.
+        QTest::qWait(300);
+        const int confirmed = m_fake->bodiesFor(endPath).size();
+        QTest::qWait(3000);
+        QCOMPARE(m_fake->bodiesFor(endPath).size(), confirmed);
+    }
+
+    // --- T026 / ADR-0096: only observed evidence reaches the Play summary or the End text -----------
+
+    void aStreamedPlayKeepsOnlyTheEvidenceItObserved_data()
+    {
+        QTest::addColumn<QStringList>("steps");
+        QTest::addColumn<QString>("presentation");
+        QTest::addColumn<bool>("manualObserved");
+        QTest::addColumn<int>("nativeCode");
+
+        constexpr int none = std::numeric_limits<int>::min();
+        QTest::newRow("generic quit, nothing observed")
+            << QStringList() << "unknown" << false << none;
+        QTest::newRow("graceful termination code only")
+            << QStringList{"code:0"} << "unknown" << false << 0;
+        QTest::newRow("native no-video-traffic")
+            << QStringList{"code:-100"} << "connection_lost" << false << -100;
+        QTest::newRow("native early termination")
+            << QStringList{"code:-102"} << "connection_lost" << false << -102;
+        QTest::newRow("native fault then manual End keeps the fault")
+            << QStringList{"code:-102", "manual"} << "connection_lost" << true << -102;
+        QTest::newRow("manual End then a later code is not a fault")
+            << QStringList{"manual", "code:-102"} << "unknown" << true << none;
+        QTest::newRow("manual End only")
+            << QStringList{"manual"} << "unknown" << true << none;
+        QTest::newRow("protected content is not a lost connection")
+            << QStringList{"code:-103"} << "unknown" << false << -103;
+    }
+
+    void aStreamedPlayKeepsOnlyTheEvidenceItObserved()
+    {
+        QFETCH(QStringList, steps);
+        QFETCH(QString, presentation);
+        QFETCH(bool, manualObserved);
+        QFETCH(int, nativeCode);
+        constexpr int none = std::numeric_limits<int>::min();
+        const QString endPath = QStringLiteral("/api/sessions/s-stages/end");
+
+        auto* engine = new FakeEngineSession;
+        {
+            SeatHubClient client;
+            beginStagedSession(client);
+            QVERIFY(!QTest::currentTestFailed());
+            client.teardown()->setVerifyIntervalMs(1);
+            // Started after sign-in: the shipper is only open to a Play once the client is home.
+            PlayCapture capture;
+            client.session()->attachSession(engine);
+            client.session()->start(nullptr);
+            // The poll's own read must not end the Play before the scripted evidence arrives.
+            PairingController* pairing = client.pairing();
+            QMetaObject::invokeMethod(
+                pairing, [pairing]() { pairing->cancel(); }, Qt::BlockingQueuedConnection);
+            emit engine->connectionStarted();
+            QCOMPARE(client.appState(), QStringLiteral("streaming"));
+
+            m_fake->answerSession(QStringLiteral("s-stages"), QStringLiteral("COMPLETED"),
+                                  QStringLiteral("CUSTOMER_ENDED"), 15);
+            for (const QString& step : steps) {
+                if (step == QLatin1String("manual")) {
+                    client.interrupt();
+                }
+                else {
+                    emitConnectionTerminated(step.mid(5).toInt());
+                }
+            }
+
+            QSignalSpy completed(client.teardown(), &TeardownController::teardownCompleted);
+            emit engine->readyForDeletion();
+            emit engine->readyForDeletion();  // repeated cleanup
+            QTRY_COMPARE_WITH_TIMEOUT(completed.count(), 1, 15000);
+            QTRY_COMPARE_WITH_TIMEOUT(client.appState(), QStringLiteral("home"), 15000);
+            QTRY_COMPARE_WITH_TIMEOUT(capture.named(QStringLiteral("play.summary")).size(), 1, 10000);
+
+            const ShippedLine summary = capture.named(QStringLiteral("play.summary")).first();
+            QCOMPARE(summary.attrs.value("end_presentation").toString(), presentation);
+            QCOMPARE(summary.attrs.contains("manual_end_observed"), manualObserved);
+            if (nativeCode == none) {
+                QVERIFY(!summary.attrs.contains("native_fault_code"));
+            }
+            else {
+                QCOMPARE(summary.attrs.value("native_fault_code").toInt(), nativeCode);
+            }
+
+            // The End the server saw is the unchanged one: no new field carries the presentation or
+            // an intent, and cleanup answering 200 is not evidence of anything.
+            QTRY_COMPARE_WITH_TIMEOUT(m_fake->bodiesFor(endPath).size(), 1, 15000);
+            const QJsonObject sent = QJsonDocument::fromJson(m_fake->bodyFor(endPath)).object();
+            QVERIFY(!sent.contains(QStringLiteral("end_presentation")));
+            QVERIFY(!sent.contains(QStringLiteral("manual")));
+            QVERIFY(!sent.contains(QStringLiteral("intent")));
+            QCOMPARE(sent.value(QStringLiteral("failed")).toBool(), false);
+
+            if (presentation == QLatin1String("connection_lost")) {
+                QVERIFY(client.endReasonText().startsWith(
+                    QStringLiteral("Your connection was lost, so the session ended.")));
+            }
+            else {
+                // A raw CUSTOMER_ENDED never claims who ended it.
+                QCOMPARE(client.endReasonText(),
+                         QStringLiteral("The session ended. Unused minutes stay in your account."));
+            }
+            QCOMPARE(capture.named(QStringLiteral("play.summary")).size(), 1);
+
+            client.session()->attachSession(nullptr);
+        }
+        delete engine;
+    }
+
+    void aSecondPlayDoesNotInheritTheFirstPlaysEvidence()
+    {
+        auto* engine = new FakeEngineSession;
+        {
+            SeatHubClient client;
+            beginStagedSession(client);
+            QVERIFY(!QTest::currentTestFailed());
+            client.teardown()->setVerifyIntervalMs(1);
+            PlayCapture capture;
+            client.session()->attachSession(engine);
+            client.session()->start(nullptr);
+            PairingController* pairing = client.pairing();
+            QMetaObject::invokeMethod(
+                pairing, [pairing]() { pairing->cancel(); }, Qt::BlockingQueuedConnection);
+            emit engine->connectionStarted();
+            emitConnectionTerminated(-102);
+            m_fake->answerSession(QStringLiteral("s-stages"), QStringLiteral("COMPLETED"),
+                                  QStringLiteral("CUSTOMER_ENDED"), 15);
+            QSignalSpy completed(client.teardown(), &TeardownController::teardownCompleted);
+            emit engine->readyForDeletion();
+            QTRY_COMPARE_WITH_TIMEOUT(completed.count(), 1, 15000);
+            QTRY_COMPARE_WITH_TIMEOUT(capture.named(QStringLiteral("play.summary")).size(), 1, 10000);
+            client.session()->attachSession(nullptr);
+
+            // The next Play, outside-cancelled while connecting, carries none of the first one's code.
+            m_fake->answerPairing(409, playRefusalBody(QStringLiteral("The rig is not ready yet."),
+                                                       QStringLiteral("SH-2K2XQ1")));
+            client.beginSession(QStringLiteral("s-second"));
+            QCOMPARE(client.appState(), QStringLiteral("connecting"));
+            SessionInfo over = sessionIn(QStringLiteral("COMPLETED"), QStringLiteral("s-second"));
+            over.endReason = QStringLiteral("CUSTOMER_ENDED");
+            report(client, over);
+            QTRY_COMPARE_WITH_TIMEOUT(capture.named(QStringLiteral("play.summary")).size(), 2, 10000);
+
+            const ShippedLine second = capture.named(QStringLiteral("play.summary")).last();
+            QCOMPARE(second.attrs.value("end_presentation").toString(), QStringLiteral("cancelled"));
+            QVERIFY(!second.attrs.contains("native_fault_code"));
+            QVERIFY(!second.attrs.contains("manual_end_observed"));
+        }
+        delete engine;
+    }
+
+    // --- T026 / E16: an outside cancel while connecting is neutral, never the failure screen --------
+
+    void anOutsideCancelWhileConnectingIsNeutral()
+    {
+        SeatHubClient client;
+        beginStagedSession(client);
+        QVERIFY(!QTest::currentTestFailed());
+        client.teardown()->setVerifyIntervalMs(1);
+        PlayCapture capture;
+        m_fake->answerSession(QStringLiteral("s-stages"), QStringLiteral("CANCELLED"),
+                              QStringLiteral("CUSTOMER_ENDED"));
+
+        SessionInfo over = sessionIn(QStringLiteral("COMPLETED"));
+        over.endReason = QStringLiteral("CUSTOMER_ENDED");
+        report(client, over);
+
+        QVERIFY(!client.connectFailed());
+        QCOMPARE(client.appState(), QStringLiteral("home"));
+        QCOMPARE(client.endReasonText(), QStringLiteral("Cancelled. You were not charged."));
+
+        QTRY_COMPARE_WITH_TIMEOUT(capture.named(QStringLiteral("play.summary")).size(), 1, 10000);
+        const ShippedLine summary = capture.named(QStringLiteral("play.summary")).first();
+        QCOMPARE(summary.attrs.value("outcome").toString(), QStringLiteral("cancelled"));
+        QCOMPARE(summary.attrs.value("end_presentation").toString(), QStringLiteral("cancelled"));
+        QVERIFY(!summary.attrs.contains("manual_end_observed"));
+        QVERIFY(!summary.attrs.contains("native_fault_code"));
+
+        // The End still goes up once, as the failed-start End it always was.
+        QTRY_VERIFY_WITH_TIMEOUT(
+            m_fake->bodiesFor(QStringLiteral("/api/sessions/s-stages/end")).size() >= 1, 15000);
+        const QJsonObject sent = QJsonDocument::fromJson(
+            m_fake->bodyFor(QStringLiteral("/api/sessions/s-stages/end"))).object();
+        QCOMPARE(sent.value(QStringLiteral("failed")).toBool(), true);
+        QCOMPARE(sent.value(QStringLiteral("stage")).toString(), QStringLiteral("connecting"));
+    }
+
     void aStageFailureReportsItsEngineCodeAndPorts()
     {
         auto* engine = new FakeEngineSession;
@@ -4975,9 +5236,10 @@ private slots:
         // The one CUST-15 asks for.
         QTest::newRow("the balance ran out")
             << "BALANCE_EXHAUSTED" << 42 << "Your balance ran out, so the session ended.";
-        QTest::newRow("the customer ended it")
+        // ADR-0096: with no observed evidence the line makes no claim about who ended it.
+        QTest::newRow("the session ended, nobody observed")
             << "CUSTOMER_ENDED" << 15
-            << "You ended the session. Unused minutes stay in your account.";
+            << "The session ended. Unused minutes stay in your account.";
         // A sentence with a number in it takes the session's own billed minutes, in mono.
         QTest::newRow("the rig was lost, with a number")
             << "HOST_LOST" << 23

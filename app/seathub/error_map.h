@@ -127,3 +127,24 @@ SeatHubFailure engineTextFailure(const QString& text);
 
 /// Maps a `Session::sessionFinished(portTestResult)` non-zero port-test result.
 SeatHubFailure mapPortTestFailure(int portTestResult);
+
+/// What this client itself observed about how a Play ended (ADR-0096). Every field is a fact a
+/// handler saw, never an inference: a generic engine Quit, a `CUSTOMER_ENDED` reason and a cleanup
+/// that answered HTTP 200 are not evidence of who ended the stream, so none of them is a field.
+struct EndEvidence
+{
+    /// The engine reported its connection started.
+    bool streamStarted = false;
+    /// The engine named a failure for this attempt (a stage failure or a launch error).
+    bool engineFailed = false;
+    /// A structured native termination code was logged before any manual End was observed.
+    bool nativeFault = false;
+    /// That first code (`kNoTerminationCode` excluded); meaningful only when `nativeFault` is set.
+    int nativeFaultCode = 0;
+};
+
+/// The derived presentation key for a `CUSTOMER_ENDED` ending (never a persisted EndReason, never
+/// sent to the control plane): `connection_lost` when a started stream's earliest evidence is a
+/// native no-traffic, no-frame or early-termination code (later manual or cleanup evidence cannot
+/// replace it); `cancelled` when no stream started and nothing failed; otherwise `unknown`.
+QString deriveEndPresentation(const EndEvidence& evidence);

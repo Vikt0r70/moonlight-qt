@@ -50,6 +50,7 @@
 #include "seathub/seathub_client.h"
 #include "seathub/session_lifecycle.h"
 #include "seathub/settings_bridge.h"
+#include "seathub/single_instance.h"
 #include "seathub/telemetry.h"
 #include "seathub/update_feed_client.h"
 #include "seathub/velopack_updater.h"
@@ -304,6 +305,30 @@ int main(int argc, char *argv[])
     // without returning; on an ordinary start it returns at once. The C API is used rather than the C++
     // header because it is the documented surface (docs.velopack.io, reference/cpp/c-api).
     VelopackUpdater::runStartupHook();
+
+#ifdef Q_OS_WIN32
+    // One copy per Windows user (ADR-0099, SC20). This is the first thing after Velopack's hook, before
+    // Sentry, the log file, SDL or any window, so a second launch never initialises any of them: it asks
+    // the first copy to come forward and exits (0 answered, 3 never reached one within the 10 s budget).
+    // The command-line subcommands are separate short-lived processes and are not guarded.
+    SingleInstance::Instance singleInstance;
+    std::vector<std::string> singleInstanceWarnings;
+    {
+        const bool isSubcommand = argc > 1 && (strcmp(argv[1], "list") == 0 || strcmp(argv[1], "stream") == 0
+                                               || strcmp(argv[1], "quit") == 0 || strcmp(argv[1], "pair") == 0);
+        if (!isSubcommand) {
+            SingleInstance::StartupDecision decision = SingleInstance::decideStartup(L"RentaPC");
+            if (decision.kind == SingleInstance::StartupDecision::Kind::AnsweredSecond) {
+                return SingleInstance::kExitAnswered;
+            }
+            if (decision.kind == SingleInstance::StartupDecision::Kind::NeverReached) {
+                return SingleInstance::kExitNeverReached;
+            }
+            singleInstanceWarnings = decision.warnings;
+            singleInstance.adopt(std::move(decision));
+        }
+    }
+#endif
 
     SDL_SetMainReady();
 
@@ -580,6 +605,20 @@ int main(int argc, char *argv[])
 #endif
 
     QGuiApplication app(argc, argv);
+
+#ifdef Q_OS_WIN32
+    // Sentry, telemetry and the log file exist now, so the guard's warnings can be recorded, and the
+    // pipe listener can start. Until it does, a second launch keeps retrying inside its budget.
+    for (const std::string &warning : singleInstanceWarnings) {
+        qWarning().noquote() << QString::fromStdString(warning);
+    }
+    {
+        std::string listenerWarning;
+        if (!singleInstance.startListener(SingleInstance::Timing(), SingleInstance::focusOwnWindow, &listenerWarning)) {
+            qWarning().noquote() << QString::fromStdString(listenerWarning);
+        }
+    }
+#endif
 
 #ifndef STEAM_LINK
     // Force use of the KMSDRM backend for SDL when using Qt platform plugins

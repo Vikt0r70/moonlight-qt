@@ -232,3 +232,23 @@ SeatHubFailure mapEndBlame(const QString& blame, const QString& reference)
 
     return f;
 }
+
+// ---------------------------------------------------------------------------
+// ADR-0096: the derived end presentation. The codes are moonlight-common-c's own
+// `ML_ERROR_NO_VIDEO_TRAFFIC` (-100), `ML_ERROR_NO_VIDEO_FRAME` (-101) and
+// `ML_ERROR_UNEXPECTED_EARLY_TERMINATION` (-102): the connection stopped delivering. Graceful (0),
+// protected content (-103), frame conversion (-104) and any other code name a host or local cause,
+// not a lost connection, so they stay `unknown`.
+// ---------------------------------------------------------------------------
+
+QString deriveEndPresentation(const EndEvidence& evidence)
+{
+    if (evidence.streamStarted && evidence.nativeFault
+        && evidence.nativeFaultCode >= -102 && evidence.nativeFaultCode <= -100) {
+        return QStringLiteral("connection_lost");
+    }
+    if (!evidence.streamStarted && !evidence.engineFailed) {
+        return QStringLiteral("cancelled");
+    }
+    return QStringLiteral("unknown");
+}

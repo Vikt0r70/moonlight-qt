@@ -265,6 +265,7 @@ SOURCES += \
     seathub/update_retry_state.cpp \
     seathub/osd_renderer.cpp \
     seathub/osd_compositor.cpp \
+    seathub/single_instance.cpp \
     streaming/streamutils.cpp \
     backend/autoupdatechecker.cpp \
     path.cpp \
@@ -345,6 +346,7 @@ HEADERS += \
     seathub/update_retry_state.h \
     seathub/osd_renderer.h \
     seathub/osd_compositor.h \
+    seathub/single_instance.h \
     seathub/stats_catalogue.h \
     streaming/video/decoder.h \
     streaming/streamutils.h \

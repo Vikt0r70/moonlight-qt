@@ -75,9 +75,12 @@ jobs:
     runs-on: windows-latest
     needs: diff-gate
     steps:
+      # Full history: tst_d28_boundary measures against the pinned upstream commit object itself
+      # and fails closed by name when that object is absent (a shallow clone), so this must stay 0.
       - uses: actions/checkout@v4
         with:
           submodules: recursive
+          fetch-depth: 0
 
       # Toolchain. Plan 03-01 left this as a placeholder rather than guess at provisioning, and
       # Plan 03-06 replaces it now that the recipe is proven on a real machine. Qt is installed
@@ -150,6 +153,17 @@ jobs:
       - name: Build and deploy SeatHub
         shell: pwsh
         run: ./scripts/build-seathub.ps1
+
+      # SC15: two suites that no earlier CI step ran. Named-suite mode builds each with the
+      # same Qt 6.11.2 and sentry-native 0.17.1 install the build above produced, and prints
+      # NAMED_SUITES_PASSED only when both pass.
+      - name: Run the telemetry and engine-boundary suites
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $out = (& cmd.exe /d /s /c 'tests\run-all-suites.cmd tst_telemetry tst_d28_boundary' 2>&1 | Out-String)
+          Write-Host $out
+          if ($out -notmatch 'NAMED_SUITES_PASSED') { throw "tst_telemetry / tst_d28_boundary did not pass." }
 
       # ADR-0063, D-01/SC-10, D-12: runs for every build. No DSN may ever be compiled into what
       # ships (a DSN can only submit events, but D-45 still forbids shipping one), and no PDB may

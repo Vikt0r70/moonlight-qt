@@ -96,6 +96,12 @@ private slots:
     void searchableReference_isTheFormTheConsoleSearchResolves();
     void everyFailureKindCarriesOnlyASearchableReference();
     void errorScreen_neverDrawsAReferenceThatIsNotOne();
+
+    // T026 / ADR-0096: the presentation key is derived from observed evidence only.
+    void endPresentation_isConnectionLostOnlyForAStartedStreamWithANativeFault_data();
+    void endPresentation_isConnectionLostOnlyForAStartedStreamWithANativeFault();
+    void endPresentation_isCancelledOnlyWhenNothingStartedAndNothingFailed();
+    void endPresentation_keepsAnActualFailedStartUnknown();
 };
 
 void TstErrorMap::initTestCase()
@@ -446,6 +452,57 @@ void TstErrorMap::errorScreen_neverDrawsAReferenceThatIsNotOne()
     QVERIFY(referenceRow);
     QVERIFY2(!referenceRow->property("visible").toBool(),
              "no reference row at all rather than a label with nothing after it");
+}
+
+void TstErrorMap::endPresentation_isConnectionLostOnlyForAStartedStreamWithANativeFault_data()
+{
+    QTest::addColumn<int>("code");
+    QTest::addColumn<QString>("expected");
+    QTest::newRow("no video traffic (-100)") << -100 << "connection_lost";
+    QTest::newRow("no video frame (-101)") << -101 << "connection_lost";
+    QTest::newRow("unexpected early termination (-102)") << -102 << "connection_lost";
+    QTest::newRow("graceful (0)") << 0 << "unknown";
+    QTest::newRow("protected content (-103)") << -103 << "unknown";
+    QTest::newRow("frame conversion (-104)") << -104 << "unknown";
+    QTest::newRow("some other code") << 5 << "unknown";
+}
+
+void TstErrorMap::endPresentation_isConnectionLostOnlyForAStartedStreamWithANativeFault()
+{
+    QFETCH(int, code);
+    QFETCH(QString, expected);
+    EndEvidence evidence;
+    evidence.streamStarted = true;
+    evidence.engineFailed = false;
+    evidence.nativeFault = true;
+    evidence.nativeFaultCode = code;
+    QCOMPARE(deriveEndPresentation(evidence), expected);
+
+    // The same code without the stream having started is not a lost connection.
+    evidence.streamStarted = false;
+    evidence.engineFailed = true;
+    QCOMPARE(deriveEndPresentation(evidence), QStringLiteral("unknown"));
+
+    // A started stream with no native fault at all (a generic quit) stays unknown.
+    EndEvidence quiet;
+    quiet.streamStarted = true;
+    QCOMPARE(deriveEndPresentation(quiet), QStringLiteral("unknown"));
+}
+
+void TstErrorMap::endPresentation_isCancelledOnlyWhenNothingStartedAndNothingFailed()
+{
+    EndEvidence evidence;
+    evidence.streamStarted = false;
+    evidence.engineFailed = false;
+    QCOMPARE(deriveEndPresentation(evidence), QStringLiteral("cancelled"));
+}
+
+void TstErrorMap::endPresentation_keepsAnActualFailedStartUnknown()
+{
+    EndEvidence evidence;
+    evidence.streamStarted = false;
+    evidence.engineFailed = true;
+    QCOMPARE(deriveEndPresentation(evidence), QStringLiteral("unknown"));
 }
 
 QTEST_MAIN(TstErrorMap)
