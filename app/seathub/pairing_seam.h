@@ -30,6 +30,7 @@
 // include `app/backend/`.
 
 #include <QByteArray>
+#include <QElapsedTimer>
 #include <QMetaType>
 #include <QObject>
 #include <QString>
@@ -83,6 +84,26 @@ struct PairingHandshakeResult
     /// caller tell a reconnect attempt that streamed on held trust from one that streamed on a
     /// fresh pairing; it carries no credential.
     bool warm = false;
+
+    // SC18 (INTENT N18 amendment 2026-10-17): the one logged retry. The fields above describe the
+    // FINAL attempt; the fields below keep the FIRST attempt on the record. None carries the PIN,
+    // the salt or any hash of either.
+    /// `success` or `failure`: the first handshake attempt's own outcome. Set by the worker on
+    /// every result (and by the deadline for a result it speaks for); empty only on a
+    /// default-constructed value.
+    QString firstOutcome;
+    /// The first attempt's frozen step and closed failure class, only when it failed and the
+    /// token is nonempty. A failure-retry success keeps these as its `attemptStep`/`stepClass`.
+    QString firstAttemptStep;
+    QString firstStepClass;
+    /// True when the worker made the Play's one automatic retry.
+    bool retried = false;
+    /// `conflict` or `failure` (`PairingRetryBudget::token`), only when `retried`.
+    QString retryReason;
+    /// True when the target's PIN is exactly four ASCII digits. A shape, not the PIN.
+    bool pinShapeOk = false;
+    /// Milliseconds from `pair()` to this result, every attempt included.
+    qint64 handshakeMs = 0;
 };
 
 // Declared for the same reason as `SeatHubFailure` and `TeardownStage`: the handshake result
@@ -246,6 +267,11 @@ private:
     std::shared_ptr<std::atomic<quint64>> m_currentGeneration;
     QTimer* m_deadline = nullptr;
     int m_deadlineMs = kDeadlineMs;
+    /// Started by `pair()` beside the deadline: `handshakeMs` and the retry's remaining budget.
+    QElapsedTimer m_clock;
+    /// `PairingRetryBudget::pinShapeOk` of the current `pair()` target, so the deadline can speak
+    /// for a handshake whose worker has not answered. A bool; the PIN itself is never kept here.
+    bool m_pinShapeOk = false;
     bool m_pending = false;
     /// The session id of the `pair()` call this object is currently running or last ran
     /// (06.6-18/T-06.6-52). Set at the top of `pair()`, read back in `finish()` to tag `hostResolved`.

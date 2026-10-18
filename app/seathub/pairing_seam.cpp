@@ -1,6 +1,7 @@
 #include "pairing_seam.h"
 
 #include <QCryptographicHash>
+#include <QElapsedTimer>
 #include <QLoggingCategory>
 #include <QMutex>
 #include <QMutexLocker>
@@ -12,6 +13,7 @@
 #include <memory>
 
 #include "pairing_recovery.h"
+#include "pairing_retry.h"
 
 Q_LOGGING_CATEGORY(seathubPairingSeam, "seathub.pairing.seam")
 
@@ -39,13 +41,16 @@ public:
     HandshakeTask(PairingHandshake handshake, WarmReturnCheck warmCheck,
                   PairingCancelRequest cancelRequest,
                   PairingTarget target, quint64 generation,
-                  std::shared_ptr<std::atomic<quint64>> currentGeneration)
+                  std::shared_ptr<std::atomic<quint64>> currentGeneration,
+                  QElapsedTimer clock, int deadlineMs)
         : m_handshake(std::move(handshake)),
           m_warmCheck(std::move(warmCheck)),
           m_cancelRequest(std::move(cancelRequest)),
           m_target(std::move(target)),
           m_generation(generation),
-          m_currentGeneration(std::move(currentGeneration))
+          m_currentGeneration(std::move(currentGeneration)),
+          m_clock(clock),
+          m_deadlineMs(deadlineMs)
     {
     }
 
@@ -84,24 +89,49 @@ public:
             result = m_handshake(m_target);
         }
 
-        // G-06.2-2 recovery, once (T-06.2-12-02: one retry, never a loop). A conflicting failure -
-        // the rig's 409 on getservercert, or ALREADY_IN_PROGRESS out of the handshake - means a
-        // half-open pending pairing session holds the shared upstream uniqueid on the rig. Clear
-        // it (the clear must COMPLETE before the retry, so the rig's answer is seen first), then
-        // run the handshake exactly once more and report whatever that produced, as-is.
+        // SC18: the first attempt stays on the record whatever the retry does.
+        const PairingHandshakeResult first = result;
+        const bool firstSucceeded = first.ok && !first.clientIdentity.isEmpty();
+
+        // The ONE automatic retry a Play may take (T-06.2-12-02: one retry, never a loop; SC18).
+        // The rig's 409 / ALREADY_IN_PROGRESS clear (G-06.2-2) and the new retry of any other
+        // non-PAIRED result draw from the same `PairingRetryBudget`, so a conflict clear followed
+        // by a failure is not a second retry. On a failure the pending-pairing slot is cleared
+        // first (the clear must COMPLETE before the retry, so the rig's answer is seen first);
+        // then the handshake runs exactly once more with the same session and PIN, and whatever
+        // that produced is reported.
         //
         // The generation gate makes the whole block a no-op for a superseded run: a fresh
         // `pair()` has since stored its own generation in the shared atomic, this run's number no
         // longer matches, and the stale run sends no clear and no retry - a clear aimed by a dead
         // run could cancel the very session that superseded it. The atomic is read and written
-        // without touching `this`, which the worker outlives.
+        // without touching `this`, which the worker outlives. It is read again AFTER the clear
+        // returns, because the clear blocks and a newer `pair()` or a cancel can land meanwhile.
+        PairingRetryBudget budget;
         if (!result.ok && m_generation == m_currentGeneration->load()) {
             m_cancelRequest(m_target.hostAddress, m_target.controlPort);
-            if (result.pairingConflict && m_generation == m_currentGeneration->load()) {
+
+            PairingRetryBudget::Inputs in;
+            in.ok = result.ok;
+            in.pairingConflict = result.pairingConflict;
+            in.generationCurrent = m_generation == m_currentGeneration->load();
+            in.reconnecting = m_target.reconnecting;
+            // No stream can exist before pairing completes.
+            in.streamExists = false;
+            in.elapsedMs = m_clock.elapsed();
+            in.deadlineMs = m_deadlineMs;
+            const std::optional<PairingRetryBudget::Reason> reason = budget.decide(in);
+            if (reason) {
+                const QString token = PairingRetryBudget::token(*reason);
+                // Neither the session, the rig address nor the PIN is part of this line.
+                qCInfo(seathubPairingSeam).noquote()
+                    << QStringLiteral("pairing handshake retried once reason=%1").arg(token);
                 result = m_handshake(m_target);
                 // A second try of the same step in this Play is attempt 2 (ADR-0072 item 2).
                 result.attempts = 2;
-                if (result.ok) {
+                result.retried = true;
+                result.retryReason = token;
+                if (result.ok && *reason == PairingRetryBudget::Reason::Conflict) {
                     // The recovered record is FROZEN by the ADR (item 2) and by
                     // `docs/spec/client.md` "Play diagnostics - Rules": `step=pair_handshake`,
                     // `failure_class=in_progress`, `attempt=2`. The conflict that was cleared was
@@ -113,11 +143,24 @@ public:
                     // diagnostic text the first run carried stays where it was: out of it.
                     result.attemptStep = QStringLiteral("pair_handshake");
                     result.stepClass = QStringLiteral("in_progress");
+                } else if (result.ok) {
+                    // A failure-retry success keeps the FIRST attempt's step and class, never
+                    // relabelled `in_progress` (SC18): the record says what went wrong first.
+                    result.attemptStep = first.attemptStep;
+                    result.stepClass = first.stepClass;
                 }
                 // A retry that fails again keeps ITS OWN class at attempt 2 (same item): the
                 // second run computed it from its own failure, and nothing here overwrites it.
             }
         }
+
+        result.firstOutcome = firstSucceeded ? QStringLiteral("success") : QStringLiteral("failure");
+        if (!firstSucceeded) {
+            result.firstAttemptStep = first.attemptStep;
+            result.firstStepClass = first.stepClass;
+        }
+        result.pinShapeOk = PairingRetryBudget::pinShapeOk(m_target.pairingPin);
+        result.handshakeMs = m_clock.elapsed();
 
         emit finished(m_generation, result);
     }
@@ -132,6 +175,10 @@ private:
     PairingTarget m_target;
     quint64 m_generation;
     std::shared_ptr<std::atomic<quint64>> m_currentGeneration;
+    /// A copy of the clock `pair()` started with the 90 s deadline: the retry draws on what that
+    /// one deadline has left and never restarts it.
+    QElapsedTimer m_clock;
+    int m_deadlineMs;
 };
 
 } // namespace
@@ -209,6 +256,9 @@ ProductionPairingSeam::ProductionPairingSeam(QObject* parent)
         PairingHandshakeResult timedOut;
         timedOut.engineError = QStringLiteral("the pairing handshake did not finish inside %1 ms")
                                    .arg(m_deadlineMs);
+        timedOut.firstOutcome = QStringLiteral("failure");
+        timedOut.pinShapeOk = m_pinShapeOk;
+        timedOut.handshakeMs = m_clock.elapsed();
         // 06.6-18/T-06.6-53: this timer is restarted by every `pair()` call, so whenever it fires
         // it is timing out whichever handshake is current - `m_generation` always names that one.
         finish(m_generation, timedOut);
@@ -272,6 +322,8 @@ void ProductionPairingSeam::pair(const PairingTarget& target,
     // Restarts the timer if one was already running (for the handshake this call just superseded) -
     // it now counts down 90 s from THIS `pair()` call, not from whatever remained of the old one.
     m_deadline->start(m_deadlineMs);
+    m_clock.start();
+    m_pinShapeOk = PairingRetryBudget::pinShapeOk(target.pairingPin);
 
     qCInfo(seathubPairingSeam).noquote()
         << QStringLiteral("pairing_instrumentation writer=client stage=start session_id=%1 client_attempt=%2")
@@ -279,7 +331,7 @@ void ProductionPairingSeam::pair(const PairingTarget& target,
             .arg(generation);
 
     HandshakeTask* task = new HandshakeTask(m_handshake, m_warmCheck, m_cancelRequest, target,
-                                            generation, m_currentGeneration);
+                                            generation, m_currentGeneration, m_clock, m_deadlineMs);
     connect(task, &HandshakeTask::finished, this, &ProductionPairingSeam::handleHandshakeResult);
     QThreadPool::globalInstance()->start(task);
 }
@@ -359,6 +411,25 @@ void ProductionPairingSeam::finish(quint64 generation, const PairingHandshakeRes
     if (!result.stepClass.isEmpty()) {
         record += QStringLiteral(" engine_class=%1").arg(result.stepClass);
     }
+    // SC18: the first attempt, the retry and the timing, appended after the fields above. The
+    // first attempt's step and class appear only for a first failure that was classified.
+    record += QStringLiteral(" first_outcome=%1")
+                  .arg(result.firstOutcome.isEmpty() ? QStringLiteral("failure") : result.firstOutcome);
+    if (result.firstOutcome != QLatin1String("success")) {
+        if (!result.firstAttemptStep.isEmpty()) {
+            record += QStringLiteral(" first_engine_step=%1").arg(result.firstAttemptStep);
+        }
+        if (!result.firstStepClass.isEmpty()) {
+            record += QStringLiteral(" first_engine_class=%1").arg(result.firstStepClass);
+        }
+    }
+    record += QStringLiteral(" retried=%1").arg(result.retried ? QStringLiteral("true") : QStringLiteral("false"));
+    if (result.retried) {
+        record += QStringLiteral(" retry_reason=%1").arg(result.retryReason);
+    }
+    record += QStringLiteral(" pin_shape_ok=%1 handshake_ms=%2")
+                  .arg(result.pinShapeOk ? QStringLiteral("true") : QStringLiteral("false"))
+                  .arg(result.handshakeMs);
     qCInfo(seathubPairingSeam).noquote() << record;
 
     std::function<void(bool, const QString&, const QString&)> done = std::move(m_done);

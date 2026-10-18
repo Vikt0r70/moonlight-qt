@@ -348,6 +348,9 @@ void PairingController::handleAuthorization(quint64 attempt, const ControlPlaneR
     // falls back to it there. This controller starts one handshake per attempt
     // (`m_handshakeInFlight`).
     target.warmReturn = authorization.warmReturn;
+    // SC18: the reconnect flow is the ACTIVE session, whatever `warm_return` says; a NEW session on
+    // a free return hold also has `warmReturn` true and must keep the seam's one pairing retry.
+    target.reconnecting = authorization.state == QLatin1String("ACTIVE");
     LogShipper::setRedactions({target.hostAddress});
 
     // The engine seam gets the address and the PIN. Nothing else in this process does.

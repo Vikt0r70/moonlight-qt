@@ -371,6 +371,14 @@ PairingHandshakeResult handshakeResult(bool ok, const QString& identity,
     return result;
 }
 
+/// The one nondeterministic value in a `stage=result` record is `handshake_ms`; every other byte is
+/// compared exactly. A non-numeric or missing value stays as it is and fails the comparison.
+QString withMsNormalized(QString body)
+{
+    return body.replace(QRegularExpression(QStringLiteral("handshake_ms=\\d+$")),
+                        QStringLiteral("handshake_ms=N"));
+}
+
 /// Everything the seam said, in the order it said it.
 struct SeamReport
 {
@@ -1371,7 +1379,7 @@ private slots:
         QCOMPARE(report.diagnostics.first(), QStringLiteral("still-conflict-2"));
     }
 
-    void seamNonConflictFailure_oneClearNoRetry()
+    void seamNonConflictFailure_oneClearOneRetry()
     {
         ProductionPairingSeam seam;
         int cancels = 0;
@@ -1379,7 +1387,8 @@ private slots:
         seam.setHandshake([&](const PairingTarget&) {
             ++handshakes;
             // No conflict flag: a plain failure. The failed run may still have left a pending
-            // session on the rig, so it still gets one clear - but no retry.
+            // session on the rig, so it gets one clear; SC18 then grants the Play its one retry
+            // (a plain failure used to get none), and the retry never repeats the clear.
             return handshakeResult(false, QString(), QStringLiteral("plain-failure"));
         });
         seam.setCancelRequest([&](const QString&, int) {
@@ -1391,7 +1400,7 @@ private slots:
         seam.pair(pairingTarget(), recordInto(&report));
         QTRY_COMPARE(report.count(), 1);
 
-        QCOMPARE(handshakes, 1);
+        QCOMPARE(handshakes, 2);
         QCOMPARE(cancels, 1);
         QCOMPARE(report.outcomes.first(), false);
         QCOMPARE(report.diagnostics.first(), QStringLiteral("plain-failure"));
@@ -1436,7 +1445,16 @@ private slots:
             classified.at(0).at(0).value<PairingHandshakeResult>();
         QCOMPARE(delivered.attemptStep, QStringLiteral("pair_handshake"));
         QCOMPARE(delivered.stepClass, QStringLiteral("pin_rejected"));
-        QCOMPARE(delivered.attempts, 1);
+        // SC18: a wrong-PIN failure is a non-PAIRED result, so the Play retried once; the final
+        // class is the same and the first failure rides the record beside it.
+        QCOMPARE(delivered.attempts, 2);
+        QCOMPARE(delivered.firstOutcome, QStringLiteral("failure"));
+        QCOMPARE(delivered.firstAttemptStep, QStringLiteral("pair_handshake"));
+        QCOMPARE(delivered.firstStepClass, QStringLiteral("pin_rejected"));
+        QVERIFY(delivered.retried);
+        QCOMPARE(delivered.retryReason, QStringLiteral("failure"));
+        QVERIFY(delivered.pinShapeOk);
+        QVERIFY(delivered.handshakeMs >= 0);
 
         // The step is one of the 11 frozen tokens, read from the header block the vocabulary
         // script checks - a step outside it could never reach `/end` or a Sentry query.
@@ -1460,7 +1478,7 @@ private slots:
         // The same classification on the accessor the facade reads once `pairingFailed` lands.
         QCOMPARE(seam.lastResult().attemptStep, QStringLiteral("pair_handshake"));
         QCOMPARE(seam.lastResult().stepClass, QStringLiteral("pin_rejected"));
-        QCOMPARE(seam.lastResult().attempts, 1);
+        QCOMPARE(seam.lastResult().attempts, 2);
         QCOMPARE(seam.lastResult().engineError, QStringLiteral("the rig rejected the pairing PIN"));
     }
 
@@ -1519,6 +1537,15 @@ private slots:
         QCOMPARE(delivered.attemptStep, QStringLiteral("pair_handshake"));
         QCOMPARE(delivered.stepClass, QStringLiteral("in_progress"));
         QCOMPARE(delivered.attempts, 2);
+        // SC18 fields: the first attempt was a failure (a conflict), the retry was the conflict
+        // clear, and the PIN only ever appears as its shape.
+        QCOMPARE(delivered.firstOutcome, QStringLiteral("failure"));
+        QCOMPARE(delivered.firstAttemptStep, QStringLiteral("pair_server_info"));
+        QCOMPARE(delivered.firstStepClass, QStringLiteral("http_4xx"));
+        QVERIFY(delivered.retried);
+        QCOMPARE(delivered.retryReason, QStringLiteral("conflict"));
+        QVERIFY(delivered.pinShapeOk);
+        QVERIFY(delivered.handshakeMs >= 0);
 
         // No diagnostic text and no address rides the record (ADR-0072 item 2, T-06.7-35).
         QVERIFY2(!delivered.stepClass.isEmpty() && delivered.stepClass != delivered.engineError,
@@ -2468,8 +2495,8 @@ private slots:
         // Stage: result
         const ShippedLine& resultLine = lines.at(1);
         QCOMPARE(resultLine.level, LogLevel::Info);
-        QCOMPARE(resultLine.body,
-                 QStringLiteral("pairing_instrumentation writer=client stage=result session_id=%1 client_attempt=1 outcome=success warm=false attempts=1 engine_step=pair_handshake engine_class=ok")
+        QCOMPARE(withMsNormalized(resultLine.body),
+                 QStringLiteral("pairing_instrumentation writer=client stage=result session_id=%1 client_attempt=1 outcome=success warm=false attempts=1 engine_step=pair_handshake engine_class=ok first_outcome=success retried=false pin_shape_ok=true handshake_ms=N")
                      .arg(testSessionId));
 
         // Strict omission of server-only fields and secrets across all emitted lines
@@ -2530,8 +2557,10 @@ private slots:
 
         const ShippedLine& resultLine = lines.at(1);
         QCOMPARE(resultLine.level, LogLevel::Info);
-        QCOMPARE(resultLine.body,
-                 QStringLiteral("pairing_instrumentation writer=client stage=result session_id=%1 client_attempt=1 outcome=failure warm=false attempts=2 engine_step=pair_handshake engine_class=pin_rejected")
+        // The fake fails every run, so the Play's one retry happened (SC18): attempts=2, the
+        // first failure stays on the record beside the final one, and the PIN is only a shape.
+        QCOMPARE(withMsNormalized(resultLine.body),
+                 QStringLiteral("pairing_instrumentation writer=client stage=result session_id=%1 client_attempt=1 outcome=failure warm=false attempts=2 engine_step=pair_handshake engine_class=pin_rejected first_outcome=failure first_engine_step=pair_handshake first_engine_class=pin_rejected retried=true retry_reason=failure pin_shape_ok=true handshake_ms=N")
                      .arg(testSessionId));
         QVERIFY(!resultLine.body.contains(secretDiagnostic));
     }
@@ -2573,8 +2602,8 @@ private slots:
 
         const ShippedLine& resultLine = lines.at(1);
         QCOMPARE(resultLine.level, LogLevel::Info);
-        QCOMPARE(resultLine.body,
-                 QStringLiteral("pairing_instrumentation writer=client stage=result session_id=%1 client_attempt=1 outcome=success warm=true attempts=1")
+        QCOMPARE(withMsNormalized(resultLine.body),
+                 QStringLiteral("pairing_instrumentation writer=client stage=result session_id=%1 client_attempt=1 outcome=success warm=true attempts=1 first_outcome=success retried=false pin_shape_ok=true handshake_ms=N")
                      .arg(testSessionId));
     }
 
@@ -2612,8 +2641,9 @@ private slots:
 
         const ShippedLine& resultLine = lines.at(1);
         QCOMPARE(resultLine.level, LogLevel::Info);
-        QCOMPARE(resultLine.body,
-                 QStringLiteral("pairing_instrumentation writer=client stage=result session_id=%1 client_attempt=1 outcome=failure warm=false attempts=1")
+        // `ok` without an identity is a failure, but not a non-PAIRED result: nothing to retry.
+        QCOMPARE(withMsNormalized(resultLine.body),
+                 QStringLiteral("pairing_instrumentation writer=client stage=result session_id=%1 client_attempt=1 outcome=failure warm=false attempts=1 first_outcome=failure retried=false pin_shape_ok=true handshake_ms=N")
                      .arg(testSessionId));
     }
 
@@ -2651,11 +2681,13 @@ private slots:
 
         const ShippedLine& resultLine = lines.at(1);
         QCOMPARE(resultLine.level, LogLevel::Info);
-        QCOMPARE(resultLine.body,
-                 QStringLiteral("pairing_instrumentation writer=client stage=result session_id=%1 client_attempt=1 outcome=failure warm=false attempts=1")
+        QCOMPARE(withMsNormalized(resultLine.body),
+                 QStringLiteral("pairing_instrumentation writer=client stage=result session_id=%1 client_attempt=1 outcome=failure warm=false attempts=1 first_outcome=failure retried=false pin_shape_ok=true handshake_ms=N")
                      .arg(testSessionId));
         QVERIFY(!resultLine.body.contains(QStringLiteral("engine_step=")));
         QVERIFY(!resultLine.body.contains(QStringLiteral("engine_class=")));
+        // The deadline spoke before the worker answered: the timing it reports is the deadline's.
+        QVERIFY(resultLine.body.contains(QRegularExpression(QStringLiteral("handshake_ms=\\d+$"))));
     }
 
     void pairingInstrumentation_cancelledAndSupersededStartsLackResult()
@@ -2725,7 +2757,7 @@ private slots:
             QCOMPARE(cancelSuiteLines.size(), 3);
             QCOMPARE(cancelSuiteLines.at(0).body, QStringLiteral("pairing_instrumentation writer=client stage=start session_id=session-cancel client_attempt=1"));
             QCOMPARE(cancelSuiteLines.at(1).body, QStringLiteral("pairing_instrumentation writer=client stage=start session_id=session-subsequent client_attempt=3"));
-            QCOMPARE(cancelSuiteLines.at(2).body, QStringLiteral("pairing_instrumentation writer=client stage=result session_id=session-subsequent client_attempt=3 outcome=success warm=false attempts=1"));
+            QCOMPARE(withMsNormalized(cancelSuiteLines.at(2).body), QStringLiteral("pairing_instrumentation writer=client stage=result session_id=session-subsequent client_attempt=3 outcome=success warm=false attempts=1 first_outcome=success retried=false pin_shape_ok=true handshake_ms=N"));
             QCOMPARE(stub.countMatching(QStringLiteral("session-cancel")), 1);
         }
 
@@ -2770,7 +2802,7 @@ private slots:
             const QVector<ShippedLine> bLines = stub.matching(QStringLiteral("session-b"));
             QCOMPARE(bLines.size(), 2);
             QCOMPARE(bLines.at(0).body, QStringLiteral("pairing_instrumentation writer=client stage=start session_id=session-b client_attempt=2"));
-            QCOMPARE(bLines.at(1).body, QStringLiteral("pairing_instrumentation writer=client stage=result session_id=session-b client_attempt=2 outcome=success warm=false attempts=1"));
+            QCOMPARE(withMsNormalized(bLines.at(1).body), QStringLiteral("pairing_instrumentation writer=client stage=result session_id=session-b client_attempt=2 outcome=success warm=false attempts=1 first_outcome=success retried=false pin_shape_ok=true handshake_ms=N"));
         }
     }
 
@@ -2856,8 +2888,8 @@ private slots:
         // But explicit body is NOT relabeled - retains original target sessionOld:
         QVERIFY(oldResult.body.contains(QStringLiteral("session_id=%1").arg(sessionOld)));
         QVERIFY(!oldResult.body.contains(QStringLiteral("session_id=%1").arg(sessionNew)));
-        QCOMPARE(oldResult.body,
-                 QStringLiteral("pairing_instrumentation writer=client stage=result session_id=%1 client_attempt=1 outcome=success warm=false attempts=1")
+        QCOMPARE(withMsNormalized(oldResult.body),
+                 QStringLiteral("pairing_instrumentation writer=client stage=result session_id=%1 client_attempt=1 outcome=success warm=false attempts=1 first_outcome=success retried=false pin_shape_ok=true handshake_ms=N")
                      .arg(sessionOld));
 
         // Now replacement seam pair with targetNew:
@@ -2880,8 +2912,8 @@ private slots:
         QCOMPARE(newLines.at(1).sessionId, sessionNew);
         QCOMPARE(newLines.at(1).hostId, hostNew);
         QCOMPARE(newLines.at(1).traceId, traceNew);
-        QCOMPARE(newLines.at(1).body,
-                 QStringLiteral("pairing_instrumentation writer=client stage=result session_id=%1 client_attempt=2 outcome=success warm=false attempts=1")
+        QCOMPARE(withMsNormalized(newLines.at(1).body),
+                 QStringLiteral("pairing_instrumentation writer=client stage=result session_id=%1 client_attempt=2 outcome=success warm=false attempts=1 first_outcome=success retried=false pin_shape_ok=true handshake_ms=N")
                      .arg(sessionNew));
     }
 
@@ -2953,6 +2985,380 @@ private slots:
             QVERIFY2(!line.body.contains(QStringLiteral("pin_ack_age_ms")), "server field must not appear in handed-off pairing_instrumentation");
             QVERIFY2(!line.body.contains(QStringLiteral("since_sunshine_start_ms")), "server field must not appear in handed-off pairing_instrumentation");
             QVERIFY2(!line.body.contains(QStringLiteral("pin_salt_match")), "server field must not appear in handed-off pairing_instrumentation");
+        }
+    }
+    // -----------------------------------------------------------------------------------------
+    // SC18, the ONE logged pairing retry. A Play whose first pairing attempt is not PAIRED gets
+    // exactly one more, drawn from the same budget as the 409 clear, and the first failure stays
+    // on the record beside the final result. Every wait below is on the worker's own effect
+    // (`waitForDone` on the pool the seam runs it on), never a sleep.
+    // -----------------------------------------------------------------------------------------
+
+    void sc18_failureThenSuccess_retriesOnceAndKeepsTheFirstClass()
+    {
+        ProductionPairingSeam seam;
+        std::atomic<int> handshakes{0};
+        QVector<int> handshakePorts;
+        QVector<int> cancelPorts;
+        QMutex lock;
+        seam.setHandshake([&](const PairingTarget& target) {
+            {
+                QMutexLocker guard(&lock);
+                handshakePorts.append(target.controlPort);
+            }
+            if (++handshakes == 1) {
+                PairingHandshakeResult rejected;
+                rejected.engineError = QStringLiteral("the rig rejected the pairing PIN");
+                rejected.attemptStep = QStringLiteral("pair_handshake");
+                rejected.stepClass = QStringLiteral("pin_rejected");
+                return rejected;
+            }
+            return handshakeResult(true, QStringLiteral("retry-identity"));
+        });
+        seam.setCancelRequest([&](const QString&, int port) {
+            QMutexLocker guard(&lock);
+            cancelPorts.append(port);
+            return true;
+        });
+
+        QSignalSpy classified(&seam, &ProductionPairingSeam::handshakeClassified);
+        SeamReport report;
+        seam.pair(pairingTarget(), recordInto(&report));
+        QTRY_COMPARE_WITH_TIMEOUT(report.count(), 1, 5000);
+        QVERIFY(QThreadPool::globalInstance()->waitForDone(10000));
+
+        QCOMPARE(handshakes.load(), 2);
+        // The only rig write the retry adds is the existing pending-slot clear, and both it and
+        // the second handshake aim at the signed per-rig control port.
+        QCOMPARE(cancelPorts, (QVector<int>{ 20000 }));
+        QCOMPARE(handshakePorts, (QVector<int>{ 20000, 20000 }));
+        QVERIFY(report.outcomes.first());
+        QCOMPARE(report.identities.first(), QStringLiteral("retry-identity"));
+
+        QTRY_COMPARE(classified.count(), 1);
+        const PairingHandshakeResult delivered =
+            classified.at(0).at(0).value<PairingHandshakeResult>();
+        QVERIFY(delivered.ok);
+        QCOMPARE(delivered.attempts, 2);
+        // Not relabelled `in_progress`: the record says what went wrong first.
+        QCOMPARE(delivered.attemptStep, QStringLiteral("pair_handshake"));
+        QCOMPARE(delivered.stepClass, QStringLiteral("pin_rejected"));
+        QCOMPARE(delivered.firstOutcome, QStringLiteral("failure"));
+        QCOMPARE(delivered.firstAttemptStep, QStringLiteral("pair_handshake"));
+        QCOMPARE(delivered.firstStepClass, QStringLiteral("pin_rejected"));
+        QVERIFY(delivered.retried);
+        QCOMPARE(delivered.retryReason, QStringLiteral("failure"));
+        QVERIFY(delivered.pinShapeOk);
+        QVERIFY(delivered.handshakeMs >= 0);
+        // The PIN never rides any of the new fields.
+        const QString pin = QString::fromLatin1(kPin);
+        QVERIFY(!delivered.firstOutcome.contains(pin) && !delivered.firstAttemptStep.contains(pin)
+                && !delivered.firstStepClass.contains(pin) && !delivered.retryReason.contains(pin));
+    }
+
+    void sc18_conflictThenSuccess_keepsInProgressAndNamesTheConflict()
+    {
+        ProductionPairingSeam seam;
+        std::atomic<int> handshakes{0};
+        seam.setHandshake([&](const PairingTarget&) {
+            if (++handshakes == 1) {
+                PairingHandshakeResult conflict = handshakeResult(false, QString(), QStringLiteral("conflict"));
+                conflict.pairingConflict = true;
+                conflict.attemptStep = QStringLiteral("pair_server_info");
+                conflict.stepClass = QStringLiteral("http_4xx");
+                return conflict;
+            }
+            return handshakeResult(true, QStringLiteral("recovered"));
+        });
+        seam.setCancelRequest([](const QString&, int) { return true; });
+
+        SeamReport report;
+        seam.pair(pairingTarget(), recordInto(&report));
+        QTRY_COMPARE_WITH_TIMEOUT(report.count(), 1, 5000);
+        QVERIFY(QThreadPool::globalInstance()->waitForDone(10000));
+
+        const PairingHandshakeResult delivered = seam.lastResult();
+        QVERIFY(delivered.ok);
+        QCOMPARE(delivered.attemptStep, QStringLiteral("pair_handshake"));
+        QCOMPARE(delivered.stepClass, QStringLiteral("in_progress"));
+        QCOMPARE(delivered.attempts, 2);
+        QCOMPARE(delivered.firstOutcome, QStringLiteral("failure"));
+        QCOMPARE(delivered.firstAttemptStep, QStringLiteral("pair_server_info"));
+        QCOMPARE(delivered.firstStepClass, QStringLiteral("http_4xx"));
+        QVERIFY(delivered.retried);
+        QCOMPARE(delivered.retryReason, QStringLiteral("conflict"));
+    }
+
+    void sc18_conflictThenFailure_doesNotRetryASecondTime()
+    {
+        ProductionPairingSeam seam;
+        std::atomic<int> handshakes{0};
+        std::atomic<int> cancels{0};
+        seam.setHandshake([&](const PairingTarget&) {
+            const int n = ++handshakes;
+            PairingHandshakeResult failed;
+            failed.attemptStep = QStringLiteral("pair_handshake");
+            failed.engineError = QStringLiteral("run %1").arg(n);
+            if (n == 1) {
+                failed.pairingConflict = true;
+                failed.stepClass = QStringLiteral("in_progress");
+            } else {
+                failed.stepClass = QStringLiteral("pin_rejected");
+            }
+            return failed;
+        });
+        seam.setCancelRequest([&](const QString&, int) {
+            ++cancels;
+            return true;
+        });
+
+        SeamReport report;
+        seam.pair(pairingTarget(), recordInto(&report));
+        QTRY_COMPARE_WITH_TIMEOUT(report.count(), 1, 5000);
+        QVERIFY(QThreadPool::globalInstance()->waitForDone(10000));
+
+        // One budget for both reasons: a conflict clear followed by a failure is not a second retry.
+        QCOMPARE(handshakes.load(), 2);
+        QCOMPARE(cancels.load(), 1);
+        const PairingHandshakeResult delivered = seam.lastResult();
+        QVERIFY(!delivered.ok);
+        QCOMPARE(delivered.attempts, 2);
+        QCOMPARE(delivered.stepClass, QStringLiteral("pin_rejected"));
+        QCOMPARE(delivered.firstOutcome, QStringLiteral("failure"));
+        QCOMPARE(delivered.firstStepClass, QStringLiteral("in_progress"));
+        QVERIFY(delivered.retried);
+        QCOMPARE(delivered.retryReason, QStringLiteral("conflict"));
+    }
+
+    void sc18_failureThenFailure_reportsTheFinalClassAndTheFirstOne()
+    {
+        ProductionPairingSeam seam;
+        std::atomic<int> handshakes{0};
+        std::atomic<int> cancels{0};
+        seam.setHandshake([&](const PairingTarget&) {
+            PairingHandshakeResult failed;
+            failed.attemptStep = QStringLiteral("pair_handshake");
+            if (++handshakes == 1) {
+                failed.stepClass = QStringLiteral("pin_rejected");
+            } else {
+                failed.stepClass = QStringLiteral("timeout");
+            }
+            return failed;
+        });
+        seam.setCancelRequest([&](const QString&, int) {
+            ++cancels;
+            return true;
+        });
+
+        SeamReport report;
+        seam.pair(pairingTarget(), recordInto(&report));
+        QTRY_COMPARE_WITH_TIMEOUT(report.count(), 1, 5000);
+        QVERIFY(QThreadPool::globalInstance()->waitForDone(10000));
+
+        QCOMPARE(handshakes.load(), 2);
+        QCOMPARE(cancels.load(), 1);
+        const PairingHandshakeResult delivered = seam.lastResult();
+        QVERIFY(!delivered.ok);
+        QCOMPARE(delivered.attempts, 2);
+        QCOMPARE(delivered.stepClass, QStringLiteral("timeout"));
+        QCOMPARE(delivered.firstStepClass, QStringLiteral("pin_rejected"));
+        QCOMPARE(delivered.retryReason, QStringLiteral("failure"));
+    }
+
+    void sc18_aReconnectingTargetNeverRetries()
+    {
+        for (const bool conflict : { false, true }) {
+            ProductionPairingSeam seam;
+            std::atomic<int> handshakes{0};
+            std::atomic<int> cancels{0};
+            seam.setHandshake([&](const PairingTarget&) {
+                ++handshakes;
+                PairingHandshakeResult failed;
+                failed.attemptStep = QStringLiteral("pair_handshake");
+                failed.stepClass = QStringLiteral("pin_rejected");
+                failed.pairingConflict = conflict;
+                return failed;
+            });
+            seam.setCancelRequest([&](const QString&, int) {
+                ++cancels;
+                return true;
+            });
+
+            PairingTarget target = pairingTarget();
+            target.reconnecting = true;
+            SeamReport report;
+            seam.pair(target, recordInto(&report));
+            QTRY_COMPARE_WITH_TIMEOUT(report.count(), 1, 5000);
+            QVERIFY(QThreadPool::globalInstance()->waitForDone(10000));
+
+            QCOMPARE(handshakes.load(), 1);
+            QCOMPARE(cancels.load(), 1);
+            const PairingHandshakeResult delivered = seam.lastResult();
+            QVERIFY(!delivered.ok);
+            QCOMPARE(delivered.attempts, 1);
+            QVERIFY(!delivered.retried);
+            QVERIFY(delivered.retryReason.isEmpty());
+            QCOMPARE(delivered.firstOutcome, QStringLiteral("failure"));
+            QCOMPARE(delivered.firstStepClass, QStringLiteral("pin_rejected"));
+        }
+    }
+
+    void sc18_aWarmReturnNewTargetWhoseWarmCheckFailsStillRetriesOnce()
+    {
+        // `warmReturn` is true for a NEW session on a free return hold too, so it is never the
+        // reconnect guard: this target is NOT reconnecting and its PIN handshake gets its retry.
+        const auto cleanup = qScopeGuard([]() { HeldRigTrust::clear(); });
+        HeldRigTrust::clear();
+        HeldRigTrust::remember(QByteArrayLiteral("held"));
+
+        ProductionPairingSeam seam;
+        std::atomic<int> handshakes{0};
+        std::atomic<int> warmChecks{0};
+        std::atomic<int> cancels{0};
+        seam.setWarmReturnCheck([&](const PairingTarget&, const QByteArray&) {
+            ++warmChecks;
+            return PairingHandshakeResult(); // not ok: the rig did not confirm the held pin
+        });
+        seam.setHandshake([&](const PairingTarget&) {
+            if (++handshakes == 1) {
+                PairingHandshakeResult failed;
+                failed.attemptStep = QStringLiteral("pair_handshake");
+                failed.stepClass = QStringLiteral("pin_rejected");
+                return failed;
+            }
+            return handshakeResult(true, QStringLiteral("pin-identity"));
+        });
+        seam.setCancelRequest([&](const QString&, int) {
+            ++cancels;
+            return true;
+        });
+
+        PairingTarget target = pairingTarget();
+        target.warmReturn = true;
+        QVERIFY(!target.reconnecting);
+        SeamReport report;
+        seam.pair(target, recordInto(&report));
+        QTRY_COMPARE_WITH_TIMEOUT(report.count(), 1, 5000);
+        QVERIFY(QThreadPool::globalInstance()->waitForDone(10000));
+
+        QCOMPARE(warmChecks.load(), 1);
+        QCOMPARE(handshakes.load(), 2);
+        QCOMPARE(cancels.load(), 1);
+        QCOMPARE(report.identities.first(), QStringLiteral("pin-identity"));
+        const PairingHandshakeResult delivered = seam.lastResult();
+        QVERIFY(delivered.ok);
+        QVERIFY(!delivered.warm);
+        QVERIFY(delivered.retried);
+        QCOMPARE(delivered.retryReason, QStringLiteral("failure"));
+        QCOMPARE(delivered.firstOutcome, QStringLiteral("failure"));
+    }
+
+    void sc18_aWarmSuccessNeverRetriesAndCountsAsAFirstSuccess()
+    {
+        const auto cleanup = qScopeGuard([]() { HeldRigTrust::clear(); });
+        HeldRigTrust::clear();
+        HeldRigTrust::remember(QByteArrayLiteral("held"));
+
+        ProductionPairingSeam seam;
+        std::atomic<int> handshakes{0};
+        std::atomic<int> cancels{0};
+        seam.setWarmReturnCheck([](const PairingTarget&, const QByteArray&) {
+            PairingHandshakeResult result = handshakeResult(true, QStringLiteral("warm-identity"));
+            result.host = std::make_shared<PairedHost>();
+            return result;
+        });
+        seam.setHandshake([&](const PairingTarget&) {
+            ++handshakes;
+            return handshakeResult(false, QString(), QStringLiteral("must not run"));
+        });
+        seam.setCancelRequest([&](const QString&, int) {
+            ++cancels;
+            return true;
+        });
+
+        PairingTarget target = pairingTarget();
+        target.warmReturn = true;
+        SeamReport report;
+        seam.pair(target, recordInto(&report));
+        QTRY_COMPARE_WITH_TIMEOUT(report.count(), 1, 5000);
+        QVERIFY(QThreadPool::globalInstance()->waitForDone(10000));
+
+        QCOMPARE(handshakes.load(), 0);
+        QCOMPARE(cancels.load(), 0);
+        const PairingHandshakeResult delivered = seam.lastResult();
+        QVERIFY(delivered.warm);
+        QCOMPARE(delivered.attempts, 1);
+        QCOMPARE(delivered.firstOutcome, QStringLiteral("success"));
+        QVERIFY(delivered.firstAttemptStep.isEmpty());
+        QVERIFY(delivered.firstStepClass.isEmpty());
+        QVERIFY(!delivered.retried);
+        QVERIFY(delivered.retryReason.isEmpty());
+    }
+
+    void sc18_noRetryOncePastTheDeadline()
+    {
+        ProductionPairingSeam seam;
+        seam.setDeadlineMs(20);
+        QSemaphore release;
+        std::atomic<int> handshakes{0};
+        seam.setHandshake([&](const PairingTarget&) {
+            ++handshakes;
+            release.acquire();
+            PairingHandshakeResult failed;
+            failed.attemptStep = QStringLiteral("pair_handshake");
+            failed.stepClass = QStringLiteral("pin_rejected");
+            return failed;
+        });
+        seam.setCancelRequest([](const QString&, int) { return true; });
+
+        SeamReport report;
+        seam.pair(pairingTarget(), recordInto(&report));
+        QTRY_COMPARE_WITH_TIMEOUT(report.count(), 1, 5000);
+
+        // The deadline has spoken; wait (on a condition, not a bare sleep) until the worker's
+        // clock copy is certain to read past it, since a coarse timer can fire a little early.
+        QElapsedTimer pastDeadline;
+        pastDeadline.start();
+        QTRY_VERIFY_WITH_TIMEOUT(pastDeadline.elapsed() >= 60, 2000);
+        release.release();
+        QVERIFY(QThreadPool::globalInstance()->waitForDone(10000));
+
+        QCOMPARE(handshakes.load(), 1);
+        QCOMPARE(report.count(), 1);
+    }
+
+    void sc18_theControllerMarksOnlyAnActiveSessionAsReconnecting()
+    {
+        struct Case { const char* name; const char* state; QJsonValue warm; bool present; bool reconnecting; bool warmReturn; };
+        const QVector<Case> cases = {
+            { "ACTIVE", "ACTIVE", QJsonValue(), false, true, false },
+            { "ACTIVE and warm", "ACTIVE", QJsonValue(true), true, true, true },
+            { "NEW", "NEW", QJsonValue(), false, false, false },
+            { "NEW and warm", "NEW", QJsonValue(true), true, false, true },
+            { "NEW and not warm", "NEW", QJsonValue(false), true, false, false },
+        };
+        for (const Case& c : cases) {
+            PairingController controller;
+            auto* fake = new FakeNetworkAccessManager;
+            auto* seam = new RecordingSeam;
+            wire(controller, fake);
+            controller.setSeam(seam);
+
+            QJsonObject body = QJsonDocument::fromJson(
+                authorizationBody(QString::fromLatin1(kPin), QString::fromLatin1(c.state))).object();
+            if (c.present) {
+                body.insert(QStringLiteral("warm_return"), c.warm);
+            }
+            fake->statuses = { 200 };
+            fake->bodies = { QJsonDocument(body).toJson(QJsonDocument::Compact) };
+
+            QSignalSpy completed(&controller, &PairingController::pairingCompleted);
+            controller.start(QString::fromLatin1(kSessionId));
+            QTRY_COMPARE_WITH_TIMEOUT(completed.count(), 1, 5000);
+
+            QCOMPARE(seam->calls, 1);
+            QVERIFY2(seam->lastTarget.reconnecting == c.reconnecting, c.name);
+            QVERIFY2(seam->lastTarget.warmReturn == c.warmReturn, c.name);
         }
     }
 };
