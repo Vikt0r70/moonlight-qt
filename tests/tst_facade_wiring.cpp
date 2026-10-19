@@ -4572,10 +4572,14 @@ private slots:
             << QStringList{"code:0"} << "unknown" << false << 0;
         QTest::newRow("native no-video-traffic")
             << QStringList{"code:-100"} << "connection_lost" << false << -100;
-        QTest::newRow("native early termination")
-            << QStringList{"code:-102"} << "connection_lost" << false << -102;
+        QTest::newRow("native early termination alone is not supported loss evidence")
+            << QStringList{"code:-102"} << "unknown" << false << -102;
+        QTest::newRow("native no-video-frame")
+            << QStringList{"code:-101"} << "connection_lost" << false << -101;
         QTest::newRow("native fault then manual End keeps the fault")
-            << QStringList{"code:-102", "manual"} << "connection_lost" << true << -102;
+            << QStringList{"code:-100", "manual"} << "connection_lost" << true << -100;
+        QTest::newRow("native early termination then manual End stays unknown")
+            << QStringList{"code:-102", "manual"} << "unknown" << true << -102;
         QTest::newRow("manual End then a later code is not a fault")
             << QStringList{"manual", "code:-102"} << "unknown" << true << none;
         QTest::newRow("manual End only")
@@ -4661,6 +4665,67 @@ private slots:
                     QStringLiteral("The session ended. Unused minutes stay in your account."),
                     10000);
             }
+            QCOMPARE(capture.named(QStringLiteral("play.summary")).size(), 1);
+
+            client.session()->attachSession(nullptr);
+        }
+        delete engine;
+    }
+
+    // T075 / F5: the shared counterexample of the server's
+    // `test_absent_ambiguous_or_generic_evidence_is_unknown_never_manual` (tests/test_end_outcomes.py):
+    // completed CUSTOMER_ENDED, stage streaming, engine_error -102 and no independent supported loss
+    // evidence is `unknown`. ADR-0096 / timeline.py limit native loss to {-100, -101}, so the client
+    // must not present -102 alone as `connection_lost`.
+    void nativeMinus102MatchesServerUnknown()
+    {
+        const QString endPath = QStringLiteral("/api/sessions/s-stages/end");
+
+        auto* engine = new FakeEngineSession;
+        {
+            SeatHubClient client;
+            beginStagedSession(client);
+            QVERIFY(!QTest::currentTestFailed());
+            client.teardown()->setVerifyIntervalMs(1);
+            PlayCapture capture;
+            client.session()->attachSession(engine);
+            client.session()->start(nullptr);
+            PairingController* pairing = client.pairing();
+            QMetaObject::invokeMethod(
+                pairing, [pairing]() { pairing->cancel(); }, Qt::BlockingQueuedConnection);
+            emit engine->connectionStarted();
+            QCOMPARE(client.appState(), QStringLiteral("streaming"));
+
+            m_fake->answerSession(QStringLiteral("s-stages"), QStringLiteral("COMPLETED"),
+                                  QStringLiteral("CUSTOMER_ENDED"), 15);
+            emitConnectionTerminated(-102);
+
+            QSignalSpy completed(client.teardown(), &TeardownController::teardownCompleted);
+            emit engine->readyForDeletion();
+            QTRY_COMPARE_WITH_TIMEOUT(completed.count(), 1, 15000);
+            QTRY_COMPARE_WITH_TIMEOUT(client.appState(), QStringLiteral("home"), 15000);
+            QTRY_COMPARE_WITH_TIMEOUT(capture.named(QStringLiteral("play.summary")).size(), 1, 10000);
+
+            // The observed native code is still recorded as the first native evidence, but it is not
+            // supported loss evidence, so the presentation is unknown.
+            const ShippedLine summary = capture.named(QStringLiteral("play.summary")).first();
+            QCOMPARE(summary.attrs.value("end_presentation").toString(), QStringLiteral("unknown"));
+            QCOMPARE(summary.attrs.value("native_fault_code").toInt(), -102);
+            QVERIFY(!summary.attrs.contains("manual_end_observed"));
+
+            // The final text never claims a lost connection.
+            QTRY_COMPARE_WITH_TIMEOUT(
+                client.endReasonText(),
+                QStringLiteral("The session ended. Unused minutes stay in your account."), 10000);
+
+            // The outbound End is the unchanged ordinary one: sent once, not failed, no new field.
+            QTRY_COMPARE_WITH_TIMEOUT(m_fake->bodiesFor(endPath).size(), 1, 15000);
+            const QJsonObject sent = QJsonDocument::fromJson(m_fake->bodyFor(endPath)).object();
+            QVERIFY(!sent.contains(QStringLiteral("end_presentation")));
+            QVERIFY(!sent.contains(QStringLiteral("manual")));
+            QVERIFY(!sent.contains(QStringLiteral("intent")));
+            QVERIFY(!sent.contains(QStringLiteral("engine_error")));
+            QCOMPARE(sent.value(QStringLiteral("failed")).toBool(), false);
             QCOMPARE(capture.named(QStringLiteral("play.summary")).size(), 1);
 
             client.session()->attachSession(nullptr);

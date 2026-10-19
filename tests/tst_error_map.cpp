@@ -102,6 +102,7 @@ private slots:
     void endPresentation_isConnectionLostOnlyForAStartedStreamWithANativeFault();
     void endPresentation_isCancelledOnlyWhenNothingStartedAndNothingFailed();
     void endPresentation_keepsAnActualFailedStartUnknown();
+    void nativeMinus102MatchesServerUnknown();
 
     // T062 / ADR-0104: the firewall sentence needs a conclusive failed port test.
     void engineStageMessage_firewallSentenceOnlyForAConclusiveFailure();
@@ -464,7 +465,7 @@ void TstErrorMap::endPresentation_isConnectionLostOnlyForAStartedStreamWithANati
     QTest::addColumn<QString>("expected");
     QTest::newRow("no video traffic (-100)") << -100 << "connection_lost";
     QTest::newRow("no video frame (-101)") << -101 << "connection_lost";
-    QTest::newRow("unexpected early termination (-102)") << -102 << "connection_lost";
+    QTest::newRow("unexpected early termination (-102)") << -102 << "unknown";
     QTest::newRow("graceful (0)") << 0 << "unknown";
     QTest::newRow("protected content (-103)") << -103 << "unknown";
     QTest::newRow("frame conversion (-104)") << -104 << "unknown";
@@ -507,6 +508,27 @@ void TstErrorMap::endPresentation_keepsAnActualFailedStartUnknown()
     evidence.streamStarted = false;
     evidence.engineFailed = true;
     QCOMPARE(deriveEndPresentation(evidence), QStringLiteral("unknown"));
+}
+
+// T075 / F5: the shared counterexample of the server's
+// `test_absent_ambiguous_or_generic_evidence_is_unknown_never_manual` (seathub-control
+// tests/test_end_outcomes.py): a completed CUSTOMER_ENDED session, stage streaming, engine_error
+// -102 and no independent supported loss evidence is `unknown`. ADR-0096 and timeline.py limit
+// native loss to {-100, -101}; -102 alone must never become `connection_lost` in the client either.
+void TstErrorMap::nativeMinus102MatchesServerUnknown()
+{
+    EndEvidence evidence;
+    evidence.streamStarted = true;
+    evidence.engineFailed = false;
+    evidence.nativeFault = true;
+    evidence.nativeFaultCode = -102;
+    QCOMPARE(deriveEndPresentation(evidence), QStringLiteral("unknown"));
+
+    // The approved native set is untouched: -100 and -101 still lose the connection.
+    for (const int supported : { -100, -101 }) {
+        evidence.nativeFaultCode = supported;
+        QCOMPARE(deriveEndPresentation(evidence), QStringLiteral("connection_lost"));
+    }
 }
 
 void TstErrorMap::engineStageMessage_firewallSentenceOnlyForAConclusiveFailure()
