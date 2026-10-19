@@ -50,17 +50,27 @@ setlocal enabledelayedexpansion
 
 set "QT=C:\Qt\6.11.2\msvc2022_64"
 set "FORK=%~dp0.."
-set "VCVARS=C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
+set "VSWHERE=%FORK%\scripts\vswhere.exe"
+
+rem Toolchain discovery, same order as Find-VcVars in scripts\build-seathub.ps1 so the build
+rem step and this step choose the same compiler: the validated fixed installs first (the
+rem owner PC's BuildTools is the first), then component-filtered vswhere. A root counts only
+rem when its VC\Tools\MSVC directory exists; see :try_vcvars_root. Flat statements only, no
+rem parenthesised block, because these paths hold a parenthesis.
+set "VCVARS="
+call :try_vcvars_root "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools"
+call :try_vcvars_root "C:\Program Files\Microsoft Visual Studio\2022\BuildTools"
+call :try_vcvars_root "C:\Program Files\Microsoft Visual Studio\2022\Enterprise"
+call :try_vcvars_root "C:\Program Files\Microsoft Visual Studio\2022\Professional"
+call :try_vcvars_root "C:\Program Files\Microsoft Visual Studio\2022\Community"
+if not defined VCVARS if exist "%VSWHERE%" for /f "usebackq delims=" %%I in (`"%VSWHERE%" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath 2^>nul`) do call :try_vcvars_root "%%I"
+if not defined VCVARS goto :vcvars_missing
+echo VCVARS_SELECTED=%VCVARS%
 
 pushd "%~dp0"
 
 call "%VCVARS%" >nul
-if errorlevel 1 (
-    echo VCVARS_FAILED - the Visual Studio 2022 BuildTools environment did not load
-    echo See the VCVARS line near the top of this file.
-    popd
-    exit /b 1
-)
+if errorlevel 1 goto :vcvars_failed
 
 set "PATH=%QT%\bin;%FORK%\libs\windows\lib\x64;%FORK%\build\sentry-native-0.17.1\install\bin;%PATH%"
 set "QT_QPA_PLATFORM_PLUGIN_PATH=%QT%\plugins"
@@ -124,6 +134,30 @@ exit /b 0
 echo SOME_SUITES_FAILED
 popd
 exit /b 1
+
+rem ---------------------------------------------------------------------------
+rem Toolchain failures. Both exit nonzero before qmake runs.
+rem ---------------------------------------------------------------------------
+:vcvars_missing
+echo VCVARS_FAILED - no Visual Studio 2022 install with the x64 C++ toolset was found
+exit /b 1
+
+:vcvars_failed
+echo VCVARS_FAILED - the selected Visual Studio x64 environment did not load
+popd
+exit /b 1
+
+rem ---------------------------------------------------------------------------
+rem One Visual Studio install root as %~1: becomes VCVARS only when VCVARS is still unset,
+rem vcvars64.bat exists and the install carries a VC\Tools\MSVC toolset directory (a Visual
+rem Studio Community install without the C++ workload has the .bat but no toolset).
+rem ---------------------------------------------------------------------------
+:try_vcvars_root
+if defined VCVARS goto :eof
+if not exist "%~1\VC\Tools\MSVC" goto :eof
+if not exist "%~1\VC\Auxiliary\Build\vcvars64.bat" goto :eof
+set "VCVARS=%~1\VC\Auxiliary\Build\vcvars64.bat"
+goto :eof
 
 rem ---------------------------------------------------------------------------
 rem One suite: qmake, jom, run, and read the suite's own Totals line.
