@@ -1,4 +1,5 @@
 #include "control_plane_client.h"
+#include "reporting_consent.h"
 #include "seathub_version.h"
 
 #include <QElapsedTimer>
@@ -1249,6 +1250,14 @@ void ControlPlaneClient::endSession(const QString& sessionId, bool failed, const
 void ControlPlaneClient::postSessionQuality(const QString& sessionId, const QJsonObject& report,
                                             Callback callback)
 {
+    // ADR-0107: a quality report is a covered upload, asked at the moment of sending. Off or no
+    // choice recorded reports "never reached the network" so the caller keeps the report.
+    if (!ReportingConsent::coveredUploadsAllowed()) {
+        if (callback) {
+            callback(ControlPlaneResult::aborted());
+        }
+        return;
+    }
     const QByteArray body = QJsonDocument(report).toJson(QJsonDocument::Compact);
     send(QStringLiteral("POST"), QStringLiteral("/api/sessions/") + encodedPathSegment(sessionId)
              + QStringLiteral("/quality"),

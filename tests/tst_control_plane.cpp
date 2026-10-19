@@ -35,6 +35,7 @@
 #include "seathub/control_plane_client.h"
 #include "seathub/countries.h"
 #include "seathub/region.h"
+#include "seathub/reporting_consent.h"
 #include "seathub/seathub_version.h"
 #include "seathub/web_origin.h"
 
@@ -646,6 +647,118 @@ private slots:
 
         QCOMPARE(fake->lastPath,
                  QStringLiteral("/api/sessions/aaaabbbb-cccc-dddd-eeee-ffff00001111/end"));
+    }
+
+    // T073 / ADR-0107: the quality report is a covered upload and the send boundary asks the
+    // customer's choice every time. Off and "no choice recorded" put nothing on the wire and tell
+    // the caller the request never reached the network (so it keeps the report); On sends the full
+    // report once. Functional calls (End) are never gated.
+    void postSessionQuality_sendsNothingWhileReportingIsOffOrUnchosen()
+    {
+        struct ConsentReset
+        {
+            ~ConsentReset()
+            {
+                ReportingConsent::setStateForTests(false, reporting_consent_store::Record{});
+            }
+        } reset;
+
+        const reporting_consent_store::Record noChoice{};
+        reporting_consent_store::Record off;
+        off.recorded = true;
+        off.send = false;
+        off.noticeVersion = reporting_consent_store::kCurrentNoticeVersion;
+        const reporting_consent_store::Record states[] = { noChoice, off };
+
+        for (const reporting_consent_store::Record& state : states) {
+            ReportingConsent::setStateForTests(true, state);
+            ControlPlaneClient client;
+            auto* fake = new FakeNetworkAccessManager;
+            client.setNetworkAccessManager(fake);
+            fake->status = 200;
+            fake->body = okBody();
+
+            QJsonObject report;
+            report.insert(QStringLiteral("rendered_fps"), 55.0);
+            report.insert(QStringLiteral("width"), 1920);
+
+            bool called = false;
+            bool aborted = false;
+            client.postSessionQuality(QStringLiteral("aaaabbbb-cccc-dddd-eeee-ffff00001111"), report,
+                                      [&](const ControlPlaneResult& result) {
+                                          aborted = result.wasAborted;
+                                          called = true;
+                                      });
+            QTRY_VERIFY(called);
+            QVERIFY(aborted);
+            QVERIFY2(fake->paths.isEmpty(), "a covered upload must not reach the network");
+
+            // The functional End call still goes out in the same state.
+            bool ended = false;
+            client.endSession(QStringLiteral("aaaabbbb-cccc-dddd-eeee-ffff00001111"), false,
+                              [&](const ControlPlaneResult&) { ended = true; });
+            QTRY_VERIFY(ended);
+            QCOMPARE(fake->paths.size(), 1);
+            QVERIFY(fake->lastPath.endsWith(QStringLiteral("/end")));
+        }
+    }
+
+    void postSessionQuality_sendsTheCompleteReportWhenReportingIsOn()
+    {
+        struct ConsentReset
+        {
+            ~ConsentReset()
+            {
+                ReportingConsent::setStateForTests(false, reporting_consent_store::Record{});
+            }
+        } reset;
+        reporting_consent_store::Record on;
+        on.recorded = true;
+        on.send = true;
+        on.noticeVersion = reporting_consent_store::kCurrentNoticeVersion;
+        ReportingConsent::setStateForTests(true, on);
+
+        ControlPlaneClient client;
+        auto* fake = new FakeNetworkAccessManager;
+        client.setNetworkAccessManager(fake);
+        fake->status = 200;
+        fake->body = okBody();
+
+        QJsonObject report;
+        report.insert(QStringLiteral("rendered_fps"), 55.0);
+        report.insert(QStringLiteral("width"), 1920);
+        report.insert(QStringLiteral("height"), 1080);
+        report.insert(QStringLiteral("target_fps"), 60.0);
+        report.insert(QStringLiteral("codec"), QStringLiteral("h265"));
+        report.insert(QStringLiteral("hdr"), false);
+        report.insert(QStringLiteral("configured_bitrate_kbps"), 0);
+        report.insert(QStringLiteral("rtt_ms"), QJsonValue::Null);
+
+        bool called = false;
+        bool ok = false;
+        client.postSessionQuality(QStringLiteral("aaaabbbb-cccc-dddd-eeee-ffff00001111"), report,
+                                  [&](const ControlPlaneResult& result) {
+                                      ok = result.ok;
+                                      called = true;
+                                  });
+        QTRY_VERIFY(called);
+        QVERIFY(ok);
+
+        QCOMPARE(fake->paths.size(), 1);
+        QCOMPARE(fake->lastPath,
+                 QStringLiteral("/api/sessions/aaaabbbb-cccc-dddd-eeee-ffff00001111/quality"));
+        const QJsonObject sent = QJsonDocument::fromJson(fake->lastBody).object();
+        QCOMPARE(sent.size(), 8);
+        QCOMPARE(sent.value(QStringLiteral("width")).toInt(), 1920);
+        QCOMPARE(sent.value(QStringLiteral("height")).toInt(), 1080);
+        QCOMPARE(sent.value(QStringLiteral("target_fps")).toDouble(), 60.0);
+        QCOMPARE(sent.value(QStringLiteral("codec")).toString(), QStringLiteral("h265"));
+        QVERIFY(sent.value(QStringLiteral("hdr")).isBool());
+        QVERIFY(!sent.value(QStringLiteral("hdr")).toBool());
+        QVERIFY(sent.value(QStringLiteral("configured_bitrate_kbps")).isDouble());
+        QCOMPARE(sent.value(QStringLiteral("configured_bitrate_kbps")).toInt(), 0);
+        QVERIFY(sent.contains(QStringLiteral("rtt_ms")));
+        QVERIFY(sent.value(QStringLiteral("rtt_ms")).isNull());
     }
 
     void createAndEndRequestsIdentifyTheSeatHubVersion()

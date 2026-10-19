@@ -601,6 +601,14 @@ private slots:
     /// session's at this point - Pitfall 7) until `handleTeardownCompleted()` posts it once.
     void handleVideoStatsParsed(VideoStats stats);
 
+    /// T073: the engine printed its "Video stream is" or "Video bitrate" line for the attached Play.
+    void handleStreamStartObserved(StreamStartContext observed);
+
+    /// T073: the account the pending quality report is bound to. Returns false when the report was
+    /// composed before sign-in finished and the auth epoch has since moved on, in which case there
+    /// is no account to tag it with.
+    bool resolvePendingQualityAccount(QString* accountId) const;
+
     // D-33: the only locally enforced end. Liveness failure is not one (see `onLivenessWarning`).
     void handleHorizonReached();
     void onLivenessWarning();
@@ -1087,6 +1095,15 @@ private:
     QJsonObject m_pendingQualityReport;
     QString m_pendingQualitySessionId;
     bool m_hasPendingQualityReport = false;
+    /// The account and auth epoch the pending report was composed under (T073). Disposal reads
+    /// these, not the live `m_accountId`/`m_authEpoch`, so a report is never re-tagged under an
+    /// account that signed in after the Play it belongs to.
+    QString m_pendingQualityAccountId;
+    quint64 m_pendingQualityEpoch = 0;
+    /// The stream-start facts the engine printed for the attached Play (T073). Reset whenever the
+    /// attached session id changes (`setAttachedSession()`), so a replacement Play never inherits
+    /// them; applied to the aggregate when a stats block is parsed.
+    StreamStartContext m_streamStart;
 
     /// WR-06 (code review 06.3-REVIEW-fork.md): a report that could not be tagged because
     /// `m_accountId` was still empty when `postOrStoreQualityReport()`/`storeQualityReportToOutbox()`

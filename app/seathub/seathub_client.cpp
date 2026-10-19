@@ -527,6 +527,8 @@ SeatHubClient::SeatHubClient(QObject* parent)
     m_statsSinkHandle = LogTee::addSink(m_statsWatcher->sink());
     connect(m_statsWatcher, &StatsWatcher::videoStatsParsed,
             this, &SeatHubClient::handleVideoStatsParsed);
+    connect(m_statsWatcher, &StatsWatcher::streamStartObserved,
+            this, &SeatHubClient::handleStreamStartObserved);
 
     // D-11, Plan 13 Task 1 + Task 2: the 60s roll-up sampler and the connection-status sink.
     // The sampler lives on the network thread (moved in `startNetworkThreads()`). The status
@@ -1107,6 +1109,8 @@ void SeatHubClient::setAttachedSession(const QString& sessionId)
     // C1: a genuinely new session id starts with no stream yet.
     if (sessionId != m_sessionId) {
         m_streamStarted = false;
+        // T073: the stream-start facts belong to one Play; a replacement starts with none.
+        m_streamStart = StreamStartContext();
     }
     m_sessionId = sessionId;
     if (sessionId.isEmpty()) {
@@ -4295,14 +4299,47 @@ void SeatHubClient::handleVideoStatsParsed(VideoStats stats)
     // again in the handler that eventually posts it, which may run after `m_sessionId` has
     // already moved on.
     m_pendingQualitySessionId = m_sessionId;
-    m_pendingQualityReport = toQualityReport(m_statsAggregator.aggregate());
+    // T073: the stream-start facts of this Play ride on the aggregate, which does not carry them
+    // itself (an aggregate of several segments is built fresh).
+    VideoStats aggregate = m_statsAggregator.aggregate();
+    aggregate.start = m_streamStart;
+    m_pendingQualityReport = toQualityReport(aggregate);
     m_hasPendingQualityReport = true;
+    m_pendingQualityAccountId = m_accountId;
+    m_pendingQualityEpoch = m_authEpoch;
 
     // SC19 / ADR-0101 (T025): write-ahead quality outbox.
     // Store ahead to disk as soon as stats are parsed so that an unexpected process termination
     // or ungraceful exit preserves the parsed quality metrics for recovery and drain.
     m_qualityOutbox.setDirectory(qualityOutboxDirectory());
-    m_qualityOutbox.put(m_pendingQualitySessionId, m_accountId, m_pendingQualityReport);
+    m_qualityOutbox.put(m_pendingQualitySessionId, m_pendingQualityAccountId, m_pendingQualityReport);
+}
+
+void SeatHubClient::handleStreamStartObserved(StreamStartContext observed)
+{
+    // Nothing is attached to bind the facts to (a local attempt, or a line that outlived its
+    // Play): dropped rather than carried into the next Play.
+    if (m_sessionId.isEmpty()) {
+        return;
+    }
+    m_streamStart.merge(observed);
+}
+
+bool SeatHubClient::resolvePendingQualityAccount(QString* accountId) const
+{
+    // A report composed after sign-in finished carries its own account. One composed before
+    // `fetchMe` answered is still unowned: it may take the account that sign-in produced, but only
+    // within the same auth epoch - a later epoch belongs to someone else.
+    if (!m_pendingQualityAccountId.isEmpty()) {
+        *accountId = m_pendingQualityAccountId;
+        return true;
+    }
+    if (m_pendingQualityEpoch == m_authEpoch) {
+        *accountId = m_accountId;
+        return true;
+    }
+    accountId->clear();
+    return false;
 }
 
 void SeatHubClient::postOrStoreQualityReport(const QString& onlyForSession)
@@ -4318,21 +4355,32 @@ void SeatHubClient::postOrStoreQualityReport(const QString& onlyForSession)
     if (!onlyForSession.isEmpty() && m_pendingQualitySessionId != onlyForSession) {
         return;
     }
+    // ADR-0107 / T073: a quality report is a covered upload, so the decision is taken here, at the
+    // moment of sending. Off or no recorded choice keeps the report; so does a report that no
+    // longer belongs to the signed-in account (it must not go out under another account's token).
+    // The queued outbox drain sends it once the customer allows it. Ending the session is not
+    // affected: this only concerns the report.
+    QString accountId;
+    const bool resolved = resolvePendingQualityAccount(&accountId);
+    if (!ReportingConsent::coveredUploadsAllowed() || !resolved || accountId != m_accountId) {
+        storeQualityReportToOutbox(onlyForSession);
+        return;
+    }
     const QString sessionId = m_pendingQualitySessionId;
     const QJsonObject report = m_pendingQualityReport;
-    const QString accountId = m_accountId;
-    // CR-04 (code review 06.3-REVIEW-fork.md, second review pass): captured here, at the
-    // moment this report is POSTED - not read again from `m_authEpoch` when the asynchronous
+    // CR-04 (code review 06.3-REVIEW-fork.md, second review pass): the epoch is the one this
+    // report was composed under - not read again from `m_authEpoch` when the asynchronous
     // reply below eventually lands. A sign-out (or a sign-in as someone else) can happen while
     // this POST is still in flight; without this capture the WR-06 hold below stamped a late
     // reply with whatever epoch happened to be current when the reply arrived, so a stalled
     // report of an untagged account A could be re-tagged and sent under a later account B's
     // token once B's own `m_accountId` was filled - the same threat (T-06.3-51) CR-03 already
     // closed for the outbox's own drain, reached here by a different path.
-    const quint64 epochAtPost = m_authEpoch;
+    const quint64 epochAtPost = m_pendingQualityEpoch;
     m_hasPendingQualityReport = false;
     m_pendingQualityReport = QJsonObject();
     m_pendingQualitySessionId.clear();
+    m_pendingQualityAccountId.clear();
 
     m_controlPlane->postSessionQuality(
         sessionId, report,
@@ -4351,6 +4399,9 @@ void SeatHubClient::postOrStoreQualityReport(const QString& onlyForSession)
                     break;
                 case QualityOutbox::Outcome::AuthFailed:
                 case QualityOutbox::Outcome::Retryable:
+                case QualityOutbox::Outcome::Aborted:
+                    // Aborted (T073): the send boundary found reporting off, so nothing reached the
+                    // network - kept like any other undelivered report.
                     // Rule 2: kept for a later attempt (the next sign-in or launch), rather
                     // than lost to a dropped connection or a momentarily refused credential -
                     // this plan's own write-trigger line names only the transport/5xx/408/429
@@ -4397,15 +4448,19 @@ void SeatHubClient::storeQualityReportToOutbox(const QString& onlyForSession)
     }
     const QString sessionId = m_pendingQualitySessionId;
     const QJsonObject report = m_pendingQualityReport;
-    const QString accountId = m_accountId;
+    // T073: the account/epoch the report was composed under, not whoever is signed in now.
+    QString accountId;
+    resolvePendingQualityAccount(&accountId);
+    const quint64 epoch = m_pendingQualityEpoch;
     m_hasPendingQualityReport = false;
     m_pendingQualityReport = QJsonObject();
     m_pendingQualitySessionId.clear();
+    m_pendingQualityAccountId.clear();
 
     if (accountId.isEmpty()) {
-        // WR-06: held, not dropped - see `postOrStoreQualityReport()`'s own comment.
-        m_untaggedQualityReports.append(
-            PendingUntaggedQualityReport{ sessionId, report, m_authEpoch });
+        // WR-06: held, not dropped - see `postOrStoreQualityReport()`'s own comment. A hold from
+        // an epoch that is no longer current is dropped by `flushUntaggedQualityReports()`.
+        m_untaggedQualityReports.append(PendingUntaggedQualityReport{ sessionId, report, epoch });
         return;
     }
     m_qualityOutbox.setDirectory(qualityOutboxDirectory());

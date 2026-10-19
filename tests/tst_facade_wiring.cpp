@@ -794,6 +794,20 @@ void emitStatsBlock(double renderedFps)
                 "----------------------------------------------------------\n%s", body.constData());
 }
 
+/// T073 (ADR-0101 amendment 2026-10-19): the two start lines the real engine logs once per Play,
+/// byte for byte as `app/streaming/session.cpp:339` (`Session::drSetup`) and `:664-666`
+/// (`Session::initialize`) print them, read-only, through the real `LogTee` singleton.
+void emitVideoStreamLine(int width, int height, int frameRate, unsigned videoFormat)
+{
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Video stream is %dx%dx%d (format 0x%x)", width,
+                height, frameRate, videoFormat);
+}
+
+void emitVideoBitrateLine(int kbps)
+{
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Video bitrate: %d kbps", kbps);
+}
+
 /// Fires upstream's own termination log line through the real `LogTee` singleton (06.1-19/J-07,
 /// `engine_termination.h`), exactly the one `SDL_LogError()` call `Session::clConnectionTerminated`
 /// makes - the one route to the engine's own code, unconditionally, on every ending including `0`
@@ -9056,6 +9070,198 @@ private slots:
         outbox.drain(QStringLiteral("gen-1"), account, post);
         QCOMPARE(posts, 2);
         QVERIFY(!outbox.hasQueuedReports());
+    }
+
+    // T073 / ADR-0107 + ADR-0101: the held quality report is a covered upload at the IMMEDIATE send
+    // boundary too. With reporting off, or no choice recorded, a Play whose stream produced stats and
+    // whose End/teardown completed sends zero quality requests, yet the account-bound write-ahead file
+    // stays on disk; switching reporting on sends it exactly once and only then removes the file.
+    void qualityTeardownHonorsConsentOffAndNoChoice()
+    {
+        for (int pass = 0; pass < 2; ++pass) {
+            const bool choiceRecorded = (pass == 1); // pass 0: no choice recorded, pass 1: recorded Off
+            const QString sessionId = QStringLiteral("aaaaaaaa-c0c0-c0c0-c0c0-c0c0c0c0c0c%1").arg(pass);
+            const QString qualityPath = QStringLiteral("/api/sessions/%1/quality").arg(sessionId);
+            const QString endPath = QStringLiteral("/api/sessions/%1/end").arg(sessionId);
+            const QString outboxPath =
+                QDir(m_dir->path()).filePath(QStringLiteral("quality-outbox/%1.json").arg(sessionId));
+
+            reporting_consent_store::Record record;
+            record.recorded = choiceRecorded;
+            record.send = false;
+            record.noticeVersion = reporting_consent_store::kCurrentNoticeVersion;
+            ReportingConsent::setStateForTests(true, record);
+
+            SeatHubClient client;
+            reachHome(client, 90);
+            QVERIFY(!QTest::currentTestFailed());
+            auto* engine = new FakeEngineSession;
+            client.session()->attachSession(engine);
+            client.teardown()->setVerifyIntervalMs(1);
+            m_fake->answerPairing(409, playRefusalBody(QStringLiteral("The rig is not ready yet."),
+                                                       QStringLiteral("SH-2K2XQ1")));
+            client.beginSession(sessionId);
+            emit engine->connectionStarted();
+            emitStatsBlock(42.0);
+
+            QSignalSpy completed(client.teardown(), &TeardownController::teardownCompleted);
+            emit engine->readyForDeletion();
+            QTRY_COMPARE_WITH_TIMEOUT(completed.count(), 1, 15000);
+            QTRY_VERIFY_WITH_TIMEOUT(m_fake->requestPaths().contains(endPath), 15000);
+            QTest::qWait(500);
+            QCOMPARE(m_fake->requestPaths().count(qualityPath), 0);
+
+            QVERIFY2(QFile::exists(outboxPath), "the write-ahead report stays durable while off");
+            {
+                QFile file(outboxPath);
+                QVERIFY(file.open(QIODevice::ReadOnly));
+                const QJsonObject envelope = QJsonDocument::fromJson(file.readAll()).object();
+                QCOMPARE(envelope.value(QStringLiteral("account_id")).toString(), accountAId());
+                QCOMPARE(envelope.value(QStringLiteral("report")).toObject()
+                             .value(QStringLiteral("rendered_fps")).toDouble(),
+                         42.0);
+            }
+
+            record.recorded = true;
+            record.send = true;
+            ReportingConsent::setStateForTests(true, record);
+            QMetaObject::invokeMethod(&client, "onNetworkBack");
+            QTRY_COMPARE_WITH_TIMEOUT(m_fake->requestPaths().count(qualityPath), 1, 15000);
+            QTest::qWait(300);
+            QTRY_VERIFY_WITH_TIMEOUT(!QFile::exists(outboxPath), 15000);
+            QTest::qWait(500);
+            QCOMPARE(m_fake->requestPaths().count(qualityPath), 1);
+
+            client.session()->attachSession(nullptr);
+            delete engine;
+        }
+    }
+
+    // T073 / ADR-0101 amendment 2026-10-19: the six stream-start fields (width, height, target_fps,
+    // codec, hdr, configured_bitrate_kbps) survive parse, write-ahead, teardown, restart and replay
+    // under their own Play and account; a Play with no start lines keeps them null (no borrowing from
+    // the Play before it); a legacy file without them still drains; another account's file never does.
+    void streamStartQualitySurvivesTeardownAndRestart()
+    {
+        const QString playA = QStringLiteral("aaaaaaaa-d1d1-d1d1-d1d1-d1d1d1d1d1d1");
+        const QString playB = QStringLiteral("aaaaaaaa-d2d2-d2d2-d2d2-d2d2d2d2d2d2");
+        const QString legacy = QStringLiteral("aaaaaaaa-d3d3-d3d3-d3d3-d3d3d3d3d3d3");
+        const QString foreign = QStringLiteral("aaaaaaaa-d4d4-d4d4-d4d4-d4d4d4d4d4d4");
+        const auto qualityPath = [](const QString& id) {
+            return QStringLiteral("/api/sessions/%1/quality").arg(id);
+        };
+        const auto outboxPath = [this](const QString& id) {
+            return QDir(m_dir->path()).filePath(QStringLiteral("quality-outbox/%1.json").arg(id));
+        };
+        const auto readEnvelope = [](const QString& path) {
+            QFile file(path);
+            return file.open(QIODevice::ReadOnly) ? QJsonDocument::fromJson(file.readAll()).object()
+                                                  : QJsonObject();
+        };
+        const QStringList startKeys{ QStringLiteral("width"), QStringLiteral("height"),
+                                     QStringLiteral("target_fps"), QStringLiteral("codec"),
+                                     QStringLiteral("hdr"), QStringLiteral("configured_bitrate_kbps") };
+
+        reporting_consent_store::Record record;
+        record.recorded = true;
+        record.send = false;
+        record.noticeVersion = reporting_consent_store::kCurrentNoticeVersion;
+        ReportingConsent::setStateForTests(true, record);
+
+        {
+            SeatHubClient client;
+            reachHome(client, 90);
+            QVERIFY(!QTest::currentTestFailed());
+            auto* engine = new FakeEngineSession;
+            client.session()->attachSession(engine);
+            client.teardown()->setVerifyIntervalMs(1);
+            m_fake->answerPairing(409, playRefusalBody(QStringLiteral("The rig is not ready yet."),
+                                                       QStringLiteral("SH-2K2XQ1")));
+
+            // Play A: 1920x1080 at 60 FPS, HEVC 8-bit (0x0100), 20000 kbps configured.
+            client.beginSession(playA);
+            emit engine->connectionStarted();
+            emitVideoStreamLine(1920, 1080, 60, 0x0100);
+            emitVideoBitrateLine(20000);
+            emitStatsBlock(55.0);
+
+            // Play B replaces it and prints no start lines at all: nothing is borrowed from A.
+            client.beginSession(playB);
+            emitStatsBlock(33.0);
+
+            emit client.teardown()->teardownCompleted(sessionIn(QStringLiteral("COMPLETED"), playA), playA);
+            emit client.teardown()->teardownCompleted(sessionIn(QStringLiteral("COMPLETED"), playB), playB);
+            QTest::qWait(500);
+            QCOMPARE(m_fake->requestPaths().count(qualityPath(playA)), 0);
+            QCOMPARE(m_fake->requestPaths().count(qualityPath(playB)), 0);
+
+            QVERIFY(QFile::exists(outboxPath(playA)));
+            QVERIFY(QFile::exists(outboxPath(playB)));
+            const QJsonObject a = readEnvelope(outboxPath(playA));
+            QCOMPARE(a.value(QStringLiteral("account_id")).toString(), accountAId());
+            const QJsonObject reportA = a.value(QStringLiteral("report")).toObject();
+            QCOMPARE(reportA.value(QStringLiteral("rendered_fps")).toDouble(), 55.0);
+            QCOMPARE(reportA.value(QStringLiteral("width")).toInt(), 1920);
+            QCOMPARE(reportA.value(QStringLiteral("height")).toInt(), 1080);
+            QCOMPARE(reportA.value(QStringLiteral("target_fps")).toDouble(), 60.0);
+            QCOMPARE(reportA.value(QStringLiteral("codec")).toString(), QStringLiteral("h265"));
+            QVERIFY(reportA.value(QStringLiteral("hdr")).isBool());
+            QCOMPARE(reportA.value(QStringLiteral("hdr")).toBool(), false);
+            QCOMPARE(reportA.value(QStringLiteral("configured_bitrate_kbps")).toInt(), 20000);
+
+            const QJsonObject reportB = readEnvelope(outboxPath(playB)).value(QStringLiteral("report")).toObject();
+            QCOMPARE(reportB.value(QStringLiteral("rendered_fps")).toDouble(), 33.0);
+            for (const QString& key : startKeys)
+                QVERIFY2(reportB.value(key).isNull(), qPrintable(key + " must stay null for a Play with no start lines"));
+
+            client.session()->attachSession(nullptr);
+            delete engine;
+        }
+
+        // A legacy file (no start fields) and another account's file are planted beside the two.
+        QualityOutbox planted;
+        planted.setDirectory(QDir(m_dir->path()).filePath(QStringLiteral("quality-outbox")));
+        planted.put(legacy, accountAId(), QJsonObject{ { QStringLiteral("rendered_fps"), 41.0 } });
+        planted.put(foreign, QStringLiteral("99999999-9999-9999-9999-999999999999"),
+                    QJsonObject{ { QStringLiteral("rendered_fps"), 22.0 } });
+
+        // Restart: a new client, reporting now on. Each file is sent once, with its own payload.
+        record.send = true;
+        ReportingConsent::setStateForTests(true, record);
+        SeatHubClient restarted;
+        reachHome(restarted, 90);
+        QVERIFY(!QTest::currentTestFailed());
+
+        QTRY_COMPARE_WITH_TIMEOUT(m_fake->requestPaths().count(qualityPath(playA)), 1, 15000);
+        QTRY_COMPARE_WITH_TIMEOUT(m_fake->requestPaths().count(qualityPath(playB)), 1, 15000);
+        QTRY_COMPARE_WITH_TIMEOUT(m_fake->requestPaths().count(qualityPath(legacy)), 1, 15000);
+        const QJsonObject sentA = QJsonDocument::fromJson(m_fake->bodyFor(qualityPath(playA))).object();
+        QCOMPARE(sentA.value(QStringLiteral("width")).toInt(), 1920);
+        QCOMPARE(sentA.value(QStringLiteral("height")).toInt(), 1080);
+        QCOMPARE(sentA.value(QStringLiteral("target_fps")).toDouble(), 60.0);
+        QCOMPARE(sentA.value(QStringLiteral("codec")).toString(), QStringLiteral("h265"));
+        QCOMPARE(sentA.value(QStringLiteral("hdr")).toBool(true), false);
+        QCOMPARE(sentA.value(QStringLiteral("configured_bitrate_kbps")).toInt(), 20000);
+        const QJsonObject sentB = QJsonDocument::fromJson(m_fake->bodyFor(qualityPath(playB))).object();
+        const QJsonObject sentLegacy = QJsonDocument::fromJson(m_fake->bodyFor(qualityPath(legacy))).object();
+        for (const QString& key : startKeys) {
+            QVERIFY2(sentB.value(key).isNull(), qPrintable(key + " must stay null in Play B's wire body"));
+            // A legacy file never had the start keys: ADR-0101 treats omitted and null alike, and
+            // either way no value may be borrowed from another Play.
+            QVERIFY2(!sentLegacy.contains(key) || sentLegacy.value(key).isNull(),
+                     qPrintable(key + " must stay unobserved for a legacy file"));
+        }
+        QCOMPARE(sentLegacy.value(QStringLiteral("rendered_fps")).toDouble(), 41.0);
+
+        QTest::qWait(300);
+        QTRY_VERIFY_WITH_TIMEOUT(!QFile::exists(outboxPath(playA)), 15000);
+        QTRY_VERIFY_WITH_TIMEOUT(!QFile::exists(outboxPath(playB)), 15000);
+        QTRY_VERIFY_WITH_TIMEOUT(!QFile::exists(outboxPath(legacy)), 15000);
+        QTest::qWait(500);
+        QCOMPARE(m_fake->requestPaths().count(qualityPath(playA)), 1);
+        QCOMPARE(m_fake->requestPaths().count(qualityPath(playB)), 1);
+        QCOMPARE(m_fake->requestPaths().count(qualityPath(legacy)), 1);
+        QCOMPARE(m_fake->requestPaths().count(qualityPath(foreign)), 0);
     }
 
     // T063 / ADR-0105: every End-outbox step is one closed log line; the payload, the retry and the

@@ -997,6 +997,8 @@ private slots:
 
     // Plan 16 / ADR-0101: videoWidth/videoHeight remain parse-only; host latency min/max/avg
     // and received_fps/decoded_fps are sent in the quality report (contract 3.25.0's 13 fields).
+    // T073 / ADR-0101 (contract 3.29.0): six stream-start keys join them, 19 in all. The decoder's
+    // own parse-only width/height and the host processing average stay out.
     void toQualityReportSendsNoNewField()
     {
         VideoStats stats;
@@ -1006,10 +1008,220 @@ private slots:
 
         const QJsonObject report = toQualityReport(stats);
 
-        QCOMPARE(report.size(), 13);
+        QCOMPARE(report.size(), 19);
         QVERIFY(!report.contains(QStringLiteral("host_processing_avg_ms")));
         QVERIFY(!report.contains(QStringLiteral("video_width")));
         QVERIFY(!report.contains(QStringLiteral("video_height")));
+    }
+
+    // --- T073: stream-start context ----------------------------------------------------------
+
+    void streamStartLine_recognizedFormats_decodeCodecAndHdr_data()
+    {
+        QTest::addColumn<QString>("format");
+        QTest::addColumn<QString>("codec");
+        QTest::addColumn<bool>("hdr");
+        QTest::newRow("h264") << "0x1" << "h264" << false;
+        QTest::newRow("h264 high 4:4:4") << "0x4" << "h264" << false;
+        QTest::newRow("h265") << "0x100" << "h265" << false;
+        QTest::newRow("h265 main10") << "0x200" << "h265" << true;
+        QTest::newRow("h265 rext8 444") << "0x400" << "h265" << false;
+        QTest::newRow("h265 rext10 444") << "0x800" << "h265" << true;
+        QTest::newRow("av1") << "0x1000" << "av1" << false;
+        QTest::newRow("av1 10-bit") << "0x2000" << "av1" << true;
+        QTest::newRow("av1 444") << "0x4000" << "av1" << false;
+        QTest::newRow("av1 444 10-bit") << "0x8000" << "av1" << true;
+    }
+
+    void streamStartLine_recognizedFormats_decodeCodecAndHdr()
+    {
+        QFETCH(QString, format);
+        QFETCH(QString, codec);
+        QFETCH(bool, hdr);
+
+        StreamStartContext start;
+        QVERIFY(parseStreamStartLine(
+            QStringLiteral("Video stream is 2560x1440x120 (format %1)").arg(format), &start));
+
+        QCOMPARE(start.width.value, 2560.0);
+        QCOMPARE(start.height.value, 1440.0);
+        QCOMPARE(start.targetFps.value, 120.0);
+        QCOMPARE(start.codec, codec);
+        QVERIFY(start.hdrKnown);
+        QCOMPARE(start.hdr, hdr);
+        QVERIFY(!start.configuredBitrateKbps.present);
+    }
+
+    // A format outside every mask leaves codec and hdr unobserved; the numbers on the same line
+    // are still real and kept.
+    void streamStartLine_unknownFormat_leavesCodecAndHdrNull_data()
+    {
+        QTest::addColumn<QString>("format");
+        QTest::newRow("zero") << "0x0";
+        QTest::newRow("no mask") << "0x10";
+        QTest::newRow("two codecs") << "0x101";
+        QTest::newRow("beyond the masks") << "0x10000";
+    }
+
+    void streamStartLine_unknownFormat_leavesCodecAndHdrNull()
+    {
+        QFETCH(QString, format);
+        StreamStartContext start;
+        QVERIFY(parseStreamStartLine(
+            QStringLiteral("Video stream is 1280x720x60 (format %1)").arg(format), &start));
+
+        QVERIFY(start.width.present);
+        QCOMPARE(start.width.value, 1280.0);
+        QVERIFY(start.targetFps.present);
+        QVERIFY(start.codec.isEmpty());
+        QVERIFY(!start.hdrKnown);
+
+        VideoStats stats;
+        stats.start = start;
+        const QJsonObject report = toQualityReport(stats);
+        QVERIFY(report.value(QStringLiteral("codec")).isNull());
+        QVERIFY(report.value(QStringLiteral("hdr")).isNull());
+        QCOMPARE(report.value(QStringLiteral("width")).toInt(), 1280);
+    }
+
+    void streamBitrateLine_givesConfiguredKbpsOnly_andZeroIsPreserved()
+    {
+        StreamStartContext start;
+        QVERIFY(parseStreamStartLine(QStringLiteral("Video bitrate: 20000 kbps"), &start));
+        QVERIFY(start.configuredBitrateKbps.present);
+        QCOMPARE(start.configuredBitrateKbps.value, 20000.0);
+        QVERIFY(!start.width.present);
+        QVERIFY(!start.targetFps.present);
+        QVERIFY(start.codec.isEmpty());
+        QVERIFY(!start.hdrKnown);
+
+        StreamStartContext zero;
+        QVERIFY(parseStreamStartLine(QStringLiteral("Video bitrate: 0 kbps"), &zero));
+        QVERIFY(zero.configuredBitrateKbps.present);
+        QCOMPARE(zero.configuredBitrateKbps.value, 0.0);
+    }
+
+    // The decoder's "Video stream: WxH FPS (Codec: X)" line is a different line with a different
+    // meaning; it must never be taken for the engine's start line.
+    void streamStartLine_otherLines_areNotStartLines()
+    {
+        const QStringList lines = {
+            QStringLiteral("Video stream: 1920x1080 59.94 FPS (Codec: H264)"),
+            QStringLiteral("Video stream is 1920x1080 (format 0x100)"),
+            QStringLiteral("Video bitrate: fast kbps"),
+            QStringLiteral("something else"),
+            QString()
+        };
+        for (const QString& line : lines) {
+            StreamStartContext start;
+            QVERIFY2(!parseStreamStartLine(line, &start), qPrintable(line));
+            QVERIFY(start.isEmpty());
+        }
+    }
+
+    // The two lines print in an engine-defined order; merging fills only what each observed.
+    void streamStartContext_mergeIsOrderIndependent()
+    {
+        StreamStartContext streamLine;
+        StreamStartContext bitrateLine;
+        QVERIFY(parseStreamStartLine(
+            QStringLiteral("Video stream is 1920x1080x60 (format 0x200)"), &streamLine));
+        QVERIFY(parseStreamStartLine(QStringLiteral("Video bitrate: 15000 kbps"), &bitrateLine));
+
+        StreamStartContext forward;
+        forward.merge(streamLine);
+        forward.merge(bitrateLine);
+        StreamStartContext backward;
+        backward.merge(bitrateLine);
+        backward.merge(streamLine);
+
+        for (const StreamStartContext& merged : { forward, backward }) {
+            QCOMPARE(merged.width.value, 1920.0);
+            QCOMPARE(merged.height.value, 1080.0);
+            QCOMPARE(merged.targetFps.value, 60.0);
+            QCOMPARE(merged.codec, QStringLiteral("h265"));
+            QVERIFY(merged.hdrKnown);
+            QVERIFY(merged.hdr);
+            QCOMPARE(merged.configuredBitrateKbps.value, 15000.0);
+        }
+    }
+
+    void toQualityReport_completeStartContext_isOnTheWire()
+    {
+        VideoStats stats;
+        stats.renderedFps = OptionalMetric::of(59.0);
+        QVERIFY(parseStreamStartLine(
+            QStringLiteral("Video stream is 3840x2160x60 (format 0x2000)"), &stats.start));
+        StreamStartContext bitrate;
+        QVERIFY(parseStreamStartLine(QStringLiteral("Video bitrate: 80000 kbps"), &bitrate));
+        stats.start.merge(bitrate);
+
+        const QJsonObject report = toQualityReport(stats);
+
+        QCOMPARE(report.size(), 19);
+        QCOMPARE(report.value(QStringLiteral("width")).toInt(), 3840);
+        QCOMPARE(report.value(QStringLiteral("height")).toInt(), 2160);
+        QCOMPARE(report.value(QStringLiteral("target_fps")).toDouble(), 60.0);
+        QCOMPARE(report.value(QStringLiteral("codec")).toString(), QStringLiteral("av1"));
+        QVERIFY(report.value(QStringLiteral("hdr")).isBool());
+        QVERIFY(report.value(QStringLiteral("hdr")).toBool());
+        QCOMPARE(report.value(QStringLiteral("configured_bitrate_kbps")).toInt(), 80000);
+        QCOMPARE(report.value(QStringLiteral("rendered_fps")).toDouble(), 59.0);
+    }
+
+    // Legacy / never-observed start: all six keys present and null, never zero-filled; an
+    // observed false stays false and an observed 0 stays 0.
+    void toQualityReport_absentStartContext_isNullNotZero()
+    {
+        const QJsonObject report = toQualityReport(VideoStats());
+        const QStringList keys = { QStringLiteral("width"), QStringLiteral("height"),
+                                   QStringLiteral("target_fps"), QStringLiteral("codec"),
+                                   QStringLiteral("hdr"), QStringLiteral("configured_bitrate_kbps") };
+        for (const QString& key : keys) {
+            QVERIFY2(report.contains(key), qPrintable(key));
+            QVERIFY2(report.value(key).isNull(), qPrintable(key));
+        }
+
+        VideoStats stats;
+        QVERIFY(parseStreamStartLine(
+            QStringLiteral("Video stream is 1920x1080x60 (format 0x100)"), &stats.start));
+        StreamStartContext zeroBitrate;
+        QVERIFY(parseStreamStartLine(QStringLiteral("Video bitrate: 0 kbps"), &zeroBitrate));
+        stats.start.merge(zeroBitrate);
+        const QJsonObject partial = toQualityReport(stats);
+        QVERIFY(partial.value(QStringLiteral("hdr")).isBool());
+        QVERIFY(!partial.value(QStringLiteral("hdr")).toBool());
+        QVERIFY(partial.value(QStringLiteral("configured_bitrate_kbps")).isDouble());
+        QCOMPARE(partial.value(QStringLiteral("configured_bitrate_kbps")).toInt(), 0);
+    }
+
+    void statsWatcher_startLines_emitStartContextAndNoStats()
+    {
+        StatsWatcher watcher;
+        StreamStartContext merged;
+        int startCount = 0;
+        int statsCount = 0;
+        connect(&watcher, &StatsWatcher::streamStartObserved, &watcher,
+                [&](StreamStartContext observed) { merged.merge(observed); ++startCount; });
+        connect(&watcher, &StatsWatcher::videoStatsParsed, &watcher,
+                [&](VideoStats) { ++statsCount; });
+
+        const LogTee::Sink sink = watcher.sink();
+        sink(LogLevel::Info, SDL_LOG_CATEGORY_APPLICATION, SDL_LOG_PRIORITY_INFO,
+             QStringLiteral("Video bitrate: 20000 kbps"));
+        sink(LogLevel::Info, SDL_LOG_CATEGORY_APPLICATION, SDL_LOG_PRIORITY_INFO,
+             QStringLiteral("Video stream is 1920x1080x60 (format 0x100)"));
+        // The right text in the wrong category or priority is not the engine's line.
+        sink(LogLevel::Info, SDL_LOG_CATEGORY_VIDEO, SDL_LOG_PRIORITY_INFO,
+             QStringLiteral("Video stream is 640x480x30 (format 0x1)"));
+        sink(LogLevel::Warning, SDL_LOG_CATEGORY_APPLICATION, SDL_LOG_PRIORITY_WARN,
+             QStringLiteral("Video stream is 640x480x30 (format 0x1)"));
+
+        QCOMPARE(startCount, 2);
+        QCOMPARE(statsCount, 0);
+        QCOMPARE(merged.width.value, 1920.0);
+        QCOMPARE(merged.codec, QStringLiteral("h265"));
+        QCOMPARE(merged.configuredBitrateKbps.value, 20000.0);
     }
 
     // --- StatsWatcher ------------------------------------------------------------------------
