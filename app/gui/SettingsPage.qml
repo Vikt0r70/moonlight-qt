@@ -2,6 +2,7 @@ import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
 import SeatHub.Tokens 1.0
+import ReportingConsent 1.0
 
 // The SeatHub Settings page - Moonlight 6.1.0's own page, section for section and row for row,
 // drawn with SeatHub's controls on `ui.md` tokens (Phase 5 D-24, superseding Phase 3's own D-48
@@ -477,6 +478,117 @@ Item {
                             bridge: page.prefs
                             title: qsTr("Keep the display awake while streaming")
                             description: qsTr("Stops the screensaver and display sleep during a session.")
+                        }
+
+                        // ADR-0107: the one control over what RentaPC sends us beyond what a session
+                        // needs (crash reports, logs, stream quality numbers, session evidence). It is
+                        // not a stream setting and not a `[streamsettings]` key: it reads and writes
+                        // the choice the setup window recorded, through the ReportingConsent
+                        // singleton. Like every row on this page it is read-only while a stream runs
+                        // (one banner, no silently dropped change). No server value, sign-in,
+                        // update or reinstall changes it; only this row does.
+                        Item {
+                            id: reportingRow
+                            objectName: "reportingConsentRow"
+                            width: parent.width
+                            implicitHeight: reportingColumn.implicitHeight
+                            opacity: page.prefs && page.prefs.writable ? 1.0 : 0.5
+
+                            Accessible.role: Accessible.Grouping
+                            Accessible.name: qsTr("Send crash reports, logs and session evidence")
+
+                            Column {
+                                id: reportingColumn
+                                width: parent.width
+                                spacing: Metrics.s1
+
+                                Row {
+                                    width: parent.width
+                                    spacing: Metrics.s6
+
+                                    Column {
+                                        width: parent.width - reportingBox.width - Metrics.s6
+                                        spacing: Metrics.s1
+
+                                        Text {
+                                            objectName: "reportingConsentTitle"
+                                            text: qsTr("Send crash reports, logs and session evidence")
+                                            width: parent.width
+                                            wrapMode: Text.Wrap
+                                            color: Tokens.foregroundDefault
+                                            font.family: Tokens.fontSansDefault
+                                            font.pixelSize: Metrics.fontBody
+                                        }
+
+                                        Text {
+                                            objectName: "reportingConsentDescription"
+                                            text: ReportingConsent.coveredUploadsAllowed
+                                                  ? qsTr("RentaPC sends crash reports and logs to Sentry, and stream quality numbers and session evidence to us, to help us fix problems.")
+                                                  : qsTr("Nothing in that list leaves your PC. We can't give proper support for errors with this turned off.")
+                                            width: parent.width
+                                            wrapMode: Text.Wrap
+                                            color: Tokens.foregroundMutedDefault
+                                            font.family: Tokens.fontSansDefault
+                                            font.pixelSize: Metrics.fontSm
+                                            lineHeight: 1.4
+                                        }
+
+                                        // When a change takes effect (ADR-0107): the three per-send
+                                        // senders stop or resume at once; Sentry and Crashpad only
+                                        // start or stop with the app.
+                                        Text {
+                                            objectName: "reportingConsentEffect"
+                                            text: qsTr("Logs, stream quality numbers and session evidence stop or resume at once. Crash reporting stops or starts at the next launch of RentaPC.")
+                                            width: parent.width
+                                            wrapMode: Text.Wrap
+                                            color: Tokens.foregroundMutedDefault
+                                            font.family: Tokens.fontSansDefault
+                                            font.pixelSize: Metrics.fontSm
+                                            lineHeight: 1.4
+                                        }
+                                    }
+
+                                    CheckBox {
+                                        id: reportingBox
+                                        objectName: "reportingConsentBox"
+                                        width: Metrics.touchTarget
+                                        height: Metrics.touchTarget
+                                        enabled: page.prefs ? page.prefs.writable : false
+                                        checked: ReportingConsent.coveredUploadsAllowed
+
+                                        indicator: Rectangle {
+                                            x: (parent.width - width) / 2
+                                            y: (parent.height - height) / 2
+                                            width: Metrics.s6
+                                            height: Metrics.s6
+                                            radius: Metrics.radiusXs
+                                            color: reportingBox.checked ? Tokens.primaryDefault : "transparent"
+                                            border.color: reportingBox.checked ? Tokens.primaryDefault : Tokens.borderStrongDefault
+                                            border.width: 1
+
+                                            Text {
+                                                anchors.centerIn: parent
+                                                visible: reportingBox.checked
+                                                Accessible.ignored: true
+                                                text: "✓"
+                                                color: Tokens.primaryForegroundDefault
+                                                font.family: Tokens.fontSansDefault
+                                                font.pixelSize: Metrics.fontSm
+                                            }
+                                        }
+
+                                        onToggled: ReportingConsent.setCoveredUploadsAllowed(checked)
+                                    }
+
+                                    // A user click breaks the `checked` binding above; this keeps the
+                                    // box in step with the recorded choice if it changes elsewhere.
+                                    Binding {
+                                        target: reportingBox
+                                        property: "checked"
+                                        value: ReportingConsent.coveredUploadsAllowed
+                                    }
+                                }
+                            }
                         }
                     }
                 }

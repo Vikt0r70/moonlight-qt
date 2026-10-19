@@ -538,6 +538,56 @@ private slots:
         sampler.finish();
     }
 
+    void samplerPassivelyCarriesReceivedDecodedRatesAndRecentObservations()
+    {
+        rollupLogs.clear();
+        StreamQualitySampler sampler;
+        sampler.setWindowMs(40);
+        sampler.start(QStringLiteral("sess-test-rates"));
+
+        VideoStats stats;
+        stats.renderedFps = OptionalMetric::of(59.9);
+        stats.receivedFps = OptionalMetric::of(60.0);
+        stats.decodedFps = OptionalMetric::of(59.8);
+
+        // Feed 3 samples with known rates
+        sampler.feed(stats);
+        sampler.feed(stats);
+        sampler.feed(stats);
+
+        QTRY_COMPARE(sampler.rollups(), 1);
+        QVERIFY(!rollupLogs.isEmpty());
+        const QJsonObject log = rollupLogs.last();
+
+        // Rates are passively aggregated
+        QCOMPARE(log.value(QStringLiteral("fps_avg")).toDouble(), 59.9);
+        QCOMPARE(log.value(QStringLiteral("incoming_fps_avg")).toDouble(), 60.0);
+        QCOMPARE(log.value(QStringLiteral("decoded_fps_avg")).toDouble(), 59.8);
+
+        // Recent observations are captured in bounded order (up to 10)
+        QCOMPARE(log.value(QStringLiteral("recent_n")).toInt(), 3);
+        QCOMPARE(log.value(QStringLiteral("recent_0_rendered_fps")).toDouble(), 59.9);
+        QCOMPARE(log.value(QStringLiteral("recent_0_incoming_fps")).toDouble(), 60.0);
+        QCOMPARE(log.value(QStringLiteral("recent_0_decoded_fps")).toDouble(), 59.8);
+        QVERIFY(log.contains(QStringLiteral("recent_0_elapsed_ms")));
+        QVERIFY(log.contains(QStringLiteral("elapsed_ms")));
+        QVERIFY(log.contains(QStringLiteral("last_sample_age_ms")));
+
+        // Empty / unpopulated rates are NOT fabricated as zero
+        VideoStats emptyRatesStats;
+        emptyRatesStats.rttMs = OptionalMetric::of(12.0); // only RTT, no FPS fields
+        sampler.feed(emptyRatesStats);
+        sampler.finish();
+
+        QVERIFY(rollupLogs.size() >= 2);
+        const QJsonObject finishLog = rollupLogs.last();
+        // Since finishLog had recent samples with some missing rates, missing ones are omitted, not 0
+        QVERIFY(finishLog.value(QStringLiteral("recent_n")).toInt() > 0);
+        int lastIdx = finishLog.value(QStringLiteral("recent_n")).toInt() - 1;
+        // Last sample has no rendered_fps, so recent_<lastIdx>_rendered_fps must be absent/omitted
+        QVERIFY(!finishLog.contains(QStringLiteral("recent_%1_rendered_fps").arg(lastIdx)));
+    }
+
     void theWindowIsAThreadSafeNonBlockingFeed()
     {
         StreamQualitySampler sampler;
@@ -582,6 +632,55 @@ private slots:
         QVERIFY(rollupLogs.last().value("partial").toBool());
         sampler.finish();
         QCOMPARE(sampler.rollups(), 2);
+    }
+
+    // ADR-0105: a full window with no samples and no drops is a stall the evidence journal
+    // records. The signal carries that window's length and is raised once per elapsed window.
+    void emptyFullWindowRaisesTheStallSignalOncePerWindow()
+    {
+        StreamQualitySampler sampler;
+        QList<qint64> empties;
+        int rollups = 0;
+        connect(&sampler, &StreamQualitySampler::emptyWindowEmitted, &sampler,
+                [&](qint64 ms) { empties.append(ms); });
+        connect(&sampler, &StreamQualitySampler::rollupEmitted, &sampler, [&]() { ++rollups; });
+        sampler.setWindowMs(30);
+        sampler.start(QStringLiteral("stall-empty"));
+        QTRY_VERIFY_WITH_TIMEOUT(empties.size() >= 3, 5000);
+        for (const qint64 ms : empties) QCOMPARE(ms, qint64(30));
+        QCOMPARE(rollups, 0);
+        QCOMPARE(sampler.rollups(), 0);
+        sampler.finish();
+    }
+
+    void aWindowWithASampleNeverRaisesTheStallSignal()
+    {
+        StreamQualitySampler sampler;
+        int empties = 0;
+        connect(&sampler, &StreamQualitySampler::emptyWindowEmitted, &sampler,
+                [&](qint64) { ++empties; });
+        sampler.setWindowMs(40);
+        sampler.start(QStringLiteral("stall-sample"));
+        VideoStats stats; stats.renderedFps = OptionalMetric::of(60);
+        sampler.feed(stats);
+        QTRY_COMPARE(sampler.rollups(), 1);
+        // The window that carried the sample is a rollup, never a stall.
+        QCOMPARE(empties, 0);
+        sampler.finish();
+    }
+
+    void finishOfAnEmptyPartialWindowRaisesNeitherSignal()
+    {
+        StreamQualitySampler sampler;
+        int empties = 0, rollups = 0;
+        connect(&sampler, &StreamQualitySampler::emptyWindowEmitted, &sampler,
+                [&](qint64) { ++empties; });
+        connect(&sampler, &StreamQualitySampler::rollupEmitted, &sampler, [&]() { ++rollups; });
+        sampler.start(QStringLiteral("stall-partial")); // default 60 s window never elapses here
+        sampler.finish();
+        QCOMPARE(empties, 0);
+        QCOMPARE(rollups, 0);
+        QCOMPARE(sampler.rollups(), 0);
     }
 
     void rollupTimerRunsOnTheSamplerWorker()
@@ -802,13 +901,24 @@ private slots:
     {
         VideoStats stats;
         stats.renderedFps = OptionalMetric::of(59.94);
-        stats.rttMs = OptionalMetric::of(23.0);
+        stats.rttMs = OptionalMetric::of(23.4);
+        stats.receivedFps = OptionalMetric::of(60.0);
+        stats.decodedFps = OptionalMetric::of(59.8);
+        stats.hostProcessingMinMs = OptionalMetric::of(1.1);
+        stats.hostProcessingMaxMs = OptionalMetric::of(3.5);
+        stats.hostProcessingAvgMs = OptionalMetric::of(2.2);
         // Every other field left absent.
 
         const QJsonObject report = toQualityReport(stats);
 
         QCOMPARE(report.value(QStringLiteral("rendered_fps")).toDouble(), 59.94);
-        QCOMPARE(report.value(QStringLiteral("rtt_ms")).toDouble(), 23.0);
+        // ADR-0101: rtt_ms rounded half-up to int
+        QCOMPARE(report.value(QStringLiteral("rtt_ms")).toInt(), 23);
+        QCOMPARE(report.value(QStringLiteral("received_fps")).toDouble(), 60.0);
+        QCOMPARE(report.value(QStringLiteral("decoded_fps")).toDouble(), 59.8);
+        QCOMPARE(report.value(QStringLiteral("host_latency_min_ms")).toDouble(), 1.1);
+        QCOMPARE(report.value(QStringLiteral("host_latency_max_ms")).toDouble(), 3.5);
+        QCOMPARE(report.value(QStringLiteral("host_latency_avg_ms")).toDouble(), 2.2);
         QVERIFY(report.value(QStringLiteral("network_dropped_frame_pct")).isNull());
         QVERIFY(report.value(QStringLiteral("jitter_dropped_frame_pct")).isNull());
         QVERIFY(report.value(QStringLiteral("rtt_variance_ms")).isNull());
@@ -885,9 +995,10 @@ private slots:
         QVERIFY(!totalLatencyMs(stats).present);
     }
 
-    // The three new parse-only fields are parse-only in fact, not just in name: the quality
-    // report the client sends to the control plane is byte-for-byte unchanged (contract 3.1.0's
-    // eight fields, nothing more).
+    // Plan 16 / ADR-0101: videoWidth/videoHeight remain parse-only; host latency min/max/avg
+    // and received_fps/decoded_fps are sent in the quality report (contract 3.25.0's 13 fields).
+    // T073 / ADR-0101 (contract 3.29.0): six stream-start keys join them, 19 in all. The decoder's
+    // own parse-only width/height and the host processing average stay out.
     void toQualityReportSendsNoNewField()
     {
         VideoStats stats;
@@ -897,10 +1008,220 @@ private slots:
 
         const QJsonObject report = toQualityReport(stats);
 
-        QCOMPARE(report.size(), 8);
+        QCOMPARE(report.size(), 19);
         QVERIFY(!report.contains(QStringLiteral("host_processing_avg_ms")));
         QVERIFY(!report.contains(QStringLiteral("video_width")));
         QVERIFY(!report.contains(QStringLiteral("video_height")));
+    }
+
+    // --- T073: stream-start context ----------------------------------------------------------
+
+    void streamStartLine_recognizedFormats_decodeCodecAndHdr_data()
+    {
+        QTest::addColumn<QString>("format");
+        QTest::addColumn<QString>("codec");
+        QTest::addColumn<bool>("hdr");
+        QTest::newRow("h264") << "0x1" << "h264" << false;
+        QTest::newRow("h264 high 4:4:4") << "0x4" << "h264" << false;
+        QTest::newRow("h265") << "0x100" << "h265" << false;
+        QTest::newRow("h265 main10") << "0x200" << "h265" << true;
+        QTest::newRow("h265 rext8 444") << "0x400" << "h265" << false;
+        QTest::newRow("h265 rext10 444") << "0x800" << "h265" << true;
+        QTest::newRow("av1") << "0x1000" << "av1" << false;
+        QTest::newRow("av1 10-bit") << "0x2000" << "av1" << true;
+        QTest::newRow("av1 444") << "0x4000" << "av1" << false;
+        QTest::newRow("av1 444 10-bit") << "0x8000" << "av1" << true;
+    }
+
+    void streamStartLine_recognizedFormats_decodeCodecAndHdr()
+    {
+        QFETCH(QString, format);
+        QFETCH(QString, codec);
+        QFETCH(bool, hdr);
+
+        StreamStartContext start;
+        QVERIFY(parseStreamStartLine(
+            QStringLiteral("Video stream is 2560x1440x120 (format %1)").arg(format), &start));
+
+        QCOMPARE(start.width.value, 2560.0);
+        QCOMPARE(start.height.value, 1440.0);
+        QCOMPARE(start.targetFps.value, 120.0);
+        QCOMPARE(start.codec, codec);
+        QVERIFY(start.hdrKnown);
+        QCOMPARE(start.hdr, hdr);
+        QVERIFY(!start.configuredBitrateKbps.present);
+    }
+
+    // A format outside every mask leaves codec and hdr unobserved; the numbers on the same line
+    // are still real and kept.
+    void streamStartLine_unknownFormat_leavesCodecAndHdrNull_data()
+    {
+        QTest::addColumn<QString>("format");
+        QTest::newRow("zero") << "0x0";
+        QTest::newRow("no mask") << "0x10";
+        QTest::newRow("two codecs") << "0x101";
+        QTest::newRow("beyond the masks") << "0x10000";
+    }
+
+    void streamStartLine_unknownFormat_leavesCodecAndHdrNull()
+    {
+        QFETCH(QString, format);
+        StreamStartContext start;
+        QVERIFY(parseStreamStartLine(
+            QStringLiteral("Video stream is 1280x720x60 (format %1)").arg(format), &start));
+
+        QVERIFY(start.width.present);
+        QCOMPARE(start.width.value, 1280.0);
+        QVERIFY(start.targetFps.present);
+        QVERIFY(start.codec.isEmpty());
+        QVERIFY(!start.hdrKnown);
+
+        VideoStats stats;
+        stats.start = start;
+        const QJsonObject report = toQualityReport(stats);
+        QVERIFY(report.value(QStringLiteral("codec")).isNull());
+        QVERIFY(report.value(QStringLiteral("hdr")).isNull());
+        QCOMPARE(report.value(QStringLiteral("width")).toInt(), 1280);
+    }
+
+    void streamBitrateLine_givesConfiguredKbpsOnly_andZeroIsPreserved()
+    {
+        StreamStartContext start;
+        QVERIFY(parseStreamStartLine(QStringLiteral("Video bitrate: 20000 kbps"), &start));
+        QVERIFY(start.configuredBitrateKbps.present);
+        QCOMPARE(start.configuredBitrateKbps.value, 20000.0);
+        QVERIFY(!start.width.present);
+        QVERIFY(!start.targetFps.present);
+        QVERIFY(start.codec.isEmpty());
+        QVERIFY(!start.hdrKnown);
+
+        StreamStartContext zero;
+        QVERIFY(parseStreamStartLine(QStringLiteral("Video bitrate: 0 kbps"), &zero));
+        QVERIFY(zero.configuredBitrateKbps.present);
+        QCOMPARE(zero.configuredBitrateKbps.value, 0.0);
+    }
+
+    // The decoder's "Video stream: WxH FPS (Codec: X)" line is a different line with a different
+    // meaning; it must never be taken for the engine's start line.
+    void streamStartLine_otherLines_areNotStartLines()
+    {
+        const QStringList lines = {
+            QStringLiteral("Video stream: 1920x1080 59.94 FPS (Codec: H264)"),
+            QStringLiteral("Video stream is 1920x1080 (format 0x100)"),
+            QStringLiteral("Video bitrate: fast kbps"),
+            QStringLiteral("something else"),
+            QString()
+        };
+        for (const QString& line : lines) {
+            StreamStartContext start;
+            QVERIFY2(!parseStreamStartLine(line, &start), qPrintable(line));
+            QVERIFY(start.isEmpty());
+        }
+    }
+
+    // The two lines print in an engine-defined order; merging fills only what each observed.
+    void streamStartContext_mergeIsOrderIndependent()
+    {
+        StreamStartContext streamLine;
+        StreamStartContext bitrateLine;
+        QVERIFY(parseStreamStartLine(
+            QStringLiteral("Video stream is 1920x1080x60 (format 0x200)"), &streamLine));
+        QVERIFY(parseStreamStartLine(QStringLiteral("Video bitrate: 15000 kbps"), &bitrateLine));
+
+        StreamStartContext forward;
+        forward.merge(streamLine);
+        forward.merge(bitrateLine);
+        StreamStartContext backward;
+        backward.merge(bitrateLine);
+        backward.merge(streamLine);
+
+        for (const StreamStartContext& merged : { forward, backward }) {
+            QCOMPARE(merged.width.value, 1920.0);
+            QCOMPARE(merged.height.value, 1080.0);
+            QCOMPARE(merged.targetFps.value, 60.0);
+            QCOMPARE(merged.codec, QStringLiteral("h265"));
+            QVERIFY(merged.hdrKnown);
+            QVERIFY(merged.hdr);
+            QCOMPARE(merged.configuredBitrateKbps.value, 15000.0);
+        }
+    }
+
+    void toQualityReport_completeStartContext_isOnTheWire()
+    {
+        VideoStats stats;
+        stats.renderedFps = OptionalMetric::of(59.0);
+        QVERIFY(parseStreamStartLine(
+            QStringLiteral("Video stream is 3840x2160x60 (format 0x2000)"), &stats.start));
+        StreamStartContext bitrate;
+        QVERIFY(parseStreamStartLine(QStringLiteral("Video bitrate: 80000 kbps"), &bitrate));
+        stats.start.merge(bitrate);
+
+        const QJsonObject report = toQualityReport(stats);
+
+        QCOMPARE(report.size(), 19);
+        QCOMPARE(report.value(QStringLiteral("width")).toInt(), 3840);
+        QCOMPARE(report.value(QStringLiteral("height")).toInt(), 2160);
+        QCOMPARE(report.value(QStringLiteral("target_fps")).toDouble(), 60.0);
+        QCOMPARE(report.value(QStringLiteral("codec")).toString(), QStringLiteral("av1"));
+        QVERIFY(report.value(QStringLiteral("hdr")).isBool());
+        QVERIFY(report.value(QStringLiteral("hdr")).toBool());
+        QCOMPARE(report.value(QStringLiteral("configured_bitrate_kbps")).toInt(), 80000);
+        QCOMPARE(report.value(QStringLiteral("rendered_fps")).toDouble(), 59.0);
+    }
+
+    // Legacy / never-observed start: all six keys present and null, never zero-filled; an
+    // observed false stays false and an observed 0 stays 0.
+    void toQualityReport_absentStartContext_isNullNotZero()
+    {
+        const QJsonObject report = toQualityReport(VideoStats());
+        const QStringList keys = { QStringLiteral("width"), QStringLiteral("height"),
+                                   QStringLiteral("target_fps"), QStringLiteral("codec"),
+                                   QStringLiteral("hdr"), QStringLiteral("configured_bitrate_kbps") };
+        for (const QString& key : keys) {
+            QVERIFY2(report.contains(key), qPrintable(key));
+            QVERIFY2(report.value(key).isNull(), qPrintable(key));
+        }
+
+        VideoStats stats;
+        QVERIFY(parseStreamStartLine(
+            QStringLiteral("Video stream is 1920x1080x60 (format 0x100)"), &stats.start));
+        StreamStartContext zeroBitrate;
+        QVERIFY(parseStreamStartLine(QStringLiteral("Video bitrate: 0 kbps"), &zeroBitrate));
+        stats.start.merge(zeroBitrate);
+        const QJsonObject partial = toQualityReport(stats);
+        QVERIFY(partial.value(QStringLiteral("hdr")).isBool());
+        QVERIFY(!partial.value(QStringLiteral("hdr")).toBool());
+        QVERIFY(partial.value(QStringLiteral("configured_bitrate_kbps")).isDouble());
+        QCOMPARE(partial.value(QStringLiteral("configured_bitrate_kbps")).toInt(), 0);
+    }
+
+    void statsWatcher_startLines_emitStartContextAndNoStats()
+    {
+        StatsWatcher watcher;
+        StreamStartContext merged;
+        int startCount = 0;
+        int statsCount = 0;
+        connect(&watcher, &StatsWatcher::streamStartObserved, &watcher,
+                [&](StreamStartContext observed) { merged.merge(observed); ++startCount; });
+        connect(&watcher, &StatsWatcher::videoStatsParsed, &watcher,
+                [&](VideoStats) { ++statsCount; });
+
+        const LogTee::Sink sink = watcher.sink();
+        sink(LogLevel::Info, SDL_LOG_CATEGORY_APPLICATION, SDL_LOG_PRIORITY_INFO,
+             QStringLiteral("Video bitrate: 20000 kbps"));
+        sink(LogLevel::Info, SDL_LOG_CATEGORY_APPLICATION, SDL_LOG_PRIORITY_INFO,
+             QStringLiteral("Video stream is 1920x1080x60 (format 0x100)"));
+        // The right text in the wrong category or priority is not the engine's line.
+        sink(LogLevel::Info, SDL_LOG_CATEGORY_VIDEO, SDL_LOG_PRIORITY_INFO,
+             QStringLiteral("Video stream is 640x480x30 (format 0x1)"));
+        sink(LogLevel::Warning, SDL_LOG_CATEGORY_APPLICATION, SDL_LOG_PRIORITY_WARN,
+             QStringLiteral("Video stream is 640x480x30 (format 0x1)"));
+
+        QCOMPARE(startCount, 2);
+        QCOMPARE(statsCount, 0);
+        QCOMPARE(merged.width.value, 1920.0);
+        QCOMPARE(merged.codec, QStringLiteral("h265"));
+        QCOMPARE(merged.configuredBitrateKbps.value, 20000.0);
     }
 
     // --- StatsWatcher ------------------------------------------------------------------------
@@ -1657,6 +1978,74 @@ private slots:
 
         outbox.put(QString::fromLatin1(kSessionA), QStringLiteral("acct-1"), sampleReport());
         QVERIFY(outbox.hasQueuedReports());
+    }
+
+    void remove_deletesTheFile()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        QualityOutbox outbox(dir.path());
+
+        outbox.put(QString::fromLatin1(kSessionA), QStringLiteral("acct-1"), sampleReport());
+        QVERIFY(QFile::exists(dir.filePath(QString::fromLatin1(kSessionA) + QStringLiteral(".json"))));
+
+        outbox.remove(QString::fromLatin1(kSessionA));
+        QVERIFY(!QFile::exists(dir.filePath(QString::fromLatin1(kSessionA) + QStringLiteral(".json"))));
+    }
+
+    void killedStream_preservesWriteAheadReport_andDrainsOnceOnRelaunch()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+
+        // Phase 1: active session writes report ahead before a simulated crash/kill.
+        {
+            QualityOutbox activeOutbox(dir.path());
+            activeOutbox.put(QString::fromLatin1(kSessionA), QStringLiteral("acct-1"), sampleReport());
+            QVERIFY(QFile::exists(dir.filePath(QString::fromLatin1(kSessionA) + QStringLiteral(".json"))));
+        }
+
+        // Phase 2: process relaunches. Different account signs in first. Report must NOT be sent.
+        {
+            QualityOutbox relaunchOutbox(dir.path());
+            int sentOther = 0;
+            relaunchOutbox.drain(QStringLiteral("gen-other"), QStringLiteral("acct-OTHER"),
+                                 [&](const QString&, const QJsonObject&, ControlPlaneClient::Callback) {
+                                     ++sentOther;
+                                 });
+            QCOMPARE(sentOther, 0);
+            QVERIFY(!QFile::exists(dir.filePath(QString::fromLatin1(kSessionA) + QStringLiteral(".json"))));
+        }
+
+        // Put a fresh write-ahead report for original account to verify drain once.
+        {
+            QualityOutbox activeOutbox(dir.path());
+            activeOutbox.put(QString::fromLatin1(kSessionB), QStringLiteral("acct-1"), sampleReport());
+            QVERIFY(QFile::exists(dir.filePath(QString::fromLatin1(kSessionB) + QStringLiteral(".json"))));
+        }
+
+        // Phase 3: original account signs in. Drains and delivers exactly once.
+        {
+            QualityOutbox relaunchOutbox(dir.path());
+            int sentAcct1 = 0;
+            relaunchOutbox.drain(QStringLiteral("gen-1"), QStringLiteral("acct-1"),
+                                 [&](const QString& sessionId, const QJsonObject& report, ControlPlaneClient::Callback callback) {
+                                     ++sentAcct1;
+                                     QCOMPARE(sessionId, QString::fromLatin1(kSessionB));
+                                     QCOMPARE(report.value(QStringLiteral("rendered_fps")).toDouble(), 59.94);
+                                     callback(resultWithStatus(200, true));
+                                 });
+            QCOMPARE(sentAcct1, 1);
+            QVERIFY(!QFile::exists(dir.filePath(QString::fromLatin1(kSessionB) + QStringLiteral(".json"))));
+
+            // Subsequent drain does not deliver again.
+            int sentAgain = 0;
+            relaunchOutbox.drain(QStringLiteral("gen-2"), QStringLiteral("acct-1"),
+                                 [&](const QString&, const QJsonObject&, ControlPlaneClient::Callback) {
+                                     ++sentAgain;
+                                 });
+            QCOMPARE(sentAgain, 0);
+        }
     }
 
     // --- ADR-0074 HI02 / HI06: delivered stream time, reported by the app ---------------------

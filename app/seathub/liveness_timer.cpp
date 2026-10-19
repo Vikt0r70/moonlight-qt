@@ -132,6 +132,7 @@ void LivenessTimer::start(const QString& sessionId)
     m_hasEngineError = false;
     m_engineError = 0;
     m_failingPorts.clear();
+    m_portTest = QJsonObject();
 
     if (!m_timer->isActive()) {
         m_timer->start();
@@ -209,6 +210,10 @@ QJsonObject LivenessTimer::buildPayload() const
     if (!m_failingPorts.isEmpty()) {
         object.insert(QStringLiteral("failing_ports"), m_failingPorts);
     }
+    // ADR-0104: the real port-test result of that failure, beside the unchanged `failing_ports`.
+    if (!m_portTest.isEmpty()) {
+        object.insert(QStringLiteral("port_test"), m_portTest);
+    }
     return object;
 }
 
@@ -280,6 +285,20 @@ void LivenessTimer::setFailingPorts(const QString& failingPorts)
     emit payloadChanged();
 }
 
+void LivenessTimer::setPortTest(const QJsonObject& portTest)
+{
+    if (!onOwnThread()) {
+        QMetaObject::invokeMethod(this, [this, portTest]() { setPortTest(portTest); },
+                                  Qt::QueuedConnection);
+        return;
+    }
+    if (m_portTest == portTest) {
+        return;
+    }
+    m_portTest = portTest;
+    emit payloadChanged();
+}
+
 void LivenessTimer::reportFailure(const QString& engineStage)
 {
     if (!onOwnThread()) {
@@ -297,17 +316,18 @@ void LivenessTimer::reportFailure(const QString& engineStage)
     m_hasEngineError = false;
     m_engineError = 0;
     m_failingPorts.clear();
+    m_portTest = QJsonObject();
     emit payloadChanged();
     reportNow();
 }
 
 void LivenessTimer::reportFailure(const QString& engineStage, int engineError,
-                                  const QString& failingPorts)
+                                  const QString& failingPorts, const QJsonObject& portTest)
 {
     if (!onOwnThread()) {
         QMetaObject::invokeMethod(
-            this, [this, engineStage, engineError, failingPorts]() {
-                reportFailure(engineStage, engineError, failingPorts);
+            this, [this, engineStage, engineError, failingPorts, portTest]() {
+                reportFailure(engineStage, engineError, failingPorts, portTest);
             },
             Qt::QueuedConnection);
         return;
@@ -319,6 +339,7 @@ void LivenessTimer::reportFailure(const QString& engineStage, int engineError,
     m_hasEngineError = true;
     m_engineError = engineError;
     m_failingPorts = failingPorts;
+    m_portTest = portTest;
     emit payloadChanged();
     reportNow();
 }

@@ -94,6 +94,8 @@ call :suite tst_facade_wiring
 call :suite tst_d28_boundary
 call :suite tst_osd_render
 call :suite tst_telemetry
+call :suite tst_single_instance
+call :suite tst_reporting_consent
 
 if defined FAILED goto :failed
 

@@ -3,6 +3,7 @@
 #include "log_shipper.h"
 #include "log_tee.h"
 #include "path.h"
+#include "reporting_consent.h"
 #include "seathub_version.h"
 #include "token_store.h"
 #include "update_retry_state.h"
@@ -312,6 +313,11 @@ QString runningExecutableDir()
 /// call regardless of caller (Task 1's rotation test reads it through `initCallCount()`).
 bool initSentry(const SeatHubTelemetry::Options& options)
 {
+    // ADR-0107: crash reports (and the Crashpad handler `sentry_init` starts) are covered. Without a
+    // recorded "send" the SDK is never initialised at all, so nothing is captured, queued or sent.
+    if (!ReportingConsent::coveredUploadsAllowed()) {
+        return false;
+    }
     sentry_options_t* sentryOptions = sentry_options_new();
 
     // Explicit every time, even when empty: no environment variable (SENTRY_DSN or otherwise) is
@@ -370,6 +376,11 @@ bool initSentry(const SeatHubTelemetry::Options& options)
 /// ... always from the handout, for every client").
 void adoptFirstDsn(const QString& dsn, const QString& environment)
 {
+    // ADR-0107: the customer switched reporting off after this process started. Do not close and
+    // re-open the SDK to take a DSN it must not use; it stays as it is until the next launch.
+    if (!ReportingConsent::coveredUploadsAllowed()) {
+        return;
+    }
     // WR-05: kept so a failed re-init below can retry with the options this process's FIRST,
     // already-working init used.
     const SeatHubTelemetry::Options previousOptions = s_lastOptions;
@@ -759,6 +770,9 @@ void emitDiagnostic(const QString& body, LogLevel level, const QJsonObject& attr
 void emitStepMetric(const QString& step, const QString& outcome, const QString& failureClass,
                     double elapsedMs)
 {
+    if (!ReportingConsent::coveredUploadsAllowed()) {
+        return; // ADR-0107: Sentry metrics are covered; a switch-off stops them at once
+    }
     // ADR-0072 item 6: two metrics per attempt step, with exactly the dimensions the ADR freezes.
     // Ownership of each attributes object transfers to the metric call (`sentry.h`).
     const QByteArray stepUtf8 = step.toUtf8();
@@ -785,6 +799,9 @@ void emitStepMetric(const QString& step, const QString& outcome, const QString& 
 
 void emitRollupMetrics(const QJsonObject& attrs)
 {
+    if (!ReportingConsent::coveredUploadsAllowed()) {
+        return; // ADR-0107: covered
+    }
     // ADR-0072, D-11, Plan 13 Task 1: emit the 17 frozen stream gauge names.
     // Each gauge uses sentry_value_new_null() attributes (no per-session dimensions).
     // Units: SENTRY_UNIT_MILLISECOND for all timing and RTT fields; no unit for fps
@@ -842,7 +859,8 @@ QJsonObject rollupDeliveryHealth()
 bool emitInstallerEvent(const InstallJournalRecord& record)
 {
     const auto cached = readCache();
-    if (!started() || s_lastOptions.dsn.isEmpty() || !cached || cached->dsn.isEmpty()
+    if (!ReportingConsent::coveredUploadsAllowed() || !started() || s_lastOptions.dsn.isEmpty()
+        || !cached || cached->dsn.isEmpty()
         || !acceptDsn(cached->dsn)
         || (record.outcome != QLatin1String("failed") && record.outcome != QLatin1String("recovered")))
         return false;
@@ -888,7 +906,8 @@ bool emitInstallerEvent(const InstallJournalRecord& record)
 void adoptInstallerJournal(const QString& folder, const QString& retryStatePath, const QDateTime& now)
 {
     const auto cached = readCache();
-    if (!started() || !cached || cached->dsn.isEmpty() || !acceptDsn(cached->dsn)) return;
+    if (!ReportingConsent::coveredUploadsAllowed() || !started() || !cached || cached->dsn.isEmpty()
+        || !acceptDsn(cached->dsn)) return;
     auto state = UpdateRetryState::load(retryStatePath);
     for (const auto& record : InstallJournal::adopt(folder, now)) {
         if (state.reportedIds.contains(record.attempt)) continue;
@@ -905,6 +924,9 @@ QString installerJournalDirectory()
 
 void emitLaunchMetric()
 {
+    if (!ReportingConsent::coveredUploadsAllowed()) {
+        return; // ADR-0107: covered
+    }
     // One count per process, no dimensions (ADR-0072 item 6 lists only the name). Called from
     // `updateCanShip()` the first time shipping turns on - see the comment there.
     sentry_value_t attributes = sentry_value_new_object();

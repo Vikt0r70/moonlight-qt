@@ -35,6 +35,7 @@
 #include "seathub/control_plane_client.h"
 #include "seathub/countries.h"
 #include "seathub/region.h"
+#include "seathub/reporting_consent.h"
 #include "seathub/seathub_version.h"
 #include "seathub/web_origin.h"
 
@@ -554,6 +555,58 @@ private slots:
         QVERIFY2(authWithoutKey.qualityProfile.isEmpty(), "an absent quality_profile parses as empty");
     }
 
+    void authorization_parsesSignedPortsWithNonDefaultBasePort()
+    {
+        // ADR-0093 / SC7: Sunshine base port P = 20000.
+        // TCP: [P-5, P, P+21] = [19995, 20000, 20021]
+        // UDP: [P+9, P+10, P+11] = [20009, 20010, 20011]
+        QJsonObject ports;
+        ports.insert(QStringLiteral("https"), 19995);
+        ports.insert(QStringLiteral("control"), 20000);
+        ports.insert(QStringLiteral("rtsp"), 20021);
+        QJsonArray tcp;
+        tcp.append(19995);
+        tcp.append(20000);
+        tcp.append(20021);
+        ports.insert(QStringLiteral("tcp"), tcp);
+        QJsonArray udp;
+        udp.append(20009);
+        udp.append(20010);
+        udp.append(20011);
+        ports.insert(QStringLiteral("udp"), udp);
+
+        QJsonObject body;
+        body.insert(QStringLiteral("session_id"), QStringLiteral("aaaabbbb-cccc-dddd-eeee-ffff00001111"));
+        body.insert(QStringLiteral("pairing_pin"), QStringLiteral("4821"));
+        body.insert(QStringLiteral("host_address"), QStringLiteral("203.0.113.7"));
+        body.insert(QStringLiteral("ports"), ports);
+
+        SessionAuthorization auth;
+        QVERIFY(SessionAuthorization::parse(body, &auth));
+        QCOMPARE(auth.controlPort, 20000);
+        QCOMPARE(auth.httpsPort, 19995);
+        QCOMPARE(auth.rtspPort, 20021);
+        QCOMPARE(auth.tcpPorts, QList<int>({19995, 20000, 20021}));
+        QCOMPARE(auth.udpPorts, QList<int>({20009, 20010, 20011}));
+        QVERIFY(auth.isReady());
+    }
+
+    void authorization_absentPortsYieldsNotReadyAuthorization()
+    {
+        // 0 ports rejected, no fallback to 47989.
+        QJsonObject body;
+        body.insert(QStringLiteral("session_id"), QStringLiteral("aaaabbbb-cccc-dddd-eeee-ffff00001111"));
+        body.insert(QStringLiteral("pairing_pin"), QStringLiteral("4821"));
+        body.insert(QStringLiteral("host_address"), QStringLiteral("203.0.113.7"));
+
+        SessionAuthorization auth;
+        QVERIFY(SessionAuthorization::parse(body, &auth));
+        QCOMPARE(auth.controlPort, 0);
+        QCOMPARE(auth.httpsPort, 0);
+        QCOMPARE(auth.rtspPort, 0);
+        QVERIFY(!auth.isReady());
+    }
+
     void liveness_postsToTheDocumentedRouteWithStateAndErrorCode()
     {
         ControlPlaneClient client;
@@ -594,6 +647,118 @@ private slots:
 
         QCOMPARE(fake->lastPath,
                  QStringLiteral("/api/sessions/aaaabbbb-cccc-dddd-eeee-ffff00001111/end"));
+    }
+
+    // T073 / ADR-0107: the quality report is a covered upload and the send boundary asks the
+    // customer's choice every time. Off and "no choice recorded" put nothing on the wire and tell
+    // the caller the request never reached the network (so it keeps the report); On sends the full
+    // report once. Functional calls (End) are never gated.
+    void postSessionQuality_sendsNothingWhileReportingIsOffOrUnchosen()
+    {
+        struct ConsentReset
+        {
+            ~ConsentReset()
+            {
+                ReportingConsent::setStateForTests(false, reporting_consent_store::Record{});
+            }
+        } reset;
+
+        const reporting_consent_store::Record noChoice{};
+        reporting_consent_store::Record off;
+        off.recorded = true;
+        off.send = false;
+        off.noticeVersion = reporting_consent_store::kCurrentNoticeVersion;
+        const reporting_consent_store::Record states[] = { noChoice, off };
+
+        for (const reporting_consent_store::Record& state : states) {
+            ReportingConsent::setStateForTests(true, state);
+            ControlPlaneClient client;
+            auto* fake = new FakeNetworkAccessManager;
+            client.setNetworkAccessManager(fake);
+            fake->status = 200;
+            fake->body = okBody();
+
+            QJsonObject report;
+            report.insert(QStringLiteral("rendered_fps"), 55.0);
+            report.insert(QStringLiteral("width"), 1920);
+
+            bool called = false;
+            bool aborted = false;
+            client.postSessionQuality(QStringLiteral("aaaabbbb-cccc-dddd-eeee-ffff00001111"), report,
+                                      [&](const ControlPlaneResult& result) {
+                                          aborted = result.wasAborted;
+                                          called = true;
+                                      });
+            QTRY_VERIFY(called);
+            QVERIFY(aborted);
+            QVERIFY2(fake->paths.isEmpty(), "a covered upload must not reach the network");
+
+            // The functional End call still goes out in the same state.
+            bool ended = false;
+            client.endSession(QStringLiteral("aaaabbbb-cccc-dddd-eeee-ffff00001111"), false,
+                              [&](const ControlPlaneResult&) { ended = true; });
+            QTRY_VERIFY(ended);
+            QCOMPARE(fake->paths.size(), 1);
+            QVERIFY(fake->lastPath.endsWith(QStringLiteral("/end")));
+        }
+    }
+
+    void postSessionQuality_sendsTheCompleteReportWhenReportingIsOn()
+    {
+        struct ConsentReset
+        {
+            ~ConsentReset()
+            {
+                ReportingConsent::setStateForTests(false, reporting_consent_store::Record{});
+            }
+        } reset;
+        reporting_consent_store::Record on;
+        on.recorded = true;
+        on.send = true;
+        on.noticeVersion = reporting_consent_store::kCurrentNoticeVersion;
+        ReportingConsent::setStateForTests(true, on);
+
+        ControlPlaneClient client;
+        auto* fake = new FakeNetworkAccessManager;
+        client.setNetworkAccessManager(fake);
+        fake->status = 200;
+        fake->body = okBody();
+
+        QJsonObject report;
+        report.insert(QStringLiteral("rendered_fps"), 55.0);
+        report.insert(QStringLiteral("width"), 1920);
+        report.insert(QStringLiteral("height"), 1080);
+        report.insert(QStringLiteral("target_fps"), 60.0);
+        report.insert(QStringLiteral("codec"), QStringLiteral("h265"));
+        report.insert(QStringLiteral("hdr"), false);
+        report.insert(QStringLiteral("configured_bitrate_kbps"), 0);
+        report.insert(QStringLiteral("rtt_ms"), QJsonValue::Null);
+
+        bool called = false;
+        bool ok = false;
+        client.postSessionQuality(QStringLiteral("aaaabbbb-cccc-dddd-eeee-ffff00001111"), report,
+                                  [&](const ControlPlaneResult& result) {
+                                      ok = result.ok;
+                                      called = true;
+                                  });
+        QTRY_VERIFY(called);
+        QVERIFY(ok);
+
+        QCOMPARE(fake->paths.size(), 1);
+        QCOMPARE(fake->lastPath,
+                 QStringLiteral("/api/sessions/aaaabbbb-cccc-dddd-eeee-ffff00001111/quality"));
+        const QJsonObject sent = QJsonDocument::fromJson(fake->lastBody).object();
+        QCOMPARE(sent.size(), 8);
+        QCOMPARE(sent.value(QStringLiteral("width")).toInt(), 1920);
+        QCOMPARE(sent.value(QStringLiteral("height")).toInt(), 1080);
+        QCOMPARE(sent.value(QStringLiteral("target_fps")).toDouble(), 60.0);
+        QCOMPARE(sent.value(QStringLiteral("codec")).toString(), QStringLiteral("h265"));
+        QVERIFY(sent.value(QStringLiteral("hdr")).isBool());
+        QVERIFY(!sent.value(QStringLiteral("hdr")).toBool());
+        QVERIFY(sent.value(QStringLiteral("configured_bitrate_kbps")).isDouble());
+        QCOMPARE(sent.value(QStringLiteral("configured_bitrate_kbps")).toInt(), 0);
+        QVERIFY(sent.contains(QStringLiteral("rtt_ms")));
+        QVERIFY(sent.value(QStringLiteral("rtt_ms")).isNull());
     }
 
     void createAndEndRequestsIdentifyTheSeatHubVersion()
@@ -726,6 +891,39 @@ private slots:
         QCOMPARE(posted.value(QStringLiteral("failed")).toBool(), true);
         QCOMPARE(posted.value(QStringLiteral("attempt_step")).toString(),
                  QStringLiteral("engine_connect"));
+        // No port test was relayed for this failure, so the key is omitted (ADR-0104).
+        QVERIFY(!posted.contains(QStringLiteral("port_test")));
+    }
+
+    void endBody_carriesPortTestExactlyWhenOneWasRun()
+    {
+        EndReport report;
+        report.stage = QStringLiteral("connecting");
+        report.attemptStep = QStringLiteral("engine_connect");
+        report.failingPorts = QStringLiteral("TCP 48010");
+
+        report.portTest = QJsonObject {
+            { QStringLiteral("outcome"), QStringLiteral("failed") },
+            { QStringLiteral("failed_mask"), 16 },
+        };
+        QJsonObject built =
+            QJsonDocument::fromJson(ControlPlaneClient::buildEndRequest(true, report)).object();
+        QCOMPARE(built.value(QStringLiteral("port_test")).toObject(), report.portTest);
+        QCOMPARE(built.value(QStringLiteral("failing_ports")).toString(),
+                 QStringLiteral("TCP 48010"));
+
+        report.portTest = QJsonObject { { QStringLiteral("outcome"), QStringLiteral("clean") } };
+        built = QJsonDocument::fromJson(ControlPlaneClient::buildEndRequest(true, report)).object();
+        QCOMPARE(built.value(QStringLiteral("port_test")).toObject(), report.portTest);
+        QVERIFY(!built.value(QStringLiteral("port_test")).toObject()
+                     .contains(QStringLiteral("failed_mask")));
+
+        // An empty object means the test was not run: the key must be absent, not `{}`.
+        report.portTest = QJsonObject();
+        built = QJsonDocument::fromJson(ControlPlaneClient::buildEndRequest(true, report)).object();
+        QVERIFY(!built.contains(QStringLiteral("port_test")));
+        QCOMPARE(built.value(QStringLiteral("failing_ports")).toString(),
+                 QStringLiteral("TCP 48010"));
     }
 
     void sessionFetch_parsesTheSessionSchema()

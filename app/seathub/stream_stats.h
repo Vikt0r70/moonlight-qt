@@ -47,6 +47,44 @@ struct OptionalMetric
     }
 };
 
+/// T073 (ADR-0101 amendment 2026-10-19, contract 3.29.0): what the engine printed once at the
+/// start of a Play - the six stream-start fields of `SessionQualityReport`. Every field is
+/// independently unobserved (JSON `null` on the wire); a supplied 0 or `false` is preserved and
+/// nothing is inferred from preferences. Total FPS and actual bitrate are NOT part of it.
+///
+/// Two read-only engine lines carry it, `StatsWatcher` reads them from the one `LogTee`:
+///   * `Video stream is %dx%dx%d (format 0x%x)` (`app/streaming/session.cpp:339`,
+///     `Session::drSetup`): width, height, target FPS (the requested frame rate - not a
+///     measurement) and the video format, from which codec and HDR are decoded.
+///   * `Video bitrate: %d kbps` (`session.cpp:664-666`): the configured bitrate, not the actual.
+/// The order of the two lines is not guaranteed, so a context is merged from partial observations.
+struct StreamStartContext
+{
+    OptionalMetric width;
+    OptionalMetric height;
+    OptionalMetric targetFps;
+    OptionalMetric configuredBitrateKbps;
+    /// `h264`, `h265` or `av1`; empty when the format is unknown or the line never printed.
+    QString codec;
+    bool hdrKnown = false;
+    bool hdr = false;
+
+    bool isEmpty() const
+    {
+        return !width.present && !height.present && !targetFps.present
+            && !configuredBitrateKbps.present && codec.isEmpty() && !hdrKnown;
+    }
+
+    /// Takes every field `other` observed; a field `other` did not observe keeps its value here.
+    void merge(const StreamStartContext& other);
+};
+
+/// Parses one engine log line into the fields it observes. Returns `false` (and leaves `out`
+/// empty) for any other text. A video format in none of `moonlight-common-c`'s `MASK_H264`,
+/// `MASK_H265` or `MASK_AV1` leaves codec and hdr unobserved; `hdr` is true when the format is in
+/// `MASK_10BIT`. Chroma 4:4:4 is not reported.
+bool parseStreamStartLine(const QString& text, StreamStartContext* out);
+
 /// Every field `SessionQualityReport` names, in the contract's own order
 /// (`docs/spec/openapi.yaml`). Each is independently absent.
 struct VideoStats
@@ -71,13 +109,18 @@ struct VideoStats
     OptionalMetric decodedFps;
 
     /// D-10 (Plan 16, `06.6-16-PLAN.md`): parse-only fields for the in-stream stats overlay's
-    /// HOST row and total-latency sum, and the RES row's resolution - like `receivedFps` above,
-    /// never sent on the wire (`toQualityReport()` does not reference any of the three). Parsed
-    /// from the "Host processing latency min/max/average: ... ms" line's own average figure and
-    /// the "Video stream: WxH ..." line's own dimensions (`ffmpeg.cpp:778-848`, read-only).
+    /// HOST row and total-latency sum, and the RES row's resolution.
+    /// ADR-0101 (T024/T025): host latency min, max, and avg are also sent in SessionQualityReport.
+    OptionalMetric hostProcessingMinMs;
+    OptionalMetric hostProcessingMaxMs;
     OptionalMetric hostProcessingAvgMs;
     OptionalMetric videoWidth;
     OptionalMetric videoHeight;
+
+    /// T073: the Play's stream-start fields. Never set by `parseVideoStatsBlock()` or by
+    /// `VideoStatsAggregator::aggregate()` - the owner applies the context it holds for the Play
+    /// after aggregating, so a multi-segment aggregate cannot drop it.
+    StreamStartContext start;
 };
 
 /// Parses the block that follows the dashes line - `stringifyVideoStats()`'s own output, with
@@ -135,6 +178,9 @@ public:
 
 signals:
     void videoStatsParsed(VideoStats stats);
+    /// T073: one stream-start engine line was recognised (`parseStreamStartLine()`); carries only
+    /// the fields that line observed.
+    void streamStartObserved(StreamStartContext observed);
 
 private:
     void handle(LogLevel level, int category, int priority, const QString& text);

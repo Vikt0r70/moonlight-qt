@@ -15,7 +15,7 @@
 //      That substitution is the whole trick: mDNS is only upstream's usual way of learning an
 //      address, and `NvHTTP` has a public constructor that takes one directly
 //      (`app/backend/nvhttp.h:112`).
-//   2. `NvHTTP::getServerInfo()` - unauthenticated, over HTTP 47989 - for `<HttpsPort>`,
+//   2. `NvHTTP::getServerInfo()` - unauthenticated, over HTTP control port - for `<HttpsPort>`,
 //      `<appversion>`, the host `uniqueid` and `PairState`. With no pinned certificate and
 //      httpsPort 0 this is the same pre-pairing path upstream's own address-only host add takes
 //      (`app/backend/computermanager.cpp:805`).
@@ -24,7 +24,7 @@
 //   4. `NvPairingManager::pair()` - the five-phase handshake
 //      (`app/backend/nvpairingmanager.cpp`): `getservercert` over HTTP, `clientchallenge`,
 //      `serverchallengeresp` (which verifies the host's signature), the PIN check, and
-//      `clientpairingsecret` + `pairchallenge` over HTTPS 47984. Success is `<paired>1</paired>`.
+//      `clientpairingsecret` + `pairchallenge` over HTTPS port. Success is `<paired>1</paired>`.
 //   5. The client identity: SHA-256 over this client's own certificate, which is the value a
 //      host-side reader of Sunshine's `GET /api/clients/list` can match to this client's pairing
 //      record (see `pairing_seam.h` for why the Sunshine UUID itself is not available here).

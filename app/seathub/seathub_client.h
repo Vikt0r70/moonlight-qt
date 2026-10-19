@@ -27,6 +27,8 @@
 #include <QWindow>
 
 #include <atomic>
+#include <QDateTime>
+#include <QSet>
 #include <functional>
 #include <limits>
 #include <memory>
@@ -41,6 +43,7 @@
 #include "liveness_timer.h"
 #include "engine_status.h"
 #include "end_outbox.h"
+#include "evidence_journal.h"
 #include "stream_quality_sampler.h"
 #include "log_tee.h"
 #include "moonlight_engine_session.h"
@@ -382,6 +385,13 @@ public:
     /// Test seam: point the durable End outbox at a temporary directory.
     void setEndOutboxDirectory(const QString& directory);
 
+    /// Test seam: point the per-Play evidence journal (ADR-0105) at a temporary directory.
+    void setEvidenceJournalDirectory(const QString& directory);
+
+    /// Test seam: the length of one quality-sampler window, so a test sees full empty windows in
+    /// milliseconds instead of minutes. Set before the stream starts.
+    void setSamplerWindowMsForTests(int windowMs);
+
     /// C-ENDING: is an End saved on disk for the signed-in account?
     bool hasSavedEnd() const;
 
@@ -591,6 +601,14 @@ private slots:
     /// session's at this point - Pitfall 7) until `handleTeardownCompleted()` posts it once.
     void handleVideoStatsParsed(VideoStats stats);
 
+    /// T073: the engine printed its "Video stream is" or "Video bitrate" line for the attached Play.
+    void handleStreamStartObserved(StreamStartContext observed);
+
+    /// T073: the account the pending quality report is bound to. Returns false when the report was
+    /// composed before sign-in finished and the auth epoch has since moved on, in which case there
+    /// is no account to tag it with.
+    bool resolvePendingQualityAccount(QString* accountId) const;
+
     // D-33: the only locally enforced end. Liveness failure is not one (see `onLivenessWarning`).
     void handleHorizonReached();
     void onLivenessWarning();
@@ -669,6 +687,22 @@ private:
     void drainEndOutbox();
     /// V-OUTBOX (V42): 1 s doubling with jitter to a 10 s cap.
     void scheduleEndOutboxRetry();
+
+    /// ADR-0105: open the Play's evidence capsule (also records the clock-skew bucket), close it
+    /// at the Play's end, record one closed entry, and send what is waiting. None of them blocks
+    /// Play, a stream or teardown, and none shows anything to the customer.
+    void openEvidenceJournal(const QString& sessionId);
+    void closeEvidenceJournal();
+    void recordEvidence(const QJsonObject& entry);
+    /// Callable from the main thread or the network thread. At most one send per capsule at a time.
+    void deliverEvidence();
+    /// Network thread: a full 60 s window ended with no samples and no drops.
+    void noteEmptyWindow(qint64 windowMs);
+    /// Network thread: a non-empty roll-up follows; the pending stall (if any) is recorded now.
+    /// Returns true when an entry was recorded.
+    bool flushPendingStall();
+    /// Record the network timeline entry for the current QNetworkInformation state.
+    void noteNetworkChange();
     /// ADR-0066 decision 9 / V42: the jittered delay for `baseMs` (up to 20%).
     int jitteredReconnectDelay(int baseMs) const;
     double reconnectJitter() const;
@@ -720,6 +754,12 @@ private:
     /// gracefully on its own: the stream had started, the engine named no failure for this
     /// attempt, and the connection was not terminated from the other side (no termination code).
     bool endIsCustomerQuit() const;
+    /// ADR-0096: what this attempt observed about how it ended, as `deriveEndPresentation()` takes
+    /// it. Read-only and passive: it feeds the neutral `CUSTOMER_ENDED` sentence and the
+    /// `play.summary` diagnostics, never the End request.
+    EndEvidence currentEndEvidence() const;
+    /// The sentence for an end reason; a `CUSTOMER_ENDED` one is keyed by `currentEndEvidence()`.
+    QString endSentence(const QString& endReason, int minutesBilled, bool styled = true) const;
     /// R06: true for a step that belongs to a session other than the one attached now: both are
     /// known and they differ. A step with no session id, or arriving with none attached, is not
     /// late. The caller drops it.
@@ -736,6 +776,9 @@ private:
     /// this queues are both marshalled onto the network thread in that order, so the server
     /// records the stage before the cancel (RESEARCH-FORK C2).
     void endAttachedSessionBeforeStream(bool failed);
+    /// The pre-stream End that carries a report (`failed: true`): outbox write, ending state, then
+    /// teardown - the in-stream End's own sequence, so a network blip is retried, not lost (E20).
+    void endPreStreamSessionWithReport(const EndReport& report);
 
 
     /// D-05/C4/C7: shared by `retry()` and `start()` - a session still attached here that never
@@ -965,7 +1008,7 @@ private:
     bool m_pendingSignedOutNotice = false;
     int m_accountFallbackMs = kAccountFallbackMs;
     int m_signedOutNoticeMs = kSignedOutNoticeMs;
-    /// Facade-thread timers, like `m_reconnectTimer`: neither needs to run while an engine stream
+    /// Facade-thread timers, like `m_endOutboxTimer`: neither needs to run while an engine stream
     /// suspends this thread's event loop (D-33 - the balance element is not even shown then), and
     /// keeping them here means starting/stopping them needs no `onClientThread()` marshal.
     QTimer* m_accountFallbackTimer = nullptr;
@@ -998,9 +1041,6 @@ private:
     /// the seam reports from. Consumed - not merely read - by whichever handler runs next, so no
     /// later failure can inherit it. Empty until a result arrives.
     PairingHandshakeResult m_pairingClassification;
-    /// L07: the pairing that last completed skipped the PIN handshake (the warm return). A
-    /// reconnect attempt that then fails drops the held trust so the next attempt pairs with the PIN.
-    bool m_lastPairingWarm = false;
     EngineLaunchReason m_engineLaunchReason = EngineLaunchReason::Started;
     QString m_lastFailedStep;
     QElapsedTimer m_playElapsed;
@@ -1055,6 +1095,15 @@ private:
     QJsonObject m_pendingQualityReport;
     QString m_pendingQualitySessionId;
     bool m_hasPendingQualityReport = false;
+    /// The account and auth epoch the pending report was composed under (T073). Disposal reads
+    /// these, not the live `m_accountId`/`m_authEpoch`, so a report is never re-tagged under an
+    /// account that signed in after the Play it belongs to.
+    QString m_pendingQualityAccountId;
+    quint64 m_pendingQualityEpoch = 0;
+    /// The stream-start facts the engine printed for the attached Play (T073). Reset whenever the
+    /// attached session id changes (`setAttachedSession()`), so a replacement Play never inherits
+    /// them; applied to the aggregate when a stats block is parsed.
+    StreamStartContext m_streamStart;
 
     /// WR-06 (code review 06.3-REVIEW-fork.md): a report that could not be tagged because
     /// `m_accountId` was still empty when `postOrStoreQualityReport()`/`storeQualityReportToOutbox()`
@@ -1108,7 +1157,7 @@ private:
     quint64 m_playToken = 0;
     int m_playRepeatBackoffMs = 0;
 
-    // --- 06.1-19/J-07: the reconnect state --------------------------------------------------------
+    // --- 06.1-19/J-07: the engine's termination code and the End outbox's backoff ------------------
 
     /// A sentinel outside the engine's own range (`Limelight.h`'s `ML_ERROR_*` are `0` or negative,
     /// per `engine_termination.h`'s own parser comment) - "no termination code has been seen yet
@@ -1122,11 +1171,40 @@ private:
     /// load) from `handleDisplayLaunchError()` on the facade thread - the exact cross-thread read
     /// T-06.1-56 asks for an atomic rather than a plain getter. Reset in `beginSession()`.
     std::atomic<int> m_lastTerminationCode{kNoTerminationCode};
+    /// ADR-0096: the customer's own Cancel or End press was observed for this attempt (set only by
+    /// `interrupt()`; atomic because the termination sink reads it from the engine's thread).
+    std::atomic<bool> m_manualEndObserved{false};
+    /// ADR-0096: the FIRST termination code logged before any manual End was observed. Later
+    /// codes, a manual End and the cleanup cannot replace it. Reset in `beginSession()`.
+    std::atomic<int> m_firstNativeFaultCode{kNoTerminationCode};
     /// ADR-0066 decision 9: the jitter source for the reconnect/outbox backoff. Empty uses 0-20%
     /// random; tests set it for deterministic delays.
     std::function<double()> m_reconnectJitterProvider;
     /// V-OUTBOX (L06): the durable End outbox, and its own re-send pace (V42).
     EndOutbox m_endOutbox;
+    /// ADR-0105: the per-Play evidence capsule (mutex-guarded; written from the main thread and
+    /// the network thread). `m_journalGeneration` counts opens and `m_journalOpen` says whether one
+    /// is open now, so the network thread can tell a stall that belongs to another Play.
+    EvidenceJournal m_journal;
+    std::atomic<quint64> m_journalGeneration{0};
+    std::atomic<bool> m_journalOpen{false};
+    /// Network-thread-readable copy of the signed-in account, guarded by `m_evidenceMutex`, along
+    /// with how many sends are outstanding. No new batch is taken while any is in flight, because
+    /// `EvidenceJournal::deliverable()` marks what it hands out and an answer removes up to that mark.
+    std::mutex m_evidenceMutex;
+    QString m_evidenceAccountId;
+    int m_evidencePending = 0;
+    bool m_evidenceProgress = false;
+    /// Pending stall: consecutive empty windows of one Play coalesce here. Owned by the network
+    /// thread only (the sampler's context), including `flushPendingStall()` from `finishPlay`.
+    int m_stallWindows = 0;
+    qint64 m_stallDurationMs = 0;
+    quint64 m_stallGeneration = 0;
+    /// The last `stream.hello` server time and when it arrived locally (main thread).
+    QDateTime m_helloServerUtc;
+    QDateTime m_helloLocalUtc;
+    /// Network timeline (main thread): coalesced change count and the last reported state.
+    int m_networkTransitions = 0;
     QTimer* m_endOutboxTimer = nullptr;
     int m_endOutboxBackoffMs = 1000;
     /// V-COUNTDOWN: the published live countdown and its source. `m_liveSseRetrySeconds` is the value

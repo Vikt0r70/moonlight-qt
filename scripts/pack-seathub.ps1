@@ -1,10 +1,14 @@
 # Packs the SeatHub deploy folder into the Velopack release (ADR-0086, I-SEATHUB).
 #
 # Input is the folder scripts\build-seathub.ps1 deploys. Output, in build\velopack-x64-release\:
-#     <packId>-Setup.exe                 the one-click, per-user, no-administrator installer. It shows one
-#                                        small window with Velopack's splash and progress bar and opens
-#                                        RentaPC when it finishes. Its SHA-256 is the release row's `sha256`
-#                                        (D-43) and is also written to setup-sha256.txt.
+#     <packId>-Setup.exe                 the installer: a small setup window (installer\bootstrapper, ADR-0107)
+#                                        that asks about crash reports and logs, then runs the unchanged
+#                                        Velopack Setup embedded inside it - the one-click, per-user,
+#                                        no-administrator installer with Velopack's splash and progress bar,
+#                                        which opens RentaPC when it finishes. This outer program's SHA-256
+#                                        is the release row's `sha256` (D-43) and is also written to
+#                                        setup-sha256.txt. The inner Setup is kept out of this folder
+#                                        (build\bootstrapper-stage\inner-setup.bin).
 #     <packId>-<version>-full.nupkg      the full package - Velopack's update payload, uploaded whole,
 #                                        never repacked
 #     releases.win.json                  Velopack's manifest for the `win` channel (the folder that holds
@@ -34,7 +38,9 @@ param(
     [string]$OutputDir = '',
     [string]$SplashImage = '',
     [string]$ProgressColor = '',
-    [string]$Vpk = 'vpk'
+    [string]$Vpk = 'vpk',
+    [string]$QtDir = 'C:\Qt\6.11.2\msvc2022_64',
+    [string]$VcVars = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -139,8 +145,73 @@ $packArgs = @(
 if ($SplashImage) { $packArgs += @('--splashImage', $SplashImage) }
 & $Vpk @packArgs
 if ($LASTEXITCODE -ne 0) { throw "vpk pack failed with exit code $LASTEXITCODE" }
-# vpk names its installer <packId>-win-Setup.exe and no vpk input changes that (installer-fields.md), so rename it to the published name.
+
+# vpk names its installer <packId>-win-Setup.exe and no vpk input changes that (installer-fields.md), so rename it
+# to the published name first.
 Move-Item -LiteralPath (Join-Path $OutputDir "$PackId-win-Setup.exe") -Destination (Join-Path $OutputDir "$PackId-Setup.exe")
+
+# ---------------------------------------------------------------- the setup window (ADR-0107)
+# The published installer is a small setup window that runs BEFORE the unchanged Velopack Setup, never inside
+# a Velopack hook (installer\bootstrapper\main.cpp). vpk's own Setup (renamed above) is moved out of the
+# release folder into the staging folder and embedded byte for byte as a resource of the bootstrapper, and the
+# outer program then takes the <packId>-Setup.exe name (the name the feed and the website use), so the release
+# folder holds only the outer program.
+Step 'Setup window (bootstrapper)'
+$StageDir = Join-Path $BuildRoot 'bootstrapper-stage'
+if (Test-Path -LiteralPath $StageDir) { Remove-Item -LiteralPath $StageDir -Recurse -Force }
+New-Item -ItemType Directory -Force -Path (Join-Path $StageDir 'build') | Out-Null
+$innerSetup = Join-Path $StageDir 'inner-setup.bin'
+Move-Item -LiteralPath (Join-Path $OutputDir "$PackId-Setup.exe") -Destination $innerSetup
+$innerHash = (Get-FileHash -LiteralPath $innerSetup -Algorithm SHA256).Hash.ToLower()
+Set-Content -LiteralPath (Join-Path $StageDir 'inner-setup-sha256.txt') -Value $innerHash -Encoding ASCII
+
+# The release version becomes the outer program's version resource (bootstrapper.rc includes this file).
+if ($Version -notmatch '^(\d+)\.(\d+)\.(\d+)') { throw "release version '$Version' is not major.minor.patch" }
+$versionNumbers = "$($Matches[1]),$($Matches[2]),$($Matches[3]),0"
+Set-Content -LiteralPath (Join-Path $StageDir 'bootstrapper-version.rci') -Encoding ASCII -Value @(
+    "#define RENTAPC_VER_NUMBERS $versionNumbers",
+    "#define RENTAPC_VER_TEXT ""$Version"""
+)
+
+if (-not $VcVars) {
+    foreach ($candidate in @(
+        'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat',
+        'C:\Program Files\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat',
+        'C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat',
+        'C:\Program Files\Microsoft Visual Studio\2022\Professional\VC\Auxiliary\Build\vcvars64.bat',
+        'C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat'
+    )) {
+        if (Test-Path -LiteralPath $candidate) { $VcVars = $candidate; break }
+    }
+}
+Require $VcVars 'MSVC vcvars64.bat (pass -VcVars)'
+$qmake = Join-Path $QtDir 'bin\qmake.exe'
+Require $qmake 'qmake (pass -QtDir)'
+$bootstrapperPro = Join-Path $RepoRoot 'installer\bootstrapper\bootstrapper.pro'
+Require $bootstrapperPro 'bootstrapper.pro'
+
+$buildDir = Join-Path $StageDir 'build'
+# A small batch file keeps the quoting of paths with spaces out of the cmd.exe command line.
+$buildCmd = Join-Path $StageDir 'build-bootstrapper.cmd'
+Set-Content -LiteralPath $buildCmd -Encoding ASCII -Value @(
+    '@echo off',
+    ('call "{0}" >nul' -f $VcVars),
+    'if errorlevel 1 exit /b 1',
+    ('"{0}" "{1}" "STAGE_DIR={2}" -spec win32-msvc' -f $qmake, $bootstrapperPro, $StageDir),
+    'if errorlevel 1 exit /b 1',
+    'nmake release',
+    'exit /b %ERRORLEVEL%'
+)
+Push-Location $buildDir
+try {
+    & cmd.exe /d /c $buildCmd
+    if ($LASTEXITCODE -ne 0) { throw "bootstrapper build failed with exit code $LASTEXITCODE" }
+}
+finally { Pop-Location }
+$outerSetup = Join-Path $buildDir 'release\RentaPC-Setup.exe'
+Require $outerSetup 'the built bootstrapper'
+Copy-Item -LiteralPath $outerSetup -Destination (Join-Path $OutputDir "$PackId-Setup.exe")
+Write-Host "inner Setup sha256  $innerHash  (embedded unchanged; also in $StageDir\inner-setup-sha256.txt)"
 
 # ---------------------------------------------------------------- verify the release
 Step 'Verify the release'

@@ -1,5 +1,7 @@
 #include "log_shipper.h"
 
+#include "reporting_consent.h"
+
 #include <QDateTime>
 #include <QDir>
 #include <QFile>
@@ -626,7 +628,7 @@ private:
             // logged since is exactly how a sign-in drains lines that piled up before it (Task 1's
             // own tracer). `holdWorkerForTests()` never suppresses this - only the queue's own
             // dequeue is held for that seam.
-            if (!handOffPaused.load() && canShip.load()) {
+            if (!handOffPaused.load() && canShip.load() && ReportingConsent::coveredUploadsAllowed()) {
                 drainSpool();
             }
 
@@ -645,7 +647,7 @@ private:
     {
         QList<ShippedLine> spooled = spool->takeAll();
         for (int i = 0; i < spooled.size(); ++i) {
-            if (handOffPaused.load() || !canShip.load()) {
+            if (handOffPaused.load() || !canShip.load() || !ReportingConsent::coveredUploadsAllowed()) {
                 requeue(spooled, i);
                 return;
             }
@@ -661,7 +663,7 @@ private:
         ShippedLine line = rawLine;
         line.body = LogShipper::scrub(line.body);
 
-        if (handOffPaused.load() || !canShip.load()) {
+        if (handOffPaused.load() || !canShip.load() || !ReportingConsent::coveredUploadsAllowed()) {
             spool->append(line);
             return;
         }

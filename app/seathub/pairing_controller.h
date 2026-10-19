@@ -23,6 +23,7 @@ struct PairingTarget {
     QString sessionId;
     QString hostAddress;
     int httpsPort = 0;
+    int controlPort = 0;
     /// Dies at the end of the launch. Never persisted (D-30, D-37).
     QString pairingPin;
     /// ADR-0074 W03 / L07: the authorization's own `warm_return` indication for this session (true
@@ -32,6 +33,11 @@ struct PairingTarget {
     /// a warm attempt that fails falls back to the PIN handshake, and the rig's own certificate
     /// check is what admits the stream.
     bool warmReturn = false;
+    /// SC18: true only for an `ACTIVE` session re-pairing inside its disconnect grace - set by the
+    /// controller from the authorization's own `state`. It is NOT `warmReturn`: that is also true
+    /// for a NEW session allocated from a free return hold, which keeps the one pairing retry. The
+    /// seam grants no retry when this is true (the reconnect flow has its own re-submission budget).
+    bool reconnecting = false;
 };
 
 // The engine's pairing entry point, as this controller needs it.

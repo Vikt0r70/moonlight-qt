@@ -3,6 +3,7 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QJsonValue>
+#include <QLoggingCategory>
 #include <QNetworkReply>
 #include <QNetworkRequest>
 #include <QRandomGenerator>
@@ -10,6 +11,10 @@
 #include <algorithm>
 
 #include "session_websocket.h"
+
+// Connection log lines carry closed outcomes, attempt numbers and elapsed milliseconds - never the
+// stream URL, a token or a frame body.
+Q_LOGGING_CATEGORY(seathubSse, "seathub.sse")
 
 bool AccountStateInfo::parse(const QJsonObject& account, AccountStateInfo* out)
 {
@@ -241,6 +246,9 @@ void SseClient::beginConnection()
     m_live = false;
     m_lastCloseReason.clear();
     m_deadStreamTimer->stop();
+    m_connectionTimer.start();
+    qCInfo(seathubSse).noquote()
+        << QStringLiteral("sse event=connect attempt=%1").arg(m_attempt + 1);
     setState(QStringLiteral("connecting"));
     // V-COUNTDOWN: the attempt is starting, so no countdown is pending any more.
     publishRetrySeconds();
@@ -269,6 +277,8 @@ void SseClient::scheduleReconnect(int delayMs)
     if (m_stopping) {
         return;
     }
+    qCInfo(seathubSse).noquote()
+        << QStringLiteral("sse event=reconnect attempt=%1 delay_ms=%2").arg(m_attempt + 1).arg(delayMs);
     m_reconnectTimer->start(delayMs);
     publishRetrySeconds();
 }
@@ -340,6 +350,18 @@ void SseClient::handleFinished()
     const QString reason = m_lastCloseReason;
     m_lastCloseReason.clear();
 
+    // The close reasons are the server's closed set (`revoked`, `replaced`, `shutdown`); anything
+    // else is logged as `other` so a stray string never reaches the log.
+    const bool knownReason = reason == QStringLiteral("revoked") || reason == QStringLiteral("replaced")
+        || reason == QStringLiteral("shutdown");
+    qCInfo(seathubSse).noquote()
+        << QStringLiteral("sse event=loss reason=%1 http_status=%2 helloed=%3 elapsed_ms=%4")
+               .arg(reason.isEmpty() ? QStringLiteral("transport")
+                                     : (knownReason ? reason : QStringLiteral("other")))
+               .arg(status)
+               .arg(m_connectionHelloed ? QStringLiteral("true") : QStringLiteral("false"))
+               .arg(m_connectionTimer.isValid() ? m_connectionTimer.elapsed() : 0);
+
     // `stream.closing {reason: "revoked"}`, or the transport itself answering 401/403 to the
     // stream request (no closing frame at all - e.g. the bearer was already revoked before this
     // attempt opened). Both mean the same thing: stop for good (§2.3).
@@ -352,6 +374,7 @@ void SseClient::handleFinished()
             emit pausedChanged(false);
         }
         setState(QStringLiteral("stopped"));
+        qCInfo(seathubSse) << "sse event=stopped reason=revoked";
         emit revoked();
         return;
     }
@@ -382,6 +405,10 @@ void SseClient::onHello(int aliveMs)
 {
     // V-L4: a hello proves the connection is alive; stop the hello limit for this attempt.
     m_helloTimer->stop();
+    qCInfo(seathubSse).noquote()
+        << QStringLiteral("sse event=hello alive_ms=%1 elapsed_ms=%2")
+               .arg(aliveMs)
+               .arg(m_connectionTimer.isValid() ? m_connectionTimer.elapsed() : 0);
     // R7: any hello proves a working stream - the indicator hides at once, whether or not the first
     // `stream.alive` (which counts the connection live for L3/L5) has come yet.
     m_connectionHelloed = true;
@@ -523,6 +550,12 @@ void SseClient::dispatchFrame()
     if (eventType == "stream.hello") {
         const QJsonValue aliveMs = data.value(QStringLiteral("alive_ms"));
         emit hello(aliveMs.isDouble() ? aliveMs.toInt() : 0);
+        // `server_time` is an ISO-8601 UTC instant. A missing or malformed one emits nothing.
+        const QDateTime serverUtc = QDateTime::fromString(
+            data.value(QStringLiteral("server_time")).toString(), Qt::ISODateWithMs);
+        if (serverUtc.isValid()) {
+            emit serverTime(serverUtc.toUTC());
+        }
     }
     else if (eventType == "stream.alive") {
         emit alive();

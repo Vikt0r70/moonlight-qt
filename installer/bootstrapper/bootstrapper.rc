@@ -1,0 +1,38 @@
+// Resources of the RentaPC setup window (ADR-0107).
+//   101  the privacy notice the window shows (installer/PRIVACY-NOTICE.txt, UTF-8)
+//   102  the unchanged Velopack Setup that `vpk pack` wrote, embedded byte for byte
+// bootstrapper-version.rci and inner-setup.bin come from the staging folder scripts/pack-seathub.ps1
+// passes as RC_INCLUDEPATH (see bootstrapper.pro); they are build outputs, never checked in.
+#include <winver.h>
+#include "bootstrapper-version.rci"
+
+101 RCDATA "../PRIVACY-NOTICE.txt"
+102 RCDATA "inner-setup.bin"
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION RENTAPC_VER_NUMBERS
+ PRODUCTVERSION RENTAPC_VER_NUMBERS
+ FILEFLAGSMASK 0x3fL
+ FILEFLAGS 0x0L
+ FILEOS VOS_NT_WINDOWS32
+ FILETYPE VFT_APP
+ FILESUBTYPE 0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"
+        BEGIN
+            VALUE "CompanyName", "RentaPC"
+            VALUE "FileDescription", "RentaPC setup"
+            VALUE "FileVersion", RENTAPC_VER_TEXT
+            VALUE "InternalName", "RentaPC-Setup"
+            VALUE "OriginalFilename", "RentaPC-Setup.exe"
+            VALUE "ProductName", "RentaPC"
+            VALUE "ProductVersion", RENTAPC_VER_TEXT
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END

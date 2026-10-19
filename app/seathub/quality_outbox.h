@@ -88,10 +88,11 @@ public:
 
     /// Writes (or overwrites) `<sessionId>.json`: the report body and `accountId`, the account
     /// this report belongs to. A no-op with no WARN for an empty `sessionId` (nothing to hold it
-    /// against); the caller is responsible for never calling this with an empty `accountId` (an
-    /// untagged file could never be proven to belong to anyone, and `drain()` would have to send
-    /// it to nobody or everybody - `SeatHubClient` logs and drops instead of ever writing one).
+    /// against). Untagged reports (empty `accountId`) are stored ahead until `accountId` is known.
     void put(const QString& sessionId, const QString& accountId, const QJsonObject& report);
+
+    /// Removes `<sessionId>.json` from disk, e.g. after delivery.
+    void remove(const QString& sessionId);
 
     /// True when at least one report is currently stored, whichever account it is tagged for.
     /// Lets a caller that does not yet know the signed-in account's id (a fresh sign-in, before
@@ -129,11 +130,21 @@ public:
     /// the 401 branch of `applyRestoreResult()`.
     void cancel();
 
+    /// T063: called once per put / drain / delivered / kept / dropped / unreadable event with the
+    /// closed event and answer tokens of `EvidenceJournal::outbox` and a count. The facade uses it
+    /// to journal the event; it never sees a path, token or body. Unset in every existing test.
+    using Observer = std::function<void(const QString& event, const QString& answer, int count)>;
+    void setObserver(Observer observer);
+
 private:
     QString pathFor(const QString& sessionId) const;
     void drainFiles(const QStringList& files, int index, const QString& tokenGeneration,
                     const QString& accountId, const PostFn& postFn, quint64 generation);
+    /// One INFO log line (session id, closed tokens, count) and then the observer.
+    void noteEvent(const QString& event, const QString& sessionId, const QString& answer,
+                   int count) const;
 
+    Observer m_observer;
     QString m_directory;
     bool m_draining = false;
     /// CR-03: bumped by every `drain()` call and by `cancel()`. Captured into each `drainFiles()`
