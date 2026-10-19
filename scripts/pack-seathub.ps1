@@ -66,6 +66,34 @@ function Require($path, $what) {
     if (-not (Test-Path -LiteralPath $path)) { throw "$what not found: $path" }
 }
 
+# Locates vcvars64.bat for an install that actually has the VC toolset, the way scripts\build-seathub.ps1 does:
+# the known 2022 roots first, then vswhere. Hosted CI runners keep Visual Studio at a path none of the known roots
+# name, so a fixed list alone fails there. An install counts only if it has both the toolset directory and
+# vcvars64.bat; a Community install without the C++ workload has the latter but not the former.
+function Find-VcVars {
+    foreach ($candidate in @(
+        'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat',
+        'C:\Program Files\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat',
+        'C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat',
+        'C:\Program Files\Microsoft Visual Studio\2022\Professional\VC\Auxiliary\Build\vcvars64.bat',
+        'C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat'
+    )) {
+        if (-not (Test-Path -LiteralPath $candidate)) { continue }
+        $msvcRoot = Join-Path (Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $candidate))) 'Tools\MSVC'
+        if (Test-Path -LiteralPath $msvcRoot) { return $candidate }
+    }
+
+    $vswhere = Join-Path $PSScriptRoot 'vswhere.exe'
+    if (Test-Path -LiteralPath $vswhere) {
+        $install = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath 2>$null
+        if ($install) {
+            $found = Join-Path $install 'VC\Auxiliary\Build\vcvars64.bat'
+            if ((Test-Path -LiteralPath $found) -and (Test-Path -LiteralPath (Join-Path $install 'VC\Tools\MSVC'))) { return $found }
+        }
+    }
+    throw 'vcvars64.bat not found. Install the "Desktop development with C++" workload (which carries the MSVC v143 x64 toolset), or pass -VcVars.'
+}
+
 # ---------------------------------------------------------------- inputs
 Step 'Inputs'
 Require (Join-Path $DeployFolder $MainExe) "deployed client ($MainExe) - run scripts\build-seathub.ps1 first"
@@ -173,17 +201,7 @@ Set-Content -LiteralPath (Join-Path $StageDir 'bootstrapper-version.rci') -Encod
     "#define RENTAPC_VER_TEXT ""$Version"""
 )
 
-if (-not $VcVars) {
-    foreach ($candidate in @(
-        'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat',
-        'C:\Program Files\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat',
-        'C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat',
-        'C:\Program Files\Microsoft Visual Studio\2022\Professional\VC\Auxiliary\Build\vcvars64.bat',
-        'C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat'
-    )) {
-        if (Test-Path -LiteralPath $candidate) { $VcVars = $candidate; break }
-    }
-}
+if (-not $VcVars) { $VcVars = Find-VcVars }
 Require $VcVars 'MSVC vcvars64.bat (pass -VcVars)'
 $qmake = Join-Path $QtDir 'bin\qmake.exe'
 Require $qmake 'qmake (pass -QtDir)'
