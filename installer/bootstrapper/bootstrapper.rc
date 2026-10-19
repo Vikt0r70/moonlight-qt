@@ -23,7 +23,7 @@ BEGIN
         BLOCK "040904b0"
         BEGIN
             VALUE "CompanyName", "RentaPC"
-            VALUE "FileDescription", "RentaPC setup"
+            VALUE "FileDescription", "RentaPC"
             VALUE "FileVersion", RENTAPC_VER_TEXT
             VALUE "InternalName", "RentaPC-Setup"
             VALUE "OriginalFilename", "RentaPC-Setup.exe"
