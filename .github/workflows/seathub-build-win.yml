@@ -2,7 +2,8 @@ name: SeatHub build (Windows)
 
 # Adds SeatHub-specific jobs alongside upstream's existing CI (D-27) — upstream workflows are the
 # baseline and are not removed until SeatHub jobs fully cover them. This job's purpose is the
-# diff gate: it enforces the engine-untouched fork boundary (D-28, amended by ADR-0046).
+# diff gate: it enforces the engine-untouched fork boundary (D-28, amended by ADR-0046 and, for
+# session.cpp's conntest server and port-test relay, ADR-0104).
 #
 # Exception pattern: `overlaymanager|session\.cpp` is the single source of truth for what may be
 # modified under app/streaming/. It is deliberately mirrored (not referenced) in three other
@@ -18,7 +19,7 @@ on:
 
 jobs:
   diff-gate:
-    name: Engine-untouched diff gate (D-28, ADR-0046)
+    name: Engine-untouched diff gate (D-28, ADR-0046, ADR-0104)
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -70,14 +71,32 @@ jobs:
             exit 1
           fi
 
+      - name: Fail if a line added to session.cpp has no SeatHub marker (ADR-0046, ADR-0104)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Every line the fork adds to session.cpp is marked, so a future upstream merge can find
+          # it: `SeatHub:` (ADR-0104's four lines) or the ADR-0046 title lines. The exact line set
+          # is pinned by tests/tst_d28_boundary.cpp; this step only refuses an unmarked addition.
+          UNMARKED=$(git diff -U0 v6.1.0..HEAD -- app/streaming/session.cpp \
+            | grep -E '^\+' | grep -Ev '^\+\+\+' | grep -Ev 'SeatHub:|ADR-0046' || true)
+          if [ -n "$UNMARKED" ]; then
+            echo "::error::session.cpp gained line(s) with no SeatHub marker:"
+            echo "$UNMARKED"
+            exit 1
+          fi
+
   seathub-windows-build:
     name: SeatHub Windows/Qt build
     runs-on: windows-latest
     needs: diff-gate
     steps:
+      # Full history: tst_d28_boundary measures against the pinned upstream commit object itself
+      # and fails closed by name when that object is absent (a shallow clone), so this must stay 0.
       - uses: actions/checkout@v4
         with:
           submodules: recursive
+          fetch-depth: 0
 
       # Toolchain. Plan 03-01 left this as a placeholder rather than guess at provisioning, and
       # Plan 03-06 replaces it now that the recipe is proven on a real machine. Qt is installed
@@ -151,6 +170,17 @@ jobs:
         shell: pwsh
         run: ./scripts/build-seathub.ps1
 
+      # SC15: two suites that no earlier CI step ran. Named-suite mode builds each with the
+      # same Qt 6.11.2 and sentry-native 0.17.1 install the build above produced, and prints
+      # NAMED_SUITES_PASSED only when both pass.
+      - name: Run the telemetry and engine-boundary suites
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $out = (& cmd.exe /d /s /c 'tests\run-all-suites.cmd tst_telemetry tst_d28_boundary' 2>&1 | Out-String)
+          Write-Host $out
+          if ($out -notmatch 'NAMED_SUITES_PASSED') { throw "tst_telemetry / tst_d28_boundary did not pass." }
+
       # ADR-0063, D-01/SC-10, D-12: runs for every build. No DSN may ever be compiled into what
       # ships (a DSN can only submit events, but D-45 still forbids shipping one), and no PDB may
       # ever ship to a customer PC -- symbols reach Sentry through the upload step below instead.
@@ -198,6 +228,9 @@ jobs:
       # ADR-0086: the deploy folder becomes the Velopack release - Setup.exe (per user, no administrator
       # prompt), the full package and releases.win.json. Runs after the scan above, so exactly what was
       # scanned is what is packed. Unsigned (D-43): "No signing parameters provided" is expected.
+      # ADR-0107: the script also builds the setup window (installer/bootstrapper) with the MSVC and Qt
+      # already installed above (qmake only, no Qt runtime in the result) and embeds vpk's Setup unchanged;
+      # the *-Setup.exe uploaded below is that outer program, and vpk's own Setup never enters the release folder.
       - name: Pack SeatHub with Velopack
         shell: pwsh
         run: ./scripts/pack-seathub.ps1
@@ -581,4 +614,4 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --target "$GITHUB_SHA" \
             --title "SeatHub $VERSION" \
-            --notes "SeatHub client $VERSION, built from ${GITHUB_SHA::7}. Setup.exe SHA-256: \`$sha\`. The same build the in-app update feed serves: Setup.exe, the full package and releases.win.json."
+            --notes "SeatHub client $VERSION, built from ${GITHUB_SHA::7}. Setup.exe SHA-256: \`$sha\`. The same build the in-app update feed serves: Setup.exe, the full package and releases.win.json. Code signing policy: https://github.com/${GITHUB_REPOSITORY}/blob/${GITHUB_SHA}/docs/code-signing-policy.md and https://rentapc.online/code-signing-policy. Privacy notice: https://github.com/${GITHUB_REPOSITORY}/blob/${GITHUB_SHA}/installer/PRIVACY-NOTICE.txt."

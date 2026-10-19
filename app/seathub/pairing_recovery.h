@@ -29,12 +29,6 @@
 /// the other cannot ship silently.
 extern const char* const kSharedPairingUniqueId;
 
-/// The plain-HTTP port pairing requests ride. 47989, upstream's `DEFAULT_HTTP_PORT`
-/// (`app/backend/nvaddress.h:5`) and the contract's `ports.control`
-/// (`docs/spec/openapi.yaml:1804-1806`). A constant here rather than `app/backend/nvaddress.h`'s
-/// own because this module must not include `app/backend/` (see the file comment above).
-inline constexpr int kPairingControlPort = 47989;
-
 /// One best-effort clear of the rig's pending pairing session for `kSharedPairingUniqueId`.
 ///
 /// Blocking: a local event loop waits up to `timeoutMs` for the rig to answer (default 3 s - a
@@ -51,5 +45,5 @@ inline constexpr int kPairingControlPort = 47989;
 /// Thread-safe: it builds its own `QNetworkAccessManager` and event loop on the calling thread,
 /// which is a pool thread in production and the test thread in tests - the same shape upstream's
 /// own pairing requests use (`app/backend/nvhttp.cpp:510-511`).
-bool sendPairingCancelRequest(const QString& hostAddress, int port = kPairingControlPort,
+bool sendPairingCancelRequest(const QString& hostAddress, int port,
                               int timeoutMs = 3000);

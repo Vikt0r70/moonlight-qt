@@ -2292,13 +2292,26 @@ private slots:
             {QStringLiteral("teardown"), {QStringLiteral("failed_net"), QStringLiteral("failed_api"),
                 QStringLiteral("failed_auth"), QStringLiteral("failed_local"), QStringLiteral("ok")}},
         };
-        const QSet<QString> streamLogKeys = {
-            "n", "coverage_pct", "dropped_samples", "partial", "res", "fps_avg", "fps_min",
-            "net_drop_avg", "net_drop_p95", "jitter_drop_avg", "jitter_drop_p95", "rtt_avg", "rtt_p95",
-            "decode_avg", "decode_p95", "queue_avg", "queue_p95", "render_avg", "render_p95",
-            "host_avg", "host_p95", "backlog_spool_lines", "backlog_retry_files", "bad_s",
-            "stream_s", "reconnects", "rollups", "bad_episodes", "bad_seconds", "sampling_gap_s",
-            "cfg_res", "cfg_fps", "cfg_bitrate_kbps", "t_first_frame_ms"};
+        // The ADR-0101 sampler keys (operations.md:202-206) are listed by exact name: six fixed
+        // keys plus recent_<i>_* for i = 0..9, built as literal strings, never matched by prefix.
+        const QSet<QString> streamLogKeys = [] {
+            QSet<QString> keys = {
+                "n", "coverage_pct", "dropped_samples", "partial", "res", "fps_avg", "fps_min",
+                "net_drop_avg", "net_drop_p95", "jitter_drop_avg", "jitter_drop_p95", "rtt_avg", "rtt_p95",
+                "decode_avg", "decode_p95", "queue_avg", "queue_p95", "render_avg", "render_p95",
+                "host_avg", "host_p95", "backlog_spool_lines", "backlog_retry_files", "bad_s",
+                "stream_s", "reconnects", "rollups", "bad_episodes", "bad_seconds", "sampling_gap_s",
+                "cfg_res", "cfg_fps", "cfg_bitrate_kbps", "t_first_frame_ms",
+                "incoming_fps_avg", "incoming_fps_min", "decoded_fps_avg", "decoded_fps_min",
+                "recent_n", "last_sample_age_ms"};
+            for (int i = 0; i < 10; ++i) {
+                keys.insert(QStringLiteral("recent_%1_elapsed_ms").arg(i));
+                keys.insert(QStringLiteral("recent_%1_incoming_fps").arg(i));
+                keys.insert(QStringLiteral("recent_%1_decoded_fps").arg(i));
+                keys.insert(QStringLiteral("recent_%1_rendered_fps").arg(i));
+            }
+            return keys;
+        }();
         const QSet<QString> allowedLogKeys = {
             QStringLiteral("step"), QStringLiteral("outcome"), QStringLiteral("failure_class"),
             QStringLiteral("http_status"), QStringLiteral("net_error"),

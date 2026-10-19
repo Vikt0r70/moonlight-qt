@@ -1,4 +1,5 @@
 #include "control_plane_client.h"
+#include "reporting_consent.h"
 #include "seathub_version.h"
 
 #include <QElapsedTimer>
@@ -160,6 +161,14 @@ bool SessionAuthorization::parse(const QJsonObject& body, SessionAuthorization* 
     auth.httpsPort = ports.value(QStringLiteral("https")).toInt();
     auth.controlPort = ports.value(QStringLiteral("control")).toInt();
     auth.rtspPort = ports.value(QStringLiteral("rtsp")).toInt();
+    const QJsonArray tcp = ports.value(QStringLiteral("tcp")).toArray();
+    for (const QJsonValue& v : tcp) {
+        auth.tcpPorts.append(v.toInt());
+    }
+    const QJsonArray udp = ports.value(QStringLiteral("udp")).toArray();
+    for (const QJsonValue& v : udp) {
+        auth.udpPorts.append(v.toInt());
+    }
 
     // `quality_profile` is `type: [string, "null"]` and optional (contract 3.3.0, ADR-0064).
     // `toString()` already answers empty for both null and absent - parsed for completeness only,
@@ -716,6 +725,10 @@ QByteArray ControlPlaneClient::buildEndRequest(bool failed, const EndReport& rep
     if (!report.attemptStep.isEmpty()) {
         object.insert(QStringLiteral("attempt_step"), report.attemptStep);
     }
+    // ADR-0104: the real port-test result of the failed stage, beside the unchanged `failing_ports`.
+    if (!report.portTest.isEmpty()) {
+        object.insert(QStringLiteral("port_test"), report.portTest);
+    }
     return QJsonDocument(object).toJson(QJsonDocument::Compact);
 }
 
@@ -1237,9 +1250,25 @@ void ControlPlaneClient::endSession(const QString& sessionId, bool failed, const
 void ControlPlaneClient::postSessionQuality(const QString& sessionId, const QJsonObject& report,
                                             Callback callback)
 {
+    // ADR-0107: a quality report is a covered upload, asked at the moment of sending. Off or no
+    // choice recorded reports "never reached the network" so the caller keeps the report.
+    if (!ReportingConsent::coveredUploadsAllowed()) {
+        if (callback) {
+            callback(ControlPlaneResult::aborted());
+        }
+        return;
+    }
     const QByteArray body = QJsonDocument(report).toJson(QJsonDocument::Compact);
     send(QStringLiteral("POST"), QStringLiteral("/api/sessions/") + encodedPathSegment(sessionId)
              + QStringLiteral("/quality"),
+         body, true, callback);
+}
+
+void ControlPlaneClient::postEvidence(const QString& sessionId, const QByteArray& body,
+                                      Callback callback)
+{
+    send(QStringLiteral("POST"), QStringLiteral("/api/sessions/") + encodedPathSegment(sessionId)
+             + QStringLiteral("/evidence"),
          body, true, callback);
 }
 

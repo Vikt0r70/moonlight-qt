@@ -1,5 +1,7 @@
 #include "seathub_client.h"
 
+#include "port_test_relay.h"
+
 #include <QDateTime>
 #include <QDesktopServices>
 #include <QDir>
@@ -22,6 +24,7 @@
 #include "osd_compositor.h"
 #include "quality_outbox.h"
 #include "region.h"
+#include "reporting_consent.h"
 #include "session_lifecycle.h"
 #include "settings_bridge.h"
 #include "stream_stats.h"
@@ -141,7 +144,13 @@ int connectStageForState(const QString& state)
 // internal key and never reaches a customer; these are the right column, which is what the home
 // screen renders after a session ends (audit E10). `%1` is the session's real `minutes_billed` -
 // copy.md: "the client substitutes the session's real `minutes_billed`".
-const char* kEndCustomerEnded = "You ended the session. Unused minutes stay in your account.";
+// `CUSTOMER_ENDED` is keyed by the end presentation (ADR-0096), never an unconditional claim of who
+// ended the session: copy.md's `unknown` line is the default, `connection_lost` and `cancelled` are
+// derived from what this client observed.
+const char* kEndCustomerEnded = "The session ended. Unused minutes stay in your account.";
+const char* kEndCustomerEndedConnectionLost =
+    "Your connection was lost, so the session ended. You were charged for %1.";
+const char* kEndCustomerEndedCancelled = "Cancelled. You were not charged.";
 const char* kEndConnectFailed = "The stream didn't start. You were not charged.";
 const char* kEndHostLost =
     "We lost contact with this rig, so the session ended. You were charged for %1.";
@@ -188,7 +197,8 @@ QString minutesPhrase(int minutesBilled, bool styled)
 // string for a reason the deck has no line for: `SESSION_LOST`, `LEASE_GUARD_LOST` and
 // `RECONNECT_LIMIT` are documented to "fall back to the client's generic ended-session string",
 // which copy.md never spells out - showing nothing is honest, inventing the sentence is not.
-QString endReasonSentence(const QString& endReason, int minutesBilled, bool styled = true)
+QString endReasonSentence(const QString& endReason, int minutesBilled, bool styled = true,
+                          const QString& presentation = QString())
 {
     struct ReasonLine {
         const char* reason;
@@ -215,7 +225,16 @@ QString endReasonSentence(const QString& endReason, int minutesBilled, bool styl
 
     for (const ReasonLine& line : kLines) {
         if (endReason == QLatin1String(line.reason)) {
-            QString sentence = QString::fromUtf8(line.sentence);
+            const char* text = line.sentence;
+            if (endReason == QLatin1String("CUSTOMER_ENDED")) {
+                if (presentation == QLatin1String("connection_lost")) {
+                    text = kEndCustomerEndedConnectionLost;
+                }
+                else if (presentation == QLatin1String("cancelled")) {
+                    text = kEndCustomerEndedCancelled;
+                }
+            }
+            QString sentence = QString::fromUtf8(text);
             if (sentence.contains(QLatin1String("%1"))) {
                 sentence = sentence.arg(minutesPhrase(minutesBilled, styled));
             }
@@ -301,25 +320,6 @@ bool isClosedEndReason(const QString& endReason)
         QStringLiteral("TEARDOWN_TIMEOUT"), QStringLiteral("CONNECT_FAILED"),
         QStringLiteral("CLIENT_ABSENT")};
     return closedEndReasons.contains(endReason);
-}
-
-// 06.1's ADR item 4 / J-22: the guard-claim-and-teardown sequence
-// `SeatHubClient::endAttachedSessionBeforeStream()` already runs for a pre-stream failure with no
-// report to add, now carrying one - shared by `handlePairingFailed()`, the no-engine branch of
-// `handlePairingCompleted()`, and `handleStageFailed()`'s pre-stream branch. A free function taking
-// the exact pieces `endAttachedSessionBeforeStream()` itself reads (`seathub_client.h` is not part
-// of this plan's touched files, so this is not a new declared member): `TeardownController` and
-// `SessionTeardownGuard` already expose the public API this needs.
-void endPreStreamSessionWithReport(SessionTeardownGuard& guard, TeardownController* teardown,
-                                   const QString& sessionId, const QString& clientUuid,
-                                   const EndReport& report)
-{
-    if (guard.markStarted()) {
-        teardown->teardown(sessionId, clientUuid, true, report);
-    }
-    // else: this session's teardown was already claimed - by `handleReadyForDeletion()` or by an
-    // earlier call here for the same session - and is already running (T-06.6-50); see
-    // `endAttachedSessionBeforeStream()`'s own comment.
 }
 
 // ADR-0074 HI06: the one stream-time checkpoint, as a function that depends on nothing but the
@@ -431,6 +431,9 @@ SeatHubClient::SeatHubClient(QObject* parent)
             int code = 0;
             const QByteArray utf8 = text.toUtf8();
             if (parseConnectionTerminated(category, priority, utf8.constData(), &code)) {
+                // ADR-0104: the port test `clConnectionTerminated` ran just before this line was
+                // logged. Queued ahead of `noteTermination`, so the report it posts carries it.
+                m_liveness->setPortTest(portTestJson(seathub::PortTestRelay::peek()));
                 m_liveness->noteTermination(code);
                 // 06.1-19/J-07/T-06.1-56: the same line, the same call - no new thread crossing.
                 // `handleDisplayLaunchError()` reads this (relaxed load) on the facade thread to
@@ -438,6 +441,13 @@ SeatHubClient::SeatHubClient(QObject* parent)
                 // `m_liveness` from a different thread than the one that owns it is exactly the
                 // unsynchronised cross-thread read WR-01 already fixed once elsewhere.
                 m_lastTerminationCode.store(code, std::memory_order_relaxed);
+                // ADR-0096: the earliest native evidence wins, and only while no manual End has
+                // been observed - a code the customer's own quit provoked is not a lost connection.
+                if (!m_manualEndObserved.load(std::memory_order_relaxed)) {
+                    int none = kNoTerminationCode;
+                    m_firstNativeFaultCode.compare_exchange_strong(none, code,
+                                                                   std::memory_order_relaxed);
+                }
             }
         });
 
@@ -459,13 +469,42 @@ SeatHubClient::SeatHubClient(QObject* parent)
         if (QNetworkInformation* info = QNetworkInformation::instance()) {
             connect(info, &QNetworkInformation::reachabilityChanged, this,
                     [this](QNetworkInformation::Reachability reachability) {
+                        ++m_networkTransitions;
+                        noteNetworkChange();
                         if (reachability == QNetworkInformation::Reachability::Online
                                 || reachability == QNetworkInformation::Reachability::Site) {
                             onNetworkBack();
                         }
                     });
+            // ADR-0105: the rest of the timeline - medium, captive portal, metered. Each is a
+            // change record only; none gates anything. A feature the backend does not support
+            // reads as `unknown` / false.
+            connect(info, &QNetworkInformation::transportMediumChanged, this,
+                    [this](QNetworkInformation::TransportMedium) {
+                        ++m_networkTransitions;
+                        noteNetworkChange();
+                    });
+            connect(info, &QNetworkInformation::isBehindCaptivePortalChanged, this, [this](bool) {
+                ++m_networkTransitions;
+                noteNetworkChange();
+            });
+            connect(info, &QNetworkInformation::isMeteredChanged, this, [this](bool) {
+                ++m_networkTransitions;
+                noteNetworkChange();
+            });
         }
     }
+
+    // ADR-0105: the per-Play evidence capsule and the outbox events it records. The observers
+    // record only closed event/answer tokens; a capsule is open only while a Play runs.
+    m_journal.setDirectory(EvidenceJournal::defaultDirectory());
+    m_endOutbox.setObserver([this](const QString& event, const QString& answer, int count) {
+        recordEvidence(EvidenceJournal::outbox(QStringLiteral("end_outbox"), event, answer, count));
+    });
+    m_qualityOutbox.setObserver([this](const QString& event, const QString& answer, int count) {
+        recordEvidence(
+            EvidenceJournal::outbox(QStringLiteral("quality_outbox"), event, answer, count));
+    });
 
     // 06.4/ADR-0067, D-04/D-06: the paused-fallback read (L5). Repeating, parented to `this` for
     // the same reason `m_retryTickTimer` is.
@@ -488,6 +527,8 @@ SeatHubClient::SeatHubClient(QObject* parent)
     m_statsSinkHandle = LogTee::addSink(m_statsWatcher->sink());
     connect(m_statsWatcher, &StatsWatcher::videoStatsParsed,
             this, &SeatHubClient::handleVideoStatsParsed);
+    connect(m_statsWatcher, &StatsWatcher::streamStartObserved,
+            this, &SeatHubClient::handleStreamStartObserved);
 
     // D-11, Plan 13 Task 1 + Task 2: the 60s roll-up sampler and the connection-status sink.
     // The sampler lives on the network thread (moved in `startNetworkThreads()`). The status
@@ -502,6 +543,18 @@ SeatHubClient::SeatHubClient(QObject* parent)
             QMetaObject::invokeMethod(sampler, [sampler, status]() {
                 sampler->noteConnectionStatus(status);
             }, Qt::QueuedConnection);
+        }
+    });
+    // ADR-0105: a stall is a run of full 60 s windows with no samples and no drops. The sampler is
+    // the CONTEXT object, so both slots run on the network thread it is moved to - the main
+    // thread is inside the SDL loop during a stream and would not run them until the stream ended.
+    // Consecutive empty windows coalesce into one pending stall that the first non-empty roll-up
+    // (or the Play's end, in `finishPlay()`) records.
+    connect(m_sampler, &StreamQualitySampler::emptyWindowEmitted, m_sampler,
+            [this](qint64 windowMs) { noteEmptyWindow(windowMs); });
+    connect(m_sampler, &StreamQualitySampler::rollupEmitted, m_sampler, [this]() {
+        if (flushPendingStall()) {
+            deliverEvidence();
         }
     });
 
@@ -649,10 +702,36 @@ SeatHubClient::SeatHubClient(QObject* parent)
     connect(m_pairingSeam, &ProductionPairingSeam::handshakeClassified, this,
             [this](const PairingHandshakeResult& result) {
                 m_pairingClassification = result;
-                // L07: whether the attempt that just paired skipped the PIN. Kept apart from the
-                // classification, which the completion handlers consume.
-                m_lastPairingWarm = result.ok && result.warm;
             });
+
+    // ADR-0105: the same result, as a closed-value evidence entry. It is called once per reported
+    // result on the seam's thread, read-only: retry, guards and callbacks are untouched. A retried
+    // attempt that recovered is a success, whose class is empty (the first failure's class is in
+    // `firstStepClass`, recorded as its own entry).
+    m_pairingSeam->setAttemptSink([this](const PairingHandshakeResult& result) {
+        const bool success = result.ok && !result.clientIdentity.isEmpty();
+        if (result.retried && !result.firstStepClass.isEmpty() && !result.firstAttemptStep.isEmpty()) {
+            const QJsonObject first = EvidenceJournal::pairingAttempt(
+                1, false, result.firstAttemptStep, result.firstStepClass, true, result.retryReason,
+                result.pinShapeOk, 0);
+            if (!first.isEmpty()) {
+                recordEvidence(first);
+            }
+        }
+        recordEvidence(EvidenceJournal::pairingAttempt(
+            result.attempts, success, result.attemptStep, success ? QString() : result.stepClass,
+            result.retried, result.retryReason, result.pinShapeOk, result.handshakeMs));
+        if (!success) {
+            deliverEvidence();
+        }
+    });
+
+    // ADR-0105: the server's clock at `stream.hello`, kept with the local time it arrived at; the
+    // skew bucket is recorded once per Play at `openEvidenceJournal()`. Evidence only.
+    connect(m_sse, &SseClient::serverTime, this, [this](const QDateTime& serverUtc) {
+        m_helloServerUtc = serverUtc;
+        m_helloLocalUtc = QDateTime::currentDateTimeUtc();
+    });
 
     connect(m_teardown, &TeardownController::teardownCompleted,
             this, &SeatHubClient::handleTeardownCompleted);
@@ -876,6 +955,9 @@ void SeatHubClient::beginSession(const QString& sessionId)
         m_controlPlane->setTraceId(m_samplerPlayId);
         SeatHubTelemetry::setTrace(m_samplerPlayId);
     }
+    // ADR-0105: the Play's evidence capsule opens now that the session id exists; it closes in
+    // `finishPlay()`. When the account is not yet known the open is retried from `setAccountId()`.
+    openEvidenceJournal(sessionId);
     m_playConfiguration = {
         {"cfg_res", QStringLiteral("%1x%2").arg(m_settings->getValue(QStringLiteral("width")).toInt())
                                             .arg(m_settings->getValue(QStringLiteral("height")).toInt())},
@@ -892,6 +974,10 @@ void SeatHubClient::beginSession(const QString& sessionId)
     // reconnect) left over from whatever this client streamed before must never leak into this
     // one's own first `handleDisplayLaunchError()`.
     m_lastTerminationCode.store(kNoTerminationCode, std::memory_order_relaxed);
+    m_firstNativeFaultCode.store(kNoTerminationCode, std::memory_order_relaxed);
+    m_manualEndObserved.store(false, std::memory_order_relaxed);
+    // ADR-0104: nor does a port-test result an earlier Play published and never used.
+    seathub::PortTestRelay::reset();
 
     // D-09/D-13: `hostId` is not known yet at this call - only `handleSessionState()`'s own
     // `SessionInfo` names it, once the server answers - so this starts the tag/attribute with an
@@ -1023,6 +1109,8 @@ void SeatHubClient::setAttachedSession(const QString& sessionId)
     // C1: a genuinely new session id starts with no stream yet.
     if (sessionId != m_sessionId) {
         m_streamStarted = false;
+        // T073: the stream-start facts belong to one Play; a replacement starts with none.
+        m_streamStart = StreamStartContext();
     }
     m_sessionId = sessionId;
     if (sessionId.isEmpty()) {
@@ -1060,6 +1148,26 @@ bool SeatHubClient::endIsCustomerQuit() const
         && m_lastTerminationCode.load(std::memory_order_relaxed) == kNoTerminationCode;
 }
 
+EndEvidence SeatHubClient::currentEndEvidence() const
+{
+    EndEvidence evidence;
+    evidence.streamStarted = m_streamStarted;
+    evidence.engineFailed = m_engineFailed;
+    const int first = m_firstNativeFaultCode.load(std::memory_order_relaxed);
+    evidence.nativeFault = first != kNoTerminationCode;
+    evidence.nativeFaultCode = evidence.nativeFault ? first : 0;
+    return evidence;
+}
+
+QString SeatHubClient::endSentence(const QString& endReason, int minutesBilled, bool styled) const
+{
+    // Only a `CUSTOMER_ENDED` line depends on how this client saw the end; every other reason keeps
+    // the sentence copy.md gives it.
+    const QString presentation = endReason == QLatin1String("CUSTOMER_ENDED")
+        ? deriveEndPresentation(currentEndEvidence()) : QString();
+    return endReasonSentence(endReason, minutesBilled, styled, presentation);
+}
+
 void SeatHubClient::setRetryBusy(bool busy)
 {
     if (m_retryBusy == busy) {
@@ -1095,6 +1203,34 @@ void SeatHubClient::endAttachedSessionBeforeStream(bool failed)
     // else: this session's teardown was already claimed - by `handleReadyForDeletion()` or by an
     // earlier call here for the same session - and is already running. A second failure while it
     // is in flight must not start a second one (T-06.6-50).
+}
+
+// 06.1's ADR item 4 / J-22: the same guard-claim-and-teardown sequence as
+// `endAttachedSessionBeforeStream()`, carrying the report the engine or the server just produced,
+// shared by `handlePairingFailed()`, the no-engine branch of `handlePairingCompleted()`,
+// `handleStageFailed()`'s and `handleDisplayLaunchError()`'s pre-stream branches and the server-ended
+// connecting branch of `handleSessionState()`.
+//
+// T026 / E20: it writes the End to the outbox first, exactly as the in-stream `handleReadyForDeletion()`
+// does. Before this, a pre-stream End that met a network blip was posted once and lost: nothing durable
+// backed it, so the server kept the session until its own timeout. Now the same `drainEndOutbox()` retry,
+// the same restart re-send and the same "ending" Home state apply until the server confirms; the payload
+// (`failed: true` plus this report) and the idempotent End endpoint are unchanged.
+void SeatHubClient::endPreStreamSessionWithReport(const EndReport& report)
+{
+    if (!m_teardownGuard.markStarted()) {
+        // This session's teardown was already claimed - by `handleReadyForDeletion()` or by an
+        // earlier call here for the same session - and is already running (T-06.6-50).
+        return;
+    }
+    const bool durable = m_endOutbox.put(m_sessionId, m_accountId, true, report);
+    if (!durable) {
+        qCWarning(seathubClient)
+            << "end outbox write failed - this End has no durable record:" << m_sessionId;
+        rememberUnconfirmedEnd(m_sessionId, true, report);
+    }
+    setHomeStatus(QString::fromLatin1(kHomeEnding));
+    m_teardown->teardown(m_sessionId, m_clientUuid, true, report);
 }
 
 // ---------------------------------------------------------------------------
@@ -1136,6 +1272,9 @@ void SeatHubClient::onNetworkBack()
         m_endOutboxBackoffMs = kEndOutboxInitialBackoffMs;
         drainEndOutbox();
     }
+    // ADR-0105: a returned network also sends any waiting evidence capsule and quality report.
+    deliverEvidence();
+    drainQualityOutbox();
 }
 
 void SeatHubClient::retryNow()
@@ -1155,6 +1294,7 @@ void SeatHubClient::retryNow()
         m_endOutboxBackoffMs = kEndOutboxInitialBackoffMs;
         drainEndOutbox();
     }
+    deliverEvidence();
 }
 
 void SeatHubClient::handleTeardownEndAnswered(const QString& sessionId, int statusCode)
@@ -1240,6 +1380,12 @@ void SeatHubClient::scheduleEndOutboxRetry()
 
 void SeatHubClient::drainEndOutbox()
 {
+    // ADR-0105: every End-outbox trigger (launch, sign-in, before the next Play, the paced retry
+    // timer) also sends waiting evidence capsules; it has its own one-at-a-time guard and never
+    // waits on the End drain below. The quality outbox rides the same triggers (network return,
+    // retry timer, before the next Play); its own guards keep a second drain from doubling a send.
+    deliverEvidence();
+    drainQualityOutbox();
     // One drain at a time: launch, sign-in, network-back, before-Play and the retry timer can all
     // ask at once, and a second concurrent drain would post every record twice.
     if (m_endOutboxInFlight) {
@@ -1276,6 +1422,8 @@ void SeatHubClient::drainEndOutbox()
     updateHomeStatusForEndOutbox();
     m_endOutboxInFlight = true;
     m_endOutboxPending = entries.size();
+    m_endOutbox.noteEvent(QStringLiteral("drain"), QString(), QStringLiteral("none"),
+                          int(entries.size()));
     for (const EndOutbox::Entry& entry : entries) {
         const QString sessionId = entry.sessionId;
         m_controlPlane->endSession(sessionId, entry.failed, entry.report,
@@ -1284,10 +1432,17 @@ void SeatHubClient::drainEndOutbox()
                 if (m_endOutboxPending > 0 && --m_endOutboxPending == 0) {
                     m_endOutboxInFlight = false;
                 }
+                const QString answer = EndOutbox::answerToken(result);
                 switch (EndOutbox::classify(result)) {
                 case EndOutbox::Delivered:
+                    m_endOutbox.noteEvent(QStringLiteral("delivered"), sessionId, answer, 1);
+                    // 2xx confirms - the record is dropped.
+                    m_endOutbox.remove(sessionId);
+                    clearUnconfirmedEnd(sessionId);
+                    break;
                 case EndOutbox::Refused:
-                    // 2xx confirms; 404 means the session is already gone - both drop the record.
+                    // 404 means the session is already gone - the record is dropped.
+                    m_endOutbox.noteEvent(QStringLiteral("dropped"), sessionId, answer, 1);
                     m_endOutbox.remove(sessionId);
                     clearUnconfirmedEnd(sessionId);
                     break;
@@ -1295,6 +1450,7 @@ void SeatHubClient::drainEndOutbox()
                 case EndOutbox::Retryable:
                 case EndOutbox::Aborted:
                     // Any other answer (0/5xx/401) keeps the record and re-sends later.
+                    m_endOutbox.noteEvent(QStringLiteral("kept"), sessionId, answer, 1);
                     scheduleEndOutboxRetry();
                     break;
                 }
@@ -1313,6 +1469,197 @@ void SeatHubClient::drainEndOutbox()
 void SeatHubClient::setEndOutboxDirectory(const QString& directory)
 {
     m_endOutbox.setDirectory(directory);
+}
+
+void SeatHubClient::setEvidenceJournalDirectory(const QString& directory)
+{
+    m_journal.setDirectory(directory);
+}
+
+void SeatHubClient::setSamplerWindowMsForTests(int windowMs)
+{
+    if (m_sampler->thread() == QThread::currentThread()) {
+        m_sampler->setWindowMs(windowMs);
+        return;
+    }
+    QMetaObject::invokeMethod(m_sampler, [this, windowMs]() { m_sampler->setWindowMs(windowMs); },
+                              Qt::BlockingQueuedConnection);
+}
+
+void SeatHubClient::openEvidenceJournal(const QString& sessionId)
+{
+    {
+        std::lock_guard<std::mutex> lock(m_evidenceMutex);
+        m_evidenceAccountId = m_accountId;
+    }
+    // A new generation first, so a stall left over from an earlier Play is never matched to this
+    // capsule.
+    m_journalOpen.store(false);
+    m_journalGeneration.fetch_add(1);
+    if (!m_journal.open(sessionId, m_accountId)) {
+        return;
+    }
+    m_journalOpen.store(true);
+    // One clock-skew bucket per Play, from the last `stream.hello`: evidence only, nothing reads it.
+    recordEvidence(EvidenceJournal::clockSkew(m_helloServerUtc, m_helloLocalUtc));
+}
+
+void SeatHubClient::closeEvidenceJournal()
+{
+    m_journalOpen.store(false);
+    m_journal.close();
+}
+
+void SeatHubClient::recordEvidence(const QJsonObject& entry)
+{
+    // A no-op while no Play is open: nothing is written while the app is idle.
+    m_journal.record(entry);
+}
+
+void SeatHubClient::deliverEvidence()
+{
+    QString accountId;
+    {
+        std::lock_guard<std::mutex> lock(m_evidenceMutex);
+        if (QThread::currentThread() == thread() && !m_accountId.isEmpty()) {
+            m_evidenceAccountId = m_accountId;
+        }
+        if (m_evidenceAccountId.isEmpty() || m_evidencePending > 0) {
+            return;
+        }
+        accountId = m_evidenceAccountId;
+    }
+    // ADR-0107: a covered upload. Checked per send so a switch-off stops it at once; the capsules
+    // stay pending in the journal and go out when the customer turns it back on.
+    if (!ReportingConsent::coveredUploadsAllowed()) {
+        return;
+    }
+    const QList<EvidenceJournal::PendingCapsule> capsules = m_journal.deliverable(accountId);
+    if (capsules.isEmpty()) {
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(m_evidenceMutex);
+        m_evidencePending += capsules.size();
+        m_evidenceProgress = false;
+    }
+    for (const EvidenceJournal::PendingCapsule& capsule : capsules) {
+        m_controlPlane->postEvidence(capsule.sessionId, capsule.body,
+                                     [this, sessionId = capsule.sessionId, runId = capsule.runId](
+                                         const ControlPlaneResult& result) {
+            // The journal is mutex-guarded, so the answer is applied on whichever thread it lands.
+            const int status = result.statusCode > 0 ? result.statusCode : -1;
+            m_journal.applyAnswer(sessionId, runId, status);
+            bool again = false;
+            {
+                std::lock_guard<std::mutex> lock(m_evidenceMutex);
+                if (m_evidencePending > 0) {
+                    --m_evidencePending;
+                }
+                if (status >= 200 && status < 300) {
+                    m_evidenceProgress = true;
+                }
+                again = m_evidencePending == 0 && m_evidenceProgress;
+            }
+            // 401/403 wait for the next sign-in; a transport or 5xx failure re-sends on the
+            // End outbox's own paced timer. That timer lives on the main thread.
+            if (status == -1 || status >= 500) {
+                QMetaObject::invokeMethod(this, [this]() { scheduleEndOutboxRetry(); },
+                                          Qt::QueuedConnection);
+            }
+            if (again) {
+                // Entries recorded while this batch was in flight go out now.
+                deliverEvidence();
+            }
+        });
+    }
+}
+
+void SeatHubClient::noteEmptyWindow(qint64 windowMs)
+{
+    if (!m_journalOpen.load()) {
+        return;
+    }
+    const quint64 generation = m_journalGeneration.load();
+    if (m_stallWindows > 0 && m_stallGeneration != generation) {
+        // Left over from an earlier Play: dropped, never attached to this one.
+        m_stallWindows = 0;
+        m_stallDurationMs = 0;
+    }
+    m_stallGeneration = generation;
+    ++m_stallWindows;
+    m_stallDurationMs += windowMs;
+}
+
+bool SeatHubClient::flushPendingStall()
+{
+    if (m_stallWindows <= 0) {
+        return false;
+    }
+    const int windows = m_stallWindows;
+    const qint64 durationMs = m_stallDurationMs;
+    const quint64 generation = m_stallGeneration;
+    m_stallWindows = 0;
+    m_stallDurationMs = 0;
+    if (!m_journalOpen.load() || generation != m_journalGeneration.load()) {
+        return false;
+    }
+    m_journal.record(EvidenceJournal::stallWindow(windows, durationMs));
+    return true;
+}
+
+void SeatHubClient::noteNetworkChange()
+{
+    QString medium = QStringLiteral("unknown");
+    QString reachability = QStringLiteral("unknown");
+    bool captivePortal = false;
+    bool metered = false;
+    if (QNetworkInformation* info = QNetworkInformation::instance()) {
+        if (info->supports(QNetworkInformation::Feature::TransportMedium)) {
+            switch (info->transportMedium()) {
+            case QNetworkInformation::TransportMedium::Ethernet:
+                medium = QStringLiteral("ethernet");
+                break;
+            case QNetworkInformation::TransportMedium::WiFi:
+                medium = QStringLiteral("wifi");
+                break;
+            case QNetworkInformation::TransportMedium::Cellular:
+                medium = QStringLiteral("cellular");
+                break;
+            case QNetworkInformation::TransportMedium::Bluetooth:
+                medium = QStringLiteral("bluetooth");
+                break;
+            case QNetworkInformation::TransportMedium::Unknown:
+                break;
+            }
+        }
+        if (info->supports(QNetworkInformation::Feature::Reachability)) {
+            switch (info->reachability()) {
+            case QNetworkInformation::Reachability::Online:
+                reachability = QStringLiteral("online");
+                break;
+            case QNetworkInformation::Reachability::Site:
+                reachability = QStringLiteral("site");
+                break;
+            case QNetworkInformation::Reachability::Local:
+                reachability = QStringLiteral("local");
+                break;
+            case QNetworkInformation::Reachability::Disconnected:
+                reachability = QStringLiteral("disconnected");
+                break;
+            case QNetworkInformation::Reachability::Unknown:
+                break;
+            }
+        }
+        if (info->supports(QNetworkInformation::Feature::CaptivePortal)) {
+            captivePortal = info->isBehindCaptivePortal();
+        }
+        if (info->supports(QNetworkInformation::Feature::Metered)) {
+            metered = info->isMetered();
+        }
+    }
+    recordEvidence(EvidenceJournal::networkChange(medium, reachability, captivePortal, metered,
+                                                  m_networkTransitions));
 }
 
 bool SeatHubClient::hasSavedEnd() const
@@ -1439,14 +1786,14 @@ void SeatHubClient::raiseConnectFailure(const SeatHubFailure& failure, const QSt
     // sentence is drawn as styled text (the minute count is mono), so anything else is escaped.
     SeatHubFailure shown = failure;
     QString reasonText;
-    const QString deckSentence = endReasonSentence(endReason, minutesBilled, true);
+    const QString deckSentence = endSentence(endReason, minutesBilled, true);
     if (failure.verbatim) {
         // ADR-0091: Moonlight's own text for a failure before the stream started, as given and
         // drawn as plain text; the deck's sentence does not replace it.
         reasonText = shown.error;
     }
     else if (!deckSentence.isEmpty()) {
-        shown.error = endReasonSentence(endReason, minutesBilled, false);
+        shown.error = endSentence(endReason, minutesBilled, false);
         reasonText = deckSentence;
     }
     else {
@@ -1577,8 +1924,15 @@ void SeatHubClient::start()
     // customer" refusal (409 `USER_HAS_NONTERMINAL_SESSION`, `openapi.yaml`).
     // V-OUTBOX (L06): a saved End is re-sent before any Play, so the server sees the end before
     // the new allocation.
-    drainEndOutbox();
-    if (hasSavedEnd() || hasUnconfirmedEndForAccount()) {
+    // T026 / E20: the attached never-streamed session's own End is already saved (a pre-stream End
+    // keeps its record until the server confirms). That End is the one waited on below, so it is
+    // neither drained here (a second post of the same End) nor treated as someone else's pending End.
+    const bool ownEndSaved = !m_sessionId.isEmpty() && !m_streamStarted
+        && (m_endOutbox.hasQueued(m_sessionId) || hasUnconfirmedEnd(m_sessionId));
+    if (!ownEndSaved) {
+        drainEndOutbox();
+    }
+    if (!ownEndSaved && (hasSavedEnd() || hasUnconfirmedEndForAccount())) {
         // C-ENDING (screens.md §23): an End for this account is still unconfirmed, so the server may
         // still hold the session. Play must not start a new one until the server confirms the end.
         updateHomeStatusForEndOutbox();
@@ -1602,6 +1956,25 @@ bool SeatHubClient::endAttachedSessionBeforePlay()
     }
     setRetryBusy(true);
     if (m_teardownGuard.markStarted()) {
+        // T026 / E20: a pre-stream End already saved for this session is asked again exactly as it
+        // was saved (`failed: true` plus its report); `put()` would overwrite it with this
+        // Play's own End and change what the server was told.
+        bool savedFailed = false;
+        EndReport savedReport;
+        bool haveSaved = false;
+        for (const EndOutbox::Entry& entry : m_endOutbox.entriesForAccount(m_accountId)) {
+            if (entry.sessionId == m_sessionId) {
+                savedFailed = entry.failed;
+                savedReport = entry.report;
+                haveSaved = true;
+                break;
+            }
+        }
+        if (haveSaved) {
+            setHomeStatus(QString::fromLatin1(kHomeEnding));
+            m_teardown->teardown(m_sessionId, m_clientUuid, savedFailed, savedReport);
+            return true;
+        }
         // V-OUTBOX (L06): every first End is saved before it is sent, this pre-Play one included,
         // so a crash or restart between here and the server's answer still re-sends it.
         const bool durable = m_endOutbox.put(m_sessionId, m_accountId, false, newEndReport());
@@ -1893,6 +2266,7 @@ void SeatHubClient::interrupt()
     // O01: whichever branch runs, this is the customer's own quit. It is remembered for the
     // attempt, so the end that follows (the engine's, below) is never reported as a failure.
     m_customerQuit = true;
+    m_manualEndObserved.store(true, std::memory_order_relaxed);
     if (!m_session->active()) {
         finishPlay(QStringLiteral("cancelled"), QStringLiteral("cancelled"), m_lastFailedStep);
         onClientThread(m_pairing, [this]() { m_pairing->cancel(); });
@@ -1993,6 +2367,10 @@ bool SeatHubClient::adoptSignIn(const AuthTokenPair& pair, const QString& identi
                 // that the account is known - to their own session ids and this account only.
                 m_streamTime->setAccountId(m_accountId);
                 drainStreamTimeOutbox();
+                // ADR-0105: a Play that began before the account was known gets its capsule now.
+                if (m_playSummaryPending && !m_journalOpen.load() && !m_sessionId.isEmpty()) {
+                    openEvidenceJournal(m_sessionId);
+                }
                 // V-OUTBOX (L06): the same for an End an earlier run could not confirm.
                 drainEndOutbox();
             }
@@ -2394,6 +2772,10 @@ void SeatHubClient::setAccount(const AccountInfo& account)
     // replayed after the relaunch, to the same session and the same account only.
     m_streamTime->setAccountId(m_accountId);
     drainStreamTimeOutbox();
+    // ADR-0105: a Play that began before the account was known gets its capsule now.
+    if (m_playSummaryPending && !m_journalOpen.load() && !m_sessionId.isEmpty()) {
+        openEvidenceJournal(m_sessionId);
+    }
     // V-OUTBOX (L06): an End an earlier run could not confirm is re-sent now the account is known.
     drainEndOutbox();
 }
@@ -2453,7 +2835,9 @@ void SeatHubClient::drainStreamTimeOutbox()
 
 void SeatHubClient::drainQualityOutbox()
 {
-    if (m_accountId.isEmpty() || !m_controlPlane->hasAccessToken()) {
+    // ADR-0107: stream quality reports are a covered upload; queued files stay on disk while off.
+    if (m_accountId.isEmpty() || !m_controlPlane->hasAccessToken()
+        || !ReportingConsent::coveredUploadsAllowed()) {
         return;
     }
 
@@ -2616,10 +3000,27 @@ void SeatHubClient::handleStageFailed(const QString& stage, int errorCode, const
     // O01: the engine named a failure for this attempt, so its end is not a quit.
     m_engineFailed = true;
 
+    // ADR-0104: the port test the engine ran for this failure (published before it emitted
+    // `stageFailed`). One result belongs to one failure, so it is taken, not peeked.
+    const PortTestResult portTest = seathub::PortTestRelay::take();
+    const QJsonObject portTestObject = portTestJson(portTest);
+
     // D-11: the server sees exactly what the customer's screen is about to say, before liveness
     // stops - the engine's own stage, its code and the ports it named, whether this failure is
     // pre-stream or (rarely) mid-stream.
-    m_liveness->reportFailure(stage, errorCode, failingPorts);
+    m_liveness->reportFailure(stage, errorCode, failingPorts, portTestObject);
+
+    // ADR-0105: the port-test result and the engine failure, as closed tokens plus the integer
+    // code, recorded for this Play and sent at once (a failure-class event).
+    const bool midStream = m_appState == QLatin1String(kStateStreaming);
+    const QJsonObject portTestEntry = EvidenceJournal::portTest(portTest);
+    if (!portTestEntry.isEmpty()) {
+        recordEvidence(portTestEntry);
+    }
+    recordEvidence(EvidenceJournal::engineFailure(
+        midStream ? QStringLiteral("stream") : QStringLiteral("engine_connect"),
+        midStream ? classForStreamError(errorCode) : classForEngineStageName(stage), errorCode));
+    deliverEvidence();
 
     if (m_appState == QLatin1String(kStateStreaming)) {
         m_lastFailedStep = QStringLiteral("stream");
@@ -2640,7 +3041,7 @@ void SeatHubClient::handleStageFailed(const QString& stage, int errorCode, const
     // the engine was in, and says so in the deck's words rather than sending them to the error view.
     if (connectingSession()) {
         // ADR-0091: Moonlight's own stage text, composed as upstream StreamSegue.qml composes it.
-        raiseConnectFailure(engineTextFailure(engineStageMessage(stage, errorCode, failingPorts)));
+        raiseConnectFailure(engineTextFailure(engineStageMessage(stage, errorCode, failingPorts, portTest)));
         // 06.1's ADR item 4 / J-22: the server needs what the engine just told us, now - not only
         // at `handleReadyForDeletion()`'s later, report-less teardown - so it can attribute blame.
         // `report.stage` is `connecting` (D-11: this is a stage failure inside stage 2, never
@@ -2656,9 +3057,9 @@ void SeatHubClient::handleStageFailed(const QString& stage, int errorCode, const
             report.hasEngineError = true;
             report.engineError = errorCode;
             report.failingPorts = failingPorts;
+            report.portTest = portTestObject;
             report.attemptStep = m_lastFailedStep;
-            endPreStreamSessionWithReport(m_teardownGuard, m_teardown, m_sessionId, m_clientUuid,
-                                          report);
+            endPreStreamSessionWithReport(report);
         }
         return;
     }
@@ -2762,8 +3163,7 @@ void SeatHubClient::handleDisplayLaunchError(const QString& text)
             EndReport report = newEndReport();
             report.stage = QStringLiteral("connecting");
             report.attemptStep = m_lastFailedStep;
-            endPreStreamSessionWithReport(m_teardownGuard, m_teardown, m_sessionId,
-                                          m_clientUuid, report);
+            endPreStreamSessionWithReport(report);
         }
         raiseConnectFailure(engineTextFailure(text));
         return;
@@ -2869,6 +3269,8 @@ void SeatHubClient::handleReadyForDeletion()
         // progress markers such as `rig_wait`, which say where a session was, not that it failed.
         EndReport report = newEndReport();
         report.attemptStep = m_lastFailedStep;
+        // ADR-0104: a termination's port test (a stage failure's was taken in `handleStageFailed`).
+        report.portTest = portTestJson(seathub::PortTestRelay::take());
         const bool failed = !report.customerQuit && !report.attemptStep.isEmpty();
         // V-OUTBOX (L06): every End caller saves the End to disk before the first POST, tagged to
         // the account that pressed it. This is the ordinary in-stream quit path; the pre-engine
@@ -3212,20 +3614,37 @@ void SeatHubClient::handleSessionState(const SessionInfo& session)
             // stepper that looks alive for a session that is over. Connecting stops here, at the stage
             // it had reached, in the server's own words for why.
             onClientThread(m_pairing, [this]() { m_pairing->cancel(); });
+            // ADR-0096: a `CUSTOMER_ENDED` start that the engine never named a failure for is an
+            // outside cancel, a neutral outcome rather than a failed start (E16).
+            const bool outsideCancel = session.endReason == QLatin1String("CUSTOMER_ENDED")
+                && !m_engineFailed;
             if (!wasAlreadyEnded && inControlPlaneSession()) {
                 m_lastFailedStep = QStringLiteral("rig_wait");
-                noteStepOutcome(m_lastFailedStep, QStringLiteral("failed"),
-                                QStringLiteral("server_ended"), m_playElapsed.elapsed(), 0,
-                                session.endReason);
-                finishPlay(QStringLiteral("server_ended_pre"), QStringLiteral("failed"),
-                           m_lastFailedStep, QStringLiteral("server_ended"));
+                const QString outcome = outsideCancel ? QStringLiteral("cancelled")
+                                                      : QStringLiteral("failed");
+                const QString failureClass = outsideCancel ? QString()
+                                                           : QStringLiteral("server_ended");
+                noteStepOutcome(m_lastFailedStep, outcome, failureClass,
+                                m_playElapsed.elapsed(), 0, session.endReason);
+                finishPlay(QStringLiteral("server_ended_pre"), outcome,
+                           m_lastFailedStep, failureClass);
                 EndReport report;
                 report.stage = QStringLiteral("connecting");
                 report.attemptStep = m_lastFailedStep;
-                endPreStreamSessionWithReport(m_teardownGuard, m_teardown, m_sessionId,
-                                              m_clientUuid, report);
+                endPreStreamSessionWithReport(report);
             }
-            raiseConnectFailure(SeatHubFailure::generic(), session.endReason, session.minutesBilled);
+            if (outsideCancel) {
+                // Neutral, like the customer's own Cancel: no failure view, straight Home with the
+                // session's own words on it (set below).
+                m_sessionChannel->close();
+                resetConnecting();
+                setAppState(!m_signedIn ? QString::fromLatin1(kStateSignedOut)
+                                        : QString::fromLatin1(kStateHome));
+            }
+            else {
+                raiseConnectFailure(SeatHubFailure::generic(), session.endReason,
+                                    session.minutesBilled);
+            }
         }
     }
 
@@ -3233,7 +3652,7 @@ void SeatHubClient::handleSessionState(const SessionInfo& session)
         // The session's own outcome, in the deck's words, ready for the home screen the customer
         // lands on once teardown finishes (audit E10). The minute count is the server's own
         // `minutes_billed`, never arithmetic done here.
-        setEndReasonText(endReasonSentence(session.endReason, session.minutesBilled));
+        setEndReasonText(endSentence(session.endReason, session.minutesBilled));
     }
 }
 
@@ -3325,6 +3744,10 @@ void SeatHubClient::finishPlay(const QString& exitPath, const QString& outcome,
     if (firstFrame >= 0) attributes.insert("t_first_frame_ms", static_cast<double>(firstFrame));
     auto finishSampler = [this, &attributes]() {
         m_sampler->finish();
+        // ADR-0105: a stall still pending (the Play ended after empty windows only) lands in THIS
+        // Play's capsule, before it closes below. Runs on the sampler's own thread, where the
+        // pending stall lives.
+        flushPendingStall();
         if (m_streamStartMs < 0) return;
         attributes.insert("rollups", m_sampler->rollups());
         attributes.insert("bad_episodes", m_sampler->badEpisodes());
@@ -3333,6 +3756,13 @@ void SeatHubClient::finishPlay(const QString& exitPath, const QString& outcome,
     };
     if (m_sampler->thread() == QThread::currentThread()) finishSampler();
     else QMetaObject::invokeMethod(m_sampler, finishSampler, Qt::BlockingQueuedConnection);
+    // ADR-0105: the Play is over, so its capsule closes (after the sampler's step above, which
+    // may add the last stall) and is sent without waiting for anything. A quitting app leaves
+    // it on disk for the next launch.
+    closeEvidenceJournal();
+    if (exitPath != QLatin1String("app_quit")) {
+        deliverEvidence();
+    }
     if (m_streamStartMs >= 0) {
         attributes.insert("stream_s", (m_playElapsed.elapsed() - m_streamStartMs) / 1000.0);
         if (m_statsAggregator.hasSegments()) {
@@ -3350,6 +3780,14 @@ void SeatHubClient::finishPlay(const QString& exitPath, const QString& outcome,
             }
         }
     }
+    // ADR-0096: passive evidence for this Play, scalar and read once here. A failed start is not
+    // given a presentation; a manual End and a native code are recorded only when observed.
+    const EndEvidence evidence = currentEndEvidence();
+    if (outcome != QLatin1String("failed") || evidence.streamStarted) {
+        attributes.insert("end_presentation", deriveEndPresentation(evidence));
+    }
+    if (m_manualEndObserved.load(std::memory_order_relaxed)) attributes.insert("manual_end_observed", true);
+    if (evidence.nativeFault) attributes.insert("native_fault_code", evidence.nativeFaultCode);
     SeatHubTelemetry::emitDiagnostic(QStringLiteral("play.summary"),
                                      outcome == QLatin1String("failed") ? LogLevel::Warning : LogLevel::Info,
                                      attributes);
@@ -3616,8 +4054,7 @@ void SeatHubClient::handlePairingCompleted(const QString& clientUuid)
             EndReport report;
             report.stage = QStringLiteral("connecting");
             report.attemptStep = m_lastFailedStep;
-            endPreStreamSessionWithReport(m_teardownGuard, m_teardown, m_sessionId, m_clientUuid,
-                                          report);
+            endPreStreamSessionWithReport(report);
         }
         // WR-01: this Play is over here, at the start refusal - the next one mints its own id.
         // `reportFailure()` above re-invoked itself onto `m_liveness`'s own (network) thread,
@@ -3807,8 +4244,7 @@ void SeatHubClient::handlePairingFailed(const SeatHubFailure& failure)
         // control-plane refusal) leaves this empty and the field absent from the body, because a
         // step the client never classified is a step it must not invent.
         report.attemptStep = m_lastFailedStep;
-        endPreStreamSessionWithReport(m_teardownGuard, m_teardown, m_sessionId, m_clientUuid,
-                                      report);
+        endPreStreamSessionWithReport(report);
     }
     // WR-01: this Play is over here, at the pairing failure - the next one mints its own id. See
     // `clearThisPlaysTraceIdAfterAnyQueuedLivenessReport()`'s own comment for why this is not a
@@ -3863,8 +4299,47 @@ void SeatHubClient::handleVideoStatsParsed(VideoStats stats)
     // again in the handler that eventually posts it, which may run after `m_sessionId` has
     // already moved on.
     m_pendingQualitySessionId = m_sessionId;
-    m_pendingQualityReport = toQualityReport(m_statsAggregator.aggregate());
+    // T073: the stream-start facts of this Play ride on the aggregate, which does not carry them
+    // itself (an aggregate of several segments is built fresh).
+    VideoStats aggregate = m_statsAggregator.aggregate();
+    aggregate.start = m_streamStart;
+    m_pendingQualityReport = toQualityReport(aggregate);
     m_hasPendingQualityReport = true;
+    m_pendingQualityAccountId = m_accountId;
+    m_pendingQualityEpoch = m_authEpoch;
+
+    // SC19 / ADR-0101 (T025): write-ahead quality outbox.
+    // Store ahead to disk as soon as stats are parsed so that an unexpected process termination
+    // or ungraceful exit preserves the parsed quality metrics for recovery and drain.
+    m_qualityOutbox.setDirectory(qualityOutboxDirectory());
+    m_qualityOutbox.put(m_pendingQualitySessionId, m_pendingQualityAccountId, m_pendingQualityReport);
+}
+
+void SeatHubClient::handleStreamStartObserved(StreamStartContext observed)
+{
+    // Nothing is attached to bind the facts to (a local attempt, or a line that outlived its
+    // Play): dropped rather than carried into the next Play.
+    if (m_sessionId.isEmpty()) {
+        return;
+    }
+    m_streamStart.merge(observed);
+}
+
+bool SeatHubClient::resolvePendingQualityAccount(QString* accountId) const
+{
+    // A report composed after sign-in finished carries its own account. One composed before
+    // `fetchMe` answered is still unowned: it may take the account that sign-in produced, but only
+    // within the same auth epoch - a later epoch belongs to someone else.
+    if (!m_pendingQualityAccountId.isEmpty()) {
+        *accountId = m_pendingQualityAccountId;
+        return true;
+    }
+    if (m_pendingQualityEpoch == m_authEpoch) {
+        *accountId = m_accountId;
+        return true;
+    }
+    accountId->clear();
+    return false;
 }
 
 void SeatHubClient::postOrStoreQualityReport(const QString& onlyForSession)
@@ -3880,21 +4355,32 @@ void SeatHubClient::postOrStoreQualityReport(const QString& onlyForSession)
     if (!onlyForSession.isEmpty() && m_pendingQualitySessionId != onlyForSession) {
         return;
     }
+    // ADR-0107 / T073: a quality report is a covered upload, so the decision is taken here, at the
+    // moment of sending. Off or no recorded choice keeps the report; so does a report that no
+    // longer belongs to the signed-in account (it must not go out under another account's token).
+    // The queued outbox drain sends it once the customer allows it. Ending the session is not
+    // affected: this only concerns the report.
+    QString accountId;
+    const bool resolved = resolvePendingQualityAccount(&accountId);
+    if (!ReportingConsent::coveredUploadsAllowed() || !resolved || accountId != m_accountId) {
+        storeQualityReportToOutbox(onlyForSession);
+        return;
+    }
     const QString sessionId = m_pendingQualitySessionId;
     const QJsonObject report = m_pendingQualityReport;
-    const QString accountId = m_accountId;
-    // CR-04 (code review 06.3-REVIEW-fork.md, second review pass): captured here, at the
-    // moment this report is POSTED - not read again from `m_authEpoch` when the asynchronous
+    // CR-04 (code review 06.3-REVIEW-fork.md, second review pass): the epoch is the one this
+    // report was composed under - not read again from `m_authEpoch` when the asynchronous
     // reply below eventually lands. A sign-out (or a sign-in as someone else) can happen while
     // this POST is still in flight; without this capture the WR-06 hold below stamped a late
     // reply with whatever epoch happened to be current when the reply arrived, so a stalled
     // report of an untagged account A could be re-tagged and sent under a later account B's
     // token once B's own `m_accountId` was filled - the same threat (T-06.3-51) CR-03 already
     // closed for the outbox's own drain, reached here by a different path.
-    const quint64 epochAtPost = m_authEpoch;
+    const quint64 epochAtPost = m_pendingQualityEpoch;
     m_hasPendingQualityReport = false;
     m_pendingQualityReport = QJsonObject();
     m_pendingQualitySessionId.clear();
+    m_pendingQualityAccountId.clear();
 
     m_controlPlane->postSessionQuality(
         sessionId, report,
@@ -3902,13 +4388,20 @@ void SeatHubClient::postOrStoreQualityReport(const QString& onlyForSession)
             onClientThread(this, [this, sessionId, report, accountId, epochAtPost, result]() {
                 switch (QualityOutbox::classify(result)) {
                 case QualityOutbox::Outcome::Delivered:
+                    m_qualityOutbox.setDirectory(qualityOutboxDirectory());
+                    m_qualityOutbox.remove(sessionId);
                     break;
                 case QualityOutbox::Outcome::Refused:
                     qCWarning(seathubClient) << "quality report for" << sessionId
                                               << "refused" << result.statusCode;
+                    m_qualityOutbox.setDirectory(qualityOutboxDirectory());
+                    m_qualityOutbox.remove(sessionId);
                     break;
                 case QualityOutbox::Outcome::AuthFailed:
                 case QualityOutbox::Outcome::Retryable:
+                case QualityOutbox::Outcome::Aborted:
+                    // Aborted (T073): the send boundary found reporting off, so nothing reached the
+                    // network - kept like any other undelivered report.
                     // Rule 2: kept for a later attempt (the next sign-in or launch), rather
                     // than lost to a dropped connection or a momentarily refused credential -
                     // this plan's own write-trigger line names only the transport/5xx/408/429
@@ -3955,15 +4448,19 @@ void SeatHubClient::storeQualityReportToOutbox(const QString& onlyForSession)
     }
     const QString sessionId = m_pendingQualitySessionId;
     const QJsonObject report = m_pendingQualityReport;
-    const QString accountId = m_accountId;
+    // T073: the account/epoch the report was composed under, not whoever is signed in now.
+    QString accountId;
+    resolvePendingQualityAccount(&accountId);
+    const quint64 epoch = m_pendingQualityEpoch;
     m_hasPendingQualityReport = false;
     m_pendingQualityReport = QJsonObject();
     m_pendingQualitySessionId.clear();
+    m_pendingQualityAccountId.clear();
 
     if (accountId.isEmpty()) {
-        // WR-06: held, not dropped - see `postOrStoreQualityReport()`'s own comment.
-        m_untaggedQualityReports.append(
-            PendingUntaggedQualityReport{ sessionId, report, m_authEpoch });
+        // WR-06: held, not dropped - see `postOrStoreQualityReport()`'s own comment. A hold from
+        // an epoch that is no longer current is dropped by `flushUntaggedQualityReports()`.
+        m_untaggedQualityReports.append(PendingUntaggedQualityReport{ sessionId, report, epoch });
         return;
     }
     m_qualityOutbox.setDirectory(qualityOutboxDirectory());
@@ -4017,7 +4514,7 @@ void SeatHubClient::handleTeardownCompleted(const SessionInfo& finalSession,
     // server gave no reason for leaves the line empty: showing nothing is honest, inventing a sentence
     // is not.
     if (!finalSession.endReason.isEmpty()) {
-        setEndReasonText(endReasonSentence(finalSession.endReason, finalSession.minutesBilled));
+        setEndReasonText(endSentence(finalSession.endReason, finalSession.minutesBilled));
     }
 
     // 06.1's ADR item 4 / J-22: the connecting view already showed the client's own best guess the

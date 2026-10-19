@@ -6,6 +6,48 @@ Moonlight also has mobile versions for [Android](https://github.com/moonlight-st
 
 You can follow development on our [Discord server](https://moonlight-stream.org/discord) and help translate Moonlight into your language on [Weblate](https://hosted.weblate.org/projects/moonlight/moonlight-qt/).
 
+<!-- SeatHub section start -->
+## RentaPC (SeatHub)
+
+This repository is the source of the RentaPC client (internal name SeatHub), the app customers use
+to rent a gaming PC by the minute and stream it to their own computer. It is a fork of
+[Moonlight](https://github.com/moonlight-stream/moonlight-qt); the Moonlight authors wrote the
+streaming engine, and this fork credits and builds on their work.
+
+Forked from moonlight-stream/moonlight-qt 6.1.0 (upstream-main branch carries upstream history at f786e94c)
+
+- The repository is public and licensed GPL-3.0.
+- GitHub does not mark it as a fork. The `upstream-main` branch holds the upstream history at the
+  commit above, and the local checkout has no upstream remote.
+- What SeatHub changed, file by file: [FORK-CHANGES.md](FORK-CHANGES.md). The streaming engine is
+  kept as upstream ships it; the changes are the RentaPC sign-in, session and update code and the
+  RentaPC interface.
+
+### Downloads
+
+Get RentaPC from the RentaPC website at https://rentapc.online or from this repository's
+[GitHub releases](https://github.com/Vikt0r70/moonlight-qt/releases). The downloads listed further
+down this page are upstream Moonlight builds, not RentaPC.
+
+### Licence and source
+
+The client is GPL-3.0. Third-party components and their licences are listed in
+[SBOM.md](SBOM.md) and [docs/licence-inventory.md](docs/licence-inventory.md); the written offer of
+source is [installer/WRITTEN-OFFER.txt](installer/WRITTEN-OFFER.txt).
+
+### Privacy
+
+The setup window asks whether the client may send crash and diagnostic reports. The notice is
+[installer/PRIVACY-NOTICE.txt](installer/PRIVACY-NOTICE.txt), and every outbound recipient is listed
+in [docs/reporting-inventory.md](docs/reporting-inventory.md), including Sentry for crash and event
+reports.
+
+### Code signing policy
+
+See [docs/code-signing-policy.md](docs/code-signing-policy.md) and the website page at
+https://rentapc.online/code-signing-policy.
+<!-- SeatHub section end -->
+
  [![AppVeyor Build Status](https://ci.appveyor.com/api/projects/status/glj5cxqwy2w3bglv/branch/master?svg=true)](https://ci.appveyor.com/project/cgutman/moonlight-qt/branch/master)
  [![Downloads](https://img.shields.io/github/downloads/moonlight-stream/moonlight-qt/total)](https://github.com/moonlight-stream/moonlight-qt/releases)
  [![Translation Status](https://hosted.weblate.org/widgets/moonlight/-/moonlight-qt/svg-badge.svg)](https://hosted.weblate.org/projects/moonlight/moonlight-qt/)

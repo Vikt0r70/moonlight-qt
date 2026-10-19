@@ -22,8 +22,10 @@
 #include <QNetworkReply>
 #include <QNetworkRequest>
 #include <QSignalSpy>
+#include <QRegularExpression>
 #include <QTimer>
 
+#include <algorithm>
 #include <cstring>
 
 #include "seathub/session_websocket.h"
@@ -215,6 +217,20 @@ protected:
     }
 };
 
+// The `seathub.sse` log lines, captured while a test installs `captureSseLog`.
+QStringList& sseLogLines()
+{
+    static QStringList lines;
+    return lines;
+}
+
+void captureSseLog(QtMsgType, const QMessageLogContext& context, const QString& message)
+{
+    if (context.category && QLatin1String(context.category) == QLatin1String("seathub.sse")) {
+        sseLogLines().append(message);
+    }
+}
+
 } // namespace
 
 class TstSseClient : public QObject
@@ -344,6 +360,40 @@ private slots:
         QCOMPARE(closing.count(), 0);
         QCOMPARE(accountState.count(), 0);
         QCOMPARE(sessionState.count(), 0);
+    }
+
+    // ADR-0105: the hello's `server_time` is exposed for the clock-skew bucket and nothing else.
+    void helloExposesServerTimeWhenWellFormed()
+    {
+        SseClient client;
+        QSignalSpy hello(&client, &SseClient::hello);
+        QSignalSpy serverTime(&client, &SseClient::serverTime);
+        QTest::ignoreMessage(QtInfoMsg, "sse event=hello alive_ms=20000 elapsed_ms=0");
+        client.feed(helloFrame(20000));
+        QCOMPARE(hello.count(), 1);
+        QCOMPARE(hello.at(0).at(0).toInt(), 20000);
+        QCOMPARE(serverTime.count(), 1);
+        const QDateTime got = serverTime.at(0).at(0).toDateTime();
+        QVERIFY(got.isValid());
+        QCOMPARE(got.timeSpec(), Qt::UTC);
+        QCOMPARE(got.toString(Qt::ISODateWithMs), QStringLiteral("2026-10-06T10:00:01.123Z"));
+    }
+
+    void helloWithoutAUsableServerTimeStillRaisesHelloOnly()
+    {
+        for (const QString& bad : { QString(), QStringLiteral("not a time") }) {
+            QJsonObject data;
+            data.insert(QStringLiteral("connection_id"), QStringLiteral("c-test"));
+            if (!bad.isNull()) data.insert(QStringLiteral("server_time"), bad);
+            data.insert(QStringLiteral("alive_ms"), 20000);
+            SseClient client;
+            QSignalSpy hello(&client, &SseClient::hello);
+            QSignalSpy serverTime(&client, &SseClient::serverTime);
+            QTest::ignoreMessage(QtInfoMsg, "sse event=hello alive_ms=20000 elapsed_ms=0");
+            client.feed(sseFrame(QStringLiteral("stream.hello"), data));
+            QCOMPARE(hello.count(), 1);
+            QCOMPARE(serverTime.count(), 0);
+        }
     }
 
     void readsAliveMsFromHello()
@@ -585,6 +635,63 @@ private slots:
         QCOMPARE(client2.state(), QStringLiteral("stopped"));
         QCOMPARE(revokedSpy2.count(), 1);
         QCOMPARE(net.replies.count(), 2);
+    }
+
+    // T063 / ADR-0105: the stream's life is one closed line per step (connect, hello, loss, reconnect,
+    // stopped) and never a host, an address, a path or an account.
+    void theStreamLogsItsLifeAsClosedLinesWithNoHostOrAddress()
+    {
+        ControlPlaneClient controlPlane;
+        StreamNetworkAccessManager net;
+        controlPlane.setStreamNetworkAccessManager(&net);
+        controlPlane.setBaseUrl(QStringLiteral("https://sentinel-host.example.test"));
+
+        sseLogLines().clear();
+        const QtMessageHandler previous = qInstallMessageHandler(captureSseLog);
+        {
+            SseClient client;
+            client.setControlPlane(&controlPlane);
+            client.setJitterProvider([]() { return 0.0; });
+            client.start();
+            QCOMPARE(net.replies.count(), 1);
+            net.replies.first()->pushBytes(helloFrame(20000));
+            net.replies.first()->finishStream(); // a lost connection after a hello
+            QTRY_VERIFY_WITH_TIMEOUT(net.replies.count() >= 2, 15000);
+
+            net.replies.last()->pushBytes(sseFrame(
+                QStringLiteral("stream.closing"),
+                QJsonObject{ { QStringLiteral("reason"), QStringLiteral("revoked") } }));
+            net.replies.last()->finishStream();
+            QCOMPARE(client.state(), QStringLiteral("stopped"));
+        }
+        qInstallMessageHandler(previous);
+
+        const QStringList lines = sseLogLines();
+        const QRegularExpression closed(QStringLiteral(
+            "^sse event=(connect attempt=[0-9]+|reconnect attempt=[0-9]+ delay_ms=[0-9]+|"
+            "hello alive_ms=[0-9]+ elapsed_ms=[0-9]+|"
+            "loss reason=(transport|revoked|replaced|shutdown|other) http_status=[0-9]+ "
+            "helloed=(true|false) elapsed_ms=-?[0-9]+|stopped reason=revoked)$"));
+        QVERIFY(!lines.isEmpty());
+        for (const QString& line : lines) {
+            QVERIFY2(closed.match(line).hasMatch(), qPrintable(line));
+            QVERIFY2(!line.contains(QLatin1String("sentinel"), Qt::CaseInsensitive), qPrintable(line));
+            QVERIFY2(!line.contains(QLatin1String("example.test")), qPrintable(line));
+            QVERIFY2(!line.contains(QLatin1String("http")) || line.contains(QLatin1String("http_status")),
+                     qPrintable(line));
+        }
+        QVERIFY(lines.contains(QStringLiteral("sse event=connect attempt=1")));
+        QVERIFY(lines.contains(QStringLiteral("sse event=hello alive_ms=20000 elapsed_ms=0"))
+                || std::any_of(lines.begin(), lines.end(), [](const QString& l) {
+                       return l.startsWith(QLatin1String("sse event=hello alive_ms=20000"));
+                   }));
+        QVERIFY(std::any_of(lines.begin(), lines.end(), [](const QString& l) {
+            return l.startsWith(QLatin1String("sse event=loss reason=transport"));
+        }));
+        QVERIFY(std::any_of(lines.begin(), lines.end(), [](const QString& l) {
+            return l.startsWith(QLatin1String("sse event=reconnect attempt=1 delay_ms="));
+        }));
+        QVERIFY(lines.contains(QStringLiteral("sse event=stopped reason=revoked")));
     }
 
     void replacedWaitsForTheCap()

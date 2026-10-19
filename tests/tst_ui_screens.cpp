@@ -48,6 +48,7 @@
 #include <QTemporaryDir>
 
 #include "seathub/agent_config.h"
+#include "seathub/reporting_consent.h"
 #include "seathub/settings_bridge.h"
 #include "settings/streamingpreferences.h"
 
@@ -93,7 +94,35 @@ void registerTokenSingletons(QQmlEngine* engine)
                              "SeatHub.Tokens", 1, 0, "Tokens");
     qmlRegisterSingletonType(QUrl::fromLocalFile(guiDir() + QStringLiteral("/Metrics.qml")),
                              "SeatHub.Tokens", 1, 0, "Metrics");
+    // ADR-0107: SettingsPage.qml imports the ReportingConsent singleton. It is the real one; these
+    // tests point its store at a test registry key (see ReportingConsentFixture) and never at the
+    // customer's. Registered once per process: the type registry is global, not per engine.
+    static bool consentRegistered = false;
+    if (!consentRegistered) {
+        ReportingConsent::registerQml();
+        consentRegistered = true;
+    }
 }
+
+// Points the reporting-choice store at a throwaway registry key and gives ReportingConsent a known
+// recorded state, then removes the key and restores the unrecorded state on the way out.
+struct ReportingConsentFixture {
+    explicit ReportingConsentFixture(bool send, bool recorded = true)
+    {
+        reporting_consent_store::setKeyPathForTests(L"Software\\Seven Hills\\T021UiScreensTest\\Reporting");
+        reporting_consent_store::clear();
+        reporting_consent_store::Record record;
+        record.recorded = recorded;
+        record.send = send;
+        record.noticeVersion = recorded ? reporting_consent_store::kCurrentNoticeVersion : 0;
+        ReportingConsent::setStateForTests(true, record);
+    }
+    ~ReportingConsentFixture()
+    {
+        reporting_consent_store::clear();
+        ReportingConsent::setStateForTests(true, reporting_consent_store::Record());
+    }
+};
 
 QObject* instantiate(QQmlEngine* engine, const QString& fileName, QString* error)
 {
@@ -853,6 +882,8 @@ private slots:
     void theStreamingBannerAndNegotiatedFallbackStillRenderOnTheRebuiltPage();
     void noSettingsPageStringCarriesTheUpstreamBrand();
     void theSettingsPageShowsTheLogsQualityAndCrashReportsDisclosureSentence();
+    void theSettingsPageHasOneReportingRowThatShowsTheRecordedChoice();
+    void changingTheReportingRowRecordsTheChoiceAndStatesWhenItTakesEffect();
     void test_slider_allows_150_mbps();
     void theBitrateSliderFollowsUnlockKeysAndDragAtBothDesktopSizes();
     void customResolutionSelectionRevealsAndPersistsTheWidthHeightFields();
@@ -3658,6 +3689,91 @@ void TstUiScreens::theSettingsPageShowsTheLogsQualityAndCrashReportsDisclosureSe
     }
     QCOMPARE(found, 1);
     QVERIFY2(!oldFound, "the old disclosure must not survive beside the updated one");
+}
+
+namespace {
+const QString kReportingLabel = QStringLiteral("Send crash reports, logs and session evidence");
+const QString kReportingOn = QStringLiteral(
+    "RentaPC sends crash reports and logs to Sentry, and stream quality numbers and session evidence to us, to help us fix problems.");
+const QString kReportingOff = QStringLiteral(
+    "Nothing in that list leaves your PC. We can't give proper support for errors with this turned off.");
+const QString kReportingEffect = QStringLiteral(
+    "Logs, stream quality numbers and session evidence stop or resume at once. Crash reporting stops or starts at the next launch of RentaPC.");
+
+int countText(QObject* root, const QString& text)
+{
+    int found = 0;
+    for (QObject* item : textItems(root)) {
+        found += item->property("text").toString() == text ? 1 : 0;
+    }
+    return found;
+}
+} // namespace
+
+// ADR-0107, screens.md § 27, copy.md § Settings: ONE labelled row in the first column shows the
+// recorded choice (ticked on a fresh install, unticked once the customer said no) and states what
+// leaves the PC - and the effective-time sentence - from the recorded value, never from a server.
+void TstUiScreens::theSettingsPageHasOneReportingRowThatShowsTheRecordedChoice()
+{
+    for (const bool send : { true, false }) {
+        ReportingConsentFixture consent(send);
+        SettingsFixture fixture;
+        QQuickStyle::setStyle(QStringLiteral("Basic"));
+        QQmlEngine engine;
+        registerTokenSingletons(&engine);
+
+        QString error;
+        QScopedPointer<QObject> root(instantiateSettingsPage(&engine, fixture.client, &error));
+        QVERIFY2(root, qPrintable(error));
+
+        QCOMPARE(countText(root.data(), kReportingLabel), 1);
+        QCOMPARE(countText(root.data(), send ? kReportingOn : kReportingOff), 1);
+        QCOMPARE(countText(root.data(), send ? kReportingOff : kReportingOn), 0);
+        QCOMPARE(countText(root.data(), kReportingEffect), 1);
+
+        QObject* box = checkBoxNear(root.data(), kReportingLabel);
+        QVERIFY2(box, "the reporting row has its check box");
+        QCOMPARE(box->property("checked").toBool(), send);
+        // Like every row on the page it is editable when no stream runs (the fixture is writable).
+        QVERIFY(box->property("enabled").toBool());
+    }
+}
+
+// The row records through the same store the setup window wrote, and the text flips with it.
+void TstUiScreens::changingTheReportingRowRecordsTheChoiceAndStatesWhenItTakesEffect()
+{
+    ReportingConsentFixture consent(true);
+    SettingsFixture fixture;
+    QQuickStyle::setStyle(QStringLiteral("Basic"));
+    QQmlEngine engine;
+    registerTokenSingletons(&engine);
+
+    QString error;
+    QScopedPointer<QObject> root(instantiateSettingsPage(&engine, fixture.client, &error));
+    QVERIFY2(root, qPrintable(error));
+
+    QObject* box = checkBoxNear(root.data(), kReportingLabel);
+    QVERIFY(box);
+    QVERIFY(ReportingConsent::coveredUploadsAllowed());
+
+    // A user click sets `checked` and then emits `toggled`; do the same two steps.
+    box->setProperty("checked", false);
+    QMetaObject::invokeMethod(box, "toggled");
+
+    QVERIFY(!ReportingConsent::coveredUploadsAllowed());
+    const reporting_consent_store::Record stored = reporting_consent_store::read();
+    QVERIFY(stored.recorded);
+    QVERIFY(!stored.send);
+    QCOMPARE(stored.noticeVersion, reporting_consent_store::kCurrentNoticeVersion);
+    QCOMPARE(countText(root.data(), kReportingOff), 1);
+    QCOMPARE(countText(root.data(), kReportingOn), 0);
+    QCOMPARE(countText(root.data(), kReportingEffect), 1);
+
+    box->setProperty("checked", true);
+    QMetaObject::invokeMethod(box, "toggled");
+    QVERIFY(ReportingConsent::coveredUploadsAllowed());
+    QVERIFY(reporting_consent_store::read().send);
+    QCOMPARE(countText(root.data(), kReportingOn), 1);
 }
 
 void TstUiScreens::test_slider_allows_150_mbps()
