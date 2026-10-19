@@ -318,6 +318,12 @@ void PairingController::handleAuthorization(quint64 attempt, const ControlPlaneR
         return;
     }
 
+    if (!authorization.isReady()) {
+        fail(SeatHubFailure::local(QString::fromLatin1(kNoAuthorization)),
+             QStringLiteral("not_ready"));
+        return;
+    }
+
     if (m_seam == nullptr) {
         // No engine pairing seam was supplied. Failing closed is the only safe answer: silently
         // reporting success here would tell the caller a rig was paired when nothing paired.
@@ -334,6 +340,7 @@ void PairingController::handleAuthorization(quint64 attempt, const ControlPlaneR
     target.sessionId = authorization.sessionId.isEmpty() ? m_sessionId : authorization.sessionId;
     target.hostAddress = authorization.hostAddress;
     target.httpsPort = authorization.httpsPort;
+    target.controlPort = authorization.controlPort;
     target.pairingPin = authorization.pairingPin;
     // W03 / L07: carried as the control plane sent it, for a new session and for a same-session
     // reconnect alike. Only the seam acts on it, and only with trust this app run itself pinned
@@ -341,6 +348,9 @@ void PairingController::handleAuthorization(quint64 attempt, const ControlPlaneR
     // falls back to it there. This controller starts one handshake per attempt
     // (`m_handshakeInFlight`).
     target.warmReturn = authorization.warmReturn;
+    // SC18: the reconnect flow is the ACTIVE session, whatever `warm_return` says; a NEW session on
+    // a free return hold also has `warmReturn` true and must keep the seam's one pairing retry.
+    target.reconnecting = authorization.state == QLatin1String("ACTIVE");
     LogShipper::setRedactions({target.hostAddress});
 
     // The engine seam gets the address and the PIN. Nothing else in this process does.

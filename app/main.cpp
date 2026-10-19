@@ -10,6 +10,7 @@
 #include <QFont>
 #include <QCursor>
 #include <QElapsedTimer>
+#include <QDateTime>
 #include <QTemporaryFile>
 #include <QRegularExpression>
 
@@ -50,8 +51,10 @@
 #include "seathub/seathub_client.h"
 #include "seathub/session_lifecycle.h"
 #include "seathub/settings_bridge.h"
+#include "seathub/single_instance.h"
 #include "seathub/telemetry.h"
 #include "seathub/update_feed_client.h"
+#include "seathub/reporting_consent.h"
 #include "seathub/velopack_updater.h"
 
 #if defined(Q_OS_WIN32)
@@ -164,7 +167,7 @@ void sdlLogToDiskHandler(void*, int category, SDL_LogPriority priority, const ch
     }
 
     QTime logTime = QTime::fromMSecsSinceStartOfDay(s_LoggerTime.elapsed());
-    QString txt = QString("%1 - SDL %2 (%3): %4\n").arg(logTime.toString()).arg(priorityTxt).arg(category).arg(message);
+    QString txt = QString("%1 - SDL %2 (%3): %4\n").arg(QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs) + " " + logTime.toString()).arg(priorityTxt).arg(category).arg(message);
 
     logToLoggerStream(txt);
 }
@@ -201,7 +204,7 @@ void qtLogToDiskHandler(QtMsgType type, const QMessageLogContext&, const QString
     }
 
     QTime logTime = QTime::fromMSecsSinceStartOfDay(s_LoggerTime.elapsed());
-    QString txt = QString("%1 - Qt %2: %3\n").arg(logTime.toString()).arg(typeTxt).arg(msg);
+    QString txt = QString("%1 - Qt %2: %3\n").arg(QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs) + " " + logTime.toString()).arg(typeTxt).arg(msg);
 
     logToLoggerStream(txt);
 }
@@ -229,7 +232,7 @@ void ffmpegLogToDiskHandler(void* ptr, int level, const char* fmt, va_list vl)
 
     if (shouldPrefixThisMessage) {
         QTime logTime = QTime::fromMSecsSinceStartOfDay(s_LoggerTime.elapsed());
-        QString txt = QString("%1 - FFmpeg: %2").arg(logTime.toString()).arg(lineBuffer);
+        QString txt = QString("%1 - FFmpeg: %2").arg(QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs) + " " + logTime.toString()).arg(lineBuffer);
         logToLoggerStream(txt);
     }
     else {
@@ -305,6 +308,34 @@ int main(int argc, char *argv[])
     // header because it is the documented surface (docs.velopack.io, reference/cpp/c-api).
     VelopackUpdater::runStartupHook();
 
+    // ADR-0107: the customer's recorded reporting choice, read before anything can upload. Every start
+    // path runs this, subcommands included; a hook above never reaches here and does no reporting work.
+    ReportingConsent::loadFromStore();
+
+#ifdef Q_OS_WIN32
+    // One copy per Windows user (ADR-0099, SC20). This is the first thing after Velopack's hook, before
+    // Sentry, the log file, SDL or any window, so a second launch never initialises any of them: it asks
+    // the first copy to come forward and exits (0 answered, 3 never reached one within the 10 s budget).
+    // The command-line subcommands are separate short-lived processes and are not guarded.
+    SingleInstance::Instance singleInstance;
+    std::vector<std::string> singleInstanceWarnings;
+    const bool isSubcommand = argc > 1 && (strcmp(argv[1], "list") == 0 || strcmp(argv[1], "stream") == 0
+                                           || strcmp(argv[1], "quit") == 0 || strcmp(argv[1], "pair") == 0);
+    {
+        if (!isSubcommand) {
+            SingleInstance::StartupDecision decision = SingleInstance::decideStartup(L"RentaPC");
+            if (decision.kind == SingleInstance::StartupDecision::Kind::AnsweredSecond) {
+                return SingleInstance::kExitAnswered;
+            }
+            if (decision.kind == SingleInstance::StartupDecision::Kind::NeverReached) {
+                return SingleInstance::kExitNeverReached;
+            }
+            singleInstanceWarnings = decision.warnings;
+            singleInstance.adopt(std::move(decision));
+        }
+    }
+#endif
+
     SDL_SetMainReady();
 
     // Set the app version for the QCommandLineParser's showVersion() command
@@ -368,6 +399,12 @@ int main(int argc, char *argv[])
 #ifdef Q_OS_WIN32
     // Create a crash dump when we crash on Windows
     SetUnhandledExceptionFilter(UnhandledExceptionHandler);
+    // ADR-0107: with no recorded choice, or a higher notice version than the recorded one, the app asks
+    // here: before Sentry starts, so nothing covered is sent first, and never inside a Velopack hook. A
+    // dismissed window records nothing and the previous choice (or "off") stays in force.
+    if (!isSubcommand && ReportingConsent::needsAsk()) {
+        ReportingConsent::askAtStartup(nullptr, 0);
+    }
     // SeatHub (ADR-0044 amendment, 06.3.1 D-02): crash reporting and log shipping start here.
     // crashpad's filter replaces upstream's above (last caller wins); if it fails, restore upstream's.
     if (!SeatHubTelemetry::start()) {
@@ -581,6 +618,20 @@ int main(int argc, char *argv[])
 
     QGuiApplication app(argc, argv);
 
+#ifdef Q_OS_WIN32
+    // Sentry, telemetry and the log file exist now, so the guard's warnings can be recorded, and the
+    // pipe listener can start. Until it does, a second launch keeps retrying inside its budget.
+    for (const std::string &warning : singleInstanceWarnings) {
+        qWarning().noquote() << QString::fromStdString(warning);
+    }
+    {
+        std::string listenerWarning;
+        if (!singleInstance.startListener(SingleInstance::Timing(), SingleInstance::focusOwnWindow, &listenerWarning)) {
+            qWarning().noquote() << QString::fromStdString(listenerWarning);
+        }
+    }
+#endif
+
 #ifndef STEAM_LINK
     // Force use of the KMSDRM backend for SDL when using Qt platform plugins
     // that directly draw to the display without a windowing system.
@@ -720,6 +771,9 @@ int main(int argc, char *argv[])
                                                    [](QQmlEngine* qmlEngine, QJSEngine*) -> QObject* {
                                                        return StreamingPreferences::get(qmlEngine);
                                                    });
+
+    // ADR-0107: the one Settings row that shows and changes the reporting choice.
+    ReportingConsent::registerQml();
 
     // Create the identity manager on the main thread
     IdentityManager::get();

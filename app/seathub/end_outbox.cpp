@@ -4,8 +4,11 @@
 #include <QFile>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QLoggingCategory>
 #include <QSaveFile>
 #include <QStandardPaths>
+
+Q_LOGGING_CATEGORY(seathubEndOutbox, "seathub.end_outbox")
 
 namespace {
 
@@ -47,6 +50,11 @@ QJsonObject reportToJson(const EndReport& report)
     if (!report.attemptStep.isEmpty()) {
         object.insert(QStringLiteral("attempt_step"), report.attemptStep);
     }
+    // ADR-0104: a retried End (same run, or after a restart) posts the same `port_test` as its
+    // first POST. Absent when none was recorded, so an entry from before this key reads back as none.
+    if (!report.portTest.isEmpty()) {
+        object.insert(QStringLiteral("port_test"), report.portTest);
+    }
     object.insert(QStringLiteral("customer_quit"), report.customerQuit);
     return object;
 }
@@ -61,6 +69,7 @@ EndReport reportFromJson(const QJsonObject& object)
     report.failingPorts = object.value(QStringLiteral("failing_ports")).toString();
     report.errorCode = object.value(QStringLiteral("error_code")).toString();
     report.attemptStep = object.value(QStringLiteral("attempt_step")).toString();
+    report.portTest = object.value(QStringLiteral("port_test")).toObject();
     report.customerQuit = object.value(QStringLiteral("customer_quit")).toBool(false);
     return report;
 }
@@ -83,6 +92,38 @@ EndOutbox::Outcome EndOutbox::classify(const ControlPlaneResult& result)
         return AuthFailed;
     }
     return Retryable;
+}
+
+QString EndOutbox::answerToken(const ControlPlaneResult& result)
+{
+    const int status = result.statusCode;
+    if (status >= 200 && status < 300) {
+        return QStringLiteral("2xx");
+    }
+    if (status >= 500 && status < 600) {
+        return QStringLiteral("5xx");
+    }
+    if (status == 400 || status == 401 || status == 403 || status == 404 || status == 422) {
+        return QString::number(status);
+    }
+    return status <= 0 ? QStringLiteral("transport") : QStringLiteral("none");
+}
+
+void EndOutbox::setObserver(Observer observer)
+{
+    m_observer = std::move(observer);
+}
+
+void EndOutbox::noteEvent(const QString& event, const QString& sessionId, const QString& answer,
+                          int count) const
+{
+    qCInfo(seathubEndOutbox).noquote()
+        << QStringLiteral("end_outbox event=%1 answer=%2 session=%3 count=%4")
+               .arg(event, answer, sessionId.isEmpty() ? QStringLiteral("-") : sessionId,
+                    QString::number(count));
+    if (m_observer) {
+        m_observer(event, answer, count);
+    }
 }
 
 EndOutbox::EndOutbox(QString directory)
@@ -120,23 +161,28 @@ bool EndOutbox::put(const QString& sessionId, const QString& accountId, bool fai
         return false;
     }
 
-    QMutexLocker locker(&m_mutex);
-    QDir().mkpath(m_directory);
+    bool written = false;
+    {
+        QMutexLocker locker(&m_mutex);
+        QDir().mkpath(m_directory);
 
-    QJsonObject object;
-    object.insert(QStringLiteral("account_id"), accountId);
-    object.insert(QStringLiteral("session_id"), sessionId);
-    object.insert(QStringLiteral("failed"), failed);
-    object.insert(QStringLiteral("report"), reportToJson(report));
+        QJsonObject object;
+        object.insert(QStringLiteral("account_id"), accountId);
+        object.insert(QStringLiteral("session_id"), sessionId);
+        object.insert(QStringLiteral("failed"), failed);
+        object.insert(QStringLiteral("report"), reportToJson(report));
 
-    // QSaveFile: a crash mid-write leaves the previous copy (or nothing) rather than a truncated
-    // record, so a restart never reads a half-written End.
-    QSaveFile file(pathFor(sessionId));
-    if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
-        return false;
+        // QSaveFile: a crash mid-write leaves the previous copy (or nothing) rather than a
+        // truncated record, so a restart never reads a half-written End.
+        QSaveFile file(pathFor(sessionId));
+        if (file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+            file.write(QJsonDocument(object).toJson(QJsonDocument::Compact));
+            written = file.commit();
+        }
     }
-    file.write(QJsonDocument(object).toJson(QJsonDocument::Compact));
-    return file.commit();
+    noteEvent(written ? QStringLiteral("put") : QStringLiteral("dropped"), sessionId,
+              QStringLiteral("none"), 1);
+    return written;
 }
 
 void EndOutbox::remove(const QString& sessionId)
@@ -169,6 +215,7 @@ QList<EndOutbox::Entry> EndOutbox::entriesForAccount(const QString& accountId) c
         return entries;
     }
 
+    int unreadable = 0;
     QMutexLocker locker(&m_mutex);
     QDir dir(m_directory);
     const QStringList names =
@@ -176,10 +223,12 @@ QList<EndOutbox::Entry> EndOutbox::entriesForAccount(const QString& accountId) c
     for (const QString& name : names) {
         QFile file(dir.filePath(name));
         if (!file.open(QIODevice::ReadOnly)) {
+            ++unreadable;
             continue;
         }
         const QJsonDocument doc = QJsonDocument::fromJson(file.readAll());
         if (!doc.isObject()) {
+            ++unreadable;
             continue;
         }
         const QJsonObject object = doc.object();
@@ -197,6 +246,12 @@ QList<EndOutbox::Entry> EndOutbox::entriesForAccount(const QString& accountId) c
         entry.failed = object.value(QStringLiteral("failed")).toBool(false);
         entry.report = reportFromJson(object.value(QStringLiteral("report")).toObject());
         entries.append(entry);
+    }
+    locker.unlock();
+    // An unreadable file stays on disk (it is not this drain's to delete); it is counted and logged
+    // instead of skipped without a trace. The "drain" line is the facade's, once per real drain.
+    if (unreadable > 0) {
+        noteEvent(QStringLiteral("unreadable"), QString(), QStringLiteral("none"), unreadable);
     }
     return entries;
 }

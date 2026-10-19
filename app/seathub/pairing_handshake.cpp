@@ -65,16 +65,19 @@ PairingHandshakeResult runUpstreamPairingHandshake(const PairingTarget& target)
     try {
         // Step 1 and 2: the address the control plane verified, and the pre-pairing server info.
         //
-        // 47989 is `ports.control` in the contract (`docs/spec/openapi.yaml:1804-1806`) and
-        // `DEFAULT_HTTP_PORT` upstream (`app/backend/nvaddress.h:5`). The HTTPS port starts at the
-        // contract's `ports.https` when the authorization carried one and is replaced by whatever
-        // `<HttpsPort>` in the server-info response says - which is why an empty certificate with
-        // httpsPort 0 stays correct either way (`app/backend/nvhttp.cpp:162-184`).
+        // `target.controlPort` is `ports.control` in the contract (`docs/spec/openapi.yaml:1804-1806`).
+        // The HTTPS port starts at the contract's `ports.https` when the authorization carried one and
+        // is replaced by whatever `<HttpsPort>` in the server-info response says - which is why an empty
+        // certificate with httpsPort 0 stays correct either way (`app/backend/nvhttp.cpp:162-184`).
         const uint16_t httpsPort =
             (target.httpsPort > 0 && target.httpsPort <= 0xFFFF)
                 ? static_cast<uint16_t>(target.httpsPort)
                 : static_cast<uint16_t>(0);
-        NvHTTP http(NvAddress(target.hostAddress, DEFAULT_HTTP_PORT), httpsPort, QSslCertificate());
+        const uint16_t controlPort =
+            (target.controlPort > 0 && target.controlPort <= 0xFFFF)
+                ? static_cast<uint16_t>(target.controlPort)
+                : static_cast<uint16_t>(0);
+        NvHTTP http(NvAddress(target.hostAddress, controlPort), httpsPort, QSslCertificate());
 
         // NVLL_NONE, not upstream's usual NVLL_ERROR/NVLL_VERBOSE: both of those log the request
         // URL when a request fails or times out, and the URL carries the rig's address. The
@@ -242,7 +245,11 @@ PairingHandshakeResult runUpstreamWarmReturnCheck(const PairingTarget& target,
         // that pin and presenting this client's certificate - and falls back to plain HTTP only on
         // a certificate refusal, whose answer never says paired. NVLL_NONE for the same reason as
         // above: the log must never carry the rig's address.
-        NvHTTP http(NvAddress(target.hostAddress, DEFAULT_HTTP_PORT),
+        const uint16_t controlPort =
+            (target.controlPort > 0 && target.controlPort <= 0xFFFF)
+                ? static_cast<uint16_t>(target.controlPort)
+                : static_cast<uint16_t>(0);
+        NvHTTP http(NvAddress(target.hostAddress, controlPort),
                     static_cast<uint16_t>(target.httpsPort), pinned);
         const QString serverInfo = http.getServerInfo(NvHTTP::NVLL_NONE);
 

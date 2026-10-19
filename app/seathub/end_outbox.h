@@ -17,6 +17,8 @@
 // It never carries a credential: the account id is the only thing stored beside the End body, and
 // the POST that drains it uses the facade's own access manager.
 
+#include <functional>
+
 #include <QMutex>
 #include <QString>
 #include <QStringList>
@@ -32,6 +34,22 @@ public:
     enum Outcome { Delivered, Refused, AuthFailed, Retryable, Aborted };
 
     static Outcome classify(const ControlPlaneResult& result);
+
+    /// The closed answer token for one End POST's answer: `2xx`, `400`, `401`, `403`, `404`, `422`,
+    /// `5xx`, `transport` (status 0) or `none`. The same vocabulary `EvidenceJournal::outbox` takes.
+    static QString answerToken(const ControlPlaneResult& result);
+
+    /// One log line per outbox event (ADR-0105): `event` is `put`, `drain`, `delivered`, `kept`,
+    /// `dropped` or `unreadable`; `answer` is `answerToken()` or `none`; `count` is how many
+    /// entries the event covers. The line carries the session id and these closed values only -
+    /// never a path, a token or a body. Also calls the observer, if one is set.
+    void noteEvent(const QString& event, const QString& sessionId, const QString& answer,
+                   int count) const;
+
+    /// Called after every `noteEvent()` (outside the lock), so the facade can record the event in
+    /// the evidence journal. Set once, before the outbox is used from another thread.
+    using Observer = std::function<void(const QString& event, const QString& answer, int count)>;
+    void setObserver(Observer observer);
 
     explicit EndOutbox(QString directory = QString());
 
@@ -75,4 +93,5 @@ private:
 
     mutable QMutex m_mutex;
     QString m_directory;
+    Observer m_observer;
 };

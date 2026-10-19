@@ -258,13 +258,16 @@ SOURCES += \
     seathub/engine_status.cpp \
     seathub/attempt_vocab.cpp \
     seathub/quality_outbox.cpp \
+    seathub/reporting_consent.cpp \
     seathub/end_outbox.cpp \
+    seathub/evidence_journal.cpp \
     seathub/stream_quality_sampler.cpp \
     seathub/telemetry.cpp \
     seathub/install_journal.cpp \
     seathub/update_retry_state.cpp \
     seathub/osd_renderer.cpp \
     seathub/osd_compositor.cpp \
+    seathub/single_instance.cpp \
     streaming/streamutils.cpp \
     backend/autoupdatechecker.cpp \
     path.cpp \
@@ -338,13 +341,17 @@ HEADERS += \
     seathub/engine_status.h \
     seathub/attempt_vocab.h \
     seathub/quality_outbox.h \
+    seathub/reporting_consent.h \
+    seathub/reporting_consent_store.h \
     seathub/end_outbox.h \
+    seathub/evidence_journal.h \
     seathub/stream_quality_sampler.h \
     seathub/telemetry.h \
     seathub/install_journal.h \
     seathub/update_retry_state.h \
     seathub/osd_renderer.h \
     seathub/osd_compositor.h \
+    seathub/single_instance.h \
     seathub/stats_catalogue.h \
     streaming/video/decoder.h \
     streaming/streamutils.h \

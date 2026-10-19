@@ -1,0 +1,26 @@
+To fix problems, RentaPC sends crash reports and logs to Sentry, a third-party service we use to receive them, and sends stream quality numbers and session evidence to RentaPC. They never include your PIN, password, email or phone number. You can change this any time in RentaPC Settings.
+
+لنتمكن من إصلاح المشكلات، يرسل RentaPC تقارير الأعطال والسجلات إلى Sentry، وهي خدمة خارجية نستخدمها لاستلامها، ويرسل أرقام جودة البث وأدلة الجلسات إلى RentaPC. لا تتضمن أبدًا رمز PIN أو كلمة المرور أو البريد الإلكتروني أو رقم الهاتف. يمكنك تغيير ذلك في أي وقت من إعدادات RentaPC.
+
+Crash reports (Sentry) / تقارير الأعطال (Sentry)
+If RentaPC crashes, it sends a crash report to Sentry, a third-party service we use to receive them. We use it to find and fix the fault. A report never includes your PIN, password, email or phone number.
+إذا تعطل RentaPC، يرسل تقرير عطل إلى Sentry، وهي خدمة خارجية نستخدمها لاستلام هذه التقارير. نستخدمه لمعرفة الخلل وإصلاحه. لا يتضمن التقرير أبدًا رمز PIN أو كلمة المرور أو البريد الإلكتروني أو رقم الهاتف.
+
+Diagnostic logs / سجلات التشخيص
+RentaPC also sends its diagnostic log lines to Sentry. They describe what the app was doing, and we use them to find and fix problems. If it cannot send them, it may keep them on your PC and try again later.
+يرسل RentaPC أيضًا سطور سجل التشخيص إلى Sentry. تصف هذه السطور ما كان التطبيق يفعله، ونستخدمها لمعرفة المشكلات وإصلاحها. إذا تعذر إرسالها، فقد يحتفظ بها على جهازك ويعيد المحاولة لاحقًا.
+
+Stream quality reports / تقارير جودة البث
+When a play ends, RentaPC sends us the stream quality numbers it measured, so we can see how the stream went. If it cannot send them, it saves them on your PC and sends them when the connection works.
+عند انتهاء الجلسة، يرسل RentaPC إلينا أرقام جودة البث التي قاسها، لنعرف كيف سار البث. إذا تعذر إرسالها، يحفظها على جهازك ويرسلها عندما يعمل الاتصال.
+
+Session evidence journal / سجل أدلة الجلسة
+While you play, RentaPC writes a small record of what happened during that play, such as connection attempts and their results, stalls, the kind of network, and whether your clock is off. It holds fixed values only and never records an IP address, Wi-Fi name, file path, user name, PIN or token. RentaPC keeps it on your PC and sends it to us when you are online and signed in, so we can find out why a play failed.
+أثناء اللعب، يكتب RentaPC سجلًا صغيرًا بما حدث في تلك الجلسة، مثل محاولات الاتصال ونتائجها وحالات التقطع ونوع الشبكة وهل ساعة جهازك غير مضبوطة. يحتوي على قيم محددة فقط، ولا يسجل أبدًا عنوان IP أو اسم شبكة Wi-Fi أو مسار ملف أو اسم مستخدم أو رمز PIN أو رمز دخول. يحتفظ RentaPC به على جهازك ويرسله إلينا عندما تكون متصلًا ومسجلًا الدخول، لنعرف سبب فشل الجلسة.
+
+Turning it off / كيفية الإيقاف
+The installer has one box, "send crash reports, logs and session evidence", ticked by default. Untick it to stop all four. You can change it any time in RentaPC Settings. Logs, stream quality numbers and session evidence stop or resume at once; crash reporting stops or starts the next time RentaPC starts. With it off, we can't give proper support for errors. Signing in, playing and checking for updates still work as usual and still talk to RentaPC.
+يحتوي المثبّت على خانة واحدة، "إرسال تقارير الأعطال والسجلات وأدلة الجلسات"، وهي محددة افتراضيًا. ألغِ تحديدها لإيقاف الأنواع الأربعة كلها. يمكنك تغييرها في أي وقت من إعدادات RentaPC. تتوقف السجلات وأرقام جودة البث وأدلة الجلسات أو تُستأنف فورًا، ويتوقف الإبلاغ عن الأعطال أو يبدأ عند التشغيل التالي لـ RentaPC. عند إيقافها لا يمكننا تقديم دعم مناسب للأخطاء. يستمر تسجيل الدخول واللعب وفحص التحديثات بالعمل كالمعتاد، ويتواصل ذلك مع RentaPC.
+
+This is a short notice, not the full Privacy Policy. The full Privacy Policy is still being prepared and will come later. More detail: https://rentapc.online/data-collection
+هذا إشعار قصير وليس سياسة الخصوصية الكاملة. لا تزال سياسة الخصوصية الكاملة قيد الإعداد وستصدر لاحقًا. مزيد من التفاصيل: https://rentapc.online/data-collection

@@ -27,6 +27,7 @@
 
 #include "seathub/authorized_through_timer.h"
 #include "seathub/liveness_timer.h"
+#include "seathub/port_test_result.h"
 
 namespace {
 
@@ -329,6 +330,81 @@ private slots:
                  QStringLiteral("RTSP handshake"));
         QCOMPARE(payload.value(QStringLiteral("engine_error")).toInt(), 10060);
         QCOMPARE(payload.value(QStringLiteral("failing_ports")).toString(), QStringLiteral("48010"));
+        // ADR-0104: no port test was relayed for this failure, so the key is absent.
+        QVERIFY(!payload.contains(QStringLiteral("port_test")));
+    }
+
+    void reportFailure_withAPortTest_sendsPortTestBesideFailingPorts()
+    {
+        LivenessTimer timer;
+        auto* client = new ControlPlaneClient(&timer);
+        auto* fake = new FakeNetworkAccessManager;
+        fake->body = sessionBody();
+        client->setNetworkAccessManager(fake);
+        timer.setControlPlane(client);
+
+        timer.start(QString::fromLatin1(kSessionId));
+        QTRY_VERIFY(!fake->postedBodies.isEmpty());
+        int callsBefore = fake->calls;
+
+        PortTestResult failed;
+        failed.outcome = PortTestResult::Outcome::Failed;
+        failed.failedMask = 0x10;
+        timer.reportFailure(QStringLiteral("RTSP handshake"), 10060, QStringLiteral("48010"),
+                            portTestJson(failed));
+        QTRY_VERIFY(fake->calls > callsBefore);
+        QJsonObject payload = lastPostedObject(*fake);
+        QCOMPARE(payload.value(QStringLiteral("failing_ports")).toString(), QStringLiteral("48010"));
+        QCOMPARE(payload.value(QStringLiteral("port_test")).toObject(), portTestJson(failed));
+        QCOMPARE(payload.value(QStringLiteral("port_test")).toObject()
+                     .value(QStringLiteral("outcome")).toString(),
+                 QStringLiteral("failed"));
+        QCOMPARE(payload.value(QStringLiteral("port_test")).toObject()
+                     .value(QStringLiteral("failed_mask")).toInt(),
+                 0x10);
+
+        // A clean test carries no mask; a not-run test (empty object) omits the key entirely.
+        callsBefore = fake->calls;
+        PortTestResult clean;
+        clean.outcome = PortTestResult::Outcome::Clean;
+        timer.reportFailure(QStringLiteral("RTSP handshake"), 10060, QStringLiteral("48010"),
+                            portTestJson(clean));
+        QTRY_VERIFY(fake->calls > callsBefore);
+        payload = lastPostedObject(*fake);
+        QJsonObject expectedClean;
+        expectedClean.insert(QStringLiteral("outcome"), QStringLiteral("clean"));
+        QCOMPARE(payload.value(QStringLiteral("port_test")).toObject(), expectedClean);
+
+        callsBefore = fake->calls;
+        timer.reportFailure(QStringLiteral("RTSP handshake"), 10060, QStringLiteral("48010"),
+                            portTestJson(PortTestResult()));
+        QTRY_VERIFY(fake->calls > callsBefore);
+        QVERIFY(!lastPostedObject(*fake).contains(QStringLiteral("port_test")));
+    }
+
+    void noteTermination_carriesThePortTestSetBeforeIt()
+    {
+        LivenessTimer timer;
+        auto* client = new ControlPlaneClient(&timer);
+        auto* fake = new FakeNetworkAccessManager;
+        fake->body = sessionBody();
+        client->setNetworkAccessManager(fake);
+        timer.setControlPlane(client);
+
+        timer.start(QString::fromLatin1(kSessionId));
+        QTRY_VERIFY(!fake->postedBodies.isEmpty());
+        const int callsBefore = fake->calls;
+
+        PortTestResult inconclusive;
+        inconclusive.outcome = PortTestResult::Outcome::Inconclusive;
+        timer.setPortTest(portTestJson(inconclusive));
+        timer.noteTermination(-100);
+        QTRY_VERIFY(fake->calls > callsBefore);
+        const QJsonObject payload = lastPostedObject(*fake);
+        QCOMPARE(payload.value(QStringLiteral("engine_error")).toInt(), -100);
+        QJsonObject expectedInconclusive;
+        expectedInconclusive.insert(QStringLiteral("outcome"), QStringLiteral("inconclusive"));
+        QCOMPARE(payload.value(QStringLiteral("port_test")).toObject(), expectedInconclusive);
     }
 
     void noteTermination_reportsAtOnceAndAQueuedStopDoesNotSuppressIt()

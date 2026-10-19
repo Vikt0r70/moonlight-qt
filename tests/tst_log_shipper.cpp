@@ -50,6 +50,7 @@
 
 #include "seathub/log_shipper.h"
 #include "seathub/log_tee.h"
+#include "seathub/reporting_consent.h"
 
 namespace {
 
@@ -193,6 +194,15 @@ private slots:
         m_appPath = QCoreApplication::applicationFilePath();
         QVERIFY(QFileInfo(m_appPath).isFile());
         LogTee::install();
+        // Never the customer's real key: this suite records a choice, so it gets its own.
+        reporting_consent_store::setKeyPathForTests(
+            L"Software\\Seven Hills\\SeatHubLogShipperTest-"
+            + std::to_wstring(QCoreApplication::applicationPid()) + L"\\Reporting");
+    }
+
+    void cleanupTestCase()
+    {
+        reporting_consent_store::clear();
     }
 
     void cleanup()
@@ -203,6 +213,8 @@ private slots:
         // CR-02: a test that shortened pauseHandOff()'s bounded wait must not leak that override
         // into a later, unrelated test.
         LogShipper::instance().setPauseTimeoutForTests(-1);
+        // Back to "state not loaded" so no test leaks a recorded choice into another.
+        ReportingConsent::setStateForTests(false, reporting_consent_store::Record{});
     }
 
     // --- the tracer: hold, then drain in order with the original time and session -------------
@@ -248,6 +260,40 @@ private slots:
             ++seen;
         }
         QCOMPARE(seen, 3);
+    }
+
+    // --- ADR-0107: reporting off keeps lines spooled, switching it on ships them ----------------
+
+    void linesStaySpooledWhileReportingIsOffAndShipWhenItIsSwitchedOn()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        StubHandOff stub;
+        StopShipperOnScopeExit stopGuard;
+        const QString marker = QStringLiteral("reporting-off-marker");
+
+        reporting_consent_store::Record off;
+        off.recorded = true;
+        off.send = false;
+        off.noticeVersion = reporting_consent_store::kCurrentNoticeVersion;
+        ReportingConsent::setStateForTests(true, off);
+
+        LogShipper::instance().setSpoolDirectoryForTests(dir.path());
+        LogShipper::instance().start([&stub](const ShippedLine& line) { return stub(line); });
+        LogShipper::instance().setCanShip(true); // signed in, handout says logs: only consent is off
+
+        for (int i = 0; i < 3; ++i) {
+            qInfo() << marker << i;
+        }
+        QTest::qWait(300);
+        QCOMPARE(stub.countMatching(marker), 0);
+        // Spooled, not dropped: the lines wait on disk for a later choice.
+        QVERIFY(QFileInfo::exists(ownSpoolFilePath(dir.path())));
+
+        QVERIFY(ReportingConsent::recordChoice(true));
+        // The worker re-checks the switch on its next pass; a new line wakes it.
+        qInfo() << marker << "wake";
+        QTRY_VERIFY_WITH_TIMEOUT(stub.countMatching(marker) >= 3, 5000);
     }
 
     // --- a debug line never reaches the queue or the spool -------------------------------------

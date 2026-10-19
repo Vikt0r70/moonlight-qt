@@ -93,13 +93,12 @@ const QRegularExpression& networkLatencyPattern()
     return re;
 }
 
-// D-10 (Plan 16): "Host processing latency min/max/average: %.1f/%.1f/%.1f ms" (`ffmpeg.cpp:811-
-// 819`, gated on `stats.framesWithHostProcessingLatency > 0`) - only the third (average) figure
-// is captured; min/max have no OSD row of their own.
-const QRegularExpression& hostProcessingAvgPattern()
+// D-10 (Plan 16), ADR-0101 (T024/T025): "Host processing latency min/max/average: %.1f/%.1f/%.1f ms"
+// (`ffmpeg.cpp:811-819`, gated on `stats.framesWithHostProcessingLatency > 0`). Captures min, max, avg.
+const QRegularExpression& hostProcessingLatencyPattern()
 {
     static const QRegularExpression re(
-        QStringLiteral("^Host processing latency min/max/average: \\d+(?:\\.\\d+)?/\\d+(?:\\.\\d+)?/"
+        QStringLiteral("^Host processing latency min/max/average: (\\d+(?:\\.\\d+)?)/(\\d+(?:\\.\\d+)?)/"
                        "(\\d+(?:\\.\\d+)?) ms$"),
         QRegularExpression::MultilineOption);
     return re;
@@ -134,7 +133,107 @@ QJsonValue metricValue(const OptionalMetric& metric)
     return metric.present ? QJsonValue(metric.value) : QJsonValue(QJsonValue::Null);
 }
 
+QJsonValue intMetricValue(const OptionalMetric& metric)
+{
+    return metric.present ? QJsonValue(static_cast<qint64>(qRound64(metric.value)))
+                          : QJsonValue(QJsonValue::Null);
+}
+
+// `app/streaming/session.cpp:339` (`Session::drSetup`), verbatim:
+// "Video stream is %dx%dx%d (format 0x%x)" - width, height, frame rate, video format. NOT the
+// decoder's `Video stream: %dx%d %.2f FPS (Codec: %s)` line (`videoStreamPattern()` above).
+const QRegularExpression& videoStreamIsPattern()
+{
+    static const QRegularExpression re(
+        QStringLiteral("^Video stream is (\\d+)x(\\d+)x(\\d+) \\(format 0x([0-9a-fA-F]+)\\)\\s*$"));
+    return re;
+}
+
+// `app/streaming/session.cpp:664-666`: "Video bitrate: %d kbps" (`m_StreamConfig.bitrate`).
+const QRegularExpression& videoBitratePattern()
+{
+    static const QRegularExpression re(QStringLiteral("^Video bitrate: (\\d+) kbps\\s*$"));
+    return re;
+}
+
+// `moonlight-common-c` `Limelight.h` lines 221-237 (pinned submodule): the video format masks.
+const quint32 kMaskH264 = 0x000F;  // formats 0x0001, 0x0004
+const quint32 kMaskH265 = 0x0F00;  // formats 0x0100, 0x0200, 0x0400, 0x0800
+const quint32 kMaskAv1 = 0xF000;   // formats 0x1000, 0x2000, 0x4000, 0x8000
+const quint32 kMask10Bit = 0xAA00; // formats 0x0200, 0x0800, 0x2000, 0x8000
+
 } // namespace
+
+void StreamStartContext::merge(const StreamStartContext& other)
+{
+    if (other.width.present) {
+        width = other.width;
+    }
+    if (other.height.present) {
+        height = other.height;
+    }
+    if (other.targetFps.present) {
+        targetFps = other.targetFps;
+    }
+    if (other.configuredBitrateKbps.present) {
+        configuredBitrateKbps = other.configuredBitrateKbps;
+    }
+    if (!other.codec.isEmpty()) {
+        codec = other.codec;
+    }
+    if (other.hdrKnown) {
+        hdrKnown = true;
+        hdr = other.hdr;
+    }
+}
+
+bool parseStreamStartLine(const QString& text, StreamStartContext* out)
+{
+    if (out == nullptr) {
+        return false;
+    }
+    *out = StreamStartContext();
+
+    QRegularExpressionMatch m = videoStreamIsPattern().match(text);
+    if (m.hasMatch()) {
+        out->width = OptionalMetric::of(m.captured(1).toDouble());
+        out->height = OptionalMetric::of(m.captured(2).toDouble());
+        out->targetFps = OptionalMetric::of(m.captured(3).toDouble());
+
+        bool ok = false;
+        const quint32 format = m.captured(4).toUInt(&ok, 16);
+        if (ok && format != 0) {
+            const quint32 known = kMaskH264 | kMaskH265 | kMaskAv1;
+            QString codec;
+            if ((format & ~known) == 0) {
+                const bool h264 = (format & kMaskH264) != 0;
+                const bool h265 = (format & kMaskH265) != 0;
+                const bool av1 = (format & kMaskAv1) != 0;
+                if (h264 && !h265 && !av1) {
+                    codec = QStringLiteral("h264");
+                } else if (h265 && !h264 && !av1) {
+                    codec = QStringLiteral("h265");
+                } else if (av1 && !h264 && !h265) {
+                    codec = QStringLiteral("av1");
+                }
+            }
+            if (!codec.isEmpty()) {
+                out->codec = codec;
+                out->hdrKnown = true;
+                out->hdr = (format & kMask10Bit) != 0;
+            }
+        }
+        return true;
+    }
+
+    m = videoBitratePattern().match(text);
+    if (m.hasMatch()) {
+        out->configuredBitrateKbps = OptionalMetric::of(m.captured(1).toDouble());
+        return true;
+    }
+
+    return false;
+}
 
 bool parseVideoStatsBlock(const QString& block, VideoStats* out)
 {
@@ -196,9 +295,11 @@ bool parseVideoStatsBlock(const QString& block, VideoStats* out)
         // stay absent, matched but not filled.
     }
 
-    m = hostProcessingAvgPattern().match(block);
+    m = hostProcessingLatencyPattern().match(block);
     if (m.hasMatch()) {
-        out->hostProcessingAvgMs = OptionalMetric::of(m.captured(1).toDouble());
+        out->hostProcessingMinMs = OptionalMetric::of(m.captured(1).toDouble());
+        out->hostProcessingMaxMs = OptionalMetric::of(m.captured(2).toDouble());
+        out->hostProcessingAvgMs = OptionalMetric::of(m.captured(3).toDouble());
         matchedAnyLine = true;
     }
 
@@ -229,11 +330,30 @@ QJsonObject toQualityReport(const VideoStats& stats)
     object.insert(QStringLiteral("rendered_fps"), metricValue(stats.renderedFps));
     object.insert(QStringLiteral("network_dropped_frame_pct"), metricValue(stats.networkDroppedFramePct));
     object.insert(QStringLiteral("jitter_dropped_frame_pct"), metricValue(stats.jitterDroppedFramePct));
-    object.insert(QStringLiteral("rtt_ms"), metricValue(stats.rttMs));
+    // ADR-0101 / T024: rtt_ms is integer, rounded half-up
+    object.insert(QStringLiteral("rtt_ms"), stats.rttMs.present
+                                                ? QJsonValue(static_cast<qint64>(qRound(stats.rttMs.value)))
+                                                : QJsonValue(QJsonValue::Null));
     object.insert(QStringLiteral("rtt_variance_ms"), metricValue(stats.rttVarianceMs));
     object.insert(QStringLiteral("decode_time_ms"), metricValue(stats.decodeTimeMs));
     object.insert(QStringLiteral("queue_time_ms"), metricValue(stats.queueTimeMs));
     object.insert(QStringLiteral("render_time_ms"), metricValue(stats.renderTimeMs));
+    object.insert(QStringLiteral("received_fps"), metricValue(stats.receivedFps));
+    object.insert(QStringLiteral("decoded_fps"), metricValue(stats.decodedFps));
+    object.insert(QStringLiteral("host_latency_min_ms"), metricValue(stats.hostProcessingMinMs));
+    object.insert(QStringLiteral("host_latency_max_ms"), metricValue(stats.hostProcessingMaxMs));
+    object.insert(QStringLiteral("host_latency_avg_ms"), metricValue(stats.hostProcessingAvgMs));
+    // T073 (contract 3.29.0): the six stream-start fields; unobserved is null, never zero-filled.
+    object.insert(QStringLiteral("width"), intMetricValue(stats.start.width));
+    object.insert(QStringLiteral("height"), intMetricValue(stats.start.height));
+    object.insert(QStringLiteral("target_fps"), metricValue(stats.start.targetFps));
+    object.insert(QStringLiteral("codec"), stats.start.codec.isEmpty()
+                                               ? QJsonValue(QJsonValue::Null)
+                                               : QJsonValue(stats.start.codec));
+    object.insert(QStringLiteral("hdr"), stats.start.hdrKnown ? QJsonValue(stats.start.hdr)
+                                                               : QJsonValue(QJsonValue::Null));
+    object.insert(QStringLiteral("configured_bitrate_kbps"),
+                  intMetricValue(stats.start.configuredBitrateKbps));
     return object;
 }
 
@@ -275,6 +395,14 @@ void StatsWatcher::handle(LogLevel level, int category, int priority, const QStr
 
     if (category != SDL_LOG_CATEGORY_APPLICATION || priority != SDL_LOG_PRIORITY_INFO) {
         // Not the category/priority `logVideoStats()` writes at all.
+        return;
+    }
+
+    // T073: the two stream-start lines (read-only engine output, `stream_stats.h`'s
+    // `StreamStartContext`); everything else falls through to the stats-block check unchanged.
+    StreamStartContext observed;
+    if (parseStreamStartLine(text, &observed)) {
+        emit streamStartObserved(observed);
         return;
     }
 
@@ -388,6 +516,8 @@ VideoStats VideoStatsAggregator::aggregate() const
     // the matching printed rate x this segment's duration instead - see
     // `frameWeightedAverage()`'s own comment.
     out.renderedFps = weightedAverage(m_segments, &VideoStats::renderedFps);
+    out.receivedFps = weightedAverage(m_segments, &VideoStats::receivedFps);
+    out.decodedFps = weightedAverage(m_segments, &VideoStats::decodedFps);
     out.networkDroppedFramePct =
         frameWeightedAverage(m_segments, &VideoStats::networkDroppedFramePct, &VideoStats::receivedFps);
     out.jitterDroppedFramePct =
@@ -398,6 +528,34 @@ VideoStats VideoStatsAggregator::aggregate() const
         frameWeightedAverage(m_segments, &VideoStats::queueTimeMs, &VideoStats::renderedFps);
     out.renderTimeMs =
         frameWeightedAverage(m_segments, &VideoStats::renderTimeMs, &VideoStats::renderedFps);
+
+    // Host processing latency (min/max/avg) across segments
+    out.hostProcessingAvgMs =
+        frameWeightedAverage(m_segments, &VideoStats::hostProcessingAvgMs, &VideoStats::decodedFps);
+    bool hasHostMin = false;
+    bool hasHostMax = false;
+    double minHost = 0.0;
+    double maxHost = 0.0;
+    for (const Segment& segment : m_segments) {
+        if (segment.stats.hostProcessingMinMs.present) {
+            if (!hasHostMin || segment.stats.hostProcessingMinMs.value < minHost) {
+                minHost = segment.stats.hostProcessingMinMs.value;
+                hasHostMin = true;
+            }
+        }
+        if (segment.stats.hostProcessingMaxMs.present) {
+            if (!hasHostMax || segment.stats.hostProcessingMaxMs.value > maxHost) {
+                maxHost = segment.stats.hostProcessingMaxMs.value;
+                hasHostMax = true;
+            }
+        }
+    }
+    if (hasHostMin) {
+        out.hostProcessingMinMs = OptionalMetric::of(minHost);
+    }
+    if (hasHostMax) {
+        out.hostProcessingMaxMs = OptionalMetric::of(maxHost);
+    }
 
     // rtt_ms / rtt_variance_ms: a point sample, not a real average (see `aggregate()`'s own
     // header comment) - taken from the longest segment that actually held one, not combined. A

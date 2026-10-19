@@ -27,6 +27,8 @@ QJsonObject aggregate(const QVector<VideoStats>& samples, int dropped, bool part
     struct Field { const char* name; OptionalMetric VideoStats::* member; int decimals; };
     const Field fields[] = {
         {"fps", &VideoStats::renderedFps, 2},
+        {"incoming_fps", &VideoStats::receivedFps, 2},
+        {"decoded_fps", &VideoStats::decodedFps, 2},
         {"net_drop", &VideoStats::networkDroppedFramePct, 2},
         {"jitter_drop", &VideoStats::jitterDroppedFramePct, 2},
         {"rtt", &VideoStats::rttMs, 2}, {"decode", &VideoStats::decodeTimeMs, 2},
@@ -44,9 +46,11 @@ QJsonObject aggregate(const QVector<VideoStats>& samples, int dropped, bool part
         std::sort(values.begin(), values.end());
         const QString prefix = QString::fromLatin1(field.name);
         attrs.insert(prefix + "_avg", rounded(sum / values.size(), field.decimals));
-        const bool fps = prefix == QLatin1String("fps");
-        const int index = fps ? 0 : int(std::ceil(0.95 * values.size())) - 1;
-        attrs.insert(prefix + (fps ? "_min" : "_p95"), rounded(values.at(index), field.decimals));
+        const bool isRate = prefix == QLatin1String("fps") ||
+                            prefix == QLatin1String("incoming_fps") ||
+                            prefix == QLatin1String("decoded_fps");
+        const int index = isRate ? 0 : int(std::ceil(0.95 * values.size())) - 1;
+        attrs.insert(prefix + (isRate ? "_min" : "_p95"), rounded(values.at(index), field.decimals));
     }
     return attrs;
 }
@@ -119,7 +123,7 @@ void StreamQualitySampler::feed(const VideoStats& stats)
     if (m_buffer.size() < kMaxSamplesPerWindow) { m_buffer.append(stats); m_samples.fetch_add(1); }
     else m_dropped.fetch_add(1);
     if (m_recent.size() == kRecentSamples) m_recent.removeFirst();
-    m_recent.append(stats);
+    m_recent.append({stats, nowMs()});
     bool changed = false;
     if (!stats.rttMs.present) {
         m_rttIn = m_rttOut = 0;
@@ -185,9 +189,12 @@ void StreamQualitySampler::updateQuality(const QString& reason)
             m_badReason.clear();
             return;
         }
-        QVector<VideoStats> recent;
+        QVector<SampleWithTime> recent;
         { QMutexLocker lock(&m_mutex); recent = m_recent; }
-        auto attrs = aggregate(recent, 0, true, kRecentSamples);
+        QVector<VideoStats> recentStats;
+        recentStats.reserve(recent.size());
+        for (const auto& s : recent) recentStats.append(s.stats);
+        auto attrs = aggregate(recentStats, 0, true, kRecentSamples);
         attrs.insert("reason", reason);
         SeatHubTelemetry::emitDiagnostic(QStringLiteral("stream.quality_bad"), LogLevel::Warning, attrs);
         ++m_badLines; m_lastBadLineMs = now;
@@ -221,7 +228,43 @@ void StreamQualitySampler::tick()
 void StreamQualitySampler::emitWindow(bool partial)
 {
     auto attrs = takeWindow(partial);
-    if (attrs.value("n").toInt() == 0) return;
+    if (attrs.value("n").toInt() == 0) {
+        // ADR-0105: a FULL window that ended with no samples and no drops is a stall window. A
+        // partial window (finish) and a drops-only window are not; nothing is logged or counted
+        // here, the facade turns the signal into an evidence entry.
+        if (!partial && attrs.isEmpty()) emit emptyWindowEmitted(m_windowMs);
+        return;
+    }
+
+    const auto now = nowMs();
+    attrs.insert("elapsed_ms", now);
+
+    QVector<SampleWithTime> recentCopy;
+    {
+        QMutexLocker lock(&m_mutex);
+        recentCopy = m_recent;
+    }
+
+    attrs.insert("recent_n", recentCopy.size());
+    for (int i = 0; i < recentCopy.size(); ++i) {
+        const auto& s = recentCopy.at(i);
+        attrs.insert(QStringLiteral("recent_%1_elapsed_ms").arg(i), s.elapsedMs);
+        if (s.stats.receivedFps.present) {
+            attrs.insert(QStringLiteral("recent_%1_incoming_fps").arg(i), rounded(s.stats.receivedFps.value, 2));
+        }
+        if (s.stats.decodedFps.present) {
+            attrs.insert(QStringLiteral("recent_%1_decoded_fps").arg(i), rounded(s.stats.decodedFps.value, 2));
+        }
+        if (s.stats.renderedFps.present) {
+            attrs.insert(QStringLiteral("recent_%1_rendered_fps").arg(i), rounded(s.stats.renderedFps.value, 2));
+        }
+    }
+
+    if (!recentCopy.isEmpty()) {
+        const auto lastSampleElapsed = recentCopy.last().elapsedMs;
+        attrs.insert("last_sample_age_ms", std::max<qint64>(0, now - lastSampleElapsed));
+    }
+
     const auto health = SeatHubTelemetry::rollupDeliveryHealth();
     for (auto it = health.begin(); it != health.end(); ++it) attrs.insert(it.key(), it.value());
     SeatHubTelemetry::emitDiagnostic(QStringLiteral("stream.rollup"), LogLevel::Info, attrs);

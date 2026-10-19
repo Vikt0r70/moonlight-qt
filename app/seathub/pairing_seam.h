@@ -30,12 +30,14 @@
 // include `app/backend/`.
 
 #include <QByteArray>
+#include <QElapsedTimer>
 #include <QMetaType>
 #include <QObject>
 #include <QString>
 #include <QTimer>
 
 #include <functional>
+#include <memory>
 
 #include "engine_session.h"
 #include "pairing_controller.h"
@@ -83,11 +85,38 @@ struct PairingHandshakeResult
     /// caller tell a reconnect attempt that streamed on held trust from one that streamed on a
     /// fresh pairing; it carries no credential.
     bool warm = false;
+
+    // SC18 (INTENT N18 amendment 2026-10-17): the one logged retry. The fields above describe the
+    // FINAL attempt; the fields below keep the FIRST attempt on the record. None carries the PIN,
+    // the salt or any hash of either.
+    /// `success` or `failure`: the first handshake attempt's own outcome. Set by the worker on
+    /// every result (and by the deadline for a result it speaks for); empty only on a
+    /// default-constructed value.
+    QString firstOutcome;
+    /// The first attempt's frozen step and closed failure class, only when it failed and the
+    /// token is nonempty. A failure-retry success keeps these as its `attemptStep`/`stepClass`.
+    QString firstAttemptStep;
+    QString firstStepClass;
+    /// True when the worker made the Play's one automatic retry.
+    bool retried = false;
+    /// `conflict` or `failure` (`PairingRetryBudget::token`), only when `retried`.
+    QString retryReason;
+    /// True when the target's PIN is exactly four ASCII digits. A shape, not the PIN.
+    bool pinShapeOk = false;
+    /// Milliseconds from `pair()` to this result, every attempt included.
+    qint64 handshakeMs = 0;
 };
 
 // Declared for the same reason as `SeatHubFailure` and `TeardownStage`: the handshake result
 // crosses the thread-pool boundary as a queued connection, which needs a registered metatype.
 Q_DECLARE_METATYPE(PairingHandshakeResult)
+
+/// What one `pair()` call's worker has settled so far (T074): the first attempt's closed outcome and
+/// the actual retry decision, published BEFORE the retry blocks so a deadline that speaks for the
+/// blocked worker still reports them. One object per `pair()` call, shared by that call's worker and
+/// the seam, so it is generation-bound by construction. Holds no PIN, salt or hash. Defined in
+/// `pairing_seam.cpp`.
+struct PairingProgress;
 
 /// The SHA-256 fingerprint of a certificate in PEM form, lowercase hex, or empty when the PEM is
 /// empty or cannot be parsed.
@@ -174,6 +203,11 @@ public:
     /// Test seam: the clear request the recovery loop (and `clearPendingPairing()`) runs.
     /// Defaults to `sendPairingCancelRequest` (`pairing_recovery.h`).
     void setCancelRequest(PairingCancelRequest cancel);
+    /// T063: a narrow, read-only sink called once per reported result, on this object's thread, right
+    /// after the `pairing_instrumentation` line - the facade journals the attempt from it. It takes
+    /// the result by const reference and cannot change the seam's retry, guards or callbacks.
+    using AttemptSink = std::function<void(const PairingHandshakeResult& result)>;
+    void setAttemptSink(AttemptSink sink);
 
     /// Start one handshake. `done` is called exactly once, on this object's thread, with
     /// `(ok, clientIdentity, engineError)`. See `pairing_controller.h` for what the identity is
@@ -237,6 +271,7 @@ private:
     PairingHandshake m_handshake;
     WarmReturnCheck m_warmCheck;
     PairingCancelRequest m_cancelRequest;
+    AttemptSink m_attemptSink;
     std::function<void(bool, const QString&, const QString&)> m_done;
     /// The generation token the pool thread reads without touching this object: bumped and
     /// stored here by every `pair()` call, captured by the worker as a `shared_ptr` copy, and
@@ -244,8 +279,16 @@ private:
     /// G-06.2-2). An atomic the worker outlives the object with, never a raw `this` (the plan's
     /// T-06.2-12-02 mitigation for the loop-spin and lifetime hazards).
     std::shared_ptr<std::atomic<quint64>> m_currentGeneration;
+    /// The current `pair()` call's progress (T074): replaced by every `pair()`, so the deadline and
+    /// `finish()` never read a superseded generation's record.
+    std::shared_ptr<PairingProgress> m_progress;
     QTimer* m_deadline = nullptr;
     int m_deadlineMs = kDeadlineMs;
+    /// Started by `pair()` beside the deadline: `handshakeMs` and the retry's remaining budget.
+    QElapsedTimer m_clock;
+    /// `PairingRetryBudget::pinShapeOk` of the current `pair()` target, so the deadline can speak
+    /// for a handshake whose worker has not answered. A bool; the PIN itself is never kept here.
+    bool m_pinShapeOk = false;
     bool m_pending = false;
     /// The session id of the `pair()` call this object is currently running or last ran
     /// (06.6-18/T-06.6-52). Set at the top of `pair()`, read back in `finish()` to tag `hostResolved`.

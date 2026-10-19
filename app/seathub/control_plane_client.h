@@ -116,6 +116,10 @@ struct EndReport
     /// Empty when unknown, and then the field is absent from the body like every other optional
     /// field here. `POST /api/sessions/{id}/end` carries it for every failed Play (contract 3.8.0).
     QString attemptStep;
+    /// ADR-0104 (T062): the `port_test` object (`portTestJson()`) of the stage failure this End
+    /// reports, `{"outcome", "failed_mask"?}`. Empty when no port test ran, and then the key is
+    /// absent from the body and from the outbox record, like every other optional field here.
+    QJsonObject portTest;
     /// UD-04 O01: the end is the customer's own quit (a Cancel, an End session press, or the
     /// in-stream quit shortcut). A deliberate quit is never a reported failure, so a report that
     /// carries this builds no `failed` body whatever else it holds: the server ends the session
@@ -142,6 +146,8 @@ struct SessionAuthorization
     int httpsPort = 0;
     int controlPort = 0;
     int rtspPort = 0;
+    QList<int> tcpPorts;
+    QList<int> udpPorts;
     /// `1080p60` | `1080p75` | `1080p120` (ADR-0011, matched by equality), or empty/absent.
     /// Parsed for completeness only - nothing reads this field (A-68, D-06 reversal: the
     /// customer's saved Settings are the only decider of stream quality now).
@@ -158,6 +164,11 @@ struct SessionAuthorization
     /// Advisory only - the rig's own certificate check is what admits the stream, a PIN is still
     /// issued, and a warm attempt that fails falls back to the PIN handshake (L07).
     bool warmReturn = false;
+
+    bool isReady() const
+    {
+        return controlPort > 0 && httpsPort > 0 && rtspPort > 0;
+    }
 
     static bool parse(const QJsonObject& body, SessionAuthorization* out);
 };
@@ -610,6 +621,13 @@ public:
     /// to suppress a retry itself; a failed POST is logged by the caller and not retried here -
     /// Plan 30 adds the outbox that keeps it.
     void postSessionQuality(const QString& sessionId, const QJsonObject& report, Callback callback);
+
+    /// `POST /api/sessions/{session_id}/evidence` (ADR-0105): one `EvidenceCapsule` per call.
+    /// `body` is the compact JSON the evidence journal built (`EvidenceJournal::deliverable`); this
+    /// client sends it as given. Authenticated with the customer token. The caller applies the
+    /// answer with `EvidenceJournal::applyAnswer`, which owns the keep and drop policy, so nothing
+    /// here retries.
+    void postEvidence(const QString& sessionId, const QByteArray& body, Callback callback);
 
     /// `POST /api/sessions/{session_id}/stream-time` (ADR-0074 W04, contract 3.11.0): one stream
     /// segment of the caller's own session per call, authenticated with the customer token and

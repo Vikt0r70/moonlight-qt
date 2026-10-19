@@ -17,6 +17,8 @@
 // `wallet` + `live_session_id` + `open_topup_notice` + `signup_stage` together.
 
 #include <QByteArray>
+#include <QDateTime>
+#include <QElapsedTimer>
 #include <QMetaType>
 #include <QObject>
 #include <QString>
@@ -152,6 +154,11 @@ signals:
     /// `stream.hello`. `aliveMs` is `alive_ms` when the hello named it, 0 when it did not (L3:
     /// the dead-stream timeout is enforced only when this is present).
     void hello(int aliveMs);
+
+    /// `stream.hello`'s `server_time` (`openapi.yaml`), parsed as a UTC instant, emitted right
+    /// after `hello()` and only when the hello carried a well-formed one. Evidence only
+    /// (ADR-0105): the facade buckets its distance from the local clock and nothing else reads it.
+    void serverTime(const QDateTime& serverUtc);
     /// `stream.alive` - the hub's own probe (ADR-0067 decision 2), distinct from the transport's
     /// `: ping` comment, which proves only TCP.
     void alive();
@@ -217,6 +224,8 @@ private:
     /// Consecutive failed-to-stay-live attempts; feeds `reconnectDelayMs`'s exponential term and
     /// resets to 0 once a connection has stayed live 60 s (L4).
     int m_attempt = 0;
+    /// Started by every `beginConnection()`; only the elapsed milliseconds in the log lines read it.
+    QElapsedTimer m_connectionTimer;
 
     QTimer* m_deadStreamTimer = nullptr;
     QTimer* m_pausedTimer = nullptr;

@@ -96,6 +96,17 @@ private slots:
     void searchableReference_isTheFormTheConsoleSearchResolves();
     void everyFailureKindCarriesOnlyASearchableReference();
     void errorScreen_neverDrawsAReferenceThatIsNotOne();
+
+    // T026 / ADR-0096: the presentation key is derived from observed evidence only.
+    void endPresentation_isConnectionLostOnlyForAStartedStreamWithANativeFault_data();
+    void endPresentation_isConnectionLostOnlyForAStartedStreamWithANativeFault();
+    void endPresentation_isCancelledOnlyWhenNothingStartedAndNothingFailed();
+    void endPresentation_keepsAnActualFailedStartUnknown();
+    void nativeMinus102MatchesServerUnknown();
+
+    // T062 / ADR-0104: the firewall sentence needs a conclusive failed port test.
+    void engineStageMessage_firewallSentenceOnlyForAConclusiveFailure();
+    void mapPortTestFailure_honoursItsArgument();
 };
 
 void TstErrorMap::initTestCase()
@@ -446,6 +457,125 @@ void TstErrorMap::errorScreen_neverDrawsAReferenceThatIsNotOne()
     QVERIFY(referenceRow);
     QVERIFY2(!referenceRow->property("visible").toBool(),
              "no reference row at all rather than a label with nothing after it");
+}
+
+void TstErrorMap::endPresentation_isConnectionLostOnlyForAStartedStreamWithANativeFault_data()
+{
+    QTest::addColumn<int>("code");
+    QTest::addColumn<QString>("expected");
+    QTest::newRow("no video traffic (-100)") << -100 << "connection_lost";
+    QTest::newRow("no video frame (-101)") << -101 << "connection_lost";
+    QTest::newRow("unexpected early termination (-102)") << -102 << "unknown";
+    QTest::newRow("graceful (0)") << 0 << "unknown";
+    QTest::newRow("protected content (-103)") << -103 << "unknown";
+    QTest::newRow("frame conversion (-104)") << -104 << "unknown";
+    QTest::newRow("some other code") << 5 << "unknown";
+}
+
+void TstErrorMap::endPresentation_isConnectionLostOnlyForAStartedStreamWithANativeFault()
+{
+    QFETCH(int, code);
+    QFETCH(QString, expected);
+    EndEvidence evidence;
+    evidence.streamStarted = true;
+    evidence.engineFailed = false;
+    evidence.nativeFault = true;
+    evidence.nativeFaultCode = code;
+    QCOMPARE(deriveEndPresentation(evidence), expected);
+
+    // The same code without the stream having started is not a lost connection.
+    evidence.streamStarted = false;
+    evidence.engineFailed = true;
+    QCOMPARE(deriveEndPresentation(evidence), QStringLiteral("unknown"));
+
+    // A started stream with no native fault at all (a generic quit) stays unknown.
+    EndEvidence quiet;
+    quiet.streamStarted = true;
+    QCOMPARE(deriveEndPresentation(quiet), QStringLiteral("unknown"));
+}
+
+void TstErrorMap::endPresentation_isCancelledOnlyWhenNothingStartedAndNothingFailed()
+{
+    EndEvidence evidence;
+    evidence.streamStarted = false;
+    evidence.engineFailed = false;
+    QCOMPARE(deriveEndPresentation(evidence), QStringLiteral("cancelled"));
+}
+
+void TstErrorMap::endPresentation_keepsAnActualFailedStartUnknown()
+{
+    EndEvidence evidence;
+    evidence.streamStarted = false;
+    evidence.engineFailed = true;
+    QCOMPARE(deriveEndPresentation(evidence), QStringLiteral("unknown"));
+}
+
+// T075 / F5: the shared counterexample of the server's
+// `test_absent_ambiguous_or_generic_evidence_is_unknown_never_manual` (seathub-control
+// tests/test_end_outcomes.py): a completed CUSTOMER_ENDED session, stage streaming, engine_error
+// -102 and no independent supported loss evidence is `unknown`. ADR-0096 and timeline.py limit
+// native loss to {-100, -101}; -102 alone must never become `connection_lost` in the client either.
+void TstErrorMap::nativeMinus102MatchesServerUnknown()
+{
+    EndEvidence evidence;
+    evidence.streamStarted = true;
+    evidence.engineFailed = false;
+    evidence.nativeFault = true;
+    evidence.nativeFaultCode = -102;
+    QCOMPARE(deriveEndPresentation(evidence), QStringLiteral("unknown"));
+
+    // The approved native set is untouched: -100 and -101 still lose the connection.
+    for (const int supported : { -100, -101 }) {
+        evidence.nativeFaultCode = supported;
+        QCOMPARE(deriveEndPresentation(evidence), QStringLiteral("connection_lost"));
+    }
+}
+
+void TstErrorMap::engineStageMessage_firewallSentenceOnlyForAConclusiveFailure()
+{
+    const QString bare = QStringLiteral("Starting RTSP handshake failed: Error 10060");
+    const QString withSentence =
+        bare + QStringLiteral("\n\nCheck your firewall and port forwarding rules for port(s): "
+                              "TCP 48010");
+
+    PortTestResult failed;
+    failed.outcome = PortTestResult::Outcome::Failed;
+    failed.failedMask = 0x10;
+    QCOMPARE(engineStageMessage(QStringLiteral("RTSP handshake"), 10060,
+                                QStringLiteral("TCP 48010"), failed),
+             withSentence);
+
+    // A clean, an inconclusive and a not-run test must not blame the customer's firewall.
+    PortTestResult clean;
+    clean.outcome = PortTestResult::Outcome::Clean;
+    PortTestResult inconclusive;
+    inconclusive.outcome = PortTestResult::Outcome::Inconclusive;
+    const PortTestResult notRun;
+    for (const PortTestResult& result : { clean, inconclusive, notRun }) {
+        QCOMPARE(engineStageMessage(QStringLiteral("RTSP handshake"), 10060,
+                                    QStringLiteral("TCP 48010"), result),
+                 bare);
+    }
+
+    // A failed test with no failing ports names no ports, so there is nothing to append.
+    QCOMPARE(engineStageMessage(QStringLiteral("RTSP handshake"), 10060, QString(), failed), bare);
+}
+
+void TstErrorMap::mapPortTestFailure_honoursItsArgument()
+{
+    // The mapped failure stays the generic copy: this task adds no new string. The classified
+    // result travels only in the diagnostic, which never reaches the view model.
+    const SeatHubFailure failed = mapPortTestFailure(0x10);
+    const SeatHubFailure clean = mapPortTestFailure(0);
+    const SeatHubFailure inconclusive = mapPortTestFailure(static_cast<int>(0xFFFFFFFFu));
+    QCOMPARE(failed.error, SeatHubFailure::generic().error);
+    QCOMPARE(clean.error, SeatHubFailure::generic().error);
+    QCOMPARE(inconclusive.error, SeatHubFailure::generic().error);
+    QVERIFY(failed.diagnostic.contains(QStringLiteral("failed")));
+    QVERIFY(clean.diagnostic.contains(QStringLiteral("clean")));
+    QVERIFY(inconclusive.diagnostic.contains(QStringLiteral("inconclusive")));
+    QVERIFY(failed.diagnostic != clean.diagnostic);
+    QVERIFY(clean.diagnostic != inconclusive.diagnostic);
 }
 
 QTEST_MAIN(TstErrorMap)

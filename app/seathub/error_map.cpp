@@ -1,5 +1,6 @@
 #include "error_map.h"
 
+#include <QJsonDocument>
 #include <QRegularExpression>
 
 namespace {
@@ -170,11 +171,13 @@ SeatHubFailure mapLaunchError(const QString& text)
     return f;
 }
 
-QString engineStageMessage(const QString& stage, int errorCode, const QString& failingPorts)
+QString engineStageMessage(const QString& stage, int errorCode, const QString& failingPorts,
+                           const PortTestResult& portTest)
 {
-    // Upstream `app/gui/StreamSegue.qml` `stageFailed()`, word for word.
+    // Upstream `app/gui/StreamSegue.qml` `stageFailed()`, word for word, except that the firewall
+    // sentence waits for a conclusive port-test failure (ADR-0104).
     QString text = QStringLiteral("Starting %1 failed: Error %2").arg(stage).arg(errorCode);
-    if (!failingPorts.isEmpty()) {
+    if (!failingPorts.isEmpty() && showFirewallSentence(portTest)) {
         text += QStringLiteral("\n\nCheck your firewall and port forwarding rules for port(s): %1")
                     .arg(failingPorts);
     }
@@ -195,8 +198,14 @@ SeatHubFailure engineTextFailure(const QString& text)
 
 SeatHubFailure mapPortTestFailure(int portTestResult)
 {
-    Q_UNUSED(portTestResult);
-    return SeatHubFailure::generic();
+    // The int is `Session::sessionFinished`'s `m_PortTestResults`, which only exists because a test
+    // ran, so it classifies with any non-zero request. The customer sentence stays the generic one;
+    // the classified result is kept in `diagnostic` (never rendered) for the log and support.
+    const PortTestResult classified = classifyPortTest(
+        1u, static_cast<unsigned int>(portTestResult), 0xFFFFFFFFu);
+    SeatHubFailure f = SeatHubFailure::generic();
+    f.diagnostic = QString::fromUtf8(QJsonDocument(portTestJson(classified)).toJson(QJsonDocument::Compact));
+    return f;
 }
 
 // ---------------------------------------------------------------------------
@@ -231,4 +240,26 @@ SeatHubFailure mapEndBlame(const QString& blame, const QString& reference)
     }
 
     return f;
+}
+
+// ---------------------------------------------------------------------------
+// ADR-0096: the derived end presentation. The codes are moonlight-common-c's own
+// `ML_ERROR_NO_VIDEO_TRAFFIC` (-100), `ML_ERROR_NO_VIDEO_FRAME` (-101): the
+// connection stopped delivering. `ML_ERROR_UNEXPECTED_EARLY_TERMINATION` (-102) is deliberately
+// not in the set: ADR-0096 and the control plane's timeline.py limit native loss to {-100, -101},
+// so -102 alone stays `unknown` here exactly as it does on the server. Graceful (0), protected
+// content (-103), frame conversion (-104) and any other code name a host or local cause, not a lost
+// connection, so they stay `unknown`.
+// ---------------------------------------------------------------------------
+
+QString deriveEndPresentation(const EndEvidence& evidence)
+{
+    if (evidence.streamStarted && evidence.nativeFault
+        && evidence.nativeFaultCode >= -101 && evidence.nativeFaultCode <= -100) {
+        return QStringLiteral("connection_lost");
+    }
+    if (!evidence.streamStarted && !evidence.engineFailed) {
+        return QStringLiteral("cancelled");
+    }
+    return QStringLiteral("unknown");
 }
