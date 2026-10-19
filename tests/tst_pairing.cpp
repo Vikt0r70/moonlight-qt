@@ -3327,6 +3327,220 @@ private slots:
         QCOMPARE(report.count(), 1);
     }
 
+    // -----------------------------------------------------------------------------------------
+    // T074 (review finding F3): the first attempt and the retry decision are published to the
+    // generation's shared progress BEFORE the retry blocks, so a deadline (or a later generation)
+    // that speaks for a blocked retry still reports them. Every wait is on the effect itself: the
+    // semaphore the retry handshake releases the moment it is entered, then the delivered result.
+    // The deadline is long enough (1 s) that the first attempt and the retry decision always land
+    // inside it, even on a loaded PC.
+    // -----------------------------------------------------------------------------------------
+
+    void firstFailureBlockedRetryDeadlineKeepsProgress()
+    {
+        ProductionPairingSeam seam;
+        seam.setDeadlineMs(1000);
+        QSemaphore retryEntered;
+        QSemaphore retryGate;
+        std::atomic<int> handshakes{0};
+        std::atomic<int> cancels{0};
+        seam.setHandshake([&](const PairingTarget&) {
+            if (++handshakes == 1) {
+                PairingHandshakeResult rejected;
+                rejected.engineError = QStringLiteral("the rig rejected the pairing PIN");
+                rejected.attemptStep = QStringLiteral("pair_handshake");
+                rejected.stepClass = QStringLiteral("pin_rejected");
+                return rejected;
+            }
+            retryEntered.release();
+            retryGate.acquire();
+            // A late, proper worker result: it must not overwrite the deadline's record.
+            return handshakeResult(true, QStringLiteral("late-identity"));
+        });
+        seam.setCancelRequest([&](const QString&, int) {
+            ++cancels;
+            return true;
+        });
+
+        QSignalSpy classified(&seam, &ProductionPairingSeam::handshakeClassified);
+        QSignalSpy resolved(&seam, &ProductionPairingSeam::hostResolved);
+        QVector<PairingHandshakeResult> sunk;
+        seam.setAttemptSink([&sunk](const PairingHandshakeResult& r) { sunk.append(r); });
+        const auto release = qScopeGuard([&retryGate]() { retryGate.release(10); });
+
+        SeamReport report;
+        seam.pair(pairingTarget(), recordInto(&report));
+        QVERIFY(retryEntered.tryAcquire(1, 5000));
+        QTRY_COMPARE_WITH_TIMEOUT(report.count(), 1, 10000);
+
+        QCOMPARE(report.outcomes.first(), false);
+        QVERIFY(report.identities.first().isEmpty());
+        QCOMPARE(classified.count(), 1);
+        QCOMPARE(sunk.size(), 1);
+        const PairingHandshakeResult delivered =
+            classified.at(0).at(0).value<PairingHandshakeResult>();
+        QVERIFY(!delivered.ok);
+        QVERIFY(delivered.engineError.contains(QStringLiteral("did not finish")));
+        // The deadline spoke for the retry, which had not answered: no final class of its own...
+        QVERIFY(delivered.attemptStep.isEmpty());
+        QVERIFY(delivered.stepClass.isEmpty());
+        // ...but the first failure and the actual retry stay on the record.
+        QCOMPARE(delivered.attempts, 2);
+        QCOMPARE(delivered.firstOutcome, QStringLiteral("failure"));
+        QCOMPARE(delivered.firstAttemptStep, QStringLiteral("pair_handshake"));
+        QCOMPARE(delivered.firstStepClass, QStringLiteral("pin_rejected"));
+        QVERIFY(delivered.retried);
+        QCOMPARE(delivered.retryReason, QStringLiteral("failure"));
+        QVERIFY(delivered.pinShapeOk);
+        QVERIFY(delivered.handshakeMs >= 0);
+        QCOMPARE(sunk.first().firstStepClass, QStringLiteral("pin_rejected"));
+        QVERIFY(sunk.first().retried);
+        QCOMPARE(seam.lastResult().firstStepClass, QStringLiteral("pin_rejected"));
+        const QString pin = QString::fromLatin1(kPin);
+        QVERIFY(!delivered.engineError.contains(pin) && !delivered.firstOutcome.contains(pin)
+                && !delivered.firstAttemptStep.contains(pin) && !delivered.firstStepClass.contains(pin)
+                && !delivered.retryReason.contains(pin));
+
+        // The late worker finishes now: nothing new is reported, and it never retries again.
+        retryGate.release();
+        QVERIFY(QThreadPool::globalInstance()->waitForDone(10000));
+        QTest::qWait(50);
+        QCOMPARE(handshakes.load(), 2);
+        QCOMPARE(cancels.load(), 1);
+        QCOMPARE(report.count(), 1);
+        QCOMPARE(classified.count(), 1);
+        QCOMPARE(sunk.size(), 1);
+        QCOMPARE(resolved.count(), 0);
+        QCOMPARE(seam.lastResult().firstStepClass, QStringLiteral("pin_rejected"));
+        QVERIFY(seam.lastResult().engineError.contains(QStringLiteral("did not finish")));
+    }
+
+    void firstFailureBlockedRetryCancelReportsNothingAndKeepsNoProgress()
+    {
+        ProductionPairingSeam seam;
+        seam.setDeadlineMs(1000);
+        QSemaphore retryEntered;
+        QSemaphore retryGate;
+        std::atomic<int> handshakes{0};
+        seam.setHandshake([&](const PairingTarget&) {
+            if (++handshakes == 1) {
+                PairingHandshakeResult rejected;
+                rejected.attemptStep = QStringLiteral("pair_handshake");
+                rejected.stepClass = QStringLiteral("pin_rejected");
+                return rejected;
+            }
+            retryEntered.release();
+            retryGate.acquire();
+            return handshakeResult(true, QStringLiteral("cancelled-late-identity"));
+        });
+        seam.setCancelRequest([](const QString&, int) { return true; });
+
+        QSignalSpy classified(&seam, &ProductionPairingSeam::handshakeClassified);
+        QSignalSpy resolved(&seam, &ProductionPairingSeam::hostResolved);
+        int sinkCalls = 0;
+        seam.setAttemptSink([&sinkCalls](const PairingHandshakeResult&) { ++sinkCalls; });
+        const auto release = qScopeGuard([&retryGate]() { retryGate.release(10); });
+
+        const PairingTarget target = pairingTarget();
+        SeamReport report;
+        seam.pair(target, recordInto(&report));
+        QVERIFY(retryEntered.tryAcquire(1, 5000));
+
+        // Cancelling abandons the generation: no completion, with or without a late worker.
+        seam.clearPendingPairing(target);
+        retryGate.release();
+        QVERIFY(QThreadPool::globalInstance()->waitForDone(10000));
+        QTest::qWait(50);
+        QCOMPARE(handshakes.load(), 2);
+        QCOMPARE(report.count(), 0);
+        QCOMPARE(classified.count(), 0);
+        QCOMPARE(resolved.count(), 0);
+        QCOMPARE(sinkCalls, 0);
+
+        // The abandoned run's progress is gone: the next Play starts from a clean record.
+        SeamReport next;
+        seam.setHandshake([](const PairingTarget&) {
+            return handshakeResult(true, QStringLiteral("next-identity"));
+        });
+        seam.pair(target, recordInto(&next));
+        QTRY_COMPARE_WITH_TIMEOUT(next.count(), 1, 5000);
+        QCOMPARE(classified.count(), 1);
+        const PairingHandshakeResult delivered =
+            classified.at(0).at(0).value<PairingHandshakeResult>();
+        QCOMPARE(delivered.firstOutcome, QStringLiteral("success"));
+        QVERIFY(delivered.firstStepClass.isEmpty());
+        QVERIFY(!delivered.retried);
+        QCOMPARE(delivered.attempts, 1);
+    }
+
+    void firstFailureBlockedRetryReplacedGenerationDoesNotLeakProgress()
+    {
+        ProductionPairingSeam seam;
+        seam.setDeadlineMs(1000);
+        QSemaphore retryEntered;
+        QSemaphore retryGate;
+        QSemaphore secondGate;
+        std::atomic<int> firstSessionHandshakes{0};
+        seam.setHandshake([&](const PairingTarget& target) {
+            if (target.sessionId == QLatin1String("session-a")) {
+                if (++firstSessionHandshakes == 1) {
+                    PairingHandshakeResult rejected;
+                    rejected.attemptStep = QStringLiteral("pair_handshake");
+                    rejected.stepClass = QStringLiteral("pin_rejected");
+                    return rejected;
+                }
+                retryEntered.release();
+                retryGate.acquire();
+                return handshakeResult(false, QString(), QStringLiteral("stale-a"));
+            }
+            // The newer generation's first attempt never answers inside its own deadline.
+            secondGate.acquire();
+            return handshakeResult(true, QStringLiteral("late-b"));
+        });
+        seam.setCancelRequest([](const QString&, int) { return true; });
+
+        QSignalSpy classified(&seam, &ProductionPairingSeam::handshakeClassified);
+        int sinkCalls = 0;
+        seam.setAttemptSink([&sinkCalls](const PairingHandshakeResult&) { ++sinkCalls; });
+        const auto release = qScopeGuard([&]() {
+            retryGate.release(10);
+            secondGate.release(10);
+        });
+
+        PairingTarget targetA = pairingTarget();
+        targetA.sessionId = QStringLiteral("session-a");
+        PairingTarget targetB = pairingTarget();
+        targetB.sessionId = QStringLiteral("session-b");
+        SeamReport reportA;
+        SeamReport reportB;
+
+        seam.pair(targetA, recordInto(&reportA));
+        QVERIFY(retryEntered.tryAcquire(1, 5000));
+        seam.pair(targetB, recordInto(&reportB));
+        QTRY_COMPARE_WITH_TIMEOUT(reportB.count(), 1, 10000);
+
+        // B's deadline speaks for B alone: A's first failure and retry are not B's.
+        QCOMPARE(reportB.outcomes.first(), false);
+        QCOMPARE(classified.count(), 1);
+        const PairingHandshakeResult delivered =
+            classified.at(0).at(0).value<PairingHandshakeResult>();
+        QCOMPARE(delivered.attempts, 1);
+        QCOMPARE(delivered.firstOutcome, QStringLiteral("failure"));
+        QVERIFY(delivered.firstAttemptStep.isEmpty());
+        QVERIFY(delivered.firstStepClass.isEmpty());
+        QVERIFY(!delivered.retried);
+        QVERIFY(delivered.retryReason.isEmpty());
+
+        retryGate.release();
+        secondGate.release();
+        QVERIFY(QThreadPool::globalInstance()->waitForDone(10000));
+        QTest::qWait(50);
+        QCOMPARE(reportA.count(), 0);
+        QCOMPARE(reportB.count(), 1);
+        QCOMPARE(classified.count(), 1);
+        QCOMPARE(sinkCalls, 1);
+    }
+
     void sc18_theControllerMarksOnlyAnActiveSessionAsReconnecting()
     {
         struct Case { const char* name; const char* state; QJsonValue warm; bool present; bool reconnecting; bool warmReturn; };

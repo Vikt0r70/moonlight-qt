@@ -37,6 +37,7 @@
 #include <QTimer>
 
 #include <functional>
+#include <memory>
 
 #include "engine_session.h"
 #include "pairing_controller.h"
@@ -109,6 +110,13 @@ struct PairingHandshakeResult
 // Declared for the same reason as `SeatHubFailure` and `TeardownStage`: the handshake result
 // crosses the thread-pool boundary as a queued connection, which needs a registered metatype.
 Q_DECLARE_METATYPE(PairingHandshakeResult)
+
+/// What one `pair()` call's worker has settled so far (T074): the first attempt's closed outcome and
+/// the actual retry decision, published BEFORE the retry blocks so a deadline that speaks for the
+/// blocked worker still reports them. One object per `pair()` call, shared by that call's worker and
+/// the seam, so it is generation-bound by construction. Holds no PIN, salt or hash. Defined in
+/// `pairing_seam.cpp`.
+struct PairingProgress;
 
 /// The SHA-256 fingerprint of a certificate in PEM form, lowercase hex, or empty when the PEM is
 /// empty or cannot be parsed.
@@ -271,6 +279,9 @@ private:
     /// G-06.2-2). An atomic the worker outlives the object with, never a raw `this` (the plan's
     /// T-06.2-12-02 mitigation for the loop-spin and lifetime hazards).
     std::shared_ptr<std::atomic<quint64>> m_currentGeneration;
+    /// The current `pair()` call's progress (T074): replaced by every `pair()`, so the deadline and
+    /// `finish()` never read a superseded generation's record.
+    std::shared_ptr<PairingProgress> m_progress;
     QTimer* m_deadline = nullptr;
     int m_deadlineMs = kDeadlineMs;
     /// Started by `pair()` beside the deadline: `handshakeMs` and the retry's remaining budget.
