@@ -7,3 +7,7 @@ The R1 customer candidate bump commit sits on the local branch `seathub-r1-bump-
 R2-VERSION: 0.1.31 r1=0.1.30
 
 Chosen at execution on 2026-10-19: 0.1.31 is the next patch above the newest published release, `seathub-v0.1.30` (`gh release list --repo Vikt0r70/moonlight-qt` and `git ls-remote --tags`, which point at commit 760c82cfbabb450187c9357faf3df7a3a6a9a928, the R1 receipt's bump= above), and above the R1 client version 0.1.30 in T013's r1-release.md (`CUSTOMER-SERVED-VERSION: 0.1.30`). No `seathub-v0.1.31` tag exists. Nothing was built, tagged or published here.
+
+R2-REPAIR-VERSION: 0.1.32 prior=0.1.31 r1=0.1.30
+
+Chosen at execution on 2026-10-19 by T083, the Setup-file description repair (the published `RentaPC-Setup.exe` described itself as `RentaPC setup` where ADR-0092 inventory row 53 approves `RentaPC`). 0.1.32 is the next patch above the newest published release, `seathub-v0.1.31` (`git ls-remote --tags origin "seathub-v0.1.*"` newest tag, and `gh release list --repo Vikt0r70/moonlight-qt` lists SeatHub 0.1.31 as Latest, published 2026-10-19T16:43:12Z), and above the R1 client version 0.1.30. No `seathub-v0.1.32` tag exists locally or on origin. The R2-VERSION record above is kept as it was: 0.1.31 was the first R2 candidate and is already published, so this record is the repair version, not a replacement. Nothing was built, tagged or published by this record.
