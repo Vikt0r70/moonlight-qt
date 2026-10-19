@@ -37,11 +37,17 @@ DEFINES += FORK_ROOT=\\\"$$PWD/..\\\"
 # upstream class links as unresolved externals.
 SOURCES += tst_ui_screens.cpp \
     ../app/seathub/agent_config.cpp \
+    ../app/seathub/reporting_consent.cpp \
     ../app/seathub/settings_bridge.cpp \
     ../app/settings/streamingpreferences.cpp \
     ../app/wm.cpp
 
+# ADR-0107: SettingsPage.qml imports the ReportingConsent singleton, so the suite builds the real one
+# (registered by registerTokenSingletons) rather than a stand-in. reporting_consent.cpp moc-processes
+# its own Q_OBJECT; the header-only store comes with it.
 HEADERS += ../app/seathub/agent_config.h \
+    ../app/seathub/reporting_consent.h \
+    ../app/seathub/reporting_consent_store.h \
     ../app/seathub/settings_bridge.h \
     ../app/seathub/stats_catalogue.h \
     ../app/settings/streamingpreferences.h \

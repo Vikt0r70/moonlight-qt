@@ -258,6 +258,7 @@ SOURCES += \
     seathub/engine_status.cpp \
     seathub/attempt_vocab.cpp \
     seathub/quality_outbox.cpp \
+    seathub/reporting_consent.cpp \
     seathub/end_outbox.cpp \
     seathub/evidence_journal.cpp \
     seathub/stream_quality_sampler.cpp \
@@ -340,6 +341,8 @@ HEADERS += \
     seathub/engine_status.h \
     seathub/attempt_vocab.h \
     seathub/quality_outbox.h \
+    seathub/reporting_consent.h \
+    seathub/reporting_consent_store.h \
     seathub/end_outbox.h \
     seathub/evidence_journal.h \
     seathub/stream_quality_sampler.h \

@@ -24,6 +24,7 @@
 #include "osd_compositor.h"
 #include "quality_outbox.h"
 #include "region.h"
+#include "reporting_consent.h"
 #include "session_lifecycle.h"
 #include "settings_bridge.h"
 #include "stream_stats.h"
@@ -1524,6 +1525,11 @@ void SeatHubClient::deliverEvidence()
         }
         accountId = m_evidenceAccountId;
     }
+    // ADR-0107: a covered upload. Checked per send so a switch-off stops it at once; the capsules
+    // stay pending in the journal and go out when the customer turns it back on.
+    if (!ReportingConsent::coveredUploadsAllowed()) {
+        return;
+    }
     const QList<EvidenceJournal::PendingCapsule> capsules = m_journal.deliverable(accountId);
     if (capsules.isEmpty()) {
         return;
@@ -2825,7 +2831,9 @@ void SeatHubClient::drainStreamTimeOutbox()
 
 void SeatHubClient::drainQualityOutbox()
 {
-    if (m_accountId.isEmpty() || !m_controlPlane->hasAccessToken()) {
+    // ADR-0107: stream quality reports are a covered upload; queued files stay on disk while off.
+    if (m_accountId.isEmpty() || !m_controlPlane->hasAccessToken()
+        || !ReportingConsent::coveredUploadsAllowed()) {
         return;
     }
 

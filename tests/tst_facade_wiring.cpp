@@ -75,6 +75,8 @@
 #include "seathub/moonlight_engine_session.h"
 #include "seathub/pairing_handshake.h"
 #include "seathub/port_test_relay.h"
+#include "seathub/quality_outbox.h"
+#include "seathub/reporting_consent.h"
 #include "seathub/seathub_client.h"
 #include "seathub/session_lifecycle.h"
 #include "seathub/teardown_controller.h"
@@ -1471,6 +1473,8 @@ private slots:
         SeatHubTelemetry::clearUser();
         SeatHubTelemetry::clearSession();
         SeatHubTelemetry::clearTrace();
+        // ADR-0107: the covered-upload switch is process-global; every test starts unloaded.
+        ReportingConsent::setStateForTests(false, reporting_consent_store::Record{});
         // The engine's own start-up state for its Debug (stats) overlay (upstream default: hidden).
         StreamingPreferences::get()->showPerformanceOverlay = false;
     }
@@ -4630,13 +4634,18 @@ private slots:
             QCOMPARE(sent.value(QStringLiteral("failed")).toBool(), false);
 
             if (presentation == QLatin1String("connection_lost")) {
-                QVERIFY(client.endReasonText().startsWith(
-                    QStringLiteral("Your connection was lost, so the session ended.")));
+                QTRY_VERIFY_WITH_TIMEOUT(
+                    client.endReasonText().startsWith(
+                        QStringLiteral("Your connection was lost, so the session ended.")),
+                    10000);
             }
             else {
-                // A raw CUSTOMER_ENDED never claims who ended it.
-                QCOMPARE(client.endReasonText(),
-                         QStringLiteral("The session ended. Unused minutes stay in your account."));
+                // A raw CUSTOMER_ENDED never claims who ended it. The text is set by the async
+                // session read after teardown, so wait on that effect itself.
+                QTRY_COMPARE_WITH_TIMEOUT(
+                    client.endReasonText(),
+                    QStringLiteral("The session ended. Unused minutes stay in your account."),
+                    10000);
             }
             QCOMPARE(capture.named(QStringLiteral("play.summary")).size(), 1);
 
@@ -5067,7 +5076,8 @@ private slots:
         QTRY_VERIFY_WITH_TIMEOUT(!client.retryBusy(), 15000);
         QTRY_COMPARE_WITH_TIMEOUT(m_fake->requestPaths().count(QStringLiteral("/api/sessions")), 1,
                                   15000);
-        QCOMPARE(client.appState(), QStringLiteral("connecting"));
+        // The request is counted before its reply moves the app on, so wait on the state itself.
+        QTRY_COMPARE_WITH_TIMEOUT(client.appState(), QStringLiteral("connecting"), 15000);
         // Pairing polls the NEW session, never the old one again - proof this was a fresh Play,
         // never a reattachment (which would have addressed "s-stages").
         QTRY_VERIFY_WITH_TIMEOUT(
@@ -5481,7 +5491,8 @@ private slots:
             QTRY_COMPARE_WITH_TIMEOUT(completed.count(), 1, 15000);
 
             QTRY_COMPARE_WITH_TIMEOUT(client.appState(), QStringLiteral("home"), 15000);
-            QCOMPARE(client.endReasonText(), expected);
+            // The text arrives with the session read, which can land just after Home does.
+            QTRY_COMPARE_WITH_TIMEOUT(client.endReasonText(), expected, 15000);
             // Fed by the session read, not by a socket: none was ever opened (ending a session closes
             // the channel, which is not opening it).
             QVERIFY(!client.sessionChannel()->isOpen());
@@ -8955,6 +8966,96 @@ private slots:
         const int delivered = m_fake->requestPaths().count(path);
         QTest::qWait(3500);
         QCOMPARE(m_fake->requestPaths().count(path), delivered);
+    }
+
+    // ADR-0107: evidence capsules are a covered upload. With reporting off nothing is posted and the
+    // capsule stays pending; sign-in (a functional call) is unaffected; switching it on sends it.
+    void aCapsuleStaysPendingWhileReportingIsOffAndIsSentWhenItIsSwitchedOn()
+    {
+        const QString path = QStringLiteral("/api/sessions/s-consent/evidence");
+        reporting_consent_store::Record record;
+        record.recorded = true;
+        record.send = false;
+        record.noticeVersion = reporting_consent_store::kCurrentNoticeVersion;
+        ReportingConsent::setStateForTests(true, record);
+
+        SeatHubClient client;
+        client.setReconnectJitterProvider([]() { return 0.0; });
+        reachHome(client, 90); // sign-in, /api/me and the wallet still work with reporting off
+        QVERIFY(!QTest::currentTestFailed());
+        QVERIFY(m_fake->requestPaths().contains(QStringLiteral("/api/me")));
+        m_fake->answerEvidence(200);
+        plantCapsule(QStringLiteral("s-consent"), accountAId());
+        QVERIFY(!QTest::currentTestFailed());
+
+        QMetaObject::invokeMethod(&client, "onNetworkBack");
+        QTest::qWait(500);
+        QCOMPARE(m_fake->requestPaths().count(path), 0);
+        QVERIFY2(capsuleOnDisk(QStringLiteral("s-consent")), "a capsule stays pending while off");
+
+        record.send = true;
+        ReportingConsent::setStateForTests(true, record);
+        QMetaObject::invokeMethod(&client, "onNetworkBack");
+        // The answer deletes the capsule on the network thread within a millisecond or two. Polling
+        // capsuleOnDisk() opens that file, and Windows refuses the delete while it is open, which
+        // left the capsule behind and made the client send it a second time. Let the post and its
+        // answer settle before the first poll.
+        QTRY_COMPARE_WITH_TIMEOUT(m_fake->requestPaths().count(path), 1, 15000);
+        QTest::qWait(300);
+        QTRY_VERIFY_WITH_TIMEOUT(!capsuleOnDisk(QStringLiteral("s-consent")), 15000);
+        QCOMPARE(m_fake->requestPaths().count(path), 1);
+    }
+
+    // ADR-0107: the quality outbox sends nothing while off, keeps its files, and a switch-off in the
+    // middle of a drain stops the rest of the chain at once.
+    void theQualityOutboxSendsNothingWhileReportingIsOffAndKeepsItsFiles()
+    {
+        const QString account = QStringLiteral("6f1c6f5e-3a1e-4b1e-9f2e-0f1a2b3c4d5e");
+        QualityOutbox outbox;
+        outbox.setDirectory(m_dir->path() + QStringLiteral("/quality-consent"));
+        outbox.put(QStringLiteral("aaaaaaaa-1111-1111-1111-111111111111"), account,
+                   QJsonObject{ { QStringLiteral("rtt_ms"), 12 } });
+        outbox.put(QStringLiteral("bbbbbbbb-2222-2222-2222-222222222222"), account,
+                   QJsonObject{ { QStringLiteral("rtt_ms"), 14 } });
+
+        reporting_consent_store::Record record;
+        record.recorded = true;
+        record.send = false;
+        record.noticeVersion = reporting_consent_store::kCurrentNoticeVersion;
+        ReportingConsent::setStateForTests(true, record);
+
+        int posts = 0;
+        bool switchOffAfterFirst = false;
+        const auto post = [&](const QString&, const QJsonObject&, ControlPlaneClient::Callback callback) {
+            ++posts;
+            if (switchOffAfterFirst) {
+                reporting_consent_store::Record off = record;
+                off.send = false;
+                ReportingConsent::setStateForTests(true, off);
+            }
+            ControlPlaneResult delivered;
+            delivered.ok = true;
+            delivered.statusCode = 200;
+            callback(delivered);
+        };
+
+        outbox.drain(QStringLiteral("gen-1"), account, post);
+        QCOMPARE(posts, 0);
+        QVERIFY2(outbox.hasQueuedReports(), "off: the files stay queued");
+
+        record.send = true;
+        ReportingConsent::setStateForTests(true, record);
+        switchOffAfterFirst = true;
+        outbox.drain(QStringLiteral("gen-1"), account, post);
+        QCOMPARE(posts, 1); // the second file is not sent once the choice flips mid-drain
+        QVERIFY2(outbox.hasQueuedReports(), "the unsent file is still queued");
+
+        switchOffAfterFirst = false;
+        record.send = true;
+        ReportingConsent::setStateForTests(true, record);
+        outbox.drain(QStringLiteral("gen-1"), account, post);
+        QCOMPARE(posts, 2);
+        QVERIFY(!outbox.hasQueuedReports());
     }
 
     // T063 / ADR-0105: every End-outbox step is one closed log line; the payload, the retry and the

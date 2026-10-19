@@ -228,6 +228,9 @@ jobs:
       # ADR-0086: the deploy folder becomes the Velopack release - Setup.exe (per user, no administrator
       # prompt), the full package and releases.win.json. Runs after the scan above, so exactly what was
       # scanned is what is packed. Unsigned (D-43): "No signing parameters provided" is expected.
+      # ADR-0107: the script also builds the setup window (installer/bootstrapper) with the MSVC and Qt
+      # already installed above (qmake only, no Qt runtime in the result) and embeds vpk's Setup unchanged;
+      # the *-Setup.exe uploaded below is that outer program, and vpk's own Setup never enters the release folder.
       - name: Pack SeatHub with Velopack
         shell: pwsh
         run: ./scripts/pack-seathub.ps1

@@ -1,5 +1,7 @@
 #include "quality_outbox.h"
 
+#include "reporting_consent.h"
+
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
@@ -170,6 +172,10 @@ void QualityOutbox::drain(const QString& tokenGeneration, const QString& account
     if (tokenGeneration.isEmpty() || accountId.isEmpty() || !postFn) {
         return;
     }
+    // ADR-0107: quality reports are a covered upload. Files stay queued while it is off.
+    if (!ReportingConsent::coveredUploadsAllowed()) {
+        return;
+    }
     // "Stops sending until the next token is set": the same generation that already drew a
     // 401/403 is not retried.
     if (!m_blockedTokenGeneration.isEmpty() && m_blockedTokenGeneration == tokenGeneration) {
@@ -246,6 +252,15 @@ void QualityOutbox::drainFiles(const QStringList& files, int index, const QStrin
         noteEvent(QStringLiteral("dropped"), sessionId, QStringLiteral("none"), 1);
         QFile::remove(path);
         drainFiles(files, index + 1, tokenGeneration, accountId, postFn, generation);
+        return;
+    }
+
+    // Checked again per file: a switch-off while this drain walks its chain stops it at once and
+    // leaves this file and the rest queued (ADR-0107 effective time).
+    if (!ReportingConsent::coveredUploadsAllowed()) {
+        if (generation == m_drainGeneration) {
+            m_draining = false;
+        }
         return;
     }
 
