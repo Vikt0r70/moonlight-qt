@@ -16,8 +16,11 @@ This list was not written from memory. Each version was read off the binary that
 Where a version genuinely is not recorded by the artifact, this file says so rather than supplying a
 plausible one. That applies to `discord-rpc` below.
 
-The payload is the deploy folder the installer packages (`build/deploy-x64-release`): 46 DLLs, the
-client executable, and one data file.
+The payload is the deploy folder the installer packages (`build/deploy-x64-release`): the DLLs and
+plugins listed below, the client executable, the Velopack C library, `gamecontrollerdb.txt`, and the
+`licenses\` folder (`GPL-3.0.txt`, `WRITTEN-OFFER.txt`, `OpenSans-OFL.txt`). The same list, by file
+group with licence-text and source locations, is in [docs/licence-inventory.md](docs/licence-inventory.md),
+which also carries the licence readings that are still open.
 
 ## Shipped in the package
 
@@ -30,6 +33,9 @@ client executable, and one data file.
 - **Modules:** Core, Gui, Network, OpenGL, Qml, QmlMeta, QmlModels, QmlWorkerScript, Quick,
   QuickControls2 (+ Basic, BasicStyleImpl, FluentWinUI3StyleImpl, Impl, Material,
   MaterialStyleImpl), QuickEffects, QuickLayouts, QuickShapes, QuickTemplates2, Svg, WebSockets.
+  The last full deploy folder on the build machine (client 0.1.27) also holds `Qt6LabsFolderListModel`,
+  `Qt6QuickDialogs2`, `Qt6QuickDialogs2QuickImpl` and `Qt6QuickDialogs2Utils`, which `windeployqt`
+  pulls in from the QML imports; they are LGPL-3.0 Qt 6.11.2 modules like the rest.
 - **Plugins:** `platforms/`, `imageformats/`, `iconengines/`, `networkinformation/`, `tls/`,
   `qml/`, `translations/`.
 - **`opengl32sw.dll`** is Qt's bundled software OpenGL implementation, same license and source.
@@ -162,6 +168,22 @@ client executable, and one data file.
 - **Linked:** dynamically (`AntiHooking.dll`). It lives beside the client rather than inside it,
   which is also why `scripts/build-seathub.ps1` copies it into the deploy folder explicitly.
 
+### Velopack
+
+- **Version:** 1.2.161 (`velopack_libc` and the pinned `vpk` CLI, `scripts/build-seathub.ps1` and
+  `scripts/pack-seathub.ps1`)
+- **License:** MIT
+- **Source:** https://github.com/velopack/velopack
+- **Ships as:**
+  - `velopack_libc_win_x64_msvc.dll`, the C library the client calls to check for and apply updates,
+    beside `SeatHub.exe` (zip pinned by SHA-256 in the build script).
+  - `Update.exe` and the setup stub, which `vpk` adds when it builds the release. They are unchanged
+    vendor files, not RentaPC files, and stay unsigned.
+  - The Velopack Setup program embedded inside `RentaPC-Setup.exe`, the RentaPC setup window built
+    from `installer/bootstrapper` (RentaPC's own code, GPL-3.0).
+- Velopack's Rust helpers have their own third-party crates; their licences are not inventoried here
+  (see the open line in `docs/licence-inventory.md`).
+
 ### Microsoft Visual C++ runtime
 
 - **Files:** `concrt140.dll`, `msvcp140.dll`, `msvcp140_1.dll`, `msvcp140_2.dll`,
@@ -193,6 +215,7 @@ Pre-existing gap, not widened by this entry: upstream's own `ModeSeven.ttf` (the
 `OverlayManager` still falls back to when no rasteriser is set, `overlaymanager.cpp`'s
 `Path::readDataFile("ModeSeven.ttf")`) has never had its own SBOM row since this file was written
 in 03-06; it is not this plan's asset and this plan does not add, remove or modify it.
+`docs/licence-inventory.md` records it as an open licence reading.
 
 ## Statically linked into SeatHub.exe
 
@@ -225,10 +248,12 @@ commits above.
 
 - **GPL-3.0 applies to the whole distributed work**, because a GPL component
   (`moonlight-common-c`) is linked into the client statically and `AntiHooking.dll` is GPL. So the
-  package ships `GPL-3.0.txt` and the corresponding-source offer, and the installer shows both on
-  its license page — the offer is assembled into `installer/packages/com.seathub.client/meta/license.txt`
-  by `scripts/build-seathub.ps1` from `GPL-3.0.txt` and `installer/WRITTEN-OFFER.txt`. The license
-  file alone is **not** compliance: the offer is what makes the source reachable (Pitfall 9).
+  package ships `GPL-3.0.txt` and the corresponding-source offer as `licenses\GPL-3.0.txt` and
+  `licenses\WRITTEN-OFFER.txt` (copied from `installer/WRITTEN-OFFER.txt` by
+  `scripts/build-seathub.ps1`, whose deploy-folder check requires them). The Qt Installer Framework
+  licence page described in earlier versions of this file was replaced by the Velopack installer; the
+  installer window itself does not show these texts. The license file alone is **not** compliance:
+  the offer is what makes the source reachable (Pitfall 9).
 - **The written offer points at the fork repository**, which is why making
   `Vikt0r70/moonlight-qt` public was a release-prep blocker until it was done on 2026-09-20
   (OWNER-ACTIONS A-4): an offer that resolves for nobody satisfies no one. The repository is

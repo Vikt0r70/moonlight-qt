@@ -614,4 +614,4 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --target "$GITHUB_SHA" \
             --title "SeatHub $VERSION" \
-            --notes "SeatHub client $VERSION, built from ${GITHUB_SHA::7}. Setup.exe SHA-256: \`$sha\`. The same build the in-app update feed serves: Setup.exe, the full package and releases.win.json."
+            --notes "SeatHub client $VERSION, built from ${GITHUB_SHA::7}. Setup.exe SHA-256: \`$sha\`. The same build the in-app update feed serves: Setup.exe, the full package and releases.win.json. Code signing policy: https://github.com/${GITHUB_REPOSITORY}/blob/${GITHUB_SHA}/docs/code-signing-policy.md and https://rentapc.online/code-signing-policy. Privacy notice: https://github.com/${GITHUB_REPOSITORY}/blob/${GITHUB_SHA}/installer/PRIVACY-NOTICE.txt."
