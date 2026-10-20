@@ -12,6 +12,7 @@
 #include <atomic>
 #include <memory>
 
+#include "pairing_key.h"
 #include "pairing_recovery.h"
 #include "pairing_retry.h"
 
@@ -132,6 +133,9 @@ public:
             }
         }
         if (!warmReturned) {
+            // ADR-0109: this real pair attempt's key record is scoped to this session and attempt
+            // on this worker thread only, and the scope ends with the call.
+            seathub::PairingKeyLogScope keyScope(m_target.sessionId, m_generation);
             result = m_handshake(m_target);
         }
 
@@ -177,7 +181,11 @@ public:
                 // Neither the session, the rig address nor the PIN is part of this line.
                 qCInfo(seathubPairingSeam).noquote()
                     << QStringLiteral("pairing handshake retried once reason=%1").arg(token);
-                result = m_handshake(m_target);
+                {
+                    // ADR-0109: the retry is a separate real pair attempt with its own scope.
+                    seathub::PairingKeyLogScope keyScope(m_target.sessionId, m_generation);
+                    result = m_handshake(m_target);
+                }
                 // A second try of the same step in this Play is attempt 2 (ADR-0072 item 2).
                 result.attempts = 2;
                 result.retried = true;

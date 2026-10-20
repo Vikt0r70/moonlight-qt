@@ -71,6 +71,33 @@ jobs:
             exit 1
           fi
 
+      - name: Fail if app/backend/ changed beyond the ADR-0109 pairing key file
+        shell: bash
+        run: |
+          set -euo pipefail
+          # ADR-0109 grants exactly one backend path. The comparison is the whole path (-x -F), so
+          # a similar name such as nvpairingmanager.cpp.orig is refused. The exact added and
+          # removed lines are pinned by tests/tst_d28_boundary.cpp; this step refuses another
+          # path, an unmarked added line, and a missing FORK-CHANGES.md entry.
+          CHANGED=$(git diff --name-only v6.1.0..HEAD -- 'app/backend/*')
+          DISALLOWED=$(echo "$CHANGED" | grep -vxF 'app/backend/nvpairingmanager.cpp' | grep -v '^$' || true)
+          if [ -n "$DISALLOWED" ]; then
+            echo "::error::Disallowed backend file(s) modified outside ADR-0109's one path:"
+            echo "$DISALLOWED"
+            exit 1
+          fi
+          if [ -n "$CHANGED" ]; then
+            grep -qF 'app/backend/nvpairingmanager.cpp' FORK-CHANGES.md \
+              || { echo "::error::app/backend/nvpairingmanager.cpp changed but has no FORK-CHANGES.md entry"; exit 1; }
+            UNMARKED=$(git diff -U0 v6.1.0..HEAD -- app/backend/nvpairingmanager.cpp \
+              | grep -E '^\+' | grep -Ev '^\+\+\+' | grep -v 'ADR-0109' || true)
+            if [ -n "$UNMARKED" ]; then
+              echo "::error::nvpairingmanager.cpp gained line(s) with no ADR-0109 marker:"
+              echo "$UNMARKED"
+              exit 1
+            fi
+          fi
+
       - name: Fail if a line added to session.cpp has no SeatHub marker (ADR-0046, ADR-0104)
         shell: bash
         run: |
@@ -170,16 +197,17 @@ jobs:
         shell: pwsh
         run: ./scripts/build-seathub.ps1
 
-      # SC15: two suites that no earlier CI step ran. Named-suite mode builds each with the
-      # same Qt 6.11.2 and sentry-native 0.17.1 install the build above produced, and prints
-      # NAMED_SUITES_PASSED only when both pass.
-      - name: Run the telemetry and engine-boundary suites
+      # SC15: suites that no earlier CI step ran. Named-suite mode builds each with the same
+      # Qt 6.11.2 and sentry-native 0.17.1 install the build above produced, and prints
+      # NAMED_SUITES_PASSED only when all pass. tst_pairing_key (ADR-0109) proves the pairing key
+      # keeps a zero byte inside the digest.
+      - name: Run the telemetry, engine-boundary and pairing-key suites
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $out = (& cmd.exe /d /s /c 'tests\run-all-suites.cmd tst_telemetry tst_d28_boundary' 2>&1 | Out-String)
+          $out = (& cmd.exe /d /s /c 'tests\run-all-suites.cmd tst_telemetry tst_d28_boundary tst_pairing_key' 2>&1 | Out-String)
           Write-Host $out
-          if ($out -notmatch 'NAMED_SUITES_PASSED') { throw "tst_telemetry / tst_d28_boundary did not pass." }
+          if ($out -notmatch 'NAMED_SUITES_PASSED') { throw "tst_telemetry / tst_d28_boundary / tst_pairing_key did not pass." }
 
       # ADR-0063, D-01/SC-10, D-12: runs for every build. No DSN may ever be compiled into what
       # ships (a DSN can only submit events, but D-45 still forbids shipping one), and no PDB may

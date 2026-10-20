@@ -44,6 +44,7 @@
 #include "seathub/log_shipper.h"
 #include "seathub/log_tee.h"
 #include "seathub/pairing_controller.h"
+#include "seathub/pairing_key.h"
 #include "seathub/pairing_recovery.h"
 #include "seathub/pairing_seam.h"
 
@@ -3574,6 +3575,93 @@ private slots:
             QVERIFY2(seam->lastTarget.reconnecting == c.reconnecting, c.name);
             QVERIFY2(seam->lastTarget.warmReturn == c.warmReturn, c.name);
         }
+    }
+
+    // ADR-0109: the key record is written on the pair worker, once per real pair attempt, carries
+    // that attempt's own session and attempt number, and carries no PIN, salt, digest or key.
+    void pairingKeyContextIsAttemptScopedAndPrivate()
+    {
+        // Public synthetic vector: salt 00..04 and PIN 1234; the digest has a zero at index 9.
+        const QByteArray saltedPin = QByteArray::fromHex("00000000000000000000000000000004") + "1234";
+        const QByteArray digest = QCryptographicHash::hash(saltedPin, QCryptographicHash::Sha256);
+        const QString secretHex = QString::fromLatin1(digest.toHex());
+        const QString keyHex = QString::fromLatin1(digest.left(16).toHex());
+
+        // No scope on this thread: the helper derives the key and writes no record.
+        RawTeeCapture rawCapture;
+        QCOMPARE(seathub::derivePairingKey(saltedPin, QCryptographicHash::Sha256).size(), 16);
+        QCOMPARE(rawCapture.count(), 0);
+
+        ProductionPairingSeam seam;
+        std::atomic<int> handshakes{0};
+        QVector<int> keyLengths;
+        QMutex lock;
+        seam.setHandshake([&](const PairingTarget&) {
+            const QByteArray key = seathub::derivePairingKey(saltedPin, QCryptographicHash::Sha256);
+            {
+                QMutexLocker guard(&lock);
+                keyLengths.append(static_cast<int>(key.size()));
+            }
+            if (++handshakes == 1) {
+                PairingHandshakeResult rejected;
+                rejected.engineError = QStringLiteral("the rig rejected the pairing PIN");
+                rejected.attemptStep = QStringLiteral("pair_handshake");
+                rejected.stepClass = QStringLiteral("pin_rejected");
+                return rejected;
+            }
+            return handshakeResult(true, QStringLiteral("retry-identity"));
+        });
+        seam.setCancelRequest([&](const QString&, int) { return true; });
+
+        SeamReport report;
+        seam.pair(pairingTarget(), recordInto(&report));
+        QTRY_COMPARE_WITH_TIMEOUT(report.count(), 1, 5000);
+        QVERIFY(QThreadPool::globalInstance()->waitForDone(10000));
+        QCOMPARE(handshakes.load(), 2);
+        QCOMPARE(keyLengths, (QVector<int>{ 16, 16 }));
+
+        QStringList keyLines;
+        QStringList startLines;
+        const QStringList all = rawCapture.lines();
+        for (const QString& line : all) {
+            if (line.contains(QLatin1String("stage=key_material"))) {
+                keyLines.append(line);
+            } else if (line.contains(QLatin1String("stage=start"))) {
+                startLines.append(line);
+            }
+        }
+        // One record per real pair attempt: the first try and the single retry, nothing for the
+        // derivation made outside a pair attempt.
+        QCOMPARE(keyLines.size(), 2);
+        QCOMPARE(startLines.size(), 1);
+
+        // Both records name the session and the same seam attempt number as the start record.
+        QRegularExpression attemptPattern(QStringLiteral("client_attempt=(\\d+)"));
+        const QRegularExpressionMatch startMatch = attemptPattern.match(startLines.first());
+        QVERIFY(startMatch.hasMatch());
+        const QString attempt = startMatch.captured(1);
+        for (const QString& line : keyLines) {
+            QCOMPARE(line,
+                     QStringLiteral("pairing_instrumentation writer=client stage=key_material "
+                                    "session_id=%1 client_attempt=%2 aes_key_len=16 "
+                                    "digest_has_nul_in_first16=true")
+                         .arg(QString::fromLatin1(kSessionId), attempt));
+        }
+
+        // Private: none of the raw lines holds the PIN, the salt, the digest or the key.
+        const QStringList forbidden = { QString::fromLatin1(kPin), QStringLiteral("1234"),
+                                        QStringLiteral("00000000000000000000000000000004"),
+                                        secretHex, keyHex };
+        for (const QString& line : all) {
+            for (const QString& secret : forbidden) {
+                QVERIFY2(!line.contains(secret), "a pairing record leaked secret material");
+            }
+        }
+
+        // The scope ended with the call: a derivation after the pair adds no record.
+        const int before = rawCapture.count();
+        seathub::derivePairingKey(saltedPin, QCryptographicHash::Sha256);
+        QCOMPARE(rawCapture.count(), before);
     }
 };
 
