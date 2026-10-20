@@ -1,0 +1,231 @@
+name: r2-install-lifecycle (published RentaPC 0.1.33 default-location read-back and lifecycle)
+
+# Throwaway measurement only. Downloads the PUBLISHED RentaPC 0.1.33 Setup from the public release URL
+# and the PUBLISHED 0.1.32 Setup from its GitHub release, and on a disposable runner:
+#   A. installs 0.1.33 at the default location, reads back the sixteen customer fields, uninstalls;
+#   B. installs 0.1.32, seeds identity/data fixtures, runs the 0.1.33 Setup over it (update), runs it
+#      again (reinstall over), uninstalls and installs 0.1.33 fresh, comparing the state after each step;
+#   C. launches the installed client for a window-title readback, then uninstalls.
+# Builds nothing, publishes nothing, writes nothing outside the runner.
+
+on:
+  push:
+    branches: [seathub-r3-readback]
+
+permissions:
+  contents: read
+
+jobs:
+  measure:
+    runs-on: windows-latest
+    timeout-minutes: 40
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      SETUP_URL_031: https://api.rentapc.online/downloads/RentaPC-Setup.exe
+      SETUP_SHA256_031: a35548f40b5a289f3cb999323be7ed650d9e90b9b777b15b2da6e7c47772d8a4
+      SETUP_URL_030: https://github.com/Vikt0r70/moonlight-qt/releases/download/seathub-v0.1.32/RentaPC-Setup.exe
+      SETUP_SHA256_030: 8c99a9ead09e9b123afb81a8cbefdccfaa12cb544aae066e22a77a5b58d07e4b
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Download both published installers
+        run: |
+          . "$env:GITHUB_WORKSPACE\r2-readback\helpers.ps1"
+          New-Item -ItemType Directory -Force -Path $script:Out, (Split-Path $script:Setup030), (Split-Path $script:Setup031) | Out-Null
+          $r = Invoke-WebRequest -Uri $env:SETUP_URL_031 -OutFile $script:Setup031 -PassThru
+          Write-Host "0.1.33 HTTP $($r.StatusCode) cf-cache-status: $($r.Headers['cf-cache-status']) etag: $($r.Headers['ETag'])"
+          $r = Invoke-WebRequest -Uri $env:SETUP_URL_030 -OutFile $script:Setup030 -PassThru
+          Write-Host "0.1.32 HTTP $($r.StatusCode)"
+
+      - name: Verify both hashes
+        run: |
+          . "$env:GITHUB_WORKSPACE\r2-readback\helpers.ps1"
+          foreach ($pair in @(@($script:Setup031, $env:SETUP_SHA256_031), @($script:Setup030, $env:SETUP_SHA256_030))) {
+            $item = Get-Item -LiteralPath $pair[0]
+            $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $pair[0]).Hash.ToLowerInvariant()
+            Write-Host "$($pair[0]) bytes $($item.Length) sha256 $hash"
+            if ($hash -ne $pair[1]) { throw "sha256 mismatch for $($pair[0]): expected $($pair[1])" }
+          }
+
+      - name: Check the runner has no RentaPC install
+        run: |
+          . "$env:GITHUB_WORKSPACE\r2-readback\helpers.ps1"
+          $problems = @()
+          if (Test-Path -LiteralPath $script:Root) { $problems += "folder exists: $script:Root" }
+          foreach ($k in $script:ArpKey, 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\RentaPC', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\RentaPC') {
+            if (Test-Path -LiteralPath $k) { $problems += "key exists: $k" }
+          }
+          if (Test-Path -LiteralPath $script:SeedKey) { $problems += "key exists: $script:SeedKey" }
+          $lnks = Get-ChildItem -Path ([Environment]::GetFolderPath('Desktop')), ([Environment]::GetFolderPath('Programs')) -Recurse -Filter 'RentaPC*.lnk' -ErrorAction SilentlyContinue
+          if ($lnks) { $problems += "shortcut exists: $($lnks.FullName -join ', ')" }
+          if ($problems) { $problems | ForEach-Object { Write-Host "PRE-EXISTING: $_" }; throw 'runner is not clean' }
+          Write-Host "clean: no RentaPC folder, key or shortcut; LOCALAPPDATA=$env:LOCALAPPDATA"
+
+      - name: A1 Snapshot shortcuts before install
+        run: |
+          . "$env:GITHUB_WORKSPACE\r2-readback\helpers.ps1"
+          $shell = New-Object -ComObject WScript.Shell
+          $rows = foreach ($spec in @(@('user','desktop','Desktop'), @('common','desktop','CommonDesktopDirectory'), @('user','start_menu','Programs'), @('common','start_menu','CommonPrograms'))) {
+            $d = [Environment]::GetFolderPath($spec[2])
+            if ($d -and (Test-Path -LiteralPath $d)) {
+              Get-ChildItem -LiteralPath $d -Recurse -Filter '*.lnk' -ErrorAction SilentlyContinue | ForEach-Object {
+                [pscustomobject]@{ Scope = $spec[0]; Place = $spec[1]; FullName = $_.FullName; Name = $_.Name; TargetPath = [string]$shell.CreateShortcut($_.FullName).TargetPath }
+              }
+            }
+          }
+          @($rows) | ConvertTo-Json -Depth 4 | Set-Content (Join-Path $script:Out 'lnks-before.json') -Encoding UTF8
+          Write-Host "shortcuts before: $(@($rows).Count)"
+
+      - name: A2 Install 0.1.33 silently at the default location
+        run: |
+          . "$env:GITHUB_WORKSPACE\r2-readback\helpers.ps1"
+          Invoke-Setup $script:Setup031
+
+      - name: A3 Read back the sixteen customer fields
+        run: |
+          . "$env:GITHUB_WORKSPACE\r2-readback\helpers.ps1"
+          Stop-App
+          $setupPath = $script:Setup031
+          $key = $script:ArpKey
+          if (-not (Test-Path -LiteralPath $key)) { throw "Add/Remove key missing: $key" }
+          $arp = Get-ItemProperty -LiteralPath $key
+          function ConvertTo-Portable([string]$Text) {
+            if (-not $Text) { return '' }
+            $out = $Text
+            foreach ($pair in @(@($env:LOCALAPPDATA, '%LOCALAPPDATA%'), @($env:ProgramFiles, '%ProgramFiles%'), @(${env:ProgramFiles(x86)}, '%ProgramFiles(x86)%'), @($env:USERPROFILE, '%USERPROFILE%'))) {
+              if ($pair[0]) { $out = $out.Replace($pair[0], $pair[1]) }
+            }
+            return $out
+          }
+          $setupInfo = (Get-Item -LiteralPath $setupPath).VersionInfo
+          $mainPath = Join-Path $script:Root 'current\SeatHub.exe'
+          if (-not (Test-Path -LiteralPath $mainPath)) { throw "installed exe missing: $mainPath" }
+          $mainInfo = (Get-Item -LiteralPath $mainPath).VersionInfo
+
+          $before = @(Get-Content (Join-Path $script:Out 'lnks-before.json') -Raw | ConvertFrom-Json) | ForEach-Object { $_.FullName }
+          $shell = New-Object -ComObject WScript.Shell
+          $new = foreach ($spec in @(@('user','desktop','Desktop'), @('common','desktop','CommonDesktopDirectory'), @('user','start_menu','Programs'), @('common','start_menu','CommonPrograms'))) {
+            $d = [Environment]::GetFolderPath($spec[2])
+            if ($d -and (Test-Path -LiteralPath $d)) {
+              Get-ChildItem -LiteralPath $d -Recurse -Filter '*.lnk' -ErrorAction SilentlyContinue | Where-Object { $before -notcontains $_.FullName } | ForEach-Object {
+                [pscustomobject]@{ Scope = $spec[0]; Place = $spec[1]; FullName = $_.FullName; Name = $_.Name; TargetPath = [string]$shell.CreateShortcut($_.FullName).TargetPath }
+              }
+            }
+          }
+          $new = @($new)
+          function Join-Lnk([string]$Place, [scriptblock]$Pick) {
+            (($new | Where-Object { $_.Place -eq $Place } | ForEach-Object $Pick | Sort-Object -Unique) -join '|')
+          }
+          $values = [ordered]@{
+            'customer.exe.company'           = $mainInfo.CompanyName
+            'customer.exe.description'       = $mainInfo.FileDescription
+            'customer.exe.product'           = $mainInfo.ProductName
+            'customer.exe.file_name'         = Split-Path -Leaf $mainPath
+            'customer.exe.original_filename' = $mainInfo.OriginalFilename
+            'customer.arp.display_name'      = [string]$arp.DisplayName
+            'customer.arp.key_name'          = Split-Path -Leaf $key
+            'customer.arp.publisher'         = [string]$arp.Publisher
+            'customer.arp.install_location'  = ConvertTo-Portable ([string]$arp.InstallLocation)
+            'customer.lnk.desktop'           = Join-Lnk 'desktop' { [IO.Path]::GetFileNameWithoutExtension($_.Name) }
+            'customer.lnk.start_menu'        = Join-Lnk 'start_menu' { [IO.Path]::GetFileNameWithoutExtension($_.Name) }
+            'customer.lnk.desktop.target'    = Join-Lnk 'desktop' { Split-Path -Leaf $_.TargetPath }
+            'customer.lnk.start_menu.target' = Join-Lnk 'start_menu' { Split-Path -Leaf $_.TargetPath }
+            'customer.setup.company'         = $setupInfo.CompanyName
+            'customer.setup.description'     = $setupInfo.FileDescription
+            'customer.setup.product'         = $setupInfo.ProductName
+          }
+          $doc = [ordered]@{
+            app    = 'customer'
+            values = $values
+            arp    = @([pscustomobject]@{
+                Hive = 'HKCU'; KeyName = (Split-Path -Leaf $key); DisplayName = [string]$arp.DisplayName; Publisher = [string]$arp.Publisher
+                DisplayVersion = [string]$arp.DisplayVersion; InstallLocationRaw = [string]$arp.InstallLocation
+                DisplayIcon = [string]$arp.DisplayIcon; UninstallString = [string]$arp.UninstallString })
+            lnks   = $new
+          }
+          $doc | ConvertTo-Json -Depth 6 | Set-Content (Join-Path $script:Out 'customer-readback.json') -Encoding UTF8
+          Get-Content (Join-Path $script:Out 'customer-readback.json') -Raw | Write-Host
+
+      - name: A4 Uninstall and assert nothing is left
+        run: |
+          . "$env:GITHUB_WORKSPACE\r2-readback\helpers.ps1"
+          $left = Invoke-Uninstall
+          if ($left) { $left | ForEach-Object { Write-Host "LEFT BEHIND: $_" }; throw 'phase A uninstall left things behind' }
+          Write-Host 'phase A uninstall assertions: clean'
+
+      - name: B1 Install the published 0.1.32, seed identity and data, record the baseline
+        run: |
+          . "$env:GITHUB_WORKSPACE\r2-readback\helpers.ps1"
+          Invoke-Setup $script:Setup030
+          New-Item -Force -Path $script:SeedKey | Out-Null
+          Set-ItemProperty -LiteralPath $script:SeedKey -Name 'DeviceId' -Value 'r2-seeded-device-0001'
+          Set-ItemProperty -LiteralPath $script:SeedKey -Name 'Marker' -Value 2 -Type DWord
+          New-Item -ItemType Directory -Force -Path $script:DataDir | Out-Null
+          Set-Content -LiteralPath $script:DataFile -Value 'r2 seeded data file' -Encoding ASCII
+          $st = Get-State 'baseline-030'
+          if ($st.arp.DisplayVersion -ne '0.1.32') { throw "baseline DisplayVersion is $($st.arp.DisplayVersion), expected 0.1.32" }
+
+      - name: B2 Update over the 0.1.32 install with the published 0.1.33 Setup
+        run: |
+          . "$env:GITHUB_WORKSPACE\r2-readback\helpers.ps1"
+          $b = Get-Content (Join-Path $script:Out 'state-baseline-030.json') -Raw | ConvertFrom-Json
+          Invoke-Setup $script:Setup031
+          $a = Get-State 'after-update-031'
+          if ($a.arp.DisplayVersion -ne '0.1.33') { throw "DisplayVersion after update is $($a.arp.DisplayVersion), expected 0.1.33" }
+          if ($a.exe.Sha256 -eq $b.exe.Sha256) { throw 'installed exe did not change in the update' }
+          foreach ($l in $a.lnks) { if ($l.Target -notlike '*\RentaPC\current\SeatHub.exe') { throw "shortcut $($l.Name) targets $($l.Target)" } }
+          Assert-Kept $b $a 'update' $true
+
+      - name: B3 Run the 0.1.33 Setup again over the 0.1.33 install (reinstall over)
+        run: |
+          . "$env:GITHUB_WORKSPACE\r2-readback\helpers.ps1"
+          $b = Get-Content (Join-Path $script:Out 'state-after-update-031.json') -Raw | ConvertFrom-Json
+          Invoke-Setup $script:Setup031
+          $a = Get-State 'after-reinstall-over-031'
+          if ($a.arp.DisplayVersion -ne '0.1.33') { throw "DisplayVersion after reinstall-over is $($a.arp.DisplayVersion)" }
+          if ($a.exe.Sha256 -ne $b.exe.Sha256) { throw 'installed exe changed in a same-version reinstall' }
+          Assert-Kept $b $a 'reinstall-over' $true
+
+      - name: B4 Uninstall for real, then install 0.1.33 fresh
+        run: |
+          . "$env:GITHUB_WORKSPACE\r2-readback\helpers.ps1"
+          $b = Get-Content (Join-Path $script:Out 'state-after-reinstall-over-031.json') -Raw | ConvertFrom-Json
+          $left = Invoke-Uninstall
+          if ($left) { $left | ForEach-Object { Write-Host "LEFT BEHIND: $_" }; throw 'uninstall left things behind' }
+          $u = Get-State 'after-uninstall'
+          Write-Host "seed registry key after uninstall present: $($null -ne $u.seed); data file present: $($null -ne $u.data)"
+          Invoke-Setup $script:Setup031
+          $f = Get-State 'after-fresh-reinstall-031'
+          if ($f.arp.DisplayVersion -ne '0.1.33') { throw "DisplayVersion after fresh reinstall is $($f.arp.DisplayVersion)" }
+          Assert-Kept $b $f 'uninstall + fresh reinstall (registry seed key not compared)' $false
+          Write-Host "seed registry key after fresh reinstall present: $($null -ne $f.seed)"
+
+      - name: C1 Launch the installed client and read its window title
+        continue-on-error: true
+        run: |
+          . "$env:GITHUB_WORKSPACE\r2-readback\helpers.ps1"
+          $exe = Join-Path $script:Root 'current\SeatHub.exe'
+          $p = Start-Process -FilePath $exe -PassThru
+          Start-Sleep -Seconds 20
+          $p.Refresh()
+          Write-Host "window title: '$($p.MainWindowTitle)' hasExited=$($p.HasExited)"
+          [ordered]@{ title = $p.MainWindowTitle; exited = $p.HasExited } | ConvertTo-Json | Set-Content (Join-Path $script:Out 'window.json') -Encoding UTF8
+          Stop-App
+
+      - name: Upload the measurements
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: r3-customer-measurements
+          path: out
+          retention-days: 14
+
+      - name: Final uninstall and assert nothing is left
+        if: always()
+        run: |
+          . "$env:GITHUB_WORKSPACE\r2-readback\helpers.ps1"
+          $left = Invoke-Uninstall
+          if ($left) { $left | ForEach-Object { Write-Host "LEFT BEHIND: $_" }; exit 1 }
+          Write-Host 'final uninstall assertions: clean'
