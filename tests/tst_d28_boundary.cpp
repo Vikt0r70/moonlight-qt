@@ -25,7 +25,10 @@
  *      measured against. The commit object must be present; a shallow clone lacks it and the suite
  *      fails by name rather than skipping.
  *   2. Under `app/streaming/` the fork changes exactly the three documented files and nothing
- *      else, and nothing under `app/backend/` changes at all.
+ *      else, and under `app/backend/` it changes exactly one file, `nvpairingmanager.cpp`
+ *      (ADR-0109, the binary-safe pairing key), by exact path and by exact lines: the helper
+ *      include and the key-material block, each added line marked ADR-0109, and reversing them
+ *      restores the pinned original apart from newlines.
  *   3. The `session.cpp` exception is a title literal and nothing more: every added line carries
  *      the ADR-0046 title lines (2) or one of the four `SeatHub: ADR-0104` lines (the conntest
  *      definition, its include and two relay calls), and exactly two upstream lines are removed
@@ -72,6 +75,9 @@ const char* kSessionCpp = "app/streaming/session.cpp";
 const char* kOverlayManagerCpp = "app/streaming/video/overlaymanager.cpp";
 const char* kOverlayManagerH = "app/streaming/video/overlaymanager.h";
 
+/// The one backend exception, as a whole repository-relative path (ADR-0109).
+const char* kPairingKeyCpp = "app/backend/nvpairingmanager.cpp";
+
 /// What a missing base reports. There is no skip and no fallback to a tag, branch or HEAD.
 const char* kMissingBaseMessage =
     "the pinned upstream commit f786e94c7b2f943e24e65d7d74deb539b827fc84 is not in this "
@@ -81,6 +87,7 @@ const char* kMissingBaseMessage =
 struct GitRun
 {
     int exitCode = -1;
+    QByteArray raw;
     QString out;
     QString err;
 };
@@ -98,7 +105,8 @@ GitRun git(const QString& root, const QStringList& args, int timeoutMs = 60000)
         return run;
     }
     run.exitCode = process.exitCode();
-    run.out = QString::fromLocal8Bit(process.readAllStandardOutput());
+    run.raw = process.readAllStandardOutput();
+    run.out = QString::fromLocal8Bit(run.raw);
     run.err = QString::fromLocal8Bit(process.readAllStandardError());
     return run;
 }
@@ -186,6 +194,31 @@ public:
         return run.out;
     }
 
+    /// The working tree against the base with no context lines, so each edit is its own hunk and
+    /// a CR before a line end is not a change (ADR-0109 restores "except newlines"). Empty when
+    /// the path is unchanged; a failed query sets `gitFailed`.
+    QString diffTextNoContext(const QString& path) const
+    {
+        const GitRun run = git(m_root, { QStringLiteral("diff"), QStringLiteral("--ignore-cr-at-eol"),
+                                         QStringLiteral("-U0"), m_base, QStringLiteral("--"), path });
+        if (run.exitCode != 0) {
+            m_gitFailed = true;
+        }
+        return run.out;
+    }
+
+    /// The path's content in the base commit, as UTF-8 text with newlines normalised.
+    QString baseContent(const QString& path) const
+    {
+        const GitRun run = git(m_root, { QStringLiteral("show"), m_base + QLatin1Char(':') + path });
+        if (run.exitCode != 0) {
+            m_gitFailed = true;
+        }
+        QString text = QString::fromUtf8(run.raw);
+        text.remove(QLatin1Char('\r'));
+        return text;
+    }
+
     /// True only for a whole-path match. ADR-0045's compositor and ADR-0046's `session.cpp`, and
     /// nothing that merely spells a similar name.
     static bool isDocumentedException(const QString& path)
@@ -194,8 +227,15 @@ public:
             || path == QLatin1String(kOverlayManagerH);
     }
 
+    /// True only for the whole path ADR-0109 grants under `app/backend/`.
+    static bool isBackendException(const QString& path)
+    {
+        return path == QLatin1String(kPairingKeyCpp);
+    }
+
     /// Every changed path that the D-28 boundary forbids: anything under `app/streaming/` that is
-    /// not one of the two documented exceptions, and anything under `app/backend/` at all.
+    /// not one of the documented exceptions, and anything under `app/backend/` except the one
+    /// exact path ADR-0109 grants.
     static QStringList violations(const QStringList& changed)
     {
         QStringList bad;
@@ -207,7 +247,9 @@ public:
                 }
             }
             else if (normalized.startsWith(QLatin1String("app/backend/"))) {
-                bad.append(normalized);
+                if (!isBackendException(normalized)) {
+                    bad.append(normalized);
+                }
             }
         }
         bad.sort();
@@ -340,6 +382,186 @@ bool commitAll(const QString& root, const QString& message)
             == 0;
 }
 
+// --- ADR-0109: the one backend exception, graded by exact path and exact lines -------------------
+
+const char* kPairingKeyIncludeStart = "#include \"seathub/pairing_key.h\"";
+const char* kPairingKeyCallStart = "QByteArray aesKey = seathub::derivePairingKey(saltedPin, hashAlgo);";
+const char* kOldKeyStatement =
+    "QByteArray aesKey = QCryptographicHash::hash(saltedPin, hashAlgo).constData();";
+const char* kOldTruncateStatement = "aesKey.truncate(16);";
+
+/// Grades the added and removed lines of `nvpairingmanager.cpp` (empty means they are exactly the
+/// grant). BACKEND-EXCEPTION-HUNKS is `helper-include,key-material-block` and
+/// BACKEND-EXCEPTION-EXTRA-LINES is `reject`: three added lines, each marked ADR-0109 (the include,
+/// a comment and the helper call), and exactly the two original key statements removed.
+QString pairingKeyLinesProblem(const QStringList& added, const QStringList& removed)
+{
+    int include = 0, call = 0, comment = 0;
+    for (const QString& line : added) {
+        const QString text = line.trimmed();
+        if (!text.contains(QLatin1String("ADR-0109"))) {
+            return QStringLiteral("an added line is not marked ADR-0109: %1").arg(text);
+        }
+        if (text.startsWith(QLatin1String(kPairingKeyIncludeStart))) {
+            ++include;
+        } else if (text.startsWith(QLatin1String(kPairingKeyCallStart))) {
+            ++call;
+        } else if (text.startsWith(QLatin1String("//"))) {
+            ++comment;
+        } else {
+            return QStringLiteral("an added line is not the helper include, the helper call or "
+                                  "their comment: %1").arg(text);
+        }
+    }
+    if (added.size() != 3 || include != 1 || call != 1 || comment != 1) {
+        return QStringLiteral("nvpairingmanager.cpp adds %1 lines (include %2, call %3, comment "
+                              "%4); the grant covers exactly 3 (1, 1, 1)")
+            .arg(added.size()).arg(include).arg(call).arg(comment);
+    }
+
+    int oldKey = 0, oldTruncate = 0;
+    for (const QString& line : removed) {
+        const QString text = line.trimmed();
+        if (text == QLatin1String(kOldKeyStatement)) {
+            ++oldKey;
+        } else if (text == QLatin1String(kOldTruncateStatement)) {
+            ++oldTruncate;
+        } else {
+            return QStringLiteral("a removed line is not one of upstream's two key statements: %1")
+                .arg(text);
+        }
+    }
+    if (removed.size() != 2 || oldKey != 1 || oldTruncate != 1) {
+        return QStringLiteral("nvpairingmanager.cpp removes %1 lines; the grant covers exactly 2")
+            .arg(removed.size());
+    }
+    return QString();
+}
+
+/// Reverses the grant: drops the include and the comment, puts upstream's two statements back in
+/// place of the helper call. BACKEND-EXCEPTION-RESTORE is `pinned-original-except-newlines`, so the
+/// result must equal the pinned file once carriage returns are ignored.
+QString restoredPairingKeyFile(const QString& current)
+{
+    QStringList out;
+    QString text = current;
+    text.remove(QLatin1Char('\r'));
+    for (const QString& line : text.split(QLatin1Char('\n'))) {
+        const QString trimmed = line.trimmed();
+        if (trimmed.contains(QLatin1String("ADR-0109"))) {
+            if (trimmed.startsWith(QLatin1String(kPairingKeyIncludeStart))
+                || trimmed.startsWith(QLatin1String("//"))) {
+                continue;
+            }
+            if (trimmed.startsWith(QLatin1String(kPairingKeyCallStart))) {
+                const QString indent = line.left(line.indexOf(trimmed));
+                out.append(indent + QLatin1String(kOldKeyStatement));
+                out.append(indent + QLatin1String(kOldTruncateStatement));
+                continue;
+            }
+        }
+        out.append(line);
+    }
+    return out.join(QLatin1Char('\n'));
+}
+
+/// The whole ADR-0109 grade for one repository (empty means the exception is exactly the grant):
+/// the base must be present, the file must show two zero-context hunks, the added and removed
+/// lines must be exactly the grant, and reversing them must give back the pinned original.
+QString pairingKeyExceptionProblem(const QString& root, const QString& baseCommit)
+{
+    const BoundaryCheck check(root, baseCommit);
+    if (!check.baseCommitPresent()) {
+        return QString::fromLatin1(kMissingBaseMessage);
+    }
+    const QString path = QString::fromLatin1(kPairingKeyCpp);
+    const QString diff = check.diffTextNoContext(path);
+    if (check.gitFailed()) {
+        return QStringLiteral("a git query against the pinned base failed");
+    }
+    if (diff.trimmed().isEmpty()) {
+        return QStringLiteral("nvpairingmanager.cpp shows no change against the pinned base");
+    }
+    int hunks = 0;
+    for (const QString& line : diff.split(QLatin1Char('\n'))) {
+        if (line.startsWith(QLatin1String("@@"))) {
+            ++hunks;
+        }
+    }
+    if (hunks != 2) {
+        return QStringLiteral("nvpairingmanager.cpp has %1 hunks; the grant is the helper include "
+                              "and the key-material block (2)").arg(hunks);
+    }
+    const QString lines = pairingKeyLinesProblem(BoundaryCheck::addedLines(diff),
+                                                 BoundaryCheck::removedLines(diff));
+    if (!lines.isEmpty()) {
+        return lines;
+    }
+    const QString original = check.baseContent(path);
+    if (check.gitFailed()) {
+        return QStringLiteral("a git query against the pinned base failed");
+    }
+    const QString current = readAll(QDir(root).filePath(path));
+    if (restoredPairingKeyFile(current) != original) {
+        return QStringLiteral("reversing the grant does not restore the pinned original of "
+                              "nvpairingmanager.cpp");
+    }
+    return QString();
+}
+
+// A small stand-in for upstream's file: the two key statements sit among lines the grant must not
+// touch. `exceptionEdit` applies exactly the grant to it.
+const char* kSyntheticUpstream =
+    "#include \"nvpairingmanager.h\"\n"
+    "#include \"utils.h\"\n"
+    "\n"
+    "void pair()\n"
+    "{\n"
+    "    int before = 0;\n"
+    "\n"
+    "    QByteArray aesKey = QCryptographicHash::hash(saltedPin, hashAlgo).constData();\n"
+    "    aesKey.truncate(16);\n"
+    "\n"
+    "    int after = 1;\n"
+    "}\n";
+
+QString exceptionEdit(QString text)
+{
+    text.replace(QStringLiteral("#include \"utils.h\"\n"),
+                 QStringLiteral("#include \"utils.h\"\n"
+                                "#include \"seathub/pairing_key.h\" // SeatHub: ADR-0109\n"));
+    text.replace(QStringLiteral("    QByteArray aesKey = QCryptographicHash::hash(saltedPin, hashAlgo).constData();\n"
+                                "    aesKey.truncate(16);\n"),
+                 QStringLiteral("    // SeatHub: ADR-0109 - the digest stays binary.\n"
+                                "    QByteArray aesKey = seathub::derivePairingKey(saltedPin, hashAlgo); // SeatHub: ADR-0109\n"));
+    return text;
+}
+
+/// A throwaway repository whose first commit holds `kSyntheticUpstream` at the exception path;
+/// `edit` then rewrites that file's working copy and the ADR-0109 grade is returned.
+QString pairingKeyProblemAfter(const std::function<QString(const QString& upstream)>& edit)
+{
+    QTemporaryDir scratch;
+    if (!scratch.isValid()) {
+        return QStringLiteral("probe: no scratch directory");
+    }
+    const QString root = scratch.path();
+    const QString file = QDir(root).filePath(QString::fromLatin1(kPairingKeyCpp));
+    if (git(root, { QStringLiteral("init") }).exitCode != 0
+        || !writeFile(file, QByteArray(kSyntheticUpstream), QIODevice::WriteOnly)
+        || !commitAll(root, QStringLiteral("upstream"))) {
+        return QStringLiteral("probe: could not build the repository");
+    }
+    const GitRun head = git(root, { QStringLiteral("rev-parse"), QStringLiteral("HEAD") });
+    const QString base = head.out.trimmed();
+    if (head.exitCode != 0 || base.size() != 40
+        || !writeFile(file, edit(QString::fromLatin1(kSyntheticUpstream)).toUtf8(),
+                      QIODevice::WriteOnly)) {
+        return QStringLiteral("probe: could not edit the file");
+    }
+    return pairingKeyExceptionProblem(root, base);
+}
+
 const char* kDecoder = "app/streaming/video/d3d11va.cpp";
 
 /// What the grader reports for one throwaway repository, after `edit` has changed its working
@@ -447,17 +669,105 @@ private slots:
         QCOMPARE(actual, expected);
     }
 
-    void noBackendFileChangesAtAll()
+    void onlyThePairingKeyFileChangesUnderBackend()
     {
         const BoundaryCheck check = forkCheck();
         QVERIFY2(check.baseCommitPresent(), kMissingBaseMessage);
 
         const QStringList backend = check.changedPaths({ QStringLiteral("app/backend/") });
         QVERIFY2(!check.gitFailed(), "a git query against the pinned base failed");
-        QVERIFY2(backend.isEmpty(),
-                 qPrintable(QStringLiteral("app/backend/ is not part of the fork boundary's "
-                                           "exceptions, but these changed: %1")
-                                .arg(backend.join(QLatin1Char(' ')))));
+        QVERIFY2(BoundaryCheck::violations(backend).isEmpty(),
+                 qPrintable(QStringLiteral("app/backend/ changes beyond ADR-0109's one path: %1")
+                                .arg(BoundaryCheck::violations(backend).join(QLatin1Char(' ')))));
+        // Exactly the one path, no more and no fewer.
+        QCOMPARE(backend, QStringList { QString::fromLatin1(kPairingKeyCpp) });
+    }
+
+    // --- the backend exception is the include and the key block, nothing else (ADR-0109) --------
+
+    void thePairingKeyExceptionIsTheIncludeAndTheKeyBlockAndNothingElse()
+    {
+        const QString problem = pairingKeyExceptionProblem(QStringLiteral(FORK_ROOT),
+                                                           QString::fromLatin1(kPinnedUpstreamCommit));
+        QVERIFY2(problem.isEmpty(), qPrintable(problem));
+    }
+
+    void pairingKeyExceptionRejectsUnrelatedBackendEdits()
+    {
+        // Control: exactly the grant, applied to the stand-in file, grades clean. Without this the
+        // refusals below could be passing because the probe itself is broken.
+        const QString clean = pairingKeyProblemAfter([](const QString& upstream) {
+            return exceptionEdit(upstream);
+        });
+        QVERIFY2(clean.isEmpty(), qPrintable(clean));
+
+        // An extra line in the permitted file, unmarked and marked.
+        QVERIFY(!pairingKeyProblemAfter([](const QString& upstream) {
+                     return exceptionEdit(upstream) + QStringLiteral("int stray = 0;\n");
+                 }).isEmpty());
+        QVERIFY(!pairingKeyProblemAfter([](const QString& upstream) {
+                     return exceptionEdit(upstream)
+                         + QStringLiteral("int stray = 0; // SeatHub: ADR-0109\n");
+                 }).isEmpty());
+
+        // An upstream line elsewhere in the permitted file changed.
+        QVERIFY(!pairingKeyProblemAfter([](const QString& upstream) {
+                     QString text = exceptionEdit(upstream);
+                     text.replace(QStringLiteral("int after = 1;"), QStringLiteral("int after = 2;"));
+                     return text;
+                 }).isEmpty());
+
+        // The helper wired but the old statements left in place, and the helper include alone.
+        QVERIFY(!pairingKeyProblemAfter([](const QString& upstream) {
+                     QString text = upstream;
+                     text.replace(QStringLiteral("#include \"utils.h\"\n"),
+                                  QStringLiteral("#include \"utils.h\"\n"
+                                                 "#include \"seathub/pairing_key.h\" // SeatHub: ADR-0109\n"));
+                     return text;
+                 }).isEmpty());
+
+        // The grant reversed does not give the pinned original: a different statement is called.
+        QVERIFY(!pairingKeyProblemAfter([](const QString& upstream) {
+                     QString text = exceptionEdit(upstream);
+                     text.replace(QStringLiteral("derivePairingKey(saltedPin, hashAlgo)"),
+                                  QStringLiteral("derivePairingKey(saltedPin, otherAlgo)"));
+                     return text;
+                 }).isEmpty());
+
+        // The pinned base missing from the repository (a shallow clone) fails by name.
+        QTemporaryDir scratch;
+        QVERIFY(scratch.isValid());
+        QCOMPARE(git(scratch.path(), { QStringLiteral("init") }).exitCode, 0);
+        QVERIFY(writeFile(QDir(scratch.path()).filePath(QString::fromLatin1(kPairingKeyCpp)),
+                          QByteArray(kSyntheticUpstream), QIODevice::WriteOnly));
+        QVERIFY(commitAll(scratch.path(), QStringLiteral("upstream")));
+        QCOMPARE(pairingKeyExceptionProblem(scratch.path(), QString::fromLatin1(kPinnedUpstreamCommit)),
+                 QString::fromLatin1(kMissingBaseMessage));
+
+        // Paths: the one exact path passes; a similar filename, a sibling, another backend file and
+        // a nested path do not.
+        QVERIFY(BoundaryCheck::violations({ QString::fromLatin1(kPairingKeyCpp) }).isEmpty());
+        const QStringList others {
+            QStringLiteral("app/backend/nvpairingmanager.cpp.orig"),
+            QStringLiteral("app/backend/nvpairingmanager2.cpp"),
+            QStringLiteral("app/backend/nvpairingmanager.h"),
+            QStringLiteral("app/backend/nvhttp.cpp"),
+            QStringLiteral("app/backend/sub/nvpairingmanager.cpp"),
+        };
+        for (const QString& other : others) {
+            QCOMPARE(BoundaryCheck::violations({ other }), QStringList { other });
+        }
+
+        // A decoder change is still refused alongside the exception.
+        const Probe probe = probeAfter([](const QString& root) {
+            return appendToDecoder(root)
+                && writeFile(QDir(root).filePath(QString::fromLatin1(kPairingKeyCpp)),
+                             "// pairing\n", QIODevice::WriteOnly);
+        });
+        QVERIFY(probe.built);
+        QVERIFY(!probe.gitFailed);
+        QCOMPARE(BoundaryCheck::violations(probe.engine), QStringList { QString::fromLatin1(kDecoder) });
+        QCOMPARE(BoundaryCheck::violations(probe.backend), QStringList());
     }
 
     // --- the exception is a literal, not a licence to edit the file ----------------------------

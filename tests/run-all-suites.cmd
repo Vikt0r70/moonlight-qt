@@ -89,6 +89,7 @@ call :suite tst_log_shipper
 call :suite tst_log_tee
 call :suite tst_overlay_injection
 call :suite tst_pairing
+call :suite tst_pairing_key
 call :suite tst_session_websocket
 call :suite tst_sse_client
 call :suite tst_settings_bridge

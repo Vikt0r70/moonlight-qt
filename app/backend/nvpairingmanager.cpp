@@ -1,5 +1,6 @@
 #include "nvpairingmanager.h"
 #include "utils.h"
+#include "seathub/pairing_key.h" // SeatHub: ADR-0109
 
 #include <stdexcept>
 
@@ -211,8 +212,8 @@ NvPairingManager::pair(QString appVersion, QString pin, QSslCertificate& serverC
     QByteArray salt = generateRandomBytes(16);
     QByteArray saltedPin = saltPin(salt, pin);
 
-    QByteArray aesKey = QCryptographicHash::hash(saltedPin, hashAlgo).constData();
-    aesKey.truncate(16);
+    // SeatHub: ADR-0109 - the digest stays binary; reading it as a C string cut the key at a zero byte.
+    QByteArray aesKey = seathub::derivePairingKey(saltedPin, hashAlgo); // SeatHub: ADR-0109
 
     QString getCert = m_Http.openConnectionToString(m_Http.m_BaseUrlHttp,
                                                     "pair",
