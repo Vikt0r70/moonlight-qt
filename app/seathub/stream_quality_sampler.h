@@ -41,6 +41,7 @@ signals:
     /// length. Not raised for a partial window (finish), a window with samples, or drops only.
     void emptyWindowEmitted(qint64 windowMs);
 private:
+    friend class TstStreamStats; // holds m_mutex from a helper thread to build a drops-only window
     bool onOwnThread() const;
     void tick();
     void emitWindow(bool partial);

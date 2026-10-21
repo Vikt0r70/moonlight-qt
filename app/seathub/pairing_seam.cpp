@@ -277,6 +277,28 @@ QByteArray& heldRigTrustBytes()
     return bytes;
 }
 
+// What a Play settled before its worker blocked, shared by the deadline and a cancel. The final
+// attempt has no class of its own here: it did not answer.
+PairingHandshakeResult progressRecord(const PairingProgress::Snapshot& progress, bool pinShapeOk,
+                                      qint64 elapsedMs)
+{
+    PairingHandshakeResult record;
+    record.firstOutcome = (progress.firstPublished && progress.firstSucceeded)
+                              ? QStringLiteral("success")
+                              : QStringLiteral("failure");
+    record.firstAttemptStep = progress.firstStep;
+    record.firstStepClass = progress.firstClass;
+    if (progress.retried) {
+        // A second try of the same step in this Play is attempt 2 (ADR-0072 item 2).
+        record.attempts = 2;
+        record.retried = true;
+        record.retryReason = progress.retryReason;
+    }
+    record.pinShapeOk = pinShapeOk;
+    record.handshakeMs = elapsedMs;
+    return record;
+}
+
 } // namespace
 
 void HeldRigTrust::remember(const QByteArray& hostCertificatePem)
@@ -314,27 +336,14 @@ ProductionPairingSeam::ProductionPairingSeam(QObject* parent)
         qCWarning(seathubPairingSeam)
             << "pairing handshake did not finish inside" << m_deadlineMs << "ms";
 
-        PairingHandshakeResult timedOut;
-        timedOut.engineError = QStringLiteral("the pairing handshake did not finish inside %1 ms")
-                                   .arg(m_deadlineMs);
         // T074: speak for what the worker had settled before it blocked. `m_progress` belongs to
         // the current `pair()` call, so a superseded generation's first failure or retry never
-        // reaches this result. The final attempt has no class of its own: it did not answer.
+        // reaches this result.
         const PairingProgress::Snapshot progress = m_progress ? m_progress->snapshot()
                                                                : PairingProgress::Snapshot();
-        timedOut.firstOutcome = (progress.firstPublished && progress.firstSucceeded)
-                                    ? QStringLiteral("success")
-                                    : QStringLiteral("failure");
-        timedOut.firstAttemptStep = progress.firstStep;
-        timedOut.firstStepClass = progress.firstClass;
-        if (progress.retried) {
-            // A second try of the same step in this Play is attempt 2 (ADR-0072 item 2).
-            timedOut.attempts = 2;
-            timedOut.retried = true;
-            timedOut.retryReason = progress.retryReason;
-        }
-        timedOut.pinShapeOk = m_pinShapeOk;
-        timedOut.handshakeMs = m_clock.elapsed();
+        PairingHandshakeResult timedOut = progressRecord(progress, m_pinShapeOk, m_clock.elapsed());
+        timedOut.engineError = QStringLiteral("the pairing handshake did not finish inside %1 ms")
+                                   .arg(m_deadlineMs);
         // 06.6-18/T-06.6-53: this timer is restarted by every `pair()` call, so whenever it fires
         // it is timing out whichever handshake is current - `m_generation` always names that one.
         finish(m_generation, timedOut);
@@ -434,12 +443,30 @@ void ProductionPairingSeam::clearPendingPairing(const PairingTarget& target)
     // then), and its worker must not clear or retry against the rig (PF15-b). A new generation
     // does both at once: `finish()` drops the old one's result and the worker's own gate no longer
     // matches. The deadline belongs to the abandoned handshake, so it stops with it.
+    //
+    // T093 (SC18): a first failure the customer already caused is still recorded, once, for the
+    // abandoned Play. Only the attempt sink hears it - the facade's evidence - and never the
+    // classification, the host, `done`, the instrumentation line or `lastResult()`, so the public
+    // cancellation stays neutral. A Play cancelled before its first attempt failed records nothing.
     if (m_pending && m_sessionId == target.sessionId) {
         m_pending = false;
         m_deadline->stop();
         m_done = nullptr;
         ++m_generation;
         m_currentGeneration->store(m_generation);
+
+        const PairingProgress::Snapshot progress = m_progress ? m_progress->snapshot()
+                                                               : PairingProgress::Snapshot();
+        if (m_attemptSink && progress.firstPublished && !progress.firstSucceeded) {
+            PairingHandshakeResult cancelled =
+                progressRecord(progress, m_pinShapeOk, m_clock.elapsed());
+            if (!cancelled.retried) {
+                // Cancelled before the retry began: the first attempt is the final one.
+                cancelled.attemptStep = progress.firstStep;
+                cancelled.stepClass = progress.firstClass;
+            }
+            m_attemptSink(cancelled);
+        }
     }
 
     // Fire-and-forget: one clear on the pool thread, so the caller (the UI thread calling

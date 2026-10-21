@@ -833,6 +833,116 @@ private slots:
         }
     }
 
+    // T095 / SC19: a quality rollup is a diagnostic line, so it rides the production shipper's own
+    // guarantees. This pins the ones a quality report depends on: it is held while shipping is off,
+    // survives a restart and a kill exactly once, keeps its attributes whole (UTF-8, oversized),
+    // never reaches the hand-off past the cap sentinel out of order, and leaves redaction to bodies.
+    void qualityRollupLinesSurviveRestartKillAndTheCapSentinelInOrder()
+    {
+        const QJsonObject rollup{
+            {QStringLiteral("n"), 3},
+            {QStringLiteral("dropped_samples"), 2},
+            {QStringLiteral("recent_n"), 0},
+            {QStringLiteral("partial"), true},
+            {QStringLiteral("note"), QStringLiteral("ملاحظة ✓")},
+        };
+        const auto rollups = [](const StubHandOff& stub) {
+            QVector<ShippedLine> found;
+            for (const ShippedLine& line : stub.received()) {
+                if (line.body == QLatin1String("stream.rollup")) found.append(line);
+            }
+            return found;
+        };
+
+        // (1) Shipping off: held in the spool, never handed over. A stop is a restart; the file left
+        // behind by a killed process (another pid) is adopted and ships exactly once.
+        {
+            QTemporaryDir dir;
+            QVERIFY(dir.isValid());
+            StopShipperOnScopeExit stopGuard;
+            StubHandOff first;
+            LogShipper::instance().setSpoolDirectoryForTests(dir.path());
+            LogShipper::instance().start([&first](const ShippedLine& line) { return first(line); });
+            LogShipper::instance().setCanShip(false);
+            LogShipper::instance().enqueueDiagnostic(QStringLiteral("stream.rollup"), LogLevel::Info, rollup);
+            QTRY_VERIFY_WITH_TIMEOUT(LogShipper::instance().backlogSpoolLines() >= 1, 5000);
+            QTest::qWait(200);
+            QCOMPARE(rollups(first).size(), 0);
+            LogShipper::instance().stop();
+            QVERIFY(QFile::rename(ownSpoolFilePath(dir.path()),
+                                  QDir(dir.path()).filePath(QStringLiteral("spool-2147483.jsonl"))));
+
+            StubHandOff second;
+            LogShipper::instance().start([&second](const ShippedLine& line) { return second(line); });
+            LogShipper::instance().setCanShip(true);
+            QTRY_COMPARE_WITH_TIMEOUT(rollups(second).size(), 1, 10000);
+            const ShippedLine shipped = rollups(second).first();
+            QVERIFY(shipped.diagnostic);
+            QCOMPARE(shipped.attrs, rollup);
+            LogShipper::instance().stop();
+
+            StubHandOff third; // a later restart finds nothing left to resend
+            LogShipper::instance().start([&third](const ShippedLine& line) { return third(line); });
+            LogShipper::instance().setCanShip(true);
+            QTest::qWait(400);
+            QCOMPARE(rollups(third).size(), 0);
+        }
+
+        // (2) Redaction is for bodies: a UTF-8 body loses the redacted literal and keeps the rest,
+        // and the rollup's attributes are left exactly as the sampler wrote them.
+        {
+            QTemporaryDir dir;
+            QVERIFY(dir.isValid());
+            StopShipperOnScopeExit stopGuard;
+            StubHandOff stub;
+            LogShipper::instance().setSpoolDirectoryForTests(dir.path());
+            LogShipper::instance().setRedactions({QStringLiteral("rig-secret-ß")});
+            LogShipper::instance().start([&stub](const ShippedLine& line) { return stub(line); });
+            LogShipper::instance().setCanShip(true);
+            qInfo().noquote() << QStringLiteral("ملاحظة rig-secret-ß ✓");
+            LogShipper::instance().enqueueDiagnostic(QStringLiteral("stream.rollup"), LogLevel::Info, rollup);
+            QTRY_COMPARE_WITH_TIMEOUT(rollups(stub).size(), 1, 10000);
+            QTRY_VERIFY_WITH_TIMEOUT(stub.countMatching(QStringLiteral("ملاحظة")) >= 1, 5000);
+            for (const ShippedLine& line : stub.received()) {
+                QVERIFY2(!line.body.contains(QStringLiteral("rig-secret-ß")), qPrintable(line.body));
+            }
+            QCOMPARE(rollups(stub).first().attrs, rollup);
+            LogShipper::instance().clearRedactions();
+        }
+
+        // (3) Past the 8 MiB byte cap one sentinel ships, then a rollup still follows it - in that
+        // order - and an oversized attribute reaches the hand-off whole.
+        {
+            QTemporaryDir dir;
+            QVERIFY(dir.isValid());
+            StopShipperOnScopeExit stopGuard;
+            StubHandOff stub;
+            LogShipper::instance().setSpoolDirectoryForTests(dir.path());
+            LogShipper::instance().start([&stub](const ShippedLine& line) { return stub(line); });
+            LogShipper::instance().setCanShip(true);
+            const QString bigBody(500 * 1024, QLatin1Char('y'));
+            for (int i = 0; i < 17; ++i) {
+                qInfo().noquote() << QStringLiteral("big-line-%1 %2").arg(i).arg(bigBody);
+            }
+            QTRY_VERIFY_WITH_TIMEOUT(stub.countMatching(QStringLiteral("log cap reached")) >= 1, 10000);
+            QJsonObject oversized = rollup;
+            const QString big(300 * 1024, QLatin1Char('z'));
+            oversized.insert(QStringLiteral("note"), big);
+            LogShipper::instance().enqueueDiagnostic(QStringLiteral("stream.rollup"), LogLevel::Info, oversized);
+            QTRY_COMPARE_WITH_TIMEOUT(rollups(stub).size(), 1, 10000);
+            QCOMPARE(stub.countMatching(QStringLiteral("log cap reached")), 1);
+            int sentinelAt = -1;
+            int rollupAt = -1;
+            const QVector<ShippedLine> all = stub.received();
+            for (int i = 0; i < all.size(); ++i) {
+                if (all.at(i).body.contains(QLatin1String("log cap reached"))) sentinelAt = i;
+                if (all.at(i).body == QLatin1String("stream.rollup")) rollupAt = i;
+            }
+            QVERIFY(sentinelAt >= 0 && rollupAt > sentinelAt);
+            QCOMPARE(rollups(stub).first().attrs.value(QStringLiteral("note")).toString().size(), big.size());
+        }
+    }
+
     void agedLeftoverLinesAreDroppedAndCountedWhenStartAdoptsThem()
     {
         // The launch record's `dropped_spool_age` is read immediately after

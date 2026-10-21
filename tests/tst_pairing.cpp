@@ -3416,7 +3416,7 @@ private slots:
         QVERIFY(seam.lastResult().engineError.contains(QStringLiteral("did not finish")));
     }
 
-    void firstFailureBlockedRetryCancelReportsNothingAndKeepsNoProgress()
+    void firstFailureBlockedRetryCancelRetainsProgressExactlyOnce()
     {
         ProductionPairingSeam seam;
         seam.setDeadlineMs(1000);
@@ -3438,8 +3438,8 @@ private slots:
 
         QSignalSpy classified(&seam, &ProductionPairingSeam::handshakeClassified);
         QSignalSpy resolved(&seam, &ProductionPairingSeam::hostResolved);
-        int sinkCalls = 0;
-        seam.setAttemptSink([&sinkCalls](const PairingHandshakeResult&) { ++sinkCalls; });
+        QVector<PairingHandshakeResult> sunk;
+        seam.setAttemptSink([&sunk](const PairingHandshakeResult& r) { sunk.append(r); });
         const auto release = qScopeGuard([&retryGate]() { retryGate.release(10); });
 
         const PairingTarget target = pairingTarget();
@@ -3447,7 +3447,31 @@ private slots:
         seam.pair(target, recordInto(&report));
         QVERIFY(retryEntered.tryAcquire(1, 5000));
 
-        // Cancelling abandons the generation: no completion, with or without a late worker.
+        // Cancelling abandons the generation: no completion, no classification, no resolution -
+        // but the first failure and the retry the customer already caused stay on the record, once.
+        seam.clearPendingPairing(target);
+        QCOMPARE(sunk.size(), 1);
+        const PairingHandshakeResult kept = sunk.first();
+        QVERIFY(!kept.ok);
+        QVERIFY(kept.clientIdentity.isEmpty());
+        QVERIFY(!kept.host);
+        QVERIFY(kept.engineError.isEmpty());
+        QVERIFY(!kept.pairingConflict);
+        QVERIFY(kept.attemptStep.isEmpty());
+        QVERIFY(kept.stepClass.isEmpty());
+        QCOMPARE(kept.attempts, 2);
+        QCOMPARE(kept.firstOutcome, QStringLiteral("failure"));
+        QCOMPARE(kept.firstAttemptStep, QStringLiteral("pair_handshake"));
+        QCOMPARE(kept.firstStepClass, QStringLiteral("pin_rejected"));
+        QVERIFY(kept.retried);
+        QCOMPARE(kept.retryReason, QStringLiteral("failure"));
+        QVERIFY(kept.pinShapeOk);
+        QVERIFY(kept.handshakeMs >= 0);
+        const QString pin = QString::fromLatin1(kPin);
+        QVERIFY(!kept.firstOutcome.contains(pin) && !kept.firstAttemptStep.contains(pin)
+                && !kept.firstStepClass.contains(pin) && !kept.retryReason.contains(pin));
+
+        // A second cancel finds nothing pending; the late worker finishes and reports nothing.
         seam.clearPendingPairing(target);
         retryGate.release();
         QVERIFY(QThreadPool::globalInstance()->waitForDone(10000));
@@ -3456,7 +3480,8 @@ private slots:
         QCOMPARE(report.count(), 0);
         QCOMPARE(classified.count(), 0);
         QCOMPARE(resolved.count(), 0);
-        QCOMPARE(sinkCalls, 0);
+        QCOMPARE(sunk.size(), 1);
+        QVERIFY(seam.lastResult().firstStepClass.isEmpty());
 
         // The abandoned run's progress is gone: the next Play starts from a clean record.
         SeamReport next;
@@ -3472,6 +3497,39 @@ private slots:
         QVERIFY(delivered.firstStepClass.isEmpty());
         QVERIFY(!delivered.retried);
         QCOMPARE(delivered.attempts, 1);
+        QCOMPARE(sunk.size(), 2);
+        QCOMPARE(sunk.last().firstOutcome, QStringLiteral("success"));
+        QVERIFY(!sunk.last().retried);
+    }
+
+    void cancelWithoutAFirstFailureRecordsNothing()
+    {
+        ProductionPairingSeam seam;
+        seam.setDeadlineMs(1000);
+        QSemaphore entered;
+        QSemaphore gate;
+        seam.setHandshake([&](const PairingTarget&) {
+            entered.release();
+            gate.acquire();
+            return handshakeResult(true, QStringLiteral("cancelled-late-identity"));
+        });
+        seam.setCancelRequest([](const QString&, int) { return true; });
+        int sinkCalls = 0;
+        seam.setAttemptSink([&sinkCalls](const PairingHandshakeResult&) { ++sinkCalls; });
+        const auto release = qScopeGuard([&gate]() { gate.release(10); });
+
+        const PairingTarget target = pairingTarget();
+        SeamReport report;
+        seam.pair(target, recordInto(&report));
+        QVERIFY(entered.tryAcquire(1, 5000));
+
+        // The first attempt is still running: there is no failure to keep.
+        seam.clearPendingPairing(target);
+        gate.release();
+        QVERIFY(QThreadPool::globalInstance()->waitForDone(10000));
+        QTest::qWait(50);
+        QCOMPARE(report.count(), 0);
+        QCOMPARE(sinkCalls, 0);
     }
 
     void firstFailureBlockedRetryReplacedGenerationDoesNotLeakProgress()
