@@ -591,7 +591,7 @@ jobs:
             --arg version "$VERSION" \
             --arg url "$CONTROL_URL/downloads/$INSTALLER" \
             --arg sha256 "$digest" \
-            --arg notes "SeatHub client $VERSION" \
+            --arg notes "RentaPC $VERSION" \
             '{app: "client", version: $version, url: $url, sha256: $sha256, notes: $notes}')
           status=$(curl -sS -o "$tmp/publish.json" -w '%{http_code}' -X POST "$CONTROL_URL/api/operator/releases" \
             -H 'Content-Type: application/json' -H "Authorization: Bearer $token" \
@@ -641,5 +641,5 @@ jobs:
           gh release create "$tag" "dist/$INSTALLER" "dist/$PACKAGE" dist/releases.win.json \
             --repo "$GITHUB_REPOSITORY" \
             --target "$GITHUB_SHA" \
-            --title "SeatHub $VERSION" \
-            --notes "SeatHub client $VERSION, built from ${GITHUB_SHA::7}. Setup.exe SHA-256: \`$sha\`. The same build the in-app update feed serves: Setup.exe, the full package and releases.win.json. Code signing policy: https://github.com/${GITHUB_REPOSITORY}/blob/${GITHUB_SHA}/docs/code-signing-policy.md and https://rentapc.online/code-signing-policy. Privacy notice: https://github.com/${GITHUB_REPOSITORY}/blob/${GITHUB_SHA}/installer/PRIVACY-NOTICE.txt."
+            --title "RentaPC $VERSION" \
+            --notes "RentaPC $VERSION, built from ${GITHUB_SHA::7}. Setup.exe SHA-256: \`$sha\`. The same build the in-app update feed serves: Setup.exe, the full package and releases.win.json. Code signing policy: https://github.com/${GITHUB_REPOSITORY}/blob/${GITHUB_SHA}/docs/code-signing-policy.md and https://rentapc.online/code-signing-policy. Privacy notice: https://github.com/${GITHUB_REPOSITORY}/blob/${GITHUB_SHA}/installer/PRIVACY-NOTICE.txt."
