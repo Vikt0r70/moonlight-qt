@@ -15,6 +15,10 @@
  *   cd tests && qmake tst_reporting_consent.pro && jom && tst_reporting_consent.exe -o tst_reporting_consent-out.txt,txt
  *****************************************************************************/
 
+// T094: the notice-version change-list test opens the real native notice window, the same way
+// reporting_consent.cpp does, so this translation unit needs its definitions too.
+#define RENTAPC_CONSENT_WINDOW 1
+
 #include <QtTest>
 
 #include <QCoreApplication>
@@ -214,6 +218,120 @@ bool readText(const QString& root, const QString& rel, QString* text)
     return true;
 }
 
+#ifdef _WIN32
+// ---- Notice-window driver (T094) ----------------------------------------------------------------
+// The notice window blocks in its own message loop, so the "customer" is a timer on that same
+// thread: it fires inside the loop, reads what the real controls show, optionally flips the box,
+// then presses OK or closes the window, exactly as the window's own handlers expect.
+
+namespace window = reporting_consent_window;
+
+struct NoticeDrive
+{
+    bool flipBox = false; // the customer clicks the box before answering
+    bool close = false;   // the customer closes the window instead of pressing OK
+
+    bool seen = false;
+    bool headingDrawn = false;
+    QString heading;
+    QString items;
+    bool boxBefore = false;
+    bool boxAfter = false;
+    bool warningAfter = false;
+    int ticks = 0;
+};
+
+NoticeDrive* g_drive = nullptr;
+
+BOOL CALLBACK findNotice(HWND hwnd, LPARAM out)
+{
+    wchar_t cls[64] = {};
+    GetClassNameW(hwnd, cls, 64);
+    if (wcscmp(cls, L"RentaPCReportingNotice") == 0) {
+        *reinterpret_cast<HWND*>(out) = hwnd;
+        return FALSE;
+    }
+    return TRUE;
+}
+
+QString childText(HWND parent, int id)
+{
+    HWND child = GetDlgItem(parent, id);
+    wchar_t text[1024] = {};
+    if (child) {
+        GetWindowTextW(child, text, 1024);
+    }
+    return QString::fromWCharArray(text);
+}
+
+VOID CALLBACK driveTick(HWND, UINT, UINT_PTR, DWORD)
+{
+    NoticeDrive& d = *g_drive;
+    if (d.seen) {
+        return;
+    }
+    HWND notice = nullptr;
+    EnumThreadWindows(GetCurrentThreadId(), findNotice, reinterpret_cast<LPARAM>(&notice));
+    if (!notice) {
+        if (++d.ticks > 250) {
+            PostQuitMessage(0); // never opened: end the loop instead of hanging the suite
+        }
+        return;
+    }
+    d.seen = true;
+    namespace ids = window::detail;
+    d.headingDrawn = GetDlgItem(notice, ids::kIdChangesHead) != nullptr;
+    d.heading = childText(notice, ids::kIdChangesHead);
+    d.items = childText(notice, ids::kIdChanges);
+    HWND box = GetDlgItem(notice, ids::kIdCheck);
+    d.boxBefore = SendMessageW(box, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    if (d.flipBox) {
+        SendMessageW(box, BM_CLICK, 0, 0);
+    }
+    d.boxAfter = SendMessageW(box, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    d.warningAfter = IsWindowVisible(GetDlgItem(notice, ids::kIdWarnEn)) != FALSE;
+    if (d.close) {
+        SendMessageW(notice, WM_CLOSE, 0, 0);
+    } else {
+        SendMessageW(notice, WM_COMMAND, MAKEWPARAM(IDOK, BN_CLICKED), 0);
+    }
+}
+
+// Runs `show` (which opens the notice window on this thread) with the customer driver attached.
+template <typename Show>
+auto withCustomer(NoticeDrive* drive, Show show)
+{
+    g_drive = drive;
+    const UINT_PTR timer = SetTimer(nullptr, 0, 20, driveTick);
+    auto result = show();
+    KillTimer(nullptr, timer);
+    // show() can return before it reads the WM_QUIT its own WM_DESTROY posted; left in the queue it
+    // would end the next window's loop at once, so each run drains it.
+    MSG quit;
+    while (PeekMessageW(&quit, nullptr, WM_QUIT, WM_QUIT, PM_REMOVE)) {
+    }
+    g_drive = nullptr;
+    return result;
+}
+
+// Test-local, clearly synthetic: the real package ships notice version one and no change list.
+const wchar_t* const kSyntheticChanges[] = { L"Synthetic change one", L"Synthetic change two" };
+constexpr int kSyntheticChangeCount = 2;
+
+void checkRenderedChangeList(const NoticeDrive& drive)
+{
+    QVERIFY2(drive.seen, "the notice window never opened");
+    QVERIFY2(drive.headingDrawn, "a nonempty change list must draw the What changed heading");
+    QCOMPARE(drive.heading,
+             QStringLiteral("What changed  /  ")
+                 + QString::fromWCharArray(window::strings::baseSpec(true).changesHeading.ar));
+    const QString bullet = QString(QChar(0x2022)) + QLatin1Char(' ');
+    QCOMPARE(drive.items.split(QStringLiteral("\r\n"), Qt::SkipEmptyParts),
+             (QStringList{ bullet + QStringLiteral("Synthetic change one"),
+                           bullet + QStringLiteral("Synthetic change two") }));
+}
+#endif
+
 } // namespace
 
 class TstReportingConsent : public QObject
@@ -388,6 +506,121 @@ private slots:
         ReportingConsent::loadFromStore();
         QVERIFY(!ReportingConsent::needsAsk(8));
         QVERIFY(!ReportingConsent::coveredUploadsAllowed());
+    }
+
+    // T094: a nonempty "What changed" list really renders in the native window. The package only
+    // ships notice version one, so version two and its change items are synthetic and test-local.
+    void noticeVersionTwoRendersChangeListAndPreservesPriorChoice_data()
+    {
+        QTest::addColumn<bool>("priorSend");
+        QTest::addColumn<bool>("flipBox");
+        QTest::addColumn<bool>("close");
+        QTest::addColumn<bool>("expectAnswered");
+        QTest::addColumn<bool>("expectSend");
+        QTest::newRow("off, left unticked, OK") << false << false << false << true << false;
+        QTest::newRow("on, left ticked, OK") << true << false << false << true << true;
+        QTest::newRow("off, ticked, OK") << false << true << false << true << true;
+        QTest::newRow("on, unticked, OK") << true << true << false << true << false;
+        QTest::newRow("off, window closed") << false << false << true << false << false;
+        QTest::newRow("on, window closed") << true << false << true << false << true;
+    }
+
+    void noticeVersionTwoRendersChangeListAndPreservesPriorChoice()
+    {
+#ifdef _WIN32
+        QFETCH(bool, priorSend);
+        QFETCH(bool, flipBox);
+        QFETCH(bool, close);
+        QFETCH(bool, expectAnswered);
+        QFETCH(bool, expectSend);
+
+        const unsigned stored = reporting_consent_store::kCurrentNoticeVersion;
+        const unsigned versionTwo = stored + 1;
+
+        QVERIFY(reporting_consent_store::write(priorSend, stored));
+        ReportingConsent::loadFromStore();
+        QVERIFY(ReportingConsent::needsAsk(versionTwo));
+        QCOMPARE(ReportingConsent::coveredUploadsAllowed(), priorSend); // in force until answered
+
+        // The same spec the app's re-ask builds (reporting_consent.cpp), with the synthetic list.
+        const Record previous = reporting_consent_store::read();
+        const std::wstring notice = std::wstring(window::strings::kNoticeEn) + L"\r\n\r\n"
+            + window::strings::kNoticeAr;
+        window::Spec spec = window::strings::baseSpec(previous.recorded ? previous.send : true);
+        spec.noticeText = notice.c_str();
+        spec.changes = kSyntheticChanges;
+        spec.changeCount = kSyntheticChangeCount;
+        spec.primary = { L"OK", L"OK" };
+
+        NoticeDrive drive;
+        drive.flipBox = flipBox;
+        drive.close = close;
+        const window::Result result = withCustomer(&drive, [&] { return window::show(spec); });
+
+        checkRenderedChangeList(drive);
+        if (QTest::currentTestFailed()) {
+            return;
+        }
+        QCOMPARE(drive.boxBefore, priorSend);          // the previous choice is pre-selected
+        QCOMPARE(drive.boxAfter, expectSend);
+        QCOMPARE(drive.warningAfter, !drive.boxAfter); // the red warning follows the box
+        QCOMPARE(result.answered, expectAnswered);
+
+        if (!expectAnswered) {
+            // Closing answers nothing: nothing is recorded, the old choice stays, the app asks again.
+            const Record kept = reporting_consent_store::read();
+            QCOMPARE(kept.send, priorSend);
+            QCOMPARE(kept.noticeVersion, stored);
+            ReportingConsent::loadFromStore();
+            QVERIFY(ReportingConsent::needsAsk(versionTwo));
+            QCOMPARE(ReportingConsent::coveredUploadsAllowed(), priorSend);
+            return;
+        }
+
+        QCOMPARE(result.send, expectSend);
+        QVERIFY(ReportingConsent::recordChoice(result.send, versionTwo));
+        QVERIFY(!ReportingConsent::needsAsk(versionTwo));
+        QCOMPARE(ReportingConsent::coveredUploadsAllowed(), expectSend);
+
+        const Record saved = reporting_consent_store::read();
+        QVERIFY(saved.recorded);
+        QCOMPARE(saved.send, expectSend);
+        QCOMPARE(saved.noticeVersion, versionTwo);
+
+        // A new process over the saved value does not ask a second time.
+        ReportingConsent::setStateForTests(false, Record{});
+        ReportingConsent::loadFromStore();
+        QVERIFY(!ReportingConsent::needsAsk(versionTwo));
+        QCOMPARE(ReportingConsent::coveredUploadsAllowed(), expectSend);
+#else
+        QSKIP("the notice window is Windows-only");
+#endif
+    }
+
+    // The app's own re-ask entry point hands the change list to that same window.
+    void askAtStartupRendersTheChangeListItIsGiven()
+    {
+#ifdef _WIN32
+        QVERIFY(reporting_consent_store::write(false, 0));
+        ReportingConsent::loadFromStore();
+
+        NoticeDrive drive;
+        const bool answered = withCustomer(
+            &drive, [] { return ReportingConsent::askAtStartup(kSyntheticChanges, kSyntheticChangeCount); });
+
+        checkRenderedChangeList(drive);
+        if (QTest::currentTestFailed()) {
+            return;
+        }
+        QVERIFY(!drive.boxBefore); // the previous "do not send" is what the box starts at
+        QVERIFY(answered);
+        const Record saved = reporting_consent_store::read();
+        QVERIFY(saved.recorded);
+        QVERIFY(!saved.send);
+        QCOMPARE(saved.noticeVersion, reporting_consent_store::kCurrentNoticeVersion);
+#else
+        QSKIP("the notice window is Windows-only");
+#endif
     }
 
     // --- the customer's own choice is the only thing that changes the switch ----------------------
