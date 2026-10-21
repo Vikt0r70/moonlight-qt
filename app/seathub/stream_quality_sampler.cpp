@@ -228,21 +228,38 @@ void StreamQualitySampler::tick()
 void StreamQualitySampler::emitWindow(bool partial)
 {
     auto attrs = takeWindow(partial);
-    if (attrs.value("n").toInt() == 0) {
+    if (attrs.isEmpty()) {
         // ADR-0105: a FULL window that ended with no samples and no drops is a stall window. A
-        // partial window (finish) and a drops-only window are not; nothing is logged or counted
-        // here, the facade turns the signal into an evidence entry.
-        if (!partial && attrs.isEmpty()) emit emptyWindowEmitted(m_windowMs);
+        // partial window (finish) with nothing in it says nothing; neither is logged or counted
+        // here, the facade turns the signal into an evidence entry. A drops-only window is not
+        // empty: it falls through and reports its drop metadata with no rate attributes.
+        if (!partial) emit emptyWindowEmitted(m_windowMs);
         return;
     }
 
     const auto now = nowMs();
     attrs.insert("elapsed_ms", now);
 
-    QVector<SampleWithTime> recentCopy;
+    QVector<SampleWithTime> allRecent;
     {
         QMutexLocker lock(&m_mutex);
-        recentCopy = m_recent;
+        allRecent = m_recent;
+    }
+
+    // ADR-0101 s.4: an observation is recent when its age is at most kWindowMs, inclusive. A
+    // stale newest observation means the window states "no recent rate" by absence (recent_n of 0,
+    // no rate attributes), never by a synthetic zero. The fixed constant, not m_windowMs, is the
+    // rule so a shortened test window does not change what "recent" means.
+    QVector<SampleWithTime> recentCopy;
+    for (const auto& s : allRecent) {
+        if (now - s.elapsedMs <= kWindowMs) recentCopy.append(s);
+    }
+    if (recentCopy.isEmpty() && !allRecent.isEmpty()) {
+        for (const char* prefix : {"fps_", "incoming_fps_", "decoded_fps_"}) {
+            for (const QString& key : attrs.keys()) {
+                if (key.startsWith(QLatin1String(prefix))) attrs.remove(key);
+            }
+        }
     }
 
     attrs.insert("recent_n", recentCopy.size());
@@ -260,8 +277,8 @@ void StreamQualitySampler::emitWindow(bool partial)
         }
     }
 
-    if (!recentCopy.isEmpty()) {
-        const auto lastSampleElapsed = recentCopy.last().elapsedMs;
+    if (!allRecent.isEmpty()) {
+        const auto lastSampleElapsed = allRecent.last().elapsedMs;
         attrs.insert("last_sample_age_ms", std::max<qint64>(0, now - lastSampleElapsed));
     }
 

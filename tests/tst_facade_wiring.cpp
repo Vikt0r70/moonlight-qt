@@ -9298,6 +9298,274 @@ private slots:
         QVERIFY(!outbox.hasQueuedReports());
     }
 
+    // T095 / SC19: the quality rollup reaches the hand-off through the production chain only - the
+    // facade's stats tap, the real sampler (real clock, 40 ms window), SeatHubTelemetry, the LogTee and
+    // the process-wide LogShipper - with no prebuilt rollup injected. The hand-off here is the same
+    // seam every other test in this file reads; it sees the line exactly as it would leave the machine.
+    void facadeQualityDeliveryUsesProductionShipper()
+    {
+        QTemporaryDir spool;
+        QMutex mutex;
+        QList<ShippedLine> records;
+        QStringList usersAtRollup;
+        const QString utf8Secret = QStringLiteral("rig-secret-ß-م");
+        LogShipper::instance().setSpoolDirectoryForTests(spool.path());
+        const auto startShipper = [&]() {
+            LogShipper::instance().start([&](const ShippedLine& line) {
+                QMutexLocker lock(&mutex);
+                records.append(line);
+                if (line.body == QLatin1String("stream.rollup")) {
+                    usersAtRollup.append(SeatHubTelemetry::currentUserId());
+                }
+                return true;
+            });
+        };
+        const auto named = [&](const QString& body) {
+            QMutexLocker lock(&mutex);
+            QList<ShippedLine> result;
+            for (const ShippedLine& line : records) {
+                if (line.body == body) result.append(line);
+            }
+            return result;
+        };
+        const auto feedRendered = [](SeatHubClient& client, const char* text) {
+            SDL_Surface* surface = OsdCompositor::rasterize(Overlay::OverlayDebug, text, true,
+                                                             SDL_Color{255, 255, 255, 255},
+                                                             &client.hud()->compositor());
+            if (surface) SDL_FreeSurface(surface);
+        };
+        const auto finishPlay = [&](SeatHubClient& client, FakeEngineSession* engine, int summaries) {
+            emit engine->sessionFinished(0);
+            emit engine->readyForDeletion();
+            QTRY_COMPARE_WITH_TIMEOUT(named(QStringLiteral("play.summary")).size(), summaries, 10000);
+            LogShipper::instance().drainBeforeSignOut();
+            endStreaming(client, engine);
+        };
+        startShipper();
+        LogShipper::instance().setCanShip(true);
+        StopShipperOnScopeExit guard;
+
+        // Play 1 - complete windows: the observed rendered rate and latency are carried, the engine
+        // rates nobody reported are absent (not zero), and a genuine observed 0 fps is present.
+        {
+            auto* engine = new FakeEngineSession;
+            SeatHubClient client;
+            WalletTicks ticks;
+            client.setSamplerWindowMsForTests(40);
+            beginStreaming(client, engine, &ticks, 90, 80);
+            QVERIFY(!QTest::currentTestFailed());
+            QVERIFY(settleIntoTheStream(client, &ticks));
+            LogShipper::instance().setCanShip(true); // sign-in recomputed it; the test owns it here
+            LogShipper::instance().setRedactions({utf8Secret}); // and it resets the redaction list
+
+            qInfo().noquote() << QStringLiteral("ملاحظة ") + utf8Secret;
+            feedRendered(client, "Rendering frame rate: 59.00 FPS\nAverage network latency: 23 ms (variance: 1 ms)");
+            QTRY_VERIFY_WITH_TIMEOUT(!named(QStringLiteral("stream.rollup")).isEmpty(), 10000);
+            const ShippedLine complete = named(QStringLiteral("stream.rollup")).first();
+            QVERIFY(complete.diagnostic);
+            QCOMPARE(complete.sessionId, QStringLiteral("s-live"));
+            QCOMPARE(complete.attrs.value(QStringLiteral("partial")).toBool(), false);
+            QVERIFY(complete.attrs.value(QStringLiteral("n")).toInt() >= 1);
+            QCOMPARE(complete.attrs.value(QStringLiteral("fps_avg")).toDouble(), 59.0);
+            QVERIFY(!complete.attrs.contains(QStringLiteral("incoming_fps_avg")));
+            QVERIFY(!complete.attrs.contains(QStringLiteral("decoded_fps_avg")));
+            QCOMPARE(complete.attrs.value(QStringLiteral("recent_n")).toInt(), 1);
+            QVERIFY(complete.attrs.contains(QStringLiteral("last_sample_age_ms")));
+            QCOMPARE(usersAtRollup.first(), accountAId());
+
+            feedRendered(client, "Rendering frame rate: 0.00 FPS\nAverage network latency: 23 ms (variance: 1 ms)");
+            QTRY_VERIFY_WITH_TIMEOUT(
+                [&]() {
+                    for (const ShippedLine& line : named(QStringLiteral("stream.rollup"))) {
+                        if (line.attrs.contains(QStringLiteral("fps_avg"))
+                            && line.attrs.value(QStringLiteral("fps_avg")).toDouble() == 0.0) {
+                            return true;
+                        }
+                    }
+                    return false;
+                }(),
+                10000);
+            for (const ShippedLine& line : named(QStringLiteral("stream.rollup"))) {
+                QVERIFY(!line.attrs.contains(QStringLiteral("incoming_fps_avg")));
+                QVERIFY(!line.attrs.contains(QStringLiteral("decoded_fps_avg")));
+            }
+            finishPlay(client, engine, 1);
+        }
+
+        // UTF-8 redaction reaches the production chain: the body loses the secret, the rest survives.
+        {
+            QMutexLocker lock(&mutex);
+            bool sawArabic = false;
+            for (const ShippedLine& line : records) {
+                QVERIFY2(!line.body.contains(utf8Secret), qPrintable(line.body));
+                if (line.body.contains(QStringLiteral("ملاحظة"))) sawArabic = true;
+            }
+            QVERIFY2(sawArabic, "the Arabic text around the redacted value still ships");
+        }
+        LogShipper::instance().clearRedactions();
+
+        // Play 2 - finish: a window cut short by the end ships once as a partial rollup, ahead of the
+        // Play summary (flush ordering), with the same session and account.
+        const int rollupsBefore = named(QStringLiteral("stream.rollup")).size();
+        {
+            // The first client's destructor stopped the shipper (its quit-time drain); start it again.
+            startShipper();
+            auto* engine = new FakeEngineSession;
+            SeatHubClient client;
+            WalletTicks ticks;
+            client.setSamplerWindowMsForTests(60000);
+            beginStreaming(client, engine, &ticks, 90, 80);
+            QVERIFY(!QTest::currentTestFailed());
+            QVERIFY(settleIntoTheStream(client, &ticks));
+            LogShipper::instance().setCanShip(true);
+            feedRendered(client, "Rendering frame rate: 58.00 FPS\nAverage network latency: 23 ms (variance: 1 ms)");
+            QTest::qWait(50);
+            finishPlay(client, engine, 2);
+        }
+        // The first Play's own summary is already in the list, so the second sits after it.
+        const QList<ShippedLine> rollups = named(QStringLiteral("stream.rollup"));
+        QCOMPARE(rollups.size(), rollupsBefore + 1);
+        const ShippedLine partial = rollups.last();
+        QCOMPARE(partial.attrs.value(QStringLiteral("partial")).toBool(), true);
+        QCOMPARE(partial.attrs.value(QStringLiteral("fps_avg")).toDouble(), 58.0);
+        QCOMPARE(partial.sessionId, QStringLiteral("s-live"));
+        QCOMPARE(usersAtRollup.last(), accountAId());
+        {
+            QMutexLocker lock(&mutex);
+            int lastRollup = -1;
+            int lastSummary = -1;
+            for (int i = 0; i < records.size(); ++i) {
+                if (records.at(i).body == QLatin1String("stream.rollup")) lastRollup = i;
+                if (records.at(i).body == QLatin1String("play.summary")) lastSummary = i;
+            }
+            QVERIFY2(lastRollup >= 0 && lastRollup < lastSummary,
+                     "the finish rollup is handed over before the Play summary");
+        }
+
+        // Account and Play replacement inside one client: A signs out, B signs in, and a new Play
+        // starts. Every rollup handed over after the switch carries B and the new Play's session id;
+        // none of them is attributed to A or to the previous Play.
+        {
+            startShipper(); // the previous client's destructor stopped the shipper
+            const int rollupsBeforeSwitch = named(QStringLiteral("stream.rollup")).size();
+            const int summariesBeforeSwitch = named(QStringLiteral("play.summary")).size();
+            auto* engine = new FakeEngineSession;
+            SeatHubClient client;
+            WalletTicks ticks;
+            client.setSamplerWindowMsForTests(40);
+            reachHome(client, 90);
+            QVERIFY(!QTest::currentTestFailed());
+            QCOMPARE(SeatHubTelemetry::currentUserId(), accountAId());
+            client.signOut();
+            QTRY_COMPARE_WITH_TIMEOUT(client.appState(), QStringLiteral("signed_out"), 15000);
+            m_fake->answerMe(200, QByteArrayLiteral(
+                "{\"id\":\"77777777-7777-7777-7777-777777777777\",\"display_name\":\"Omar\","
+                "\"username\":\"omar\",\"email\":\"omar@example.com\",\"phone_e164\":\"+962790000001\","
+                "\"role\":\"customer\",\"signup_stage\":\"complete\",\"email_verified\":true,"
+                "\"phone_verified\":true,\"created_at\":\"2026-09-01T00:00:00Z\"}"));
+            m_fake->answerWallet(200, walletBody(90));
+            m_fake->answerLogin(200, QByteArrayLiteral("{\"access_token\":\"sb_at_for_b\"}"));
+            client.signInWithPassword(QStringLiteral("omar@example.com"), QStringLiteral("irrelevant"));
+            QTRY_COMPARE_WITH_TIMEOUT(client.appState(), QStringLiteral("home"), 15000);
+            QTRY_COMPARE_WITH_TIMEOUT(SeatHubTelemetry::currentUserId(), accountBId(), 15000);
+
+            client.session()->attachSession(engine);
+            m_fake->answerPairing(409, playRefusalBody(QStringLiteral("The rig is not ready yet."),
+                                                       QStringLiteral("SH-2K2XQ1")));
+            m_fake->answerWallet(200, walletBody(80));
+            connect(client.liveness(), &LivenessTimer::walletRead, &client,
+                    [&ticks](qint64 minutes) {
+                        ticks.lastBalance.store(minutes);
+                        ticks.read.fetch_add(1);
+                    },
+                    Qt::DirectConnection);
+            connect(client.liveness(), &LivenessTimer::walletReadFailed, &client,
+                    [&ticks]() { ticks.failed.fetch_add(1); }, Qt::DirectConnection);
+            client.beginSession(QStringLiteral("s-live-b"));
+            emit engine->connectionStarted();
+            QCOMPARE(client.appState(), QStringLiteral("streaming"));
+            QVERIFY(settleIntoTheStream(client, &ticks));
+            LogShipper::instance().setCanShip(true);
+            feedRendered(client, "Rendering frame rate: 56.00 FPS\nAverage network latency: 23 ms (variance: 1 ms)");
+            QTRY_VERIFY_WITH_TIMEOUT(named(QStringLiteral("stream.rollup")).size() > rollupsBeforeSwitch, 10000);
+            finishPlay(client, engine, summariesBeforeSwitch + 1);
+
+            const QList<ShippedLine> after = named(QStringLiteral("stream.rollup")).mid(rollupsBeforeSwitch);
+            QVERIFY(!after.isEmpty());
+            for (const ShippedLine& line : after) {
+                QCOMPARE(line.sessionId, QStringLiteral("s-live-b"));
+            }
+            QMutexLocker lock(&mutex);
+            QVERIFY(usersAtRollup.size() >= rollupsBeforeSwitch + after.size());
+            for (int i = rollupsBeforeSwitch; i < usersAtRollup.size(); ++i) {
+                QCOMPARE(usersAtRollup.at(i), accountBId());
+            }
+        }
+
+        // Consent: with no choice recorded, and with the choice recorded Off, a Play's rollup is held
+        // in the spool and never handed over. After a kill (a spool left by another process) and a
+        // restart under consent it ships exactly once, and a further restart finds nothing to resend.
+        for (int pass = 0; pass < 2; ++pass) {
+            LogShipper::instance().stop();
+            {
+                QMutexLocker lock(&mutex);
+                records.clear();
+                usersAtRollup.clear();
+            }
+            reporting_consent_store::Record record;
+            record.recorded = (pass == 1);
+            record.send = false;
+            record.noticeVersion = reporting_consent_store::kCurrentNoticeVersion;
+            ReportingConsent::setStateForTests(true, record);
+            startShipper();
+            LogShipper::instance().setCanShip(true);
+
+            auto* engine = new FakeEngineSession;
+            SeatHubClient client;
+            WalletTicks ticks;
+            client.setSamplerWindowMsForTests(60000);
+            beginStreaming(client, engine, &ticks, 90, 80);
+            QVERIFY(!QTest::currentTestFailed());
+            QVERIFY(settleIntoTheStream(client, &ticks));
+            LogShipper::instance().setCanShip(true);
+            feedRendered(client, "Rendering frame rate: 57.00 FPS\nAverage network latency: 23 ms (variance: 1 ms)");
+            QTest::qWait(50);
+            emit engine->sessionFinished(0);
+            emit engine->readyForDeletion();
+            QTRY_VERIFY_WITH_TIMEOUT(LogShipper::instance().backlogSpoolLines() >= 1, 10000);
+            QTest::qWait(300);
+            QCOMPARE(named(QStringLiteral("stream.rollup")).size(), 0);
+            QCOMPARE(named(QStringLiteral("play.summary")).size(), 0);
+            endStreaming(client, engine);
+
+            LogShipper::instance().stop();
+            QDir dir(spool.path());
+            const QStringList files = dir.entryList({QStringLiteral("spool-*.jsonl")}, QDir::Files);
+            QVERIFY(!files.isEmpty());
+            for (const QString& file : files) {
+                QVERIFY(QFile::rename(dir.filePath(file),
+                                      dir.filePath(QStringLiteral("spool-2147%1-%2.jsonl").arg(pass).arg(file.size()))));
+            }
+            record.recorded = true;
+            record.send = true;
+            ReportingConsent::setStateForTests(true, record);
+            startShipper();
+            LogShipper::instance().setCanShip(true);
+            QTRY_COMPARE_WITH_TIMEOUT(named(QStringLiteral("stream.rollup")).size(), 1, 10000);
+            QCOMPARE(named(QStringLiteral("stream.rollup")).first().attrs.value(QStringLiteral("fps_avg")).toDouble(), 57.0);
+
+            LogShipper::instance().stop();
+            {
+                QMutexLocker lock(&mutex);
+                records.clear();
+            }
+            startShipper();
+            LogShipper::instance().setCanShip(true);
+            QTest::qWait(400);
+            QCOMPARE(named(QStringLiteral("stream.rollup")).size(), 0);
+        }
+    }
+
     // T073 / ADR-0107 + ADR-0101: the held quality report is a covered upload at the IMMEDIATE send
     // boundary too. With reporting off, or no choice recorded, a Play whose stream produced stats and
     // whose End/teardown completed sends zero quality requests, yet the account-bound write-ahead file

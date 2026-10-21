@@ -683,6 +683,245 @@ private slots:
         QCOMPARE(sampler.rollups(), 0);
     }
 
+    // T095 / SC19, ADR-0101 s.4 and operations.md Sampler: a sample is recent when its age is at
+    // most 60000 ms, inclusive. Fake clock, the sampler's timer fired by hand, no sleeping.
+    void samplerRecentFreshnessAndEmptyBoundaries()
+    {
+        const auto sample = [](double fps) {
+            VideoStats s;
+            s.renderedFps = OptionalMetric::of(fps);
+            s.receivedFps = OptionalMetric::of(fps + 1);
+            s.decodedFps = OptionalMetric::of(fps + 2);
+            return s;
+        };
+        const auto recentKeys = [](const QJsonObject& attrs) {
+            int count = 0;
+            for (const QString& key : attrs.keys())
+                if (key.startsWith(QLatin1String("recent_")) && key != QLatin1String("recent_n")) ++count;
+            return count;
+        };
+        const auto fire = [](StreamQualitySampler& sampler) {
+            QTimer* timer = sampler.findChild<QTimer*>();
+            return timer && QMetaObject::invokeMethod(timer, "timeout", Qt::DirectConnection);
+        };
+        const QStringList rateKeys = {"fps_avg", "fps_min", "incoming_fps_avg", "incoming_fps_min",
+                                      "decoded_fps_avg", "decoded_fps_min"};
+
+        // The boundary: one sample accepted at 0, the window ended `ageMs` later.
+        const auto rollupAtAge = [&](qint64 ageMs) {
+            rollupLogs.clear(); rollupMetrics.clear();
+            qint64 now = 0;
+            StreamQualitySampler sampler(nullptr, [&]() { return now; });
+            sampler.start(QStringLiteral("age"));
+            sampler.feed(sample(60));
+            now = ageMs;
+            const bool fired = fire(sampler);
+            const QJsonObject out = fired && !rollupLogs.isEmpty() ? rollupLogs.last() : QJsonObject();
+            sampler.finish();
+            return out;
+        };
+        for (const qint64 age : {qint64(59999), qint64(60000)}) {
+            const QJsonObject recent = rollupAtAge(age);
+            QVERIFY2(!recent.isEmpty(), "a window that carried a sample always emits a rollup");
+            QCOMPARE(recent.value("recent_n").toInt(), 1);
+            QCOMPARE(recent.value("last_sample_age_ms").toDouble(), double(age));
+            QCOMPARE(recent.value("recent_0_rendered_fps").toDouble(), 60.0);
+            for (const QString& key : rateKeys) QVERIFY2(recent.contains(key), qPrintable(key));
+        }
+        const QJsonObject stale = rollupAtAge(60001);
+        QVERIFY(!stale.isEmpty());
+        QCOMPARE(stale.value("n").toInt(), 1); // the window's own counters keep their meaning
+        QCOMPARE(stale.value("recent_n").toInt(), 0);
+        QCOMPARE(recentKeys(stale), 0);
+        QCOMPARE(stale.value("last_sample_age_ms").toDouble(), 60001.0);
+        for (const QString& key : rateKeys) QVERIFY2(!stale.contains(key), qPrintable(key));
+
+        // No callback yet: nothing is emitted or counted before the window ends.
+        {
+            rollupLogs.clear();
+            qint64 now = 0;
+            StreamQualitySampler sampler(nullptr, [&]() { return now; });
+            sampler.start(QStringLiteral("quiet"));
+            sampler.feed(sample(60));
+            now = 59999;
+            QVERIFY(rollupLogs.isEmpty());
+            QCOMPARE(sampler.rollups(), 0);
+            sampler.takeWindow(false);
+            sampler.finish();
+        }
+
+        // Absence versus an observed zero, and the last ten observations oldest first.
+        {
+            rollupLogs.clear();
+            qint64 now = 0;
+            StreamQualitySampler sampler(nullptr, [&]() { return now; });
+            sampler.start(QStringLiteral("zero"));
+            sampler.feed(sample(0)); // an observed zero
+            now = 1000;
+            VideoStats rttOnly; rttOnly.rttMs = OptionalMetric::of(12); // no rate observed
+            sampler.feed(rttOnly);
+            now = 2000;
+            sampler.feed(sample(5));
+            QVERIFY(fire(sampler));
+            const QJsonObject out = rollupLogs.last();
+            QCOMPARE(out.value("recent_n").toInt(), 3);
+            QVERIFY(out.contains("recent_0_rendered_fps"));
+            QCOMPARE(out.value("recent_0_rendered_fps").toDouble(), 0.0);
+            QVERIFY(!out.contains("recent_1_rendered_fps"));
+            QVERIFY(!out.contains("recent_1_incoming_fps"));
+            QVERIFY(!out.contains("recent_1_decoded_fps"));
+            QCOMPARE(out.value("recent_1_elapsed_ms").toDouble(), 1000.0);
+            QCOMPARE(out.value("recent_2_rendered_fps").toDouble(), 5.0);
+            sampler.finish();
+        }
+        {
+            rollupLogs.clear();
+            qint64 now = 0;
+            StreamQualitySampler sampler(nullptr, [&]() { return now; });
+            sampler.start(QStringLiteral("ten"));
+            for (int i = 0; i < 12; ++i) { now = i * 1000; sampler.feed(sample(i)); }
+            QVERIFY(fire(sampler));
+            const QJsonObject out = rollupLogs.last();
+            QCOMPARE(out.value("n").toInt(), 12);
+            QCOMPARE(out.value("recent_n").toInt(), 10);
+            QCOMPARE(out.value("recent_0_elapsed_ms").toDouble(), 2000.0);
+            QCOMPARE(out.value("recent_0_rendered_fps").toDouble(), 2.0);
+            QCOMPARE(out.value("recent_9_elapsed_ms").toDouble(), 11000.0);
+            QCOMPARE(out.value("recent_9_rendered_fps").toDouble(), 11.0);
+            QVERIFY(!out.contains("recent_10_elapsed_ms"));
+            sampler.finish();
+        }
+
+        // 120 accepted samples per window and the explicit drops beyond them.
+        {
+            rollupLogs.clear();
+            qint64 now = 0;
+            StreamQualitySampler sampler(nullptr, [&]() { return now; });
+            sampler.start(QStringLiteral("cap"));
+            for (int i = 0; i < 130; ++i) sampler.feed(sample(60));
+            now = 60000;
+            QVERIFY(fire(sampler));
+            const QJsonObject out = rollupLogs.last();
+            QCOMPARE(out.value("n").toInt(), 120);
+            QCOMPARE(out.value("dropped_samples").toInt(), 10);
+            QCOMPARE(out.value("recent_n").toInt(), 10);
+            QCOMPARE(out.value("last_sample_age_ms").toDouble(), 60000.0);
+            sampler.finish();
+        }
+
+        // Non-waiting contention: a feed that finds the window busy drops, it never waits. A window
+        // whose every feed was dropped still reports its drops, with no invented rates.
+        {
+            rollupLogs.clear();
+            int empties = 0;
+            qint64 now = 0;
+            StreamQualitySampler sampler(nullptr, [&]() { return now; });
+            connect(&sampler, &StreamQualitySampler::emptyWindowEmitted, &sampler,
+                    [&](qint64) { ++empties; });
+            sampler.start(QStringLiteral("busy"));
+            QSemaphore locked, release;
+            QThread* holder = QThread::create([&]() {
+                QMutexLocker lock(&sampler.m_mutex);
+                locked.release();
+                release.acquire();
+            });
+            holder->start();
+            locked.acquire();
+            for (int i = 0; i < 3; ++i) sampler.feed(sample(60));
+            release.release();
+            holder->wait(); delete holder;
+            now = 60000;
+            QVERIFY(fire(sampler));
+            QCOMPARE(empties, 0); // drops are not a stall
+            QCOMPARE(rollupLogs.size(), 1);
+            const QJsonObject full = rollupLogs.last();
+            QCOMPARE(full.value("n").toInt(), 0);
+            QCOMPARE(full.value("dropped_samples").toInt(), 3);
+            QVERIFY(!full.value("partial").toBool());
+            QCOMPARE(full.value("recent_n").toInt(), 0);
+            QCOMPARE(recentKeys(full), 0);
+            for (const QString& key : rateKeys) QVERIFY2(!full.contains(key), qPrintable(key));
+            QCOMPARE(sampler.rollups(), 1);
+
+            // The same at finish: a partial window of drops only.
+            QThread* second = QThread::create([&]() {
+                QMutexLocker lock(&sampler.m_mutex);
+                locked.release();
+                release.acquire();
+            });
+            second->start();
+            locked.acquire();
+            sampler.feed(sample(60)); sampler.feed(sample(60));
+            release.release();
+            second->wait(); delete second;
+            now = 61000;
+            sampler.finish();
+            QCOMPARE(rollupLogs.size(), 2);
+            const QJsonObject partial = rollupLogs.last();
+            QCOMPARE(partial.value("n").toInt(), 0);
+            QCOMPARE(partial.value("dropped_samples").toInt(), 2);
+            QVERIFY(partial.value("partial").toBool());
+            QCOMPARE(partial.value("recent_n").toInt(), 0);
+            for (const QString& key : rateKeys) QVERIFY2(!partial.contains(key), qPrintable(key));
+        }
+
+        // ADR-0105 is unchanged: a complete empty window is the stall signal and no rollup.
+        {
+            rollupLogs.clear();
+            QList<qint64> empties;
+            qint64 now = 0;
+            StreamQualitySampler sampler(nullptr, [&]() { return now; });
+            connect(&sampler, &StreamQualitySampler::emptyWindowEmitted, &sampler,
+                    [&](qint64 ms) { empties.append(ms); });
+            sampler.start(QStringLiteral("stall"));
+            now = 60000;
+            QVERIFY(fire(sampler));
+            QCOMPARE(empties.size(), 1);
+            QCOMPARE(empties.first(), qint64(60000));
+            QVERIFY(rollupLogs.isEmpty());
+            QCOMPARE(sampler.rollups(), 0);
+            now = 61000;
+            sampler.finish();
+            QVERIFY(rollupLogs.isEmpty());
+            QCOMPARE(empties.size(), 1);
+        }
+
+        // Play replacement, same-Play reconnect and finish: the ring never crosses a start, the
+        // monotonic origin survives a reconnect of the same Play and restarts for a new one.
+        {
+            rollupLogs.clear();
+            qint64 now = 1000;
+            StreamQualitySampler sampler(nullptr, [&]() { return now; });
+            sampler.start(QStringLiteral("p1"));
+            now = 1500; sampler.feed(sample(10));
+            now = 2000; sampler.finish();
+            QCOMPARE(rollupLogs.size(), 1);
+            QCOMPARE(rollupLogs.last().value("elapsed_ms").toDouble(), 1000.0);
+            QCOMPARE(rollupLogs.last().value("recent_n").toInt(), 1);
+            QCOMPARE(rollupLogs.last().value("recent_0_elapsed_ms").toDouble(), 500.0);
+            QVERIFY(rollupLogs.last().value("partial").toBool());
+
+            now = 5000; sampler.start(QStringLiteral("p1")); // reconnect of the same Play
+            now = 5500; sampler.feed(sample(20));
+            now = 6000; sampler.finish();
+            QCOMPARE(rollupLogs.size(), 2);
+            QCOMPARE(sampler.rollups(), 2);
+            QCOMPARE(rollupLogs.last().value("elapsed_ms").toDouble(), 5000.0);
+            QCOMPARE(rollupLogs.last().value("recent_n").toInt(), 1); // the old observation is gone
+            QCOMPARE(rollupLogs.last().value("recent_0_rendered_fps").toDouble(), 20.0);
+            QCOMPARE(rollupLogs.last().value("recent_0_elapsed_ms").toDouble(), 4500.0);
+
+            now = 9000; sampler.start(QStringLiteral("p2")); // a replacement Play
+            now = 9100; sampler.feed(sample(30));
+            now = 9200; sampler.finish();
+            QCOMPARE(rollupLogs.size(), 3);
+            QCOMPARE(sampler.rollups(), 1);
+            QCOMPARE(rollupLogs.last().value("elapsed_ms").toDouble(), 200.0);
+            QCOMPARE(rollupLogs.last().value("recent_0_elapsed_ms").toDouble(), 100.0);
+            QCOMPARE(rollupLogs.last().value("recent_0_rendered_fps").toDouble(), 30.0);
+        }
+    }
+
     void rollupTimerRunsOnTheSamplerWorker()
     {
         QThread worker;
