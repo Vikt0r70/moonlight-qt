@@ -53,6 +53,7 @@
 #include <QRegularExpression>
 #include <QScopeGuard>
 #include <QScopedPointer>
+#include <QSemaphore>
 #include <QSignalSpy>
 #include <QSettings>
 #include <QTemporaryDir>
@@ -147,6 +148,11 @@ void MoonlightEngineSession::setTextRasterizer(Overlay::OverlayManager::TextRast
 bool g_recoveredHandshakeArmed = false;
 bool g_noAppHandshakeArmed = false;
 bool g_failedRetryHandshakeArmed = false;
+// T093: a first attempt that fails with the conflict tag, then a retry that blocks (and says so) until
+// the test releases it. The seam has published the first failure by the time the retry is entered.
+bool g_blockedRetryHandshakeArmed = false;
+QSemaphore g_blockedRetryEntered;
+QSemaphore g_blockedRetryGate;
 int g_handshakeCalls = 0;
 // ADR-0074 W03: how many times the seam fell back to (or started with) the normal handshake, in any
 // mode. `g_handshakeCalls` above counts only the armed retry scenarios.
@@ -161,6 +167,25 @@ PairingHandshakeResult runUpstreamPairingHandshake(const PairingTarget&)
         paired.clientIdentity = QStringLiteral("no-app-identity");
         paired.host = std::make_shared<PairedHost>();
         return paired;
+    }
+    if (g_blockedRetryHandshakeArmed) {
+        ++g_handshakeCalls;
+        if (g_handshakeCalls == 1) {
+            PairingHandshakeResult conflict;
+            conflict.attemptStep = QStringLiteral("pair_server_info");
+            conflict.stepClass = QStringLiteral("http_4xx");
+            conflict.pairingConflict = true;
+            conflict.engineError = QStringLiteral("fixture conflict before blocked retry");
+            return conflict;
+        }
+        g_blockedRetryEntered.release();
+        g_blockedRetryGate.tryAcquire(1, 30000);
+        // A late, proper worker result: after a cancel it must reach nobody.
+        PairingHandshakeResult late;
+        late.ok = true;
+        late.clientIdentity = QStringLiteral("cancelled-late-identity");
+        late.host = std::make_shared<PairedHost>();
+        return late;
     }
     if (g_failedRetryHandshakeArmed) {
         ++g_handshakeCalls;
@@ -1003,6 +1028,24 @@ private:
                 if (kind.isEmpty() || entry.value(QStringLiteral("kind")).toString() == kind) {
                     found.append(entry);
                 }
+            }
+        }
+        return found;
+    }
+
+    /// Every entry of one kind in the capsule(s) on disk for `sessionId` (ADR-0105), in capsule order.
+    QList<QJsonObject> evidenceEntriesFor(const QString& sessionId, const QString& kind) const
+    {
+        QList<QJsonObject> found;
+        const QDir dir(m_dir->path() + QStringLiteral("/evidence-journal"));
+        for (const QString& name : dir.entryList({QStringLiteral("evj-*.json")}, QDir::Files, QDir::Name)) {
+            QFile file(dir.filePath(name));
+            if (!file.open(QIODevice::ReadOnly)) continue;
+            const QJsonObject capsule = QJsonDocument::fromJson(file.readAll()).object();
+            if (capsule.value(QStringLiteral("session_id")).toString() != sessionId) continue;
+            for (const QJsonValue& value : capsule.value(QStringLiteral("entries")).toArray()) {
+                const QJsonObject entry = value.toObject();
+                if (entry.value(QStringLiteral("kind")).toString() == kind) found.append(entry);
             }
         }
         return found;
@@ -4304,6 +4347,124 @@ private slots:
         QCOMPARE(endBody.value(QStringLiteral("failed")).toBool(), true);
         QCOMPARE(endBody.value(QStringLiteral("attempt_step")).toString(),
                  QStringLiteral("pair_handshake"));
+    }
+
+    // T093 (SC18/SC13): a first pairing failure and a retry that is still blocked when the customer
+    // cancels reach the evidence capsule BEFORE the Play closes it, on every production path that
+    // cancels pairing. The seam is the real one; only upstream's handshake is the fixture above.
+    void cancelBeforeJournalCloseRetainsFirstFailure_data()
+    {
+        QTest::addColumn<int>("path");
+        QTest::newRow("customer cancel") << 0;
+        QTest::newRow("sign-out") << 1;
+        QTest::newRow("server-ended while connecting") << 2;
+    }
+
+    void cancelBeforeJournalCloseRetainsFirstFailure()
+    {
+        QFETCH(int, path);
+        // 503 keeps the capsule on disk after its delivery attempt, so it can be read back.
+        m_evidenceStatusAtArm = 503;
+        const QString sessionId = QStringLiteral("s-cancel-journal");
+        g_blockedRetryHandshakeArmed = true;
+        g_handshakeCalls = 0;
+        g_blockedRetryEntered.acquire(g_blockedRetryEntered.available());
+        g_blockedRetryGate.acquire(g_blockedRetryGate.available());
+        auto disarm = qScopeGuard([]() {
+            g_blockedRetryHandshakeArmed = false;
+            g_handshakeCalls = 0;
+        });
+        // Declared before the client, so it runs after the client is gone: a replacement Play's
+        // worker must not outlive this row and reach the next row's armed fixture.
+        auto drainWorkers = qScopeGuard([]() { QThreadPool::globalInstance()->waitForDone(30000); });
+
+        SeatHubClient client;
+        reachHome(client, 90);
+        QVERIFY(!QTest::currentTestFailed());
+        // Declared after the client, so the blocked worker is freed before the client is destroyed.
+        auto freeWorker = qScopeGuard([]() { g_blockedRetryGate.release(10); });
+
+        QJsonObject ports;
+        ports.insert(QStringLiteral("https"), 47984);
+        ports.insert(QStringLiteral("control"), 47989);
+        ports.insert(QStringLiteral("rtsp"), 48010);
+        QJsonObject authBody;
+        authBody.insert(QStringLiteral("session_id"), sessionId);
+        authBody.insert(QStringLiteral("pairing_pin"), QStringLiteral("4821"));
+        authBody.insert(QStringLiteral("host_address"), QStringLiteral("127.0.0.1"));
+        authBody.insert(QStringLiteral("ports"), ports);
+        authBody.insert(QStringLiteral("state"), QStringLiteral("READY"));
+        m_fake->answerPairing(200, QJsonDocument(authBody).toJson(QJsonDocument::Compact));
+        m_fake->answerPlay(201, QByteArrayLiteral("{\"id\":\"s-cancel-journal\"}"));
+
+        client.beginSession(sessionId);
+        QVERIFY2(g_blockedRetryEntered.tryAcquire(1, 20000), "the retry must be entered and blocked");
+        QVERIFY(evidenceEntriesFor(sessionId, QStringLiteral("pairing_attempt")).isEmpty());
+
+        switch (path) {
+        case 0: client.interrupt(); break;
+        case 1: client.signOut(); break;
+        case 2: {
+            SessionInfo over = sessionIn(QStringLiteral("COMPLETED"), sessionId);
+            over.endReason = QStringLiteral("CUSTOMER_ENDED");
+            report(client, over);
+            break;
+        }
+        }
+
+        // The cancel has returned, and the capsule the Play closed already holds the first failure.
+        const auto assertFirstFailureKeptOnce = [&]() {
+            const QList<QJsonObject> attempts =
+                evidenceEntriesFor(sessionId, QStringLiteral("pairing_attempt"));
+            int first = 0;
+            for (const QJsonObject& entry : attempts) {
+                if (entry.value(QStringLiteral("attempt")).toInt() != 1) continue;
+                ++first;
+                QCOMPARE(entry.value(QStringLiteral("outcome")).toString(), QStringLiteral("failure"));
+                QCOMPARE(entry.value(QStringLiteral("engine_step")).toString(),
+                         QStringLiteral("pair_server_info"));
+                QCOMPARE(entry.value(QStringLiteral("engine_class")).toString(),
+                         QStringLiteral("http_4xx"));
+                QVERIFY(entry.value(QStringLiteral("retried")).toBool());
+                QVERIFY(!entry.value(QStringLiteral("retry_reason")).toString().isEmpty());
+            }
+            // The cancelled retry never finished, so the first failure is the whole record: once,
+            // and no invented second attempt.
+            QCOMPARE(first, 1);
+            QCOMPARE(attempts.size(), 1);
+        };
+        assertFirstFailureKeptOnce();
+        if (QTest::currentTestFailed()) return;
+
+        // The same record went out with the capsule's delivery.
+        const QString evidencePath = QStringLiteral("/api/sessions/%1/evidence").arg(sessionId);
+        QTRY_VERIFY_WITH_TIMEOUT(!m_fake->bodiesFor(evidencePath).isEmpty(), 15000);
+        QVERIFY(m_fake->bodiesFor(evidencePath).last().contains("http_4xx"));
+
+        // The visible result stays neutral: Home (or the signed-out state), and no retry or reconnect.
+        if (path == 1) {
+            QVERIFY(!client.signedIn());
+        } else {
+            QCOMPARE(client.appState(), QStringLiteral("home"));
+        }
+
+        // The late worker finishes: nothing more reaches the record, and it never retries again.
+        g_blockedRetryGate.release();
+        QVERIFY(QThreadPool::globalInstance()->waitForDone(15000));
+        QTest::qWait(100);
+        QCOMPARE(g_handshakeCalls, 2);
+        assertFirstFailureKeptOnce();
+        if (QTest::currentTestFailed()) return;
+
+        // A replacement Play does not touch the closed capsule either.
+        if (path != 1) {
+            g_blockedRetryHandshakeArmed = false;
+            client.beginSession(QStringLiteral("s-cancel-journal-2"));
+            QTest::qWait(200);
+            assertFirstFailureKeptOnce();
+            QVERIFY(evidenceEntriesFor(QStringLiteral("s-cancel-journal-2"),
+                                       QStringLiteral("pairing_attempt")).size() <= 1);
+        }
     }
 
     void aNoLaunchableAppEmitsOneClassifiedStepAndEndsWithThatStep()

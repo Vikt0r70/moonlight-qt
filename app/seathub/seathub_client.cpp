@@ -360,6 +360,21 @@ void onClientThread(QObject* owner, Fn fn)
     QMetaObject::invokeMethod(owner, std::move(fn), Qt::QueuedConnection);
 }
 
+// Cancels pairing and returns only once it has. `finishPlay()` closes the evidence journal, and a
+// first pairing failure whose retry was still blocked is recorded by `PairingController::cancel()`
+// (SC18/SC13), so the cancel has to land before the journal does. A queued cancel could not
+// promise that; this blocks on the pairing thread the same way `finishPlay()` does for its sampler
+// (SYNTHESIS, "SC18/SC13 cancel record ordering in the customer-app facade").
+static void cancelPairingBeforeJournalClose(PairingController* pairing)
+{
+    if (QThread::currentThread() == pairing->thread()) {
+        pairing->cancel();
+        return;
+    }
+    QMetaObject::invokeMethod(pairing, [pairing]() { pairing->cancel(); },
+                              Qt::BlockingQueuedConnection);
+}
+
 void SeatHubClient::adoptJournal()
 {
     const auto cached = SeatHubTelemetry::readCache();
@@ -2268,8 +2283,8 @@ void SeatHubClient::interrupt()
     m_customerQuit = true;
     m_manualEndObserved.store(true, std::memory_order_relaxed);
     if (!m_session->active()) {
+        cancelPairingBeforeJournalClose(m_pairing);
         finishPlay(QStringLiteral("cancelled"), QStringLiteral("cancelled"), m_lastFailedStep);
-        onClientThread(m_pairing, [this]() { m_pairing->cancel(); });
         m_liveness->stop();
         endAttachedSessionBeforeStream(false);
         m_sessionChannel->close();
@@ -2500,6 +2515,7 @@ QVariantMap SeatHubClient::readAgentConfigFile(const QUrl& fileUrl)
 
 void SeatHubClient::signOut()
 {
+    cancelPairingBeforeJournalClose(m_pairing);
     finishPlay(QStringLiteral("signed_out"), QStringLiteral("cancelled"));
     // CR-02: a report still pending when the customer signs out (mid-teardown, or between
     // `handleVideoStatsParsed()` and a teardown outcome) is written to the outbox under the
@@ -2555,7 +2571,6 @@ void SeatHubClient::signOut()
     // 06.4/ADR-0067, D-07: a manual sign-out inside the notice's own wait stops the timer and
     // clears it, so no second sign-out follows once it would otherwise have elapsed.
     clearSignedOutNotice();
-    onClientThread(m_pairing, [this]() { m_pairing->cancel(); });
     m_teardown->cancel();
     // D-05/C4: `TeardownController::cancel()` emits neither `teardownCompleted` nor
     // `teardownFailed`, so a `retry()` wait abandoned by a sign-out would otherwise never clear -
@@ -3613,7 +3628,7 @@ void SeatHubClient::handleSessionState(const SessionInfo& session)
             // No engine has started, so there is nothing to interrupt and the customer would sit on a
             // stepper that looks alive for a session that is over. Connecting stops here, at the stage
             // it had reached, in the server's own words for why.
-            onClientThread(m_pairing, [this]() { m_pairing->cancel(); });
+            cancelPairingBeforeJournalClose(m_pairing);
             // ADR-0096: a `CUSTOMER_ENDED` start that the engine never named a failure for is an
             // outside cancel, a neutral outcome rather than a failed start (E16).
             const bool outsideCancel = session.endReason == QLatin1String("CUSTOMER_ENDED")

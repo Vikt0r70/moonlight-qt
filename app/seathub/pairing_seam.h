@@ -204,7 +204,8 @@ public:
     /// Defaults to `sendPairingCancelRequest` (`pairing_recovery.h`).
     void setCancelRequest(PairingCancelRequest cancel);
     /// T063: a narrow, read-only sink called once per reported result, on this object's thread, right
-    /// after the `pairing_instrumentation` line - the facade journals the attempt from it. It takes
+    /// after the `pairing_instrumentation` line - the facade journals the attempt from it. T093: also
+    /// once for a Play cancelled after its first attempt failed (no instrumentation line). It takes
     /// the result by const reference and cannot change the seam's retry, guards or callbacks.
     using AttemptSink = std::function<void(const PairingHandshakeResult& result)>;
     void setAttemptSink(AttemptSink sink);
@@ -225,8 +226,10 @@ public:
     /// The clear is fenced to the attempt that asked for it (PF15-b): if a newer `pair()` has
     /// started by the time the pool thread runs it, it is dropped, because the rig has one pending
     /// pairing slot and the older attempt's clear would cancel the newer attempt's pairing. A
-    /// handshake of `target`'s session that is still pending is abandoned by the same call: its
-    /// result is never reported, and its worker neither clears nor retries.
+    /// handshake of `target`'s session that is still pending is abandoned by the same call: no
+    /// result, classification or host is ever reported for it, and its worker neither clears nor
+    /// retries. If its first attempt had already failed, the attempt sink (below) gets one
+    /// neutral record of that failure and the retry, and nothing else does.
     void clearPendingPairing(const PairingTarget& target) override;
 
     /// The classification this seam last reported, or a default-constructed result before any
