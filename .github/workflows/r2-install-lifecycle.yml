@@ -1,16 +1,16 @@
-name: r2-install-lifecycle (published RentaPC 0.1.33 default-location read-back and lifecycle)
+name: r2-install-lifecycle (published RentaPC 0.1.34 default-location read-back and lifecycle)
 
-# Throwaway measurement only. Downloads the PUBLISHED RentaPC 0.1.33 Setup from the public release URL
-# and the PUBLISHED 0.1.32 Setup from its GitHub release, and on a disposable runner:
-#   A. installs 0.1.33 at the default location, reads back the sixteen customer fields, uninstalls;
-#   B. installs 0.1.32, seeds identity/data fixtures, runs the 0.1.33 Setup over it (update), runs it
-#      again (reinstall over), uninstalls and installs 0.1.33 fresh, comparing the state after each step;
+# Throwaway measurement only. Downloads the PUBLISHED RentaPC 0.1.34 Setup from the public release URL
+# and the PUBLISHED 0.1.33 Setup from its GitHub release, and on a disposable runner:
+#   A. installs 0.1.34 at the default location, reads back the sixteen customer fields, uninstalls;
+#   B. installs 0.1.33, seeds identity/data fixtures, runs the 0.1.34 Setup over it (update), runs it
+#      again (reinstall over), uninstalls and installs 0.1.34 fresh, comparing the state after each step;
 #   C. launches the installed client for a window-title readback, then uninstalls.
 # Builds nothing, publishes nothing, writes nothing outside the runner.
 
 on:
   push:
-    branches: [seathub-r3-readback]
+    branches: [seathub-r4-readback]
 
 permissions:
   contents: read
@@ -24,9 +24,9 @@ jobs:
         shell: pwsh
     env:
       SETUP_URL_031: https://api.rentapc.online/downloads/RentaPC-Setup.exe
-      SETUP_SHA256_031: a35548f40b5a289f3cb999323be7ed650d9e90b9b777b15b2da6e7c47772d8a4
-      SETUP_URL_030: https://github.com/Vikt0r70/moonlight-qt/releases/download/seathub-v0.1.32/RentaPC-Setup.exe
-      SETUP_SHA256_030: 8c99a9ead09e9b123afb81a8cbefdccfaa12cb544aae066e22a77a5b58d07e4b
+      SETUP_SHA256_031: 3f081f95564cc112baddca91f93b8565a694361ade0f17f6e10c72ea66f0ba6a
+      SETUP_URL_030: https://github.com/Vikt0r70/moonlight-qt/releases/download/seathub-v0.1.33/RentaPC-Setup.exe
+      SETUP_SHA256_030: a35548f40b5a289f3cb999323be7ed650d9e90b9b777b15b2da6e7c47772d8a4
     steps:
       - uses: actions/checkout@v5
 
@@ -35,9 +35,9 @@ jobs:
           . "$env:GITHUB_WORKSPACE\r2-readback\helpers.ps1"
           New-Item -ItemType Directory -Force -Path $script:Out, (Split-Path $script:Setup030), (Split-Path $script:Setup031) | Out-Null
           $r = Invoke-WebRequest -Uri $env:SETUP_URL_031 -OutFile $script:Setup031 -PassThru
-          Write-Host "0.1.33 HTTP $($r.StatusCode) cf-cache-status: $($r.Headers['cf-cache-status']) etag: $($r.Headers['ETag'])"
+          Write-Host "0.1.34 HTTP $($r.StatusCode) cf-cache-status: $($r.Headers['cf-cache-status']) etag: $($r.Headers['ETag'])"
           $r = Invoke-WebRequest -Uri $env:SETUP_URL_030 -OutFile $script:Setup030 -PassThru
-          Write-Host "0.1.32 HTTP $($r.StatusCode)"
+          Write-Host "0.1.33 HTTP $($r.StatusCode)"
 
       - name: Verify both hashes
         run: |
@@ -78,7 +78,7 @@ jobs:
           @($rows) | ConvertTo-Json -Depth 4 | Set-Content (Join-Path $script:Out 'lnks-before.json') -Encoding UTF8
           Write-Host "shortcuts before: $(@($rows).Count)"
 
-      - name: A2 Install 0.1.33 silently at the default location
+      - name: A2 Install 0.1.34 silently at the default location
         run: |
           . "$env:GITHUB_WORKSPACE\r2-readback\helpers.ps1"
           Invoke-Setup $script:Setup031
@@ -155,7 +155,7 @@ jobs:
           if ($left) { $left | ForEach-Object { Write-Host "LEFT BEHIND: $_" }; throw 'phase A uninstall left things behind' }
           Write-Host 'phase A uninstall assertions: clean'
 
-      - name: B1 Install the published 0.1.32, seed identity and data, record the baseline
+      - name: B1 Install the published 0.1.33, seed identity and data, record the baseline
         run: |
           . "$env:GITHUB_WORKSPACE\r2-readback\helpers.ps1"
           Invoke-Setup $script:Setup030
@@ -165,30 +165,30 @@ jobs:
           New-Item -ItemType Directory -Force -Path $script:DataDir | Out-Null
           Set-Content -LiteralPath $script:DataFile -Value 'r2 seeded data file' -Encoding ASCII
           $st = Get-State 'baseline-030'
-          if ($st.arp.DisplayVersion -ne '0.1.32') { throw "baseline DisplayVersion is $($st.arp.DisplayVersion), expected 0.1.32" }
+          if ($st.arp.DisplayVersion -ne '0.1.33') { throw "baseline DisplayVersion is $($st.arp.DisplayVersion), expected 0.1.33" }
 
-      - name: B2 Update over the 0.1.32 install with the published 0.1.33 Setup
+      - name: B2 Update over the 0.1.33 install with the published 0.1.34 Setup
         run: |
           . "$env:GITHUB_WORKSPACE\r2-readback\helpers.ps1"
           $b = Get-Content (Join-Path $script:Out 'state-baseline-030.json') -Raw | ConvertFrom-Json
           Invoke-Setup $script:Setup031
           $a = Get-State 'after-update-031'
-          if ($a.arp.DisplayVersion -ne '0.1.33') { throw "DisplayVersion after update is $($a.arp.DisplayVersion), expected 0.1.33" }
+          if ($a.arp.DisplayVersion -ne '0.1.34') { throw "DisplayVersion after update is $($a.arp.DisplayVersion), expected 0.1.34" }
           if ($a.exe.Sha256 -eq $b.exe.Sha256) { throw 'installed exe did not change in the update' }
           foreach ($l in $a.lnks) { if ($l.Target -notlike '*\RentaPC\current\SeatHub.exe') { throw "shortcut $($l.Name) targets $($l.Target)" } }
           Assert-Kept $b $a 'update' $true
 
-      - name: B3 Run the 0.1.33 Setup again over the 0.1.33 install (reinstall over)
+      - name: B3 Run the 0.1.34 Setup again over the 0.1.34 install (reinstall over)
         run: |
           . "$env:GITHUB_WORKSPACE\r2-readback\helpers.ps1"
           $b = Get-Content (Join-Path $script:Out 'state-after-update-031.json') -Raw | ConvertFrom-Json
           Invoke-Setup $script:Setup031
           $a = Get-State 'after-reinstall-over-031'
-          if ($a.arp.DisplayVersion -ne '0.1.33') { throw "DisplayVersion after reinstall-over is $($a.arp.DisplayVersion)" }
+          if ($a.arp.DisplayVersion -ne '0.1.34') { throw "DisplayVersion after reinstall-over is $($a.arp.DisplayVersion)" }
           if ($a.exe.Sha256 -ne $b.exe.Sha256) { throw 'installed exe changed in a same-version reinstall' }
           Assert-Kept $b $a 'reinstall-over' $true
 
-      - name: B4 Uninstall for real, then install 0.1.33 fresh
+      - name: B4 Uninstall for real, then install 0.1.34 fresh
         run: |
           . "$env:GITHUB_WORKSPACE\r2-readback\helpers.ps1"
           $b = Get-Content (Join-Path $script:Out 'state-after-reinstall-over-031.json') -Raw | ConvertFrom-Json
@@ -198,7 +198,7 @@ jobs:
           Write-Host "seed registry key after uninstall present: $($null -ne $u.seed); data file present: $($null -ne $u.data)"
           Invoke-Setup $script:Setup031
           $f = Get-State 'after-fresh-reinstall-031'
-          if ($f.arp.DisplayVersion -ne '0.1.33') { throw "DisplayVersion after fresh reinstall is $($f.arp.DisplayVersion)" }
+          if ($f.arp.DisplayVersion -ne '0.1.34') { throw "DisplayVersion after fresh reinstall is $($f.arp.DisplayVersion)" }
           Assert-Kept $b $f 'uninstall + fresh reinstall (registry seed key not compared)' $false
           Write-Host "seed registry key after fresh reinstall present: $($null -ne $f.seed)"
 
