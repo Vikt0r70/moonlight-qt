@@ -11,6 +11,7 @@ TEMPLATE = app
 TARGET = RentaPC-Setup
 CONFIG -= qt
 CONFIG += windows release c++17
+CONFIG += static_runtime
 CONFIG -= console
 QT =
 
