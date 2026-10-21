@@ -228,6 +228,11 @@ try {
 finally { Pop-Location }
 $outerSetup = Join-Path $buildDir 'release\RentaPC-Setup.exe'
 Require $outerSetup 'the built bootstrapper'
+$guardPath = Join-Path $PSScriptRoot 'check-pe-imports.ps1'
+$guardLine = & $guardPath -Path $outerSetup
+$guardCode = $LASTEXITCODE
+Write-Host $guardLine
+if ($guardCode -ne 0) { throw "The built bootstrapper failed the PE import check (exit $guardCode): $guardLine" }
 Copy-Item -LiteralPath $outerSetup -Destination (Join-Path $OutputDir "$PackId-Setup.exe")
 Write-Host "inner Setup sha256  $innerHash  (embedded unchanged; also in $StageDir\inner-setup-sha256.txt)"
 
