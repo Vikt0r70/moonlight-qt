@@ -24,6 +24,8 @@ namespace {
 // V-REQ (ADR-0083 decision 1): the inactivity limit for every short control-plane request.
 // `openAccountStream()` deliberately does not set it (its own comment explains why).
 const int kShortRequestTimeoutMs = 8000;
+// SC24: the drop check's one health request gives up after 5 s (docs/spec/client.md, Stream record).
+const int kHealthRequestTimeoutMs = 5000;
 
 // A short, stable class name for a route, for the transport-failure log: never the URL, the
 // session id, an address or a token (V-REQ, ADR-0083 decision 11).
@@ -974,7 +976,8 @@ void ControlPlaneClient::sendOnOwningThread(const QString& method, const QString
     // so a request on a connection that stopped answering fails instead of hanging. This is the
     // one place every short call funnels through; `openAccountStream()` builds its own request on
     // `m_streamNetwork` and deliberately leaves this unset.
-    request.setTransferTimeout(kShortRequestTimeoutMs);
+    request.setTransferTimeout(path == QLatin1String("/health") ? kHealthRequestTimeoutMs
+                                                                 : kShortRequestTimeoutMs);
 
     QNetworkReply* reply = nullptr;
     if (method == QLatin1String("GET")) {
@@ -1270,6 +1273,11 @@ void ControlPlaneClient::postEvidence(const QString& sessionId, const QByteArray
     send(QStringLiteral("POST"), QStringLiteral("/api/sessions/") + encodedPathSegment(sessionId)
              + QStringLiteral("/evidence"),
          body, true, callback);
+}
+
+void ControlPlaneClient::checkHealth(Callback callback)
+{
+    send(QStringLiteral("GET"), QStringLiteral("/health"), QByteArray(), false, callback);
 }
 
 void ControlPlaneClient::postStreamTime(const QString& sessionId, int segmentNo, qint64 deliveredMs,

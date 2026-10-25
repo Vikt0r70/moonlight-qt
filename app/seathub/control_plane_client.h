@@ -629,6 +629,11 @@ public:
     /// here retries.
     void postEvidence(const QString& sessionId, const QByteArray& body, Callback callback);
 
+    /// SC24 / ADR-0117: ONE unauthenticated `GET /health`, bounded by a 5 s transfer timeout, no
+    /// retry. The drop check (`drop_check.h`) is its only caller; `callback` gets the control
+    /// plane's answer or a transport failure (statusCode 0), once.
+    void checkHealth(Callback callback);
+
     /// `POST /api/sessions/{session_id}/stream-time` (ADR-0074 W04, contract 3.11.0): one stream
     /// segment of the caller's own session per call, authenticated with the customer token and
     /// bound to `sessionId` by the server's ownership check (another customer's session answers

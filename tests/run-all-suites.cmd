@@ -107,6 +107,7 @@ call :suite tst_osd_render
 call :suite tst_telemetry
 call :suite tst_single_instance
 call :suite tst_reporting_consent
+call :suite tst_stream_record
 
 if defined FAILED goto :failed
 

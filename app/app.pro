@@ -262,6 +262,8 @@ SOURCES += \
     seathub/end_outbox.cpp \
     seathub/evidence_journal.cpp \
     seathub/stream_quality_sampler.cpp \
+    seathub/stream_record.cpp \
+    seathub/drop_check.cpp \
     seathub/telemetry.cpp \
     seathub/install_journal.cpp \
     seathub/update_retry_state.cpp \
@@ -346,6 +348,8 @@ HEADERS += \
     seathub/end_outbox.h \
     seathub/evidence_journal.h \
     seathub/stream_quality_sampler.h \
+    seathub/stream_record.h \
+    seathub/drop_check.h \
     seathub/telemetry.h \
     seathub/install_journal.h \
     seathub/update_retry_state.h \

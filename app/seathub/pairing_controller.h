@@ -149,6 +149,15 @@ public:
     /// True once the deadline has passed without a result.
     bool deadlineExceeded() const;
 
+    /// The rig's address and port P (the control port) from the last authorization, for the one
+    /// reachability check after a bad end (SC24, ADR-0117). It carries no PIN and no other field of
+    /// the target; empty `host` / `port` 0 until an authorization was granted.
+    struct RigEndpoint {
+        QString host;
+        int port = 0;
+    };
+    RigEndpoint rigEndpoint() const { return {m_lastTarget.hostAddress, m_lastTarget.controlPort}; }
+
 signals:
     void stateChanged();
     /// The control plane granted the session. Carries no argument: the authorization's own

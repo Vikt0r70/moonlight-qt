@@ -43,8 +43,10 @@
 #include "liveness_timer.h"
 #include "engine_status.h"
 #include "end_outbox.h"
+#include "drop_check.h"
 #include "evidence_journal.h"
 #include "stream_quality_sampler.h"
+#include "stream_record.h"
 #include "log_tee.h"
 #include "moonlight_engine_session.h"
 #include "pairing_controller.h"
@@ -391,6 +393,11 @@ public:
     /// Test seam: the length of one quality-sampler window, so a test sees full empty windows in
     /// milliseconds instead of minutes. Set before the stream starts.
     void setSamplerWindowMsForTests(int windowMs);
+
+    /// Test seams for the stream record (T054): the length of one `stream_minute` window, and the
+    /// rig endpoint the drop check dials (production reads it from the pairing controller).
+    void setStreamRecordMinuteMsForTests(qint64 minuteMs);
+    void setRigEndpointForTests(const QString& host, int port);
 
     /// C-ENDING: is an End saved on disk for the signed-in account?
     bool hasSavedEnd() const;
@@ -1188,6 +1195,16 @@ private:
     EvidenceJournal m_journal;
     std::atomic<quint64> m_journalGeneration{0};
     std::atomic<bool> m_journalOpen{false};
+    /// T054 / ADR-0117: the per-minute stream record and the one drop check after a bad end. The
+    /// recorder writes into `m_journal` (declared above it) and is mutex-guarded: the render thread
+    /// feeds samples, the network thread advances minutes and warnings, the main thread ends it.
+    void startDropCheck();
+    StreamRecorder m_streamRecorder{&m_journal};
+    DropCheck* m_dropCheck = nullptr;
+    LogTee::SinkHandle m_streamWarningSinkHandle = 0;
+    QString m_rigHostForTests;
+    int m_rigPortForTests = 0;
+    bool m_rigForcedForTests = false;
     /// Network-thread-readable copy of the signed-in account, guarded by `m_evidenceMutex`, along
     /// with how many sends are outstanding. No new batch is taken while any is in flight, because
     /// `EvidenceJournal::deliverable()` marks what it hands out and an answer removes up to that mark.

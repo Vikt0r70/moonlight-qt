@@ -92,6 +92,16 @@ public:
     void close();
     bool isOpen() const;
 
+    /// ADR-0117 rollover support (the stream recorder is the only caller). `runId()` is the open
+    /// capsule's `run_id`; `entryCount()` how many entries it holds; `entryCap()` its limit.
+    /// `rollRun()` keeps the session and account but starts a new capsule under a new `run_id`
+    /// (seq from 0) and settles the folder cap; the closed capsule stays on disk for delivery.
+    /// False (nothing changed) while no capsule is open.
+    QString runId() const;
+    int entryCount() const;
+    int entryCap() const;
+    bool rollRun();
+
     /// Add one entry (a builder's result) to the open capsule, stamping `seq`, `at` and
     /// `elapsed_ms`. A no-op while closed. An empty or invalid entry, or one past the entry cap,
     /// stores nothing and counts `dropped_entries`.
@@ -148,6 +158,7 @@ private:
     Counters readPendingCounters() const;
     void addPendingCounters(const Counters& delta) const;
     void enforceCapLocked();
+    void startRunLocked();
     void removeUnreadable(const QString& fileName) const;
 
     mutable QMutex m_mutex;

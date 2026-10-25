@@ -13,6 +13,8 @@
 #include <QThread>
 #include <QWindow>
 
+#include <chrono>
+
 #include <SDL.h>
 
 #include "agent_config.h"
@@ -27,6 +29,7 @@
 #include "reporting_consent.h"
 #include "session_lifecycle.h"
 #include "settings_bridge.h"
+#include "stream_record.h"
 #include "stream_stats.h"
 #include "telemetry.h"
 #include "update_retry_state.h"
@@ -343,6 +346,25 @@ std::function<void()> makeStreamTimeCheckpoint(const std::shared_ptr<DeliveredSt
     };
 }
 
+// The stream record's clock: monotonic and thread-safe, because the render thread, the network
+// thread and the main thread all stamp samples and warnings against it (T054).
+qint64 streamRecordNowMs()
+{
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+// Local now moved onto the server's clock by the offset the last `stream.hello` gave
+// (`server_time = local_now + (m_helloServerUtc - m_helloLocalUtc)`); no new clock exchange.
+QDateTime serverNowFrom(const QDateTime& helloServerUtc, const QDateTime& helloLocalUtc)
+{
+    const QDateTime local = QDateTime::currentDateTimeUtc();
+    if (!helloServerUtc.isValid() || !helloLocalUtc.isValid()) {
+        return local;
+    }
+    return local.addMSecs(helloLocalUtc.msecsTo(helloServerUtc));
+}
+
 } // namespace
 
 // Control-plane callbacks arrive on the network thread once `startNetworkThreads()` has moved the
@@ -565,13 +587,32 @@ SeatHubClient::SeatHubClient(QObject* parent)
     // thread is inside the SDL loop during a stream and would not run them until the stream ended.
     // Consecutive empty windows coalesce into one pending stall that the first non-empty roll-up
     // (or the Play's end, in `finishPlay()`) records.
+    // T054: the same two beats also close the stream record's elapsed minutes, so a minute with no
+    // samples is still written (E37).
     connect(m_sampler, &StreamQualitySampler::emptyWindowEmitted, m_sampler,
-            [this](qint64 windowMs) { noteEmptyWindow(windowMs); });
+            [this](qint64 windowMs) {
+                m_streamRecorder.advance(streamRecordNowMs());
+                noteEmptyWindow(windowMs);
+            });
     connect(m_sampler, &StreamQualitySampler::rollupEmitted, m_sampler, [this]() {
+        m_streamRecorder.advance(streamRecordNowMs());
         if (flushPendingStall()) {
             deliverEvidence();
         }
     });
+    // T054: engine warnings become closed warning codes for the minute row. The sink only maps and
+    // marshals (it never blocks or logs); the line text is matched and dropped here, never stored.
+    m_streamWarningSinkHandle = LogTee::addSink(
+        [sampler = m_sampler, this](LogLevel level, int, int, const QString& message) {
+            const StreamRecord::WarningCode code = StreamRecord::warningCodeForLine(message);
+            if (code == StreamRecord::WarningCode::Other && level < LogLevel::Warning) {
+                return;
+            }
+            const qint64 now = streamRecordNowMs();
+            QMetaObject::invokeMethod(sampler, [this, now, code]() {
+                m_streamRecorder.addWarning(now, code);
+            }, Qt::QueuedConnection);
+        });
 
     // ADR-0074 HI02/HI06: the delivered-stream-time clock and its record. The clock reads the
     // engine's three segment-ending log lines through its own sink on the one `LogTee` (the stats
@@ -789,6 +830,8 @@ SeatHubClient::~SeatHubClient()
     m_hud.compositor().setStatsTap(nullptr);
     if (m_statusSinkHandle != 0) LogTee::removeSink(m_statusSinkHandle);
     m_statusSinkHandle = 0;
+    if (m_streamWarningSinkHandle != 0) LogTee::removeSink(m_streamWarningSinkHandle);
+    m_streamWarningSinkHandle = 0;
     // D-17/A-51: unregister both `LogTee` sinks FIRST, before anything either lambda captures -
     // `this` (the termination sink calls `m_liveness->noteTermination()`) and `m_statsWatcher`
     // (owned by the stats sink) - is destroyed. `LogTee`'s sink list is process-global and
@@ -1491,6 +1534,18 @@ void SeatHubClient::setEvidenceJournalDirectory(const QString& directory)
     m_journal.setDirectory(directory);
 }
 
+void SeatHubClient::setStreamRecordMinuteMsForTests(qint64 minuteMs)
+{
+    m_streamRecorder.setMinuteMsForTests(minuteMs);
+}
+
+void SeatHubClient::setRigEndpointForTests(const QString& host, int port)
+{
+    m_rigHostForTests = host;
+    m_rigPortForTests = port;
+    m_rigForcedForTests = true;
+}
+
 void SeatHubClient::setSamplerWindowMsForTests(int windowMs)
 {
     if (m_sampler->thread() == QThread::currentThread()) {
@@ -1517,6 +1572,39 @@ void SeatHubClient::openEvidenceJournal(const QString& sessionId)
     m_journalOpen.store(true);
     // One clock-skew bucket per Play, from the last `stream.hello`: evidence only, nothing reads it.
     recordEvidence(EvidenceJournal::clockSkew(m_helloServerUtc, m_helloLocalUtc));
+}
+
+void SeatHubClient::startDropCheck()
+{
+    if (m_dropCheck != nullptr) {
+        m_dropCheck->deleteLater();
+        m_dropCheck = nullptr;
+    }
+    QString host = m_rigHostForTests;
+    int port = m_rigPortForTests;
+    if (!m_rigForcedForTests && m_pairing != nullptr) {
+        // The PIN-free view of the last authorization: the address and port P, nothing else.
+        const PairingController::RigEndpoint endpoint = m_pairing->rigEndpoint();
+        host = endpoint.host;
+        port = endpoint.port;
+    }
+    const quint64 generation = m_journalGeneration.load();
+    DropCheck* check = new DropCheck(m_controlPlane, this);
+    m_dropCheck = check;
+    connect(check, &DropCheck::finished, this, [this, check, generation](const DropCheck::Result& result) {
+        // Another Play opened its own capsule meanwhile: this answer belongs to a capsule that is
+        // no longer ours to write into.
+        if (generation == m_journalGeneration.load() && m_journalOpen.load()) {
+            m_streamRecorder.writeDropCheck(streamRecordNowMs(), result);
+            closeEvidenceJournal();
+            deliverEvidence();
+        }
+        if (m_dropCheck == check) {
+            m_dropCheck = nullptr;
+        }
+        check->deleteLater();
+    });
+    check->start(host, port);
 }
 
 void SeatHubClient::closeEvidenceJournal()
@@ -3092,12 +3180,18 @@ void SeatHubClient::handleConnectionStarted()
     }
 
     const bool firstConnection = m_streamStartMs < 0;
-    if (firstConnection) m_streamStartMs = m_playElapsed.elapsed();
+    if (firstConnection) {
+        m_streamStartMs = m_playElapsed.elapsed();
+        // T054: the Play's minute rows start with the stream (the overlay state is not readable
+        // here without an engine edit, so `overlay_visible` stays "unknown").
+        m_streamRecorder.begin(streamRecordNowMs(), serverNowFrom(m_helloServerUtc, m_helloLocalUtc));
+    }
     const auto generation = m_playGeneration.load();
     const QElapsedTimer clock = m_playElapsed;
     m_hud.compositor().setStatsTap([this, generation, clock](const VideoStats& stats) {
         if (generation != m_playGeneration.load()) return;
         m_sampler->feed(stats);
+        m_streamRecorder.addSample(streamRecordNowMs(), stats);
         qint64 absent = -1;
         if (stats.renderedFps.present && stats.renderedFps.value > 0
             && m_firstFrameMs.compare_exchange_strong(absent, clock.elapsed())) {
@@ -3774,9 +3868,29 @@ void SeatHubClient::finishPlay(const QString& exitPath, const QString& outcome,
     // ADR-0105: the Play is over, so its capsule closes (after the sampler's step above, which
     // may add the last stall) and is sent without waiting for anything. A quitting app leaves
     // it on disk for the next launch.
-    closeEvidenceJournal();
-    if (exitPath != QLatin1String("app_quit")) {
-        deliverEvidence();
+    // T054 / ADR-0117: the last (partial) minute row, then - only on a bad end - the 30-second tail
+    // stamped at this first local bad-end signal, and the one drop check. They go into the same
+    // capsule, so it stays open until the check answers (at most 5 s); a quitting app closes it now.
+    const qint64 endedMono = streamRecordNowMs();
+    m_streamRecorder.finish(endedMono);
+    const bool badEnd = m_streamStartMs >= 0 && (outcome == QLatin1String("failed") || m_engineFailed);
+    bool dropCheckPending = false;
+    if (badEnd) {
+        const QString endClass = failureClass.isEmpty() ? m_lastFailureClass : failureClass;
+        if (m_streamRecorder.writeTail(endedMono, StreamRecord::endReasonForClass(endClass, m_engineFailed))
+            && exitPath != QLatin1String("app_quit")) {
+            startDropCheck();
+            dropCheckPending = true;
+        }
+    }
+    // ADR-0105: the Play is over, so its capsule closes (after the sampler's step above, which
+    // may add the last stall) and is sent without waiting for anything. A quitting app leaves
+    // it on disk for the next launch.
+    if (!dropCheckPending) {
+        closeEvidenceJournal();
+        if (exitPath != QLatin1String("app_quit")) {
+            deliverEvidence();
+        }
     }
     if (m_streamStartMs >= 0) {
         attributes.insert("stream_s", (m_playElapsed.elapsed() - m_streamStartMs) / 1000.0);
@@ -4148,6 +4262,7 @@ void SeatHubClient::handleHostResolved(const QString& sessionId, const PairedHos
     // by passing nullptr). The compositor holds the function-pointer behind its own mutex.
     m_hud.compositor().setStatsTap([this](const VideoStats& stats) {
         m_sampler->feed(stats);
+        m_streamRecorder.addSample(streamRecordNowMs(), stats);
     });
 
     // D-26 (Plan 14): the compositor's own stats-label choice, set alongside the filter above.
