@@ -233,7 +233,11 @@ public:
     /// held line must belong to before it may be handed to the SDK. `telemetry.cpp`'s `setUser()`
     /// publishes it before `setCanShip()`; `clearUser()` publishes the empty account after it, so a
     /// line is never dropped in the gap between the two. Empty means no account is signed in.
-    void publishAccount(const QString& accountId);
+    /// `underLock` (T070 / A2) runs before the account is stored, while the worker is excluded: a
+    /// line the worker has already checked is emitted to the SDK in full first, then this change
+    /// applies. Pass the SDK user change here so it cannot land between a line's account check and
+    /// its emission. It must not call `pauseHandOff()` or `drainBeforeSignOut()`.
+    void publishAccount(const QString& accountId, const std::function<void()>& underLock = {});
     /// T023: how many lines were dropped (never shipped, never re-spooled) because they were logged
     /// under a different account than the one signed in when they were due to ship.
     qint64 droppedAccountCount() const;

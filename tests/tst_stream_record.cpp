@@ -148,6 +148,18 @@ public:
         m_healthStatus = status;
         m_healthDelayMs = delayMs;
     }
+    /// T070: what `/evidence` answers (503 keeps every capsule on disk, the default; 200 delivers).
+    void answerEvidence(int status)
+    {
+        QMutexLocker lock(&m_mutex);
+        m_evidenceStatus = status;
+    }
+    /// T070: every `/evidence` body posted, as `{session id, JSON object}`, in arrival order.
+    QList<QPair<QString, QJsonObject>> evidencePosts() const
+    {
+        QMutexLocker lock(&m_mutex);
+        return m_evidencePosts;
+    }
     int count(const QString& path) const
     {
         QMutexLocker lock(&m_mutex);
@@ -160,16 +172,31 @@ public:
     }
 
 protected:
-    QNetworkReply* createRequest(Operation, const QNetworkRequest& request, QIODevice*) override
+    QNetworkReply* createRequest(Operation, const QNetworkRequest& request, QIODevice* outgoing) override
     {
         const QString path = request.url().path();
         int healthStatus;
         int healthDelay;
+        int evidenceStatus;
         {
             QMutexLocker lock(&m_mutex);
             m_paths.append(path);
             healthStatus = m_healthStatus;
             healthDelay = m_healthDelayMs;
+            evidenceStatus = m_evidenceStatus;
+        }
+        if (path.endsWith(QLatin1String("/evidence"))) {
+            // /api/sessions/<id>/evidence
+            const QString sessionId = path.section(QLatin1Char('/'), 3, 3);
+            QByteArray body;
+            if (outgoing != nullptr) {
+                body = outgoing->readAll();
+                if (!outgoing->isSequential()) {
+                    outgoing->reset();
+                }
+            }
+            QMutexLocker lock(&m_mutex);
+            m_evidencePosts.append({sessionId, QJsonDocument::fromJson(body).object()});
         }
         if (path == QLatin1String("/health")) {
             return new FakeReply(healthStatus, QByteArrayLiteral("{\"status\":\"ok\"}"), this, healthDelay);
@@ -200,7 +227,10 @@ protected:
         }
         if (path.endsWith(QLatin1String("/evidence"))) {
             // A 5xx keeps every capsule on disk (ADR-0105), so the test can read what was written.
-            return new FakeReply(503, QByteArrayLiteral("{\"status\":false,\"error\":\"busy\"}"), this);
+            if (evidenceStatus == 200) {
+                return new FakeReply(200, QByteArrayLiteral("{\"status\":true}"), this);
+            }
+            return new FakeReply(evidenceStatus, QByteArrayLiteral("{\"status\":false,\"error\":\"busy\"}"), this);
         }
         if (path.endsWith(QLatin1String("/quality"))) {
             return new FakeReply(200, QByteArrayLiteral("{\"status\":true}"), this);
@@ -217,6 +247,8 @@ private:
     QStringList m_paths;
     int m_healthStatus = 200;
     int m_healthDelayMs = 0;
+    int m_evidenceStatus = 503;
+    QList<QPair<QString, QJsonObject>> m_evidencePosts;
 };
 
 class FakeEngineSession : public EngineSession
@@ -278,6 +310,7 @@ struct Capsule
 {
     QString runId;
     QJsonArray entries;
+    QString sessionId;
 };
 
 QList<Capsule> readCapsules(const QString& directory)
@@ -291,7 +324,8 @@ QList<Capsule> readCapsules(const QString& directory)
         }
         const QJsonObject object = QJsonDocument::fromJson(file.readAll()).object();
         capsules.append({object.value(QStringLiteral("run_id")).toString(),
-                         object.value(QStringLiteral("entries")).toArray()});
+                         object.value(QStringLiteral("entries")).toArray(),
+                         object.value(QStringLiteral("session_id")).toString()});
     }
     return capsules;
 }
@@ -987,6 +1021,193 @@ private slots:
             client.session()->attachSession(nullptr);
         }
         delete engine;
+    }
+
+    // ---------------------------------------------------------------- T070: closing Play context
+
+    /// Entries of `kind` over every capsule of one session (a long Play may roll into several).
+    static QList<QJsonObject> sessionEntries(const QList<Capsule>& capsules, const QString& sessionId,
+                                             const QString& kind)
+    {
+        QList<Capsule> mine;
+        for (const Capsule& capsule : capsules) {
+            if (capsule.sessionId == sessionId) {
+                mine.append(capsule);
+            }
+        }
+        return entriesOfKind(mine, kind);
+    }
+
+    /// Two Plays that both end badly while the first one's drop check is still out. The health
+    /// answer is held for 3.5 s (inside the 5 s bound), which is longer than the second Play needs
+    /// to start, stream and fail. `evidenceStatus` is what the control plane answers to a capsule:
+    /// 503 is the offline case (capsules stay on disk), 200 is delivery.
+    void twoBadPlaysBeforeTheFirstCheckAnswers(int evidenceStatus)
+    {
+        CountingListener rig;
+        QVERIFY(rig.listening());
+
+        auto* engineOne = new FakeEngineSession;
+        auto* engineTwo = new FakeEngineSession;
+        {
+            SeatHubClient client;
+            client.credentialStore()->setDirectory(m_dir->path());
+            QTemporaryDir backup;
+            client.credentialStore()->setBackupRoot(backup.path());
+            client.setEndOutboxDirectory(m_dir->path() + QStringLiteral("/end-outbox"));
+            client.setEvidenceJournalDirectory(journalDir());
+            client.controlPlane()->setBaseUrl(QStringLiteral("https://control.invalid"));
+            ControlPlaneClient* planeClient = client.controlPlane();
+            auto arm = [this, planeClient]() {
+                m_plane = new MiniPlane(planeClient);
+                planeClient->setNetworkAccessManager(m_plane);
+            };
+            if (planeClient->thread() == QThread::currentThread()) {
+                arm();
+            } else {
+                QMetaObject::invokeMethod(planeClient, arm, Qt::BlockingQueuedConnection);
+            }
+            m_plane->answerEvidence(evidenceStatus);
+            m_plane->answerHealth(200, 3500);
+            QVERIFY(client.credentialStore()->storeToken(TokenStore::accessTokenName(),
+                                                         QString::fromLatin1(kAccessToken)));
+            client.restoreSession();
+            QTRY_COMPARE_WITH_TIMEOUT(client.appState(), QStringLiteral("home"), 15000);
+
+            client.setSamplerWindowMsForTests(40);
+            client.setStreamRecordMinuteMsForTests(40);
+            client.setRigEndpointForTests(QStringLiteral("127.0.0.1"), rig.port());
+
+            auto startPlay = [&](FakeEngineSession* engine, const QString& sessionId) {
+                client.session()->attachSession(engine);
+                client.beginSession(sessionId);
+                emit engine->connectionStarted();
+                QCOMPARE(client.appState(), QStringLiteral("streaming"));
+                QElapsedTimer clock;
+                clock.start();
+                while (clock.elapsed() < 300) {
+                    SDL_Surface* surface = OsdCompositor::rasterize(
+                        Overlay::OverlayDebug,
+                        "Rendering frame rate: 59.00 FPS\nAverage network latency: 23 ms (variance: 1 ms)",
+                        true, SDL_Color{255, 255, 255, 255}, &client.hud()->compositor());
+                    if (surface) SDL_FreeSurface(surface);
+                    QTest::qWait(10);
+                }
+                QTRY_VERIFY_WITH_TIMEOUT(
+                    !sessionEntries(readCapsules(journalDir()), sessionId, QStringLiteral("stream_minute")).isEmpty(),
+                    10000);
+            };
+            auto badEnd = [&](FakeEngineSession* engine, const QString& sessionId) {
+                emit engine->stageFailed(QStringLiteral("RTSP handshake"), -1, QString());
+                emit engine->readyForDeletion();
+                QTRY_VERIFY_WITH_TIMEOUT(
+                    !sessionEntries(readCapsules(journalDir()), sessionId, QStringLiteral("stream_tail")).isEmpty(),
+                    10000);
+            };
+
+            startPlay(engineOne, QStringLiteral("s-one"));
+            badEnd(engineOne, QStringLiteral("s-one"));
+            // The first Play's check is still out. A failed Play leaves the error screen up until
+            // the person dismisses it, then the next Play starts and fails before it answers.
+            QCOMPARE(client.appState(), QStringLiteral("error"));
+            client.dismissError();
+            QTRY_COMPARE_WITH_TIMEOUT(client.appState(), QStringLiteral("home"), 15000);
+            startPlay(engineTwo, QStringLiteral("s-two"));
+            QVERIFY(sessionEntries(readCapsules(journalDir()), QStringLiteral("s-two"), QStringLiteral("drop_check"))
+                        .isEmpty());
+            badEnd(engineTwo, QStringLiteral("s-two"));
+
+            // Each Play ends with exactly its own tail and exactly one check, in its own capsule.
+            const QString one = QStringLiteral("s-one");
+            const QString two = QStringLiteral("s-two");
+            auto dropCount = [&](const QString& sessionId) -> int {
+                if (evidenceStatus == 200) {
+                    QSet<QString> seen;
+                    for (const auto& post : m_plane->evidencePosts()) {
+                        if (post.first != sessionId) continue;
+                        for (const QJsonValue& value : post.second.value(QStringLiteral("entries")).toArray()) {
+                            const QJsonObject entry = value.toObject();
+                            if (entry.value(QStringLiteral("kind")).toString() == QLatin1String("drop_check")) {
+                                seen.insert(entry.value(QStringLiteral("run_id")).toString()
+                                            + QLatin1Char('#') + QString::number(entry.value(QStringLiteral("seq")).toInt()));
+                            }
+                        }
+                    }
+                    return seen.size();
+                }
+                return sessionEntries(readCapsules(journalDir()), sessionId, QStringLiteral("drop_check")).size();
+            };
+            QTRY_COMPARE_WITH_TIMEOUT(dropCount(one), 1, 20000);
+            QTRY_COMPARE_WITH_TIMEOUT(dropCount(two), 1, 20000);
+            QTest::qWait(400); // a duplicate, a retry or a reconnect would show by now
+            QCOMPARE(dropCount(one), 1);
+            QCOMPARE(dropCount(two), 1);
+            QCOMPARE(m_plane->count(QStringLiteral("/health")), 2);
+            QCOMPARE(rig.accepted(), 2);
+
+            if (evidenceStatus != 200) {
+                // Offline: both capsules wait on disk, each whole and apart from the other.
+                const QList<Capsule> capsules = readCapsules(journalDir());
+                for (const QString& sessionId : {one, two}) {
+                    const QList<QJsonObject> tails = sessionEntries(capsules, sessionId, QStringLiteral("stream_tail"));
+                    const QList<QJsonObject> drops = sessionEntries(capsules, sessionId, QStringLiteral("drop_check"));
+                    QCOMPARE(tails.size(), 1);
+                    QCOMPARE(drops.size(), 1);
+                    QCOMPARE(drops.first().value(QStringLiteral("run_id")).toString(),
+                             tails.first().value(QStringLiteral("run_id")).toString());
+                    QVERIFY(drops.first().value(QStringLiteral("seq")).toInt()
+                            > tails.first().value(QStringLiteral("seq")).toInt());
+                    QVERIFY(QDateTime::fromString(drops.first().value(QStringLiteral("checked_at_server_time")).toString(), Qt::ISODate)
+                            >= QDateTime::fromString(tails.first().value(QStringLiteral("ended_at_server_time")).toString(), Qt::ISODate));
+                    QCOMPARE(tails.first().value(QStringLiteral("end_reason")).toString(), QStringLiteral("engine_failure"));
+                    // What the end outbox records while the check is still out keeps landing in the
+                    // ended Play's own capsule: closing it for a new Play must not lose entries.
+                    QVERIFY2(!sessionEntries(capsules, sessionId, QStringLiteral("end_outbox")).isEmpty(),
+                             qPrintable(sessionId + QStringLiteral(" lost its end_outbox entry")));
+                }
+                const QString runOne = sessionEntries(capsules, one, QStringLiteral("stream_tail")).first()
+                                           .value(QStringLiteral("run_id")).toString();
+                const QString runTwo = sessionEntries(capsules, two, QStringLiteral("stream_tail")).first()
+                                           .value(QStringLiteral("run_id")).toString();
+                QVERIFY(runOne != runTwo);
+                // The second capsule holds nothing of the first: every entry carries its own run.
+                for (const Capsule& capsule : capsules) {
+                    for (const QJsonValue& value : capsule.entries) {
+                        const QString entryRun = value.toObject().value(QStringLiteral("run_id")).toString();
+                        if (!entryRun.isEmpty()) {
+                            QCOMPARE(entryRun, capsule.runId);
+                        }
+                    }
+                }
+            } else {
+                // Delivered: no capsule of either Play is left, and each one's check went out with
+                // its own run (never inside the other Play's capsule).
+                QTRY_VERIFY_WITH_TIMEOUT(readCapsules(journalDir()).isEmpty(), 20000);
+                for (const auto& post : m_plane->evidencePosts()) {
+                    const QString bodyRun = post.second.value(QStringLiteral("run_id")).toString();
+                    for (const QJsonValue& value : post.second.value(QStringLiteral("entries")).toArray()) {
+                        const QString entryRun = value.toObject().value(QStringLiteral("run_id")).toString();
+                        if (!entryRun.isEmpty()) {
+                            QCOMPARE(entryRun, bodyRun);
+                        }
+                    }
+                }
+            }
+
+            client.session()->attachSession(nullptr);
+        }
+        delete engineOne;
+        delete engineTwo;
+    }
+
+    void aNextPlayAndASecondBadEndDoNotCostTheFirstCapsuleItsTailAndDropCheckOffline()
+    {
+        twoBadPlaysBeforeTheFirstCheckAnswers(503);
+    }
+
+    void aNextPlayAndASecondBadEndDoNotCostTheFirstCapsuleItsTailAndDropCheckOnline()
+    {
+        twoBadPlaysBeforeTheFirstCheckAnswers(200);
     }
 };
 

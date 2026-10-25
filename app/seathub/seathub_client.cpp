@@ -534,7 +534,8 @@ SeatHubClient::SeatHubClient(QObject* parent)
 
     // ADR-0105: the per-Play evidence capsule and the outbox events it records. The observers
     // record only closed event/answer tokens; a capsule is open only while a Play runs.
-    m_journal.setDirectory(EvidenceJournal::defaultDirectory());
+    m_evidenceDirectory = EvidenceJournal::defaultDirectory();
+    std::atomic_store(&m_evidence, makeEvidenceSet());
     m_endOutbox.setObserver([this](const QString& event, const QString& answer, int count) {
         recordEvidence(EvidenceJournal::outbox(QStringLiteral("end_outbox"), event, answer, count));
     });
@@ -591,11 +592,11 @@ SeatHubClient::SeatHubClient(QObject* parent)
     // samples is still written (E37).
     connect(m_sampler, &StreamQualitySampler::emptyWindowEmitted, m_sampler,
             [this](qint64 windowMs) {
-                m_streamRecorder.advance(streamRecordNowMs());
+                evidence()->recorder.advance(streamRecordNowMs());
                 noteEmptyWindow(windowMs);
             });
     connect(m_sampler, &StreamQualitySampler::rollupEmitted, m_sampler, [this]() {
-        m_streamRecorder.advance(streamRecordNowMs());
+        evidence()->recorder.advance(streamRecordNowMs());
         if (flushPendingStall()) {
             deliverEvidence();
         }
@@ -610,7 +611,7 @@ SeatHubClient::SeatHubClient(QObject* parent)
             }
             const qint64 now = streamRecordNowMs();
             QMetaObject::invokeMethod(sampler, [this, now, code]() {
-                m_streamRecorder.addWarning(now, code);
+                evidence()->recorder.addWarning(now, code);
             }, Qt::QueuedConnection);
         });
 
@@ -1531,12 +1532,24 @@ void SeatHubClient::setEndOutboxDirectory(const QString& directory)
 
 void SeatHubClient::setEvidenceJournalDirectory(const QString& directory)
 {
-    m_journal.setDirectory(directory);
+    m_evidenceDirectory = directory;
+    evidence()->journal.setDirectory(directory);
 }
 
 void SeatHubClient::setStreamRecordMinuteMsForTests(qint64 minuteMs)
 {
-    m_streamRecorder.setMinuteMsForTests(minuteMs);
+    m_streamMinuteMsForTests = minuteMs;
+    evidence()->recorder.setMinuteMsForTests(minuteMs);
+}
+
+std::shared_ptr<SeatHubClient::EvidenceSet> SeatHubClient::makeEvidenceSet() const
+{
+    auto set = std::make_shared<EvidenceSet>();
+    set->journal.setDirectory(m_evidenceDirectory);
+    if (m_streamMinuteMsForTests > 0) {
+        set->recorder.setMinuteMsForTests(m_streamMinuteMsForTests);
+    }
+    return set;
 }
 
 void SeatHubClient::setRigEndpointForTests(const QString& host, int port)
@@ -1556,8 +1569,19 @@ void SeatHubClient::setSamplerWindowMsForTests(int windowMs)
                               Qt::BlockingQueuedConnection);
 }
 
+void SeatHubClient::retireEndedEvidenceSet()
+{
+    // The active set belongs to a bad-ended Play whose check is still out: a new Play gets its own.
+    if (m_pendingCheckSet != nullptr && evidence().get() == m_pendingCheckSet) {
+        std::atomic_store(&m_evidence, makeEvidenceSet());
+        m_journalOpen.store(false);
+    }
+    m_pendingCheckSet = nullptr;
+}
+
 void SeatHubClient::openEvidenceJournal(const QString& sessionId)
 {
+    retireEndedEvidenceSet();
     {
         std::lock_guard<std::mutex> lock(m_evidenceMutex);
         m_evidenceAccountId = m_accountId;
@@ -1566,7 +1590,7 @@ void SeatHubClient::openEvidenceJournal(const QString& sessionId)
     // capsule.
     m_journalOpen.store(false);
     m_journalGeneration.fetch_add(1);
-    if (!m_journal.open(sessionId, m_accountId)) {
+    if (!evidence()->journal.open(sessionId, m_accountId)) {
         return;
     }
     m_journalOpen.store(true);
@@ -1576,10 +1600,13 @@ void SeatHubClient::openEvidenceJournal(const QString& sessionId)
 
 void SeatHubClient::startDropCheck()
 {
-    if (m_dropCheck != nullptr) {
-        m_dropCheck->deleteLater();
-        m_dropCheck = nullptr;
-    }
+    // T070 / A6: this Play's capsule (account, session, run, recorder, journal) is owned by its own
+    // completion from here. It stays the active set, so entries recorded until the next Play opens
+    // (outbox events, a late stall) still land in it as before; the next Play replaces the active set
+    // (`retireEndedEvidenceSet()`), so nothing it does can reach this capsule, and nothing here
+    // cancels an earlier Play's check.
+    std::shared_ptr<EvidenceSet> ending = evidence();
+    m_pendingCheckSet = ending.get();
     QString host = m_rigHostForTests;
     int port = m_rigPortForTests;
     if (!m_rigForcedForTests && m_pairing != nullptr) {
@@ -1588,20 +1615,22 @@ void SeatHubClient::startDropCheck()
         host = endpoint.host;
         port = endpoint.port;
     }
-    const quint64 generation = m_journalGeneration.load();
     DropCheck* check = new DropCheck(m_controlPlane, this);
-    m_dropCheck = check;
-    connect(check, &DropCheck::finished, this, [this, check, generation](const DropCheck::Result& result) {
-        // Another Play opened its own capsule meanwhile: this answer belongs to a capsule that is
-        // no longer ours to write into.
-        if (generation == m_journalGeneration.load() && m_journalOpen.load()) {
-            m_streamRecorder.writeDropCheck(streamRecordNowMs(), result);
-            closeEvidenceJournal();
-            deliverEvidence();
+    m_dropChecks.append(check);
+    connect(check, &DropCheck::finished, this, [this, check, ending](const DropCheck::Result& result) {
+        // Exactly one check lands in this Play's own capsule, which then closes and goes out.
+        {
+            std::lock_guard<std::mutex> lock(m_evidenceIoMutex);
+            ending->recorder.writeDropCheck(streamRecordNowMs(), result);
+            ending->journal.close();
         }
-        if (m_dropCheck == check) {
-            m_dropCheck = nullptr;
+        // Only the active set's open flag is shared; a newer Play already owns it otherwise.
+        if (evidence() == ending) {
+            m_journalOpen.store(false);
+            m_pendingCheckSet = nullptr;
         }
+        deliverEvidence();
+        m_dropChecks.removeAll(check);
         check->deleteLater();
     });
     check->start(host, port);
@@ -1610,13 +1639,13 @@ void SeatHubClient::startDropCheck()
 void SeatHubClient::closeEvidenceJournal()
 {
     m_journalOpen.store(false);
-    m_journal.close();
+    evidence()->journal.close();
 }
 
 void SeatHubClient::recordEvidence(const QJsonObject& entry)
 {
     // A no-op while no Play is open: nothing is written while the app is idle.
-    m_journal.record(entry);
+    evidence()->journal.record(entry);
 }
 
 void SeatHubClient::deliverEvidence()
@@ -1637,7 +1666,14 @@ void SeatHubClient::deliverEvidence()
     if (!ReportingConsent::coveredUploadsAllowed()) {
         return;
     }
-    const QList<EvidenceJournal::PendingCapsule> capsules = m_journal.deliverable(accountId);
+    // The set that hands a capsule out is the one that applies its answer (it keeps the hand-out
+    // marks), even if a newer Play has replaced it as the active set meanwhile.
+    const std::shared_ptr<EvidenceSet> set = evidence();
+    QList<EvidenceJournal::PendingCapsule> capsules;
+    {
+        std::lock_guard<std::mutex> lock(m_evidenceIoMutex);
+        capsules = set->journal.deliverable(accountId);
+    }
     if (capsules.isEmpty()) {
         return;
     }
@@ -1648,11 +1684,14 @@ void SeatHubClient::deliverEvidence()
     }
     for (const EvidenceJournal::PendingCapsule& capsule : capsules) {
         m_controlPlane->postEvidence(capsule.sessionId, capsule.body,
-                                     [this, sessionId = capsule.sessionId, runId = capsule.runId](
+                                     [this, set, sessionId = capsule.sessionId, runId = capsule.runId](
                                          const ControlPlaneResult& result) {
             // The journal is mutex-guarded, so the answer is applied on whichever thread it lands.
             const int status = result.statusCode > 0 ? result.statusCode : -1;
-            m_journal.applyAnswer(sessionId, runId, status);
+            {
+                std::lock_guard<std::mutex> ioLock(m_evidenceIoMutex);
+                set->journal.applyAnswer(sessionId, runId, status);
+            }
             bool again = false;
             {
                 std::lock_guard<std::mutex> lock(m_evidenceMutex);
@@ -1707,7 +1746,7 @@ bool SeatHubClient::flushPendingStall()
     if (!m_journalOpen.load() || generation != m_journalGeneration.load()) {
         return false;
     }
-    m_journal.record(EvidenceJournal::stallWindow(windows, durationMs));
+    evidence()->journal.record(EvidenceJournal::stallWindow(windows, durationMs));
     return true;
 }
 
@@ -3184,14 +3223,17 @@ void SeatHubClient::handleConnectionStarted()
         m_streamStartMs = m_playElapsed.elapsed();
         // T054: the Play's minute rows start with the stream (the overlay state is not readable
         // here without an engine edit, so `overlay_visible` stays "unknown").
-        m_streamRecorder.begin(streamRecordNowMs(), serverNowFrom(m_helloServerUtc, m_helloLocalUtc));
+        // A Play whose capsule opens late (account not yet known) must not reset the recorder of a
+        // bad-ended Play still waiting for its check.
+        retireEndedEvidenceSet();
+        evidence()->recorder.begin(streamRecordNowMs(), serverNowFrom(m_helloServerUtc, m_helloLocalUtc));
     }
     const auto generation = m_playGeneration.load();
     const QElapsedTimer clock = m_playElapsed;
     m_hud.compositor().setStatsTap([this, generation, clock](const VideoStats& stats) {
         if (generation != m_playGeneration.load()) return;
         m_sampler->feed(stats);
-        m_streamRecorder.addSample(streamRecordNowMs(), stats);
+        evidence()->recorder.addSample(streamRecordNowMs(), stats);
         qint64 absent = -1;
         if (stats.renderedFps.present && stats.renderedFps.value > 0
             && m_firstFrameMs.compare_exchange_strong(absent, clock.elapsed())) {
@@ -3872,12 +3914,12 @@ void SeatHubClient::finishPlay(const QString& exitPath, const QString& outcome,
     // stamped at this first local bad-end signal, and the one drop check. They go into the same
     // capsule, so it stays open until the check answers (at most 5 s); a quitting app closes it now.
     const qint64 endedMono = streamRecordNowMs();
-    m_streamRecorder.finish(endedMono);
+    evidence()->recorder.finish(endedMono);
     const bool badEnd = m_streamStartMs >= 0 && (outcome == QLatin1String("failed") || m_engineFailed);
     bool dropCheckPending = false;
     if (badEnd) {
         const QString endClass = failureClass.isEmpty() ? m_lastFailureClass : failureClass;
-        if (m_streamRecorder.writeTail(endedMono, StreamRecord::endReasonForClass(endClass, m_engineFailed))
+        if (evidence()->recorder.writeTail(endedMono, StreamRecord::endReasonForClass(endClass, m_engineFailed))
             && exitPath != QLatin1String("app_quit")) {
             startDropCheck();
             dropCheckPending = true;
@@ -4262,7 +4304,7 @@ void SeatHubClient::handleHostResolved(const QString& sessionId, const PairedHos
     // by passing nullptr). The compositor holds the function-pointer behind its own mutex.
     m_hud.compositor().setStatsTap([this](const VideoStats& stats) {
         m_sampler->feed(stats);
-        m_streamRecorder.addSample(streamRecordNowMs(), stats);
+        evidence()->recorder.addSample(streamRecordNowMs(), stats);
     });
 
     // D-26 (Plan 14): the compositor's own stats-label choice, set alongside the filter above.

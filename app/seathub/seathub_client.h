@@ -1192,15 +1192,37 @@ private:
     /// ADR-0105: the per-Play evidence capsule (mutex-guarded; written from the main thread and
     /// the network thread). `m_journalGeneration` counts opens and `m_journalOpen` says whether one
     /// is open now, so the network thread can tell a stall that belongs to another Play.
-    EvidenceJournal m_journal;
+    /// T070 / A6: one Play's capsule writer. The journal keeps a single open run, so a capsule can
+    /// only be finished by the instance that opened it; each Play therefore gets its own set. The
+    /// recorder writes into the journal beside it (declared first) and is mutex-guarded: the render
+    /// thread feeds samples, the network thread advances minutes and warnings, the main thread ends it.
+    struct EvidenceSet {
+        EvidenceJournal journal;
+        StreamRecorder recorder{&journal};
+    };
+    /// The set of the Play in progress (or the last one, once closed). Read with
+    /// `std::atomic_load()` through `evidence()`, replaced only by `startDropCheck()` and the
+    /// constructor. A bad-ended Play's set moves to its own drop-check completion and stays alive
+    /// until that completion has written and closed it.
+    std::shared_ptr<EvidenceSet> m_evidence;
+    std::shared_ptr<EvidenceSet> evidence() const { return std::atomic_load(&m_evidence); }
+    std::shared_ptr<EvidenceSet> makeEvidenceSet() const;
+    /// The active set while its bad-ended Play's check is still out (main thread only); compared by
+    /// address, never dereferenced.
+    EvidenceSet* m_pendingCheckSet = nullptr;
+    void retireEndedEvidenceSet();
+    QString m_evidenceDirectory;
+    qint64 m_streamMinuteMsForTests = 0;
+    /// Serialises the journal calls that read or rewrite capsules across sets (hand-out, answer, the
+    /// closing check's write): two sets share one folder, and each only locks itself.
+    std::mutex m_evidenceIoMutex;
     std::atomic<quint64> m_journalGeneration{0};
     std::atomic<bool> m_journalOpen{false};
-    /// T054 / ADR-0117: the per-minute stream record and the one drop check after a bad end. The
-    /// recorder writes into `m_journal` (declared above it) and is mutex-guarded: the render thread
-    /// feeds samples, the network thread advances minutes and warnings, the main thread ends it.
+    /// T054 / ADR-0117: the one drop check after a bad end. Each ended Play owns its own, parented to
+    /// the client, and nothing cancels or replaces it: a later Play, or a second bad end, never
+    /// touches an earlier Play's completion.
     void startDropCheck();
-    StreamRecorder m_streamRecorder{&m_journal};
-    DropCheck* m_dropCheck = nullptr;
+    QList<DropCheck*> m_dropChecks;
     LogTee::SinkHandle m_streamWarningSinkHandle = 0;
     QString m_rigHostForTests;
     int m_rigPortForTests = 0;

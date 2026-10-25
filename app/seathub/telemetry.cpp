@@ -1034,11 +1034,14 @@ void setUser(const QString& accountId)
     s_currentUserId = accountId;
     s_signedIn = true;
     const QByteArray idUtf8 = accountId.toUtf8();
-    sentry_set_user(sentry_value_new_user(idUtf8.constData(), nullptr, nullptr, nullptr));
-    sentry_set_tag("signed_in", "true");
     // T023: the shipper learns the account BEFORE it may ship again, so a line held under another
-    // account is never handed to the SDK under this user's scope.
-    LogShipper::instance().publishAccount(accountId);
+    // account is never handed to the SDK under this user's scope. T070: the SDK user changes under
+    // the shipper's account lock, so a line already checked against the old account reaches the
+    // SDK before the new user does.
+    LogShipper::instance().publishAccount(accountId, [&idUtf8]() {
+        sentry_set_user(sentry_value_new_user(idUtf8.constData(), nullptr, nullptr, nullptr));
+        sentry_set_tag("signed_in", "true");
+    });
     updateCanShip();
 }
 
@@ -1046,11 +1049,14 @@ void clearUser()
 {
     s_currentUserId.clear();
     s_signedIn = false;
-    sentry_remove_user();
-    sentry_set_tag("signed_in", "false");
-    updateCanShip();
     // T023: shipping stops first, then the account clears, so a line is never dropped in the gap.
-    LogShipper::instance().publishAccount(QString());
+    // T070: all three happen under the shipper's account lock, so no line is emitted after the SDK
+    // user is gone but before shipping stops (the refused-restore path has no drain to rely on).
+    LogShipper::instance().publishAccount(QString(), []() {
+        sentry_remove_user();
+        sentry_set_tag("signed_in", "false");
+        updateCanShip();
+    });
 }
 
 void setSession(const QString& sessionId, const QString& hostId)

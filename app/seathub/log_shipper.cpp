@@ -471,8 +471,15 @@ public:
         std::atomic_store(&currentIds, next);
     }
 
-    void publishAccount(const QString& accountId)
+    void publishAccount(const QString& accountId, const std::function<void()>& underLock)
     {
+        // The worker holds `accountMutex` from its account check until the SDK has taken the
+        // line, so waiting here means any line already past that check is emitted under the SDK
+        // user it was checked against, and the next line is checked against this account.
+        std::lock_guard<std::mutex> lock(accountMutex);
+        if (underLock) {
+            underLock();
+        }
         std::atomic_store(&currentAccount, std::make_shared<const QString>(accountId));
     }
 
@@ -660,6 +667,9 @@ private:
     {
         QList<ShippedLine> spooled = spool->takeAll();
         for (int i = 0; i < spooled.size(); ++i) {
+            // Per line, so a sign-out never waits behind the whole spool. The gate is re-checked
+            // under the lock: it may have flipped while this thread waited for it.
+            std::lock_guard<std::mutex> accountLock(accountMutex);
             if (handOffPaused.load() || !canShip.load() || !ReportingConsent::coveredUploadsAllowed()) {
                 requeue(spooled, i);
                 return;
@@ -679,6 +689,9 @@ private:
         ShippedLine line = rawLine;
         line.body = LogShipper::scrub(line.body);
 
+        // The account check and the whole SDK emission are one step with respect to
+        // `publishAccount()`, so the SDK user cannot change between the two (T070 / A2).
+        std::lock_guard<std::mutex> accountLock(accountMutex);
         if (handOffPaused.load() || !canShip.load() || !ReportingConsent::coveredUploadsAllowed()) {
             spool->append(line);
             return;
@@ -814,6 +827,10 @@ private:
     std::shared_ptr<const Ids> currentIds;
     std::shared_ptr<const QString> currentAccount;
     std::atomic<qint64> droppedAccountCount{ 0 };
+    /// Held by the worker from the account comparison through the end of the hand-off, and by
+    /// `publishAccount()` around the SDK user change. Lock order: this, then the SDK's own locks.
+    /// Never held across `pauseHandOff()` or `drainBeforeSignOut()`.
+    std::mutex accountMutex;
 
     std::mutex queueMutex;
     std::condition_variable queueCv;
@@ -888,9 +905,9 @@ void LogShipper::publishIds(const QString& sessionId, const QString& hostId, con
     m_impl->publishIds(sessionId, hostId, traceId);
 }
 
-void LogShipper::publishAccount(const QString& accountId)
+void LogShipper::publishAccount(const QString& accountId, const std::function<void()>& underLock)
 {
-    m_impl->publishAccount(accountId);
+    m_impl->publishAccount(accountId, underLock);
 }
 
 qint64 LogShipper::droppedAccountCount() const
