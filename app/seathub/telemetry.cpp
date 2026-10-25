@@ -1036,6 +1036,9 @@ void setUser(const QString& accountId)
     const QByteArray idUtf8 = accountId.toUtf8();
     sentry_set_user(sentry_value_new_user(idUtf8.constData(), nullptr, nullptr, nullptr));
     sentry_set_tag("signed_in", "true");
+    // T023: the shipper learns the account BEFORE it may ship again, so a line held under another
+    // account is never handed to the SDK under this user's scope.
+    LogShipper::instance().publishAccount(accountId);
     updateCanShip();
 }
 
@@ -1046,6 +1049,8 @@ void clearUser()
     sentry_remove_user();
     sentry_set_tag("signed_in", "false");
     updateCanShip();
+    // T023: shipping stops first, then the account clears, so a line is never dropped in the gap.
+    LogShipper::instance().publishAccount(QString());
 }
 
 void setSession(const QString& sessionId, const QString& hostId)

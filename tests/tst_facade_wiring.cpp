@@ -9298,6 +9298,101 @@ private slots:
         QVERIFY(!outbox.hasQueuedReports());
     }
 
+    // T023 / R4: a diagnostic line held (spooled) while account A was signed in must not reach Sentry
+    // under account B after sign-out and sign-in. Real SeatHubTelemetry identity and real LogShipper;
+    // the hand-off is the same seam the tests around it read (sentry-native is not initialised in this
+    // suite), and it records which account the telemetry facade names at the moment of hand-off.
+    void aLineHeldAcrossSignOutIsNotShippedUnderTheNextAccount()
+    {
+        QTemporaryDir spool;
+        QMutex mutex;
+        QList<ShippedLine> records;
+        QStringList usersAtHandOff;
+        const qint64 droppedBefore = LogShipper::instance().droppedAccountCount();
+        reporting_consent_store::Record record;
+        record.recorded = true;
+        record.send = true;
+        record.noticeVersion = reporting_consent_store::kCurrentNoticeVersion;
+        ReportingConsent::setStateForTests(true, record);
+        LogShipper::instance().setSpoolDirectoryForTests(spool.path());
+        LogShipper::instance().start([&](const ShippedLine& line) {
+            QMutexLocker lock(&mutex);
+            records.append(line);
+            usersAtHandOff.append(SeatHubTelemetry::currentUserId());
+            return true;
+        });
+        StopShipperOnScopeExit guard;
+        const auto handedOver = [&](const QString& body) {
+            QMutexLocker lock(&mutex);
+            for (const ShippedLine& line : records) {
+                if (line.body == body) return true;
+            }
+            return false;
+        };
+
+        SeatHubTelemetry::setUser(accountAId());
+        LogShipper::instance().setCanShip(false); // this suite has logs disabled; the test owns it
+        SeatHubTelemetry::emitDiagnostic(QStringLiteral("held.line"), LogLevel::Info, {{"k", "v"}});
+        LogShipper::instance().drainBeforeSignOut(); // the line is now spooled under account A
+        QVERIFY(!handedOver(QStringLiteral("held.line")));
+
+        SeatHubTelemetry::clearUser();
+        SeatHubTelemetry::setUser(accountBId());
+        LogShipper::instance().setCanShip(true);
+        SeatHubTelemetry::emitDiagnostic(QStringLiteral("b.line"), LogLevel::Info, {{"k", "v"}});
+        QTRY_VERIFY_WITH_TIMEOUT(handedOver(QStringLiteral("b.line")), 10000);
+        LogShipper::instance().drainBeforeSignOut();
+
+        QVERIFY2(!handedOver(QStringLiteral("held.line")),
+                 "account A's held line must not be shipped while account B is signed in");
+        QMutexLocker lock(&mutex);
+        for (const QString& user : usersAtHandOff) QCOMPARE(user, accountBId());
+        for (const ShippedLine& line : records) QCOMPARE(line.accountId, accountBId());
+        QCOMPARE(LogShipper::instance().droppedAccountCount() - droppedBefore, qint64(1));
+    }
+
+    // The same account signing back in still ships what it held.
+    void aLineHeldAcrossSignOutShipsWhenTheSameAccountSignsBackIn()
+    {
+        QTemporaryDir spool;
+        QMutex mutex;
+        QList<ShippedLine> records;
+        const qint64 droppedBefore = LogShipper::instance().droppedAccountCount();
+        reporting_consent_store::Record record;
+        record.recorded = true;
+        record.send = true;
+        record.noticeVersion = reporting_consent_store::kCurrentNoticeVersion;
+        ReportingConsent::setStateForTests(true, record);
+        LogShipper::instance().setSpoolDirectoryForTests(spool.path());
+        LogShipper::instance().start([&](const ShippedLine& line) {
+            QMutexLocker lock(&mutex);
+            records.append(line);
+            return true;
+        });
+        StopShipperOnScopeExit guard;
+
+        SeatHubTelemetry::setUser(accountAId());
+        LogShipper::instance().setCanShip(false);
+        SeatHubTelemetry::emitDiagnostic(QStringLiteral("held.line"), LogLevel::Info, {{"k", "v"}});
+        LogShipper::instance().drainBeforeSignOut();
+
+        SeatHubTelemetry::clearUser();
+        SeatHubTelemetry::setUser(accountAId());
+        LogShipper::instance().setCanShip(true);
+        QTRY_VERIFY_WITH_TIMEOUT(
+            [&]() {
+                QMutexLocker lock(&mutex);
+                for (const ShippedLine& line : records) {
+                    if (line.body == QLatin1String("held.line")) return true;
+                }
+                return false;
+            }(),
+            10000);
+        QMutexLocker lock(&mutex);
+        QCOMPARE(records.first().accountId, accountAId());
+        QCOMPARE(LogShipper::instance().droppedAccountCount() - droppedBefore, qint64(0));
+    }
+
     // T095 / SC19: the quality rollup reaches the hand-off through the production chain only - the
     // facade's stats tap, the real sampler (real clock, 40 ms window), SeatHubTelemetry, the LogTee and
     // the process-wide LogShipper - with no prebuilt rollup injected. The hand-off here is the same

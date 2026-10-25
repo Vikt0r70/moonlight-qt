@@ -65,6 +65,11 @@ struct ShippedLine
     /// the tee captured. Persisted, so a diagnostic line that waits in the spool keeps both its
     /// attributes and its exemption from the 8 MiB body cap across a crash and a restart.
     bool diagnostic = false;
+    /// T023: the account that was signed in when the line was logged (empty before any sign-in, and
+    /// for a spool file written before this field existed). The SDK stamps whichever user is in
+    /// scope at hand-off, so a line held across sign-out and a different account's sign-in would
+    /// ship under that account. The worker drops a line whose account is not the current one.
+    QString accountId;
 };
 
 /// `true` when the SDK took the line (an envelope now owns it, one way or another); `false` for
@@ -223,6 +228,15 @@ public:
     /// arbitrary, thread). Safe to call before `start()` - a snapshot published early is simply
     /// what the first captured line already carries.
     void publishIds(const QString& sessionId, const QString& hostId, const QString& traceId);
+
+    /// T023: publishes the signed-in account every future line is stamped with, and the account a
+    /// held line must belong to before it may be handed to the SDK. `telemetry.cpp`'s `setUser()`
+    /// publishes it before `setCanShip()`; `clearUser()` publishes the empty account after it, so a
+    /// line is never dropped in the gap between the two. Empty means no account is signed in.
+    void publishAccount(const QString& accountId);
+    /// T023: how many lines were dropped (never shipped, never re-spooled) because they were logged
+    /// under a different account than the one signed in when they were due to ship.
+    qint64 droppedAccountCount() const;
 
     /// ADR-0072 item 7 / plan 09: the diagnostic lane's entry point - one structured line with
     /// scalar attributes, enqueued exactly like an ordinary line (same queue, same scrub, same
