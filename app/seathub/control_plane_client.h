@@ -76,6 +76,9 @@ struct ControlPlaneResult
     /// `Error.kind`, when the control plane named one - e.g. the `session.pairing_limit` refusal a
     /// reconnect episode's fourth PIN request gets (V10). Empty when absent.
     QString kind;
+    /// `Error.refusal_reason` of a 412 `session.no_verified_path` (M002 T011/T012): one of
+    /// `no_external_path`, `no_lease`, `host_unknown`, `port_unverified`. Empty when absent.
+    QString refusalReason;
     /// The parsed response object. Empty on failure.
     QJsonObject body;
 

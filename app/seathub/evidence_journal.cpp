@@ -106,7 +106,8 @@ const QStringList& clockBucketSet()
 
 // Number, Uuid, DateTime, Warnings and TailSeconds serve the stream record (T054, ADR-0117): a
 // reading with a fraction, the run id, a server-time instant, and the two closed arrays.
-enum class FieldType { Int, Bool, Enum, Token, Number, Uuid, DateTime, Warnings, TailSeconds };
+// Host serves the `attempt` entry's `dial_host` (openapi `^[A-Za-z0-9.:_-]{1,255}$`, T012).
+enum class FieldType { Int, Bool, Enum, Token, Number, Uuid, DateTime, Warnings, TailSeconds, Host };
 
 struct FieldRule {
     QString name;
@@ -129,11 +130,12 @@ FieldRule numberField(const char* name, double lo, double hi, bool optional = fa
     rule.optional = optional;
     return rule;
 }
-FieldRule plainField(const char* name, FieldType type)
+FieldRule plainField(const char* name, FieldType type, bool optional = false)
 {
     FieldRule rule;
     rule.name = QLatin1String(name);
     rule.type = type;
+    rule.optional = optional;
     return rule;
 }
 
@@ -184,12 +186,26 @@ FieldRule enumField(const char* name, const QStringList& values, bool optional =
     rule.optional = optional;
     return rule;
 }
-FieldRule tokenField(const char* name)
+FieldRule tokenField(const char* name, bool optional = false)
 {
     FieldRule rule;
     rule.name = QLatin1String(name);
     rule.type = FieldType::Token;
+    rule.optional = optional;
     return rule;
+}
+
+// The `attempt` entry's outcome set (openapi `EvidenceOutcome` for kind `attempt`).
+const QStringList& attemptOutcomeSet()
+{
+    static const QStringList v{QStringLiteral("refused"), QStringLiteral("dialing"),
+                               QStringLiteral("connected"), QStringLiteral("failed")};
+    return v;
+}
+const QStringList& attemptSideSet()
+{
+    static const QStringList v{QStringLiteral("client")};
+    return v;
 }
 
 const QHash<QString, QList<FieldRule>>& kindRules()
@@ -221,6 +237,20 @@ const QHash<QString, QList<FieldRule>>& kindRules()
                   intField("engine_code", std::numeric_limits<qint32>::min(),
                            std::numeric_limits<qint32>::max())});
         r.insert(QStringLiteral("clock_skew"), {enumField("bucket", clockBucketSet())});
+        // M002 T012 (openapi AttemptEntry): one start attempt, refused or dialled. Unknown values
+        // are omitted, never null; the client states side `client` on every entry it posts.
+        r.insert(QStringLiteral("attempt"),
+                 {enumField("side", attemptSideSet()), intField("attempt", 1, 2),
+                  enumField("outcome", attemptOutcomeSet()),
+                  plainField("session_id", FieldType::Uuid, true),
+                  intField("handed_https", 1, 65535, true), intField("handed_control", 1, 65535, true),
+                  intField("handed_rtsp", 1, 65535, true),
+                  plainField("dial_host", FieldType::Host, true), intField("dial_port", 1, 65535, true),
+                  tokenField("refusal_class", true), tokenField("engine_step", true),
+                  tokenField("engine_class", true), intField("duration_ms", 0, kMaxSafeInteger, true),
+                  plainField("server_time", FieldType::DateTime, true),
+                  intField("skew_ms", std::numeric_limits<qint32>::min(),
+                           std::numeric_limits<qint32>::max(), true)});
         // The six readings are present only when sample_count > 0 (a cross-field rule below) and
         // are never null (ADR-0117, openapi.yaml StreamMinuteEntry).
         r.insert(QStringLiteral("stream_minute"),
@@ -315,6 +345,23 @@ bool isRfc3339Utc(const QString& s)
     return QDateTime::fromString(s, Qt::ISODateWithMs).isValid();
 }
 
+// ^[A-Za-z0-9.:_-]{1,255}$ - a plain host name or IP literal, never a path, user, query or space.
+bool isPlainHost(const QString& s)
+{
+    if (s.isEmpty() || s.size() > 255) {
+        return false;
+    }
+    for (const QChar qc : s) {
+        const ushort c = qc.unicode();
+        const bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
+            || c == '.' || c == ':' || c == '_' || c == '-';
+        if (!ok) {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool isAttemptStep(const QString& step)
 {
     return attemptStepTokens().contains(step);
@@ -399,6 +446,8 @@ bool fieldOk(const FieldRule& rule, const QJsonValue& value)
         return value.isString() && isCanonicalUuid(value.toString());
     case FieldType::DateTime:
         return value.isString() && isRfc3339Utc(value.toString());
+    case FieldType::Host:
+        return value.isString() && isPlainHost(value.toString());
     case FieldType::Warnings:
         return warningsOk(value);
     case FieldType::TailSeconds:
@@ -871,6 +920,44 @@ QJsonObject EvidenceJournal::engineFailure(const QString& step, const QString& e
     o.insert(QStringLiteral("step"), step);
     o.insert(QStringLiteral("engine_class"), engineClass);
     o.insert(QStringLiteral("engine_code"), engineCode);
+    return finishBuilt(o);
+}
+
+QJsonObject EvidenceJournal::attempt(const AttemptRecord& record)
+{
+    QJsonObject o;
+    o.insert(QStringLiteral("kind"), QStringLiteral("attempt"));
+    o.insert(QStringLiteral("side"), QStringLiteral("client"));
+    o.insert(QStringLiteral("attempt"), record.attempt);
+    o.insert(QStringLiteral("outcome"), record.outcome);
+    // Unknown values are left out (never null); the rules below refuse anything out of range.
+    const auto putText = [&o](const char* key, const QString& value) {
+        if (!value.isEmpty()) {
+            o.insert(QLatin1String(key), value);
+        }
+    };
+    const auto putPort = [&o](const char* key, int value) {
+        if (value != 0) {
+            o.insert(QLatin1String(key), value);
+        }
+    };
+    putText("session_id", record.sessionId);
+    putPort("handed_https", record.handedHttps);
+    putPort("handed_control", record.handedControl);
+    putPort("handed_rtsp", record.handedRtsp);
+    putText("dial_host", record.dialHost);
+    putPort("dial_port", record.dialPort);
+    putText("refusal_class", record.refusalClass);
+    putText("engine_step", record.engineStep);
+    putText("engine_class", record.engineClass);
+    o.insert(QStringLiteral("duration_ms"), record.durationMs);
+    if (record.serverTime.isValid()) {
+        o.insert(QStringLiteral("server_time"),
+                 record.serverTime.toUTC().toString(Qt::ISODateWithMs));
+    }
+    if (record.hasSkew) {
+        o.insert(QStringLiteral("skew_ms"), record.skewMs);
+    }
     return finishBuilt(o);
 }
 

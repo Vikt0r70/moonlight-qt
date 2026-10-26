@@ -701,6 +701,9 @@ private:
     void openEvidenceJournal(const QString& sessionId);
     void closeEvidenceJournal();
     void recordEvidence(const QJsonObject& entry);
+    /// M002 T012: stamp the server clock on a dialled attempt, write its `attempt_record` line and
+    /// record its `attempt` entry. A refused attempt arrives already stamped and logged.
+    void noteAttemptRecord(AttemptRecord record);
     /// Callable from the main thread or the network thread. At most one send per capsule at a time.
     void deliverEvidence();
     /// Network thread: a full 60 s window ended with no samples and no drops.
@@ -933,6 +936,11 @@ private:
     QString m_stageText;
     int m_connectStage = 0;
     bool m_connectFailed = false;
+    /// M002 T012: the pairing failure on screen is a refused start (HTTP 412
+    /// `session.no_verified_path`). The server will attribute its end to us and its late
+    /// `end_blame` would otherwise overwrite the refusal sentence with the rig's, so the terminal
+    /// session read leaves the text alone while this is set. Cleared with the stall (`clearStall()`).
+    bool m_sessionRefused = false;
     QString m_stalledStepText;
     QString m_stalledReasonText;
     bool m_stalledReasonPlain = false;

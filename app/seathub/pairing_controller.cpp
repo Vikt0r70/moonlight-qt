@@ -36,7 +36,52 @@ const char* kNoAuthorization = "We couldn't get this session ready. Try again.";
 // pairing target yet - the host has not reached READY. That is a wait, not a failure.
 const int kHttpConflict = 409;
 
+// 412 from the same route: the control plane refused to start the session because it could not
+// verify a path to the rig (M002 T011). Terminal, never retried; `kind` tells it apart from any
+// other 412 a proxy might send.
+const int kHttpPreconditionFailed = 412;
+const char* kRefusalKind = "session.no_verified_path";
+const char* kRefusalFailurePrefix = "session_refused.";
+
+// `docs/spec/copy.md` "Refused starts", one sentence per closed `refusal_reason`. The server's own
+// `error` text carries only the first clause; the second sentence ("You were not charged.") is the
+// client's, so the whole sentence is built here from the reason alone and the server text never
+// reaches the screen.
+struct RefusalSentence {
+    const char* reason;
+    const char* sentence;
+};
+const RefusalSentence kRefusalSentences[] = {
+    {"no_external_path",
+     "We could not see where you are connecting from, so we did not start your session. You were "
+     "not charged."},
+    {"no_lease",
+     "Your session has no connection permission yet, so we did not start it. You were not charged."},
+    {"host_unknown",
+     "We could not verify the address of your rig, so we did not start your session. You were not "
+     "charged."},
+    {"port_unverified",
+     "We could not verify a working path to your rig, so we did not start your session. You were "
+     "not charged."},
+};
+
 } // namespace
+
+bool isSessionRefusal(const SeatHubFailure& failure)
+{
+    return failure.failure.startsWith(QLatin1String(kRefusalFailurePrefix));
+}
+
+QString pairingFailureStage(const SeatHubFailure& failure)
+{
+    return isSessionRefusal(failure) ? QStringLiteral("session_refused") : QStringLiteral("pairing");
+}
+
+void PairingController::setHelloClock(const QDateTime& serverUtc, const QDateTime& localUtc)
+{
+    m_helloServerUtc = serverUtc;
+    m_helloLocalUtc = localUtc;
+}
 
 PairingController::PairingController(QObject* parent)
     : QObject(parent),
@@ -263,6 +308,35 @@ void PairingController::handleAuthorization(quint64 attempt, const ControlPlaneR
             return;
         }
 
+        if (result.statusCode == kHttpPreconditionFailed
+            && result.kind == QLatin1String(kRefusalKind)) {
+            // A refused start. Fail here, before any PairingTarget exists, so no port is dialled
+            // and the customer sees the sentence at once instead of after a 30 s deadline. A
+            // reason outside the closed set keeps the server's own sentence and the class
+            // `unknown`: still a refusal, never a retry and never a "pairing" end.
+            QString sentence = result.error;
+            QString reason = QStringLiteral("unknown");
+            for (const RefusalSentence& known : kRefusalSentences) {
+                if (result.refusalReason == QLatin1String(known.reason)) {
+                    sentence = QString::fromLatin1(known.sentence);
+                    reason = result.refusalReason;
+                    break;
+                }
+            }
+            AttemptRecord record;
+            record.sessionId = m_sessionId;
+            record.attempt = 1;
+            record.outcome = QStringLiteral("refused");
+            record.refusalClass = reason;
+            record.durationMs = m_clock.elapsed();
+            stampAttemptClock(&record, m_helloServerUtc, m_helloLocalUtc);
+            logAttemptRecord(record);
+            emit attemptRecorded(record);
+            fail(SeatHubFailure::api(kHttpPreconditionFailed, sentence, result.reference,
+                                     QLatin1String(kRefusalFailurePrefix) + reason));
+            return;
+        }
+
         fail(result.toFailure(), result.statusCode >= 400 && result.statusCode < 500
                                     ? QStringLiteral("refused")
                                     : QStringLiteral("bad_response"));
@@ -341,6 +415,7 @@ void PairingController::handleAuthorization(quint64 attempt, const ControlPlaneR
     target.hostAddress = authorization.hostAddress;
     target.httpsPort = authorization.httpsPort;
     target.controlPort = authorization.controlPort;
+    target.rtspPort = authorization.rtspPort;
     target.pairingPin = authorization.pairingPin;
     // W03 / L07: carried as the control plane sent it, for a new session and for a same-session
     // reconnect alike. Only the seam acts on it, and only with trust this app run itself pinned

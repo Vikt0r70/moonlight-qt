@@ -625,6 +625,7 @@ ControlPlaneResult ControlPlaneClient::classify(int httpStatus, const QByteArray
     result.reference = object.value(QStringLiteral("reference")).toString();
     result.failure = object.value(QStringLiteral("failure")).toString();
     result.kind = object.value(QStringLiteral("kind")).toString();
+    result.refusalReason = object.value(QStringLiteral("refusal_reason")).toString();
     if (result.error.isEmpty()) {
         result.error = SeatHubFailure::generic().error;
     }

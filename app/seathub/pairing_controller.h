@@ -9,8 +9,40 @@
 
 #include "control_plane_client.h"
 #include "error_map.h"
+#include "evidence_journal.h"
 
 class ControlPlaneClient;
+
+struct PairingTarget;
+
+// ---- M002 T012: refused starts and the attempt record -----------------------------------------
+//
+// The control plane answers a pairing request with no verified path as HTTP 412
+// `session.no_verified_path` plus a closed `refusal_reason` (openapi 3.34.0). The controller turns
+// that into one typed failure (`SeatHubFailure::failure == "session_refused.<reason>"`) and fails
+// BEFORE any `PairingTarget` is built, so no port is dialled.
+
+/// True when `failure` is a refused start (see above).
+bool isSessionRefusal(const SeatHubFailure& failure);
+/// The end-report stage for a failed pairing: `session_refused` for a refusal, else `pairing`.
+/// A refusal must never end as `pairing` - the server would blame the rig for our refusal.
+QString pairingFailureStage(const SeatHubFailure& failure);
+
+/// One line per attempt, keys in the contract's order, `-` for an unknown value:
+/// `attempt_record side=client session_id=... attempt=... handed_https=... ... skew_ms=...`.
+/// It holds no PIN, certificate or free text. Defined in `pairing_seam.cpp`.
+QString attemptRecordLine(const AttemptRecord& record);
+/// Writes `attemptRecordLine()` to the log (category `seathub.pairing.seam`). Defined in
+/// `pairing_seam.cpp`.
+void logAttemptRecord(const AttemptRecord& record);
+/// Fills `serverTime` (the local clock corrected by the SSE hello's server time) and `skewMs`
+/// (positive: the client is ahead). Both stay unknown when either instant is invalid.
+void stampAttemptClock(AttemptRecord* record, const QDateTime& serverUtc, const QDateTime& localUtc);
+/// A dialled attempt: the handed ports, the control port actually dialled, and the engine's closed
+/// step and class tokens (`connected` when `succeeded`, else `failed`).
+AttemptRecord dialedAttemptRecord(const PairingTarget& target, int attempt, bool succeeded,
+                                  const QString& engineStep, const QString& engineClass,
+                                  qint64 durationMs);
 
 // What the engine's pairing call needs, and nothing more.
 //
@@ -24,6 +56,9 @@ struct PairingTarget {
     QString hostAddress;
     int httpsPort = 0;
     int controlPort = 0;
+    /// The signed `ports.rtsp`, carried only so the attempt record can state what was handed out
+    /// (M002 T012). The engine seam never reads it. 0 when the authorization had none.
+    int rtspPort = 0;
     /// Dies at the end of the launch. Never persisted (D-30, D-37).
     QString pairingPin;
     /// ADR-0074 W03 / L07: the authorization's own `warm_return` indication for this session (true
@@ -158,6 +193,14 @@ public:
     };
     RigEndpoint rigEndpoint() const { return {m_lastTarget.hostAddress, m_lastTarget.controlPort}; }
 
+    /// The last PairingTarget a handshake was started for (empty until one was). The facade uses
+    /// it to state what was handed out and dialled in the attempt record; it carries the PIN, so
+    /// nothing but `dialedAttemptRecord()` may read it.
+    const PairingTarget& lastTarget() const { return m_lastTarget; }
+    /// The SSE hello's server time and the local instant it arrived at, so a refusal's record can
+    /// carry `server_time` and `skew_ms`. Both invalid until the first hello.
+    void setHelloClock(const QDateTime& serverUtc, const QDateTime& localUtc);
+
 signals:
     void stateChanged();
     /// The control plane granted the session. Carries no argument: the authorization's own
@@ -175,6 +218,9 @@ signals:
     void pairingFailed(const SeatHubFailure& failure);
     /// Closed attempt classification for authorization failures; never carries response text.
     void stepFailed(const QString& step, const QString& failureClass, qint64 elapsedMs);
+    /// A refused start was recorded (M002 T012). Emitted once per refusal, after the line is logged.
+    /// The dialled attempts are recorded by the facade from the seam's result, not here.
+    void attemptRecorded(const AttemptRecord& record);
     /// The session exactly as `GET /api/sessions/{id}` reported it on one poll tick. It rides the
     /// tick this controller already runs - the same interval, no timer of its own - and is what the
     /// connecting stages are read from (CUST-12, `ADR-0055`). A read that failed, or that arrived
@@ -245,4 +291,6 @@ private:
     // did (D-30, D-37) - it is copied into no log, no signal and no property.
     PairingTarget m_lastTarget;
     bool m_handshakeStarted = false;
+    QDateTime m_helloServerUtc;
+    QDateTime m_helloLocalUtc;
 };

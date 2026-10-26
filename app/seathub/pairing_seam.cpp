@@ -18,6 +18,84 @@
 
 Q_LOGGING_CATEGORY(seathubPairingSeam, "seathub.pairing.seam")
 
+// ---- M002 T012: the client attempt record ------------------------------------------------------
+//
+// One line per start attempt, refused or dialled. Keys are fixed and in the contract's order, values
+// carry no spaces, an unknown value is `-`, and nothing here can hold a PIN, a certificate or free
+// text: every field is an integer, a UUID, a closed token or an instant. `dial_host` is the rig host
+// the control plane handed out; N5 (never substitute a default port) is why the handed and dialled
+// ports are both printed, so a port the engine swaps later (`nvhttp.cpp`) shows as a mismatch.
+namespace {
+
+QString portOrDash(int port)
+{
+    return port > 0 ? QString::number(port) : QStringLiteral("-");
+}
+
+QString textOrDash(const QString& text)
+{
+    return text.isEmpty() ? QStringLiteral("-") : text;
+}
+
+QString instantOrDash(const QDateTime& instant)
+{
+    return instant.isValid() ? instant.toUTC().toString(Qt::ISODateWithMs) : QStringLiteral("-");
+}
+
+} // namespace
+
+QString attemptRecordLine(const AttemptRecord& record)
+{
+    return QStringLiteral(
+               "attempt_record side=client session_id=%1 attempt=%2 handed_https=%3 handed_control=%4 "
+               "handed_rtsp=%5 dial_host=%6 dial_port=%7 outcome=%8 refusal_class=%9 engine_step=%10 "
+               "engine_class=%11 duration_ms=%12 at=%13 server_time=%14 skew_ms=%15")
+        .arg(textOrDash(record.sessionId))
+        .arg(record.attempt)
+        .arg(portOrDash(record.handedHttps), portOrDash(record.handedControl),
+             portOrDash(record.handedRtsp), textOrDash(record.dialHost), portOrDash(record.dialPort),
+             textOrDash(record.outcome), textOrDash(record.refusalClass))
+        .arg(textOrDash(record.engineStep), textOrDash(record.engineClass))
+        .arg(record.durationMs)
+        .arg(instantOrDash(record.at), instantOrDash(record.serverTime),
+             record.hasSkew ? QString::number(record.skewMs) : QStringLiteral("-"));
+}
+
+void logAttemptRecord(const AttemptRecord& record)
+{
+    qCInfo(seathubPairingSeam).noquote() << attemptRecordLine(record);
+}
+
+void stampAttemptClock(AttemptRecord* record, const QDateTime& serverUtc, const QDateTime& localUtc)
+{
+    if (!record || !serverUtc.isValid() || !localUtc.isValid()) {
+        return;
+    }
+    // The server's time now = the hello's server time + how long ago the hello arrived.
+    record->serverTime = serverUtc.addMSecs(localUtc.msecsTo(record->at));
+    record->skewMs = serverUtc.msecsTo(localUtc); // positive: the client is ahead
+    record->hasSkew = true;
+}
+
+AttemptRecord dialedAttemptRecord(const PairingTarget& target, int attempt, bool succeeded,
+                                  const QString& engineStep, const QString& engineClass,
+                                  qint64 durationMs)
+{
+    AttemptRecord record;
+    record.sessionId = target.sessionId;
+    record.attempt = qBound(1, attempt, 2);
+    record.handedHttps = target.httpsPort;
+    record.handedControl = target.controlPort;
+    record.handedRtsp = target.rtspPort;
+    record.dialHost = target.hostAddress;
+    record.dialPort = target.controlPort;
+    record.outcome = succeeded ? QStringLiteral("connected") : QStringLiteral("failed");
+    record.engineStep = engineStep;
+    record.engineClass = succeeded ? QString() : engineClass;
+    record.durationMs = durationMs;
+    return record;
+}
+
 /// T074: the worker publishes here, under the lock, what it has settled so far - the first attempt's
 /// closed outcome (before the pending-slot clear and the retry can block) and the actual retry
 /// decision (before the retry handshake blocks). The seam's deadline reads a snapshot to speak for a

@@ -778,16 +778,35 @@ SeatHubClient::SeatHubClient(QObject* parent)
         recordEvidence(EvidenceJournal::pairingAttempt(
             result.attempts, success, result.attemptStep, success ? QString() : result.stepClass,
             result.retried, result.retryReason, result.pinShapeOk, result.handshakeMs));
+
+        // M002 T012: the same result as the contract's `attempt_record` line and `attempt` entry,
+        // one per attempt, with the ports the server handed and the port actually dialled. A
+        // retried run that recovered writes its first (failed) attempt too.
+        const PairingTarget target = m_pairing->lastTarget();
+        if (result.retried && !result.firstStepClass.isEmpty() && !result.firstAttemptStep.isEmpty()) {
+            noteAttemptRecord(dialedAttemptRecord(target, 1, false, result.firstAttemptStep,
+                                                  result.firstStepClass, 0));
+        }
+        noteAttemptRecord(dialedAttemptRecord(target, result.attempts, success, result.attemptStep,
+                                              success ? QString() : result.stepClass,
+                                              result.handshakeMs));
         if (!success) {
             deliverEvidence();
         }
     });
+    // M002 T012: a refused start never reaches the seam, so the controller hands over its record.
+    connect(m_pairing, &PairingController::attemptRecorded, this,
+            [this](const AttemptRecord& record) {
+                recordEvidence(EvidenceJournal::attempt(record));
+                deliverEvidence();
+            });
 
     // ADR-0105: the server's clock at `stream.hello`, kept with the local time it arrived at; the
     // skew bucket is recorded once per Play at `openEvidenceJournal()`. Evidence only.
     connect(m_sse, &SseClient::serverTime, this, [this](const QDateTime& serverUtc) {
         m_helloServerUtc = serverUtc;
         m_helloLocalUtc = QDateTime::currentDateTimeUtc();
+        m_pairing->setHelloClock(m_helloServerUtc, m_helloLocalUtc);
     });
 
     connect(m_teardown, &TeardownController::teardownCompleted,
@@ -1642,6 +1661,15 @@ void SeatHubClient::closeEvidenceJournal()
     evidence()->journal.close();
 }
 
+void SeatHubClient::noteAttemptRecord(AttemptRecord record)
+{
+    if (m_helloServerUtc.isValid() && m_helloLocalUtc.isValid()) {
+        stampAttemptClock(&record, m_helloServerUtc, m_helloLocalUtc);
+    }
+    logAttemptRecord(record);
+    recordEvidence(EvidenceJournal::attempt(record));
+}
+
 void SeatHubClient::recordEvidence(const QJsonObject& entry)
 {
     // A no-op while no Play is open: nothing is written while the app is idle.
@@ -1896,6 +1924,7 @@ bool SeatHubClient::connectingSession() const
 
 void SeatHubClient::clearStall()
 {
+    m_sessionRefused = false;
     if (!m_connectFailed && m_stalledStepText.isEmpty() && m_stalledReasonText.isEmpty()) {
         return;
     }
@@ -4393,7 +4422,11 @@ void SeatHubClient::handlePairingFailed(const SeatHubFailure& failure)
     // D-11: a pairing timeout or a control-plane refusal of the pairing read, neither with an
     // engine code - reported before liveness stops, so the server sees "SeatHub failed at
     // pairing" rather than a session that simply went quiet.
-    m_liveness->reportFailure(QStringLiteral("pairing"));
+    // M002 T012: a refused start reports `session_refused`, never `pairing` - the server blames the
+    // rig for a pairing failure, and a refusal is ours.
+    const QString failureStage = pairingFailureStage(failure);
+    m_sessionRefused = isSessionRefusal(failure);
+    m_liveness->reportFailure(failureStage);
     // WR-02: stops it, queued after the report above on the same (network) thread, so the failure
     // report still goes out first. Without this the timer kept reporting `stage: failed` (and
     // reading the wallet) every 10 s while the customer read the error screen and after returning
@@ -4410,12 +4443,15 @@ void SeatHubClient::handlePairingFailed(const SeatHubFailure& failure)
     if (inControlPlaneSession()) {
         setAttachedSessionEnded(true);
         EndReport report;
-        report.stage = QStringLiteral("pairing");
+        report.stage = failureStage;
         // ADR-0072 item 1 / plan 09: the failing step rides `/end` (contract 3.8.0) - and only
         // the step. An unclassified pairing failure (the controller's own deadline, a
         // control-plane refusal) leaves this empty and the field absent from the body, because a
-        // step the client never classified is a step it must not invent.
-        report.attemptStep = m_lastFailedStep;
+        // step the client never classified is a step it must not invent. A refused start never
+        // dialled, so it has no step at all.
+        if (!m_sessionRefused) {
+            report.attemptStep = m_lastFailedStep;
+        }
         endPreStreamSessionWithReport(report);
     }
     // WR-01: this Play is over here, at the pairing failure - the next one mints its own id. See
@@ -4698,7 +4734,11 @@ void SeatHubClient::handleTeardownCompleted(const SessionInfo& finalSession,
     // failure from overwriting the FIRST one the customer read), so this writes `m_failure` and
     // `m_stalledReasonText` directly instead. Any other end reason keeps whatever
     // `raiseConnectFailure()` already showed.
-    if (m_connectFailed && finalSession.endReason == QLatin1String("CONNECT_FAILED")) {
+    // M002 T012: a refused start keeps its own sentence. The server ends it as `us` (stage
+    // `session_refused`), and the rig sentence `mapEndBlame` would pick for any blame must never
+    // replace "we did not start your session".
+    if (m_connectFailed && !m_sessionRefused
+        && finalSession.endReason == QLatin1String("CONNECT_FAILED")) {
         const SeatHubFailure blamed = mapEndBlame(finalSession.endBlame, finalSession.endReference);
         if (m_stalledReasonPlain) {
             // ADR-0091: the sentence stays Moonlight's; only the server's reference is taken.
