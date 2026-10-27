@@ -53,6 +53,9 @@ public:
         : QNetworkReply(parent)
     {
         setAttribute(QNetworkRequest::HttpStatusCodeAttribute, QVariant(httpStatus));
+        if (httpStatus == 0) {
+            setError(QNetworkReply::HostNotFoundError, QStringLiteral("fixture lookup failed"));
+        }
         m_buffer.setData(body);
         m_buffer.open(QIODevice::ReadOnly);
         open(QIODevice::ReadOnly);
@@ -195,8 +198,8 @@ QByteArray authorizationBody()
 QString expectedSentence(const QString& reason)
 {
     if (reason == QLatin1String("no_external_path")) {
-        return QStringLiteral("We could not see where you are connecting from, so we did not start "
-                              "your session. You were not charged.");
+        return QStringLiteral("We could not verify a usable connection from your network, so we did "
+                              "not start your session. You were not charged.");
     }
     if (reason == QLatin1String("no_lease")) {
         return QStringLiteral("Your session has no connection permission yet, so we did not start "
@@ -230,6 +233,41 @@ class TstPairingRefusal : public QObject
     Q_OBJECT
 
 private slots:
+    void cancellingOrDestroyingAControllerFencesLateDnsBeforeAnyPairingSend()
+    {
+        FakeNetworkAccessManager network;
+        network.statuses = {200};
+        network.bodies = {authorizationBody()};
+        ControlPlaneClient client;
+        client.setNetworkAccessManager(&network);
+        QList<std::function<void(const QHostInfo&)>> pending;
+        client.setPairingResolver([&](const QString&, QObject*, auto callback) {
+            pending.append(callback);
+            return []() {};
+        });
+        RecordingSeam seam;
+        int failures = 0;
+        {
+            PairingController controller;
+            controller.setControlPlane(&client);
+            controller.setSeam(&seam);
+            connect(&controller, &PairingController::pairingFailed, &client,
+                    [&](const auto&) { ++failures; });
+            controller.start(QString::fromLatin1(kSessionId));
+            QCOMPARE(pending.size(), 1);
+            controller.cancel();
+            controller.start(QString::fromLatin1(kSessionId));
+            QCOMPARE(pending.size(), 2);
+        }
+        QHostInfo info;
+        info.setAddresses({QHostAddress(QHostAddress::LocalHost)});
+        for (const auto& callback : pending) callback(info);
+        QTest::qWait(50);
+        QCOMPARE(network.calls, 2); // Only the two independent session reads, no pairing GET.
+        QCOMPARE(seam.calls, 0);
+        QCOMPARE(failures, 0);
+    }
+
     void initTestCase()
     {
         qRegisterMetaType<SeatHubFailure>("SeatHubFailure");
@@ -295,6 +333,45 @@ private slots:
         QCOMPARE(pairingFailureStage(SeatHubFailure::local(QStringLiteral("x"))),
                  QStringLiteral("pairing"));
         QVERIFY(!isSessionRefusal(SeatHubFailure::generic()));
+    }
+
+    void aLocalTransportFailureIsATerminalRefusalNotARigDeadline()
+    {
+        PairingController controller;
+        auto* fake = new FakeNetworkAccessManager;
+        fake->setParent(&controller);
+        RecordingSeam seam;
+        wire(controller, fake);
+        controller.setSeam(&seam);
+        fake->statuses = { 0 };
+        fake->bodies = { QByteArray() };
+        QCOMPARE(controller.deadlineMs(), 30000);
+        QSignalSpy failed(&controller, &PairingController::pairingFailed);
+        QSignalSpy granted(&controller, &PairingController::authorizationGranted);
+        QSignalSpy steps(&controller, &PairingController::stepFailed);
+        QSignalSpy records(&controller, &PairingController::attemptRecorded);
+        QElapsedTimer clock;
+        clock.start();
+        controller.start(QString::fromLatin1(kSessionId));
+        QTRY_COMPARE_WITH_TIMEOUT(failed.count(), 1, 1900);
+        QVERIFY(clock.elapsed() < 2000);
+        const auto failure = failed.first().first().value<SeatHubFailure>();
+        QCOMPARE(failure.kind, FailureKind::Local);
+        QCOMPARE(failure.statusCode, 0);
+        QVERIFY(failure.reference.isEmpty());
+        QCOMPARE(failure.error, expectedSentence(QStringLiteral("no_external_path")));
+        QCOMPARE(failure.failure, QStringLiteral("session_refused.no_external_path"));
+        QCOMPARE(pairingFailureStage(failure), QStringLiteral("session_refused"));
+        QCOMPARE(seam.calls, 0);
+        QCOMPARE(granted.count(), 0);
+        QCOMPARE(steps.count(), 0);
+        QCOMPARE(records.count(), 1);
+        QCOMPARE(records.first().first().value<AttemptRecord>().refusalClass,
+                 QStringLiteral("no_external_path"));
+        QCOMPARE(fake->calls, 2);
+        QTest::qWait(1100);
+        QCOMPARE(failed.count(), 1);
+        QCOMPARE(fake->calls, 2);
     }
 
     void aConflictStillWaitsAndNeverShowsTheRefusalSentence()

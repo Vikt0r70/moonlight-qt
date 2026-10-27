@@ -153,6 +153,7 @@ public:
     static const int kDeadlineMs = 30000;
 
     explicit PairingController(QObject* parent = nullptr);
+    ~PairingController() override;
 
     QString state() const { return m_state; }
     QString sessionId() const { return m_sessionId; }
@@ -260,6 +261,8 @@ private:
     /// before either is told apart from one issued after, which the session id alone cannot do
     /// (the same session is started again for each reconnect attempt).
     quint64 m_attempt = 0;
+    quint64 m_authorizationRead = 0;
+    ControlPlaneClient::PairingCancellation m_cancelAuthorization;
 
     QElapsedTimer m_clock;
     QTimer* m_pollTimer = nullptr;

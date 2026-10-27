@@ -4179,6 +4179,54 @@ private slots:
         verifyNoInternalNameIsShown(client);
     }
 
+    void aPairingTransportFailureRefusesImmediatelyWithoutBlamingOrDiallingTheRig()
+    {
+        SeatHubClient client;
+        reachHome(client, 90);
+        QVERIFY(!QTest::currentTestFailed());
+        const int handshakes = g_plainHandshakeRuns;
+        const int engineCreates = g_engineCreateCalls;
+        QSignalSpy failed(client.pairing(), &PairingController::pairingFailed);
+        QSignalSpy stepFailed(client.pairing(), &PairingController::stepFailed);
+        m_fake->answerPairing(0);
+        int deadline = 0;
+        auto* pairing = client.pairing();
+        QMetaObject::invokeMethod(pairing, [&]() { deadline = pairing->deadlineMs(); },
+                                  Qt::BlockingQueuedConnection);
+        QCOMPARE(deadline, 30000);
+        QElapsedTimer clock;
+        clock.start();
+        client.beginSession(QStringLiteral("s-stages"));
+        QTRY_VERIFY_WITH_TIMEOUT(client.connectFailed(), 1900);
+        QVERIFY(clock.elapsed() < 2000);
+        QCOMPARE(failed.size(), 1);
+        const auto failure = failed.first().first().value<SeatHubFailure>();
+        QCOMPARE(failure.kind, FailureKind::Local);
+        QCOMPARE(failure.statusCode, 0);
+        QCOMPARE(failure.failure, QStringLiteral("session_refused.no_external_path"));
+        QCOMPARE(client.stalledReasonText(), QStringLiteral("We could not verify a usable connection "
+                 "from your network, so we did not start your session. You were not charged."));
+        QVERIFY(client.reference().isEmpty());
+        QCOMPARE(stepFailed.size(), 0);
+        QCOMPARE(g_plainHandshakeRuns, handshakes);
+        QCOMPARE(g_engineCreateCalls, engineCreates);
+        const QString end = QStringLiteral("/api/sessions/s-stages/end");
+        QTRY_VERIFY_WITH_TIMEOUT(m_fake->requestPaths().contains(end), 1900);
+        const auto endBody = QJsonDocument::fromJson(m_fake->bodyFor(end)).object();
+        QCOMPARE(endBody.value(QStringLiteral("stage")).toString(), QStringLiteral("session_refused"));
+        QVERIFY(!endBody.contains(QStringLiteral("attempt_step")));
+        const QString liveness = QStringLiteral("/api/sessions/s-stages/liveness");
+        QTRY_VERIFY_WITH_TIMEOUT(m_fake->bodyFor(liveness).contains("session_refused"), 1900);
+        const auto liveBody = QJsonDocument::fromJson(m_fake->bodyFor(liveness)).object();
+        QCOMPARE(liveBody.value(QStringLiteral("engine_stage")).toString(), QStringLiteral("session_refused"));
+        QCOMPARE(liveBody.value(QStringLiteral("stage")).toString(), QStringLiteral("failed"));
+        const int polls = m_fake->requestPaths().count(QStringLiteral("/api/sessions/s-stages/pairing"));
+        QTest::qWait(1100);
+        QCOMPARE(m_fake->requestPaths().count(QStringLiteral("/api/sessions/s-stages/pairing")), polls);
+        QCOMPARE(polls, 1);
+        verifyNoInternalNameIsShown(client);
+    }
+
     void theClientsOwnPairingDeadlineIsAStallToo()
     {
         SeatHubClient client;
@@ -4203,11 +4251,10 @@ private slots:
                 [](const ShippedLine& line) { return line.body == QLatin1String("play.step"); }));
         };
 
-        // A run of 409s no longer stalls this deadline (fork `15962514`: "a 409 while the rig is
-        // prepared does not spend the pairing deadline" - it restarts D-08's clock on every "not
-        // yet" answer). A transport failure still does, so the authorization poll never resolving
-        // at all is what makes this deadline expire.
-        m_fake->answerPairing(0);
+        // Real READY/null-PIN waiting spends the deadline; 409/PREPARING reset it and an
+        // unusable API transport now refuses immediately instead of blaming a rig deadline.
+        m_fake->answerPairing(200, QByteArrayLiteral(
+            "{\"session_id\":\"s-stages\",\"state\":\"READY\",\"pairing_pin\":null}"));
 
         // The deadline is measured by the pairing controller, on its own thread: shorten it there, then
         // let a real pairing wait for a rig that never becomes ready.
@@ -4239,7 +4286,7 @@ private slots:
                  QStringLiteral("pair_authorize"));
         QCOMPARE(record->attrs.value(QStringLiteral("outcome")).toString(), QStringLiteral("failed"));
         QCOMPARE(record->attrs.value(QStringLiteral("failure_class")).toString(),
-                 QStringLiteral("unreachable_deadline"));
+                  QStringLiteral("deadline"));
         verifyNoInternalNameIsShown(client);
     }
 
