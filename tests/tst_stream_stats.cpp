@@ -657,15 +657,24 @@ private slots:
     {
         StreamQualitySampler sampler;
         int empties = 0;
+        int emptiesAtFirstRollup = -1;
         connect(&sampler, &StreamQualitySampler::emptyWindowEmitted, &sampler,
                 [&](qint64) { ++empties; });
-        sampler.setWindowMs(40);
+        // Read the stall count at the instant the first rollup is emitted. Waiting on the rollup
+        // counter from the outside can run past the next window, and that window is legitimately
+        // empty, which would fail the test for the sampler working as designed.
+        connect(&sampler, &StreamQualitySampler::rollupEmitted, &sampler, [&]() {
+            if (emptiesAtFirstRollup < 0) emptiesAtFirstRollup = empties;
+        });
+        // 200 ms keeps start() and feed() inside the first window even after a scheduler delay,
+        // and the test still finishes in well under a second.
+        sampler.setWindowMs(200);
         sampler.start(QStringLiteral("stall-sample"));
         VideoStats stats; stats.renderedFps = OptionalMetric::of(60);
         sampler.feed(stats);
-        QTRY_COMPARE(sampler.rollups(), 1);
+        QTRY_VERIFY_WITH_TIMEOUT(emptiesAtFirstRollup >= 0, 5000);
         // The window that carried the sample is a rollup, never a stall.
-        QCOMPARE(empties, 0);
+        QCOMPARE(emptiesAtFirstRollup, 0);
         sampler.finish();
     }
 

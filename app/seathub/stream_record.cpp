@@ -307,7 +307,7 @@ void StreamRecorder::closeMinute(bool partial, qint64 endMonoMs)
     entry.insert(QStringLiteral("warnings"), warnings);
     entry.insert(QStringLiteral("warnings_dropped"), m_warningsDropped);
 
-    // The six readings exist only for a minute that had samples, and are omitted - never null -
+    // The sixteen readings exist only for a minute that had samples, and are omitted - never null -
     // otherwise (ADR-0117). A metric no sample carried reads 0.
     if (count > 0) {
         QVector<double> fps, loss, jitter, rtt, decode;
@@ -329,12 +329,36 @@ void StreamRecorder::closeMinute(bool partial, qint64 endMonoMs)
             std::sort(v.begin(), v.end());
             return static_cast<qint64>(std::llround(percentile(v, p)));
         };
+        // The same five families also carry their MIN and MAX (T088, contract 3.37.0): taken over
+        // the samples this minute holds, rounded and bounded like the averages beside them.
+        auto low = [](const QVector<double>& v) {
+            if (v.isEmpty()) return 0.0;
+            double best = v.first();
+            for (double x : v) best = qMin(best, x);
+            return best;
+        };
+        auto high = [](const QVector<double>& v) {
+            if (v.isEmpty()) return 0.0;
+            double best = v.first();
+            for (double x : v) best = qMax(best, x);
+            return best;
+        };
         entry.insert(QStringLiteral("fps_avg"), round2(mean(fps)));
         entry.insert(QStringLiteral("network_loss_pct"), round2(mean(loss)));
         entry.insert(QStringLiteral("jitter_drop_pct"), round2(mean(jitter)));
         entry.insert(QStringLiteral("delay_ms_p50"), pct(rtt, 0.50));
         entry.insert(QStringLiteral("delay_ms_p95"), pct(rtt, 0.95));
         entry.insert(QStringLiteral("decode_ms_p50"), pct(decode, 0.50));
+        entry.insert(QStringLiteral("fps_min"), round2(low(fps)));
+        entry.insert(QStringLiteral("fps_max"), round2(high(fps)));
+        entry.insert(QStringLiteral("network_loss_pct_min"), round2(low(loss)));
+        entry.insert(QStringLiteral("network_loss_pct_max"), round2(high(loss)));
+        entry.insert(QStringLiteral("jitter_drop_pct_min"), round2(low(jitter)));
+        entry.insert(QStringLiteral("jitter_drop_pct_max"), round2(high(jitter)));
+        entry.insert(QStringLiteral("delay_ms_min"), static_cast<qint64>(std::llround(low(rtt))));
+        entry.insert(QStringLiteral("delay_ms_max"), static_cast<qint64>(std::llround(high(rtt))));
+        entry.insert(QStringLiteral("decode_ms_min"), static_cast<qint64>(std::llround(low(decode))));
+        entry.insert(QStringLiteral("decode_ms_max"), static_cast<qint64>(std::llround(high(decode))));
     }
 
     // Room for this minute and, behind it, the closing entries (tail, drop check) (E36).

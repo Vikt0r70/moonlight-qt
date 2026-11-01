@@ -466,7 +466,11 @@ private slots:
             if (minute.value(QStringLiteral("sample_count")).toInt() == 0) {
                 ++zero;
                 for (const char* reading : {"fps_avg", "network_loss_pct", "jitter_drop_pct",
-                                            "delay_ms_p50", "delay_ms_p95", "decode_ms_p50"}) {
+                                            "delay_ms_p50", "delay_ms_p95", "decode_ms_p50",
+                                            "fps_min", "fps_max", "network_loss_pct_min",
+                                            "network_loss_pct_max", "jitter_drop_pct_min",
+                                            "jitter_drop_pct_max", "delay_ms_min", "delay_ms_max",
+                                            "decode_ms_min", "decode_ms_max"}) {
                     QVERIFY2(!minute.contains(QLatin1String(reading)), reading);
                 }
             }
@@ -508,6 +512,84 @@ private slots:
         QCOMPARE(minute.value(QStringLiteral("poor_connection_flags")).toInt(), 0);
         QVERIFY(minute.value(QStringLiteral("coverage_pct")).toDouble() > 0);
         QVERIFY(minute.value(QStringLiteral("coverage_pct")).toDouble() <= 100);
+        QVERIFY(!anyNull(minute));
+    }
+
+    // T088 (owner ruling 2026-10-31, "each value should have MIN AVG MAX"; contract 3.37.0): the
+    // same five families now carry their minimum and maximum beside the figures they already ship.
+    void aMinuteCarriesTheTenMinAndMaxReadingsBesideItsAverages()
+    {
+        EvidenceJournal journal(journalDir());
+        QVERIFY(journal.open(QStringLiteral("s-minmax"), QStringLiteral("acct-1")));
+        StreamRecorder recorder(&journal);
+        recorder.begin(0, serverStart());
+        // Ascending in every family, so each minimum sits below its central figure below its maximum.
+        recorder.addSample(1000, sample(30, 0.5, 0.1, 10, 2));
+        recorder.addSample(2000, sample(50, 1.0, 0.2, 20, 4));
+        recorder.addSample(3000, sample(70, 1.5, 0.3, 30, 6));
+        recorder.advance(60000);
+
+        const QList<QJsonObject> minutes = entriesOfKind(readCapsules(journalDir()), QStringLiteral("stream_minute"));
+        QCOMPARE(minutes.size(), 1);
+        const QJsonObject& minute = minutes.first();
+        QCOMPARE(minute.value(QStringLiteral("sample_count")).toInt(), 3);
+
+        // Every figure T054 already shipped is unchanged.
+        QVERIFY(qAbs(minute.value(QStringLiteral("fps_avg")).toDouble() - 50.0) < 0.001);
+        QVERIFY(qAbs(minute.value(QStringLiteral("network_loss_pct")).toDouble() - 1.0) < 0.001);
+        QVERIFY(qAbs(minute.value(QStringLiteral("jitter_drop_pct")).toDouble() - 0.2) < 0.001);
+        QCOMPARE(minute.value(QStringLiteral("delay_ms_p50")).toInt(), 20);
+        QCOMPARE(minute.value(QStringLiteral("delay_ms_p95")).toInt(), 30);
+        QCOMPARE(minute.value(QStringLiteral("decode_ms_p50")).toInt(), 4);
+
+        // The ten new readings sit beside them on the same base tokens.
+        QVERIFY(qAbs(minute.value(QStringLiteral("fps_min")).toDouble() - 30.0) < 0.001);
+        QVERIFY(qAbs(minute.value(QStringLiteral("fps_max")).toDouble() - 70.0) < 0.001);
+        QVERIFY(qAbs(minute.value(QStringLiteral("network_loss_pct_min")).toDouble() - 0.5) < 0.001);
+        QVERIFY(qAbs(minute.value(QStringLiteral("network_loss_pct_max")).toDouble() - 1.5) < 0.001);
+        QVERIFY(qAbs(minute.value(QStringLiteral("jitter_drop_pct_min")).toDouble() - 0.1) < 0.001);
+        QVERIFY(qAbs(minute.value(QStringLiteral("jitter_drop_pct_max")).toDouble() - 0.3) < 0.001);
+        QCOMPARE(minute.value(QStringLiteral("delay_ms_min")).toInt(), 10);
+        QCOMPARE(minute.value(QStringLiteral("delay_ms_max")).toInt(), 30);
+        QCOMPARE(minute.value(QStringLiteral("decode_ms_min")).toInt(), 2);
+        QCOMPARE(minute.value(QStringLiteral("decode_ms_max")).toInt(), 6);
+        QVERIFY(!anyNull(minute));
+    }
+
+    // A family no sample carried reads 0 in its minimum and maximum, exactly what its *_avg
+    // sibling already reads today: the sixteen readings stand or fall together on this wire.
+    void aFamilyNoSampleCarriedReadsZeroInItsMinAndMaxLikeItsAverage()
+    {
+        EvidenceJournal journal(journalDir());
+        QVERIFY(journal.open(QStringLiteral("s-absent"), QStringLiteral("acct-1")));
+        StreamRecorder recorder(&journal);
+        recorder.begin(0, serverStart());
+        VideoStats carried = sample(60, 0.5, 0.0, 0.0, 0.0);
+        carried.jitterDroppedFramePct = OptionalMetric::none();
+        carried.rttMs = OptionalMetric::none();
+        carried.decodeTimeMs = OptionalMetric::none();
+        recorder.addSample(1000, carried);
+        recorder.addSample(2000, carried);
+        recorder.advance(60000);
+
+        const QList<QJsonObject> minutes = entriesOfKind(readCapsules(journalDir()), QStringLiteral("stream_minute"));
+        QCOMPARE(minutes.size(), 1);
+        const QJsonObject& minute = minutes.first();
+        QCOMPARE(minute.value(QStringLiteral("sample_count")).toInt(), 2);
+        for (const char* reading : {"fps_avg", "network_loss_pct", "jitter_drop_pct",
+                                    "delay_ms_p50", "delay_ms_p95", "decode_ms_p50",
+                                    "fps_min", "fps_max", "network_loss_pct_min",
+                                    "network_loss_pct_max", "jitter_drop_pct_min",
+                                    "jitter_drop_pct_max", "delay_ms_min", "delay_ms_max",
+                                    "decode_ms_min", "decode_ms_max"}) {
+            QVERIFY2(minute.contains(QLatin1String(reading)), reading);
+        }
+        QCOMPARE(minute.value(QStringLiteral("jitter_drop_pct_min")).toDouble(), 0.0);
+        QCOMPARE(minute.value(QStringLiteral("jitter_drop_pct_max")).toDouble(), 0.0);
+        QCOMPARE(minute.value(QStringLiteral("delay_ms_min")).toInt(), 0);
+        QCOMPARE(minute.value(QStringLiteral("delay_ms_max")).toInt(), 0);
+        QCOMPARE(minute.value(QStringLiteral("decode_ms_min")).toInt(), 0);
+        QCOMPARE(minute.value(QStringLiteral("decode_ms_max")).toInt(), 0);
         QVERIFY(!anyNull(minute));
     }
 

@@ -251,8 +251,11 @@ const QHash<QString, QList<FieldRule>>& kindRules()
                   plainField("server_time", FieldType::DateTime, true),
                   intField("skew_ms", std::numeric_limits<qint32>::min(),
                            std::numeric_limits<qint32>::max(), true)});
-        // The six readings are present only when sample_count > 0 (a cross-field rule below) and
-        // are never null (ADR-0117, openapi.yaml StreamMinuteEntry).
+        // The sixteen readings (the six T054 shipped and the ten min/max T088 adds) are present
+        // only when sample_count > 0 (a cross-field rule below) and are never null (ADR-0117,
+        // openapi.yaml StreamMinuteEntry). The ten are individually optional so an entry stating
+        // only the six older readings still validates and stores (contract 3.37.0 is additive);
+        // the cross-field rule keeps them together.
         r.insert(QStringLiteral("stream_minute"),
                  {plainField("run_id", FieldType::Uuid), intField("minute_seq", 0, kMaxSafeInteger),
                   plainField("window_start_server_time", FieldType::DateTime),
@@ -265,7 +268,16 @@ const QHash<QString, QList<FieldRule>>& kindRules()
                   numberField("jitter_drop_pct", 0, 100, true),
                   intField("delay_ms_p50", 0, kMaxSafeInteger, true),
                   intField("delay_ms_p95", 0, kMaxSafeInteger, true),
-                  intField("decode_ms_p50", 0, kMaxSafeInteger, true)});
+                  intField("decode_ms_p50", 0, kMaxSafeInteger, true),
+                  numberField("fps_min", 0, 1000, true), numberField("fps_max", 0, 1000, true),
+                  numberField("network_loss_pct_min", 0, 100, true),
+                  numberField("network_loss_pct_max", 0, 100, true),
+                  numberField("jitter_drop_pct_min", 0, 100, true),
+                  numberField("jitter_drop_pct_max", 0, 100, true),
+                  intField("delay_ms_min", 0, kMaxSafeInteger, true),
+                  intField("delay_ms_max", 0, kMaxSafeInteger, true),
+                  intField("decode_ms_min", 0, kMaxSafeInteger, true),
+                  intField("decode_ms_max", 0, kMaxSafeInteger, true)});
         r.insert(QStringLiteral("stream_tail"),
                  {plainField("run_id", FieldType::Uuid), enumField("end_reason", streamEndReasonSet()),
                   plainField("ended_at_server_time", FieldType::DateTime),
@@ -534,7 +546,7 @@ bool validateEntry(const QJsonObject& entry, bool envelope, bool strictVocab)
             return false;
         }
     } else if (kind == QLatin1String("stream_minute")) {
-        // The six readings exist exactly when the minute had samples; a null never passes the
+        // The sixteen readings exist exactly when the minute had samples; a null never passes the
         // type checks above, so a zero-sample minute carries none of them.
         const bool sampled = entry.value(QStringLiteral("sample_count")).toDouble() > 0;
         for (const char* reading : {"fps_avg", "network_loss_pct", "jitter_drop_pct", "delay_ms_p50",
@@ -542,6 +554,21 @@ bool validateEntry(const QJsonObject& entry, bool envelope, bool strictVocab)
             if (sampled != entry.contains(QLatin1String(reading))) {
                 return false;
             }
+        }
+        // The ten min/max readings arrive together (T088): a partial set claims readings the minute
+        // cannot have, and a zero-sample minute may not carry them at all. Their absence stays legal
+        // so an entry stating only the six older readings still validates and stores.
+        int minMaxStated = 0;
+        for (const char* reading : {"fps_min", "fps_max", "network_loss_pct_min",
+                                    "network_loss_pct_max", "jitter_drop_pct_min",
+                                    "jitter_drop_pct_max", "delay_ms_min", "delay_ms_max",
+                                    "decode_ms_min", "decode_ms_max"}) {
+            if (entry.contains(QLatin1String(reading))) {
+                ++minMaxStated;
+            }
+        }
+        if (minMaxStated != 0 && (minMaxStated != 10 || !sampled)) {
+            return false;
         }
     } else if (kind == QLatin1String("engine_failure") && strictVocab) {
         const QString step = entry.value(QStringLiteral("step")).toString();

@@ -56,6 +56,44 @@ QJsonObject pairingFailure()
                                            QStringLiteral("failure"), true, 4200);
 }
 
+// A complete `stream_minute` shaped as `StreamRecorder::closeMinute` writes it: the base keys, the
+// six readings T054 shipped, and (when `minMax`) the ten min/max readings T088 adds.
+QJsonObject streamMinute(int sampleCount, bool minMax)
+{
+    QJsonObject entry;
+    entry.insert(QStringLiteral("kind"), QStringLiteral("stream_minute"));
+    entry.insert(QStringLiteral("run_id"), QStringLiteral("0b6e5f0a-1c1d-4e37-9a3e-0f7d5c1e2b40"));
+    entry.insert(QStringLiteral("minute_seq"), 0);
+    entry.insert(QStringLiteral("window_start_server_time"), QStringLiteral("2026-10-25T10:00:00.000Z"));
+    entry.insert(QStringLiteral("sample_count"), sampleCount);
+    entry.insert(QStringLiteral("coverage_pct"), 100.0);
+    entry.insert(QStringLiteral("poor_connection_flags"), 0);
+    entry.insert(QStringLiteral("overlay_visible"), QStringLiteral("unknown"));
+    entry.insert(QStringLiteral("warnings"), QJsonArray());
+    entry.insert(QStringLiteral("warnings_dropped"), 0);
+    if (sampleCount > 0) {
+        entry.insert(QStringLiteral("fps_avg"), 60.0);
+        entry.insert(QStringLiteral("network_loss_pct"), 0.5);
+        entry.insert(QStringLiteral("jitter_drop_pct"), 0.1);
+        entry.insert(QStringLiteral("delay_ms_p50"), 20);
+        entry.insert(QStringLiteral("delay_ms_p95"), 30);
+        entry.insert(QStringLiteral("decode_ms_p50"), 3);
+    }
+    if (minMax) {
+        entry.insert(QStringLiteral("fps_min"), 55.0);
+        entry.insert(QStringLiteral("fps_max"), 60.0);
+        entry.insert(QStringLiteral("network_loss_pct_min"), 0.1);
+        entry.insert(QStringLiteral("network_loss_pct_max"), 0.9);
+        entry.insert(QStringLiteral("jitter_drop_pct_min"), 0.0);
+        entry.insert(QStringLiteral("jitter_drop_pct_max"), 0.3);
+        entry.insert(QStringLiteral("delay_ms_min"), 10);
+        entry.insert(QStringLiteral("delay_ms_max"), 40);
+        entry.insert(QStringLiteral("decode_ms_min"), 2);
+        entry.insert(QStringLiteral("decode_ms_max"), 5);
+    }
+    return entry;
+}
+
 QStringList capsuleFiles(const QString& dir)
 {
     return QDir(dir).entryList(QStringList{QStringLiteral("evj-*.json")}, QDir::Files, QDir::Name);
@@ -438,6 +476,45 @@ private slots:
     {
         QFETCH(QJsonObject, entry);
         QVERIFY(entry.isEmpty());
+    }
+
+    // T088: the journal is the recorder's only front door, so the ten min/max readings must pass
+    // its own checks before any capsule can hold them (and stay away from an empty minute).
+    void aStreamMinuteRecordsItsTenMinMaxReadingsOnlyOnASampledMinute()
+    {
+        EvidenceJournal journal(m_dir);
+        QVERIFY(journal.open(kSessA, kAcct1));
+
+        // Sampled, all sixteen readings: recorded.
+        journal.record(streamMinute(3, true));
+        QCOMPARE(journal.pendingCounters().droppedEntries, qint64(0));
+        QCOMPARE(capsuleFiles(m_dir).size(), 1);
+
+        // Sampled, only the six older readings: still valid, the contract is additive.
+        journal.record(streamMinute(3, false));
+        // Zero samples and no reading at all: still the empty minute E37 requires.
+        journal.record(streamMinute(0, false));
+        QCOMPARE(journal.pendingCounters().droppedEntries, qint64(0));
+
+        // The ten on a minute that had no samples would claim readings it does not have.
+        journal.record(streamMinute(0, true));
+        QCOMPARE(journal.pendingCounters().droppedEntries, qint64(1));
+
+        // A partial set is refused: nine of ten, and ten of ten with one replaced by null.
+        QJsonObject partial = streamMinute(3, true);
+        partial.remove(QStringLiteral("decode_ms_max"));
+        journal.record(partial);
+        QCOMPARE(journal.pendingCounters().droppedEntries, qint64(2));
+
+        QJsonObject nulled = streamMinute(3, true);
+        nulled.insert(QStringLiteral("fps_max"), QJsonValue::Null);
+        journal.record(nulled);
+        QCOMPARE(journal.pendingCounters().droppedEntries, qint64(3));
+
+        // The three stored minutes are the sampled pair and the empty one.
+        journal.close();
+        const QJsonObject body = parseBody(journal.deliverable(kAcct1).first().body);
+        QCOMPARE(body.value(QStringLiteral("entries")).toArray().size(), 3);
     }
 
     void anInvalidEntryStoresNothingAndCountsADroppedEntry()
