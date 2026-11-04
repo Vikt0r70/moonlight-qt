@@ -657,15 +657,24 @@ private slots:
     {
         StreamQualitySampler sampler;
         int empties = 0;
+        int emptiesAtFirstRollup = -1;
         connect(&sampler, &StreamQualitySampler::emptyWindowEmitted, &sampler,
                 [&](qint64) { ++empties; });
-        sampler.setWindowMs(40);
+        // Read the stall count at the instant the first rollup is emitted. Waiting on the rollup
+        // counter from the outside can run past the next window, and that window is legitimately
+        // empty, which would fail the test for the sampler working as designed.
+        connect(&sampler, &StreamQualitySampler::rollupEmitted, &sampler, [&]() {
+            if (emptiesAtFirstRollup < 0) emptiesAtFirstRollup = empties;
+        });
+        // 200 ms keeps start() and feed() inside the first window even after a scheduler delay,
+        // and the test still finishes in well under a second.
+        sampler.setWindowMs(200);
         sampler.start(QStringLiteral("stall-sample"));
         VideoStats stats; stats.renderedFps = OptionalMetric::of(60);
         sampler.feed(stats);
-        QTRY_COMPARE(sampler.rollups(), 1);
+        QTRY_VERIFY_WITH_TIMEOUT(emptiesAtFirstRollup >= 0, 5000);
         // The window that carried the sample is a rollup, never a stall.
-        QCOMPARE(empties, 0);
+        QCOMPARE(emptiesAtFirstRollup, 0);
         sampler.finish();
     }
 
@@ -862,6 +871,78 @@ private slots:
             QCOMPARE(partial.value("dropped_samples").toInt(), 2);
             QVERIFY(partial.value("partial").toBool());
             QCOMPARE(partial.value("recent_n").toInt(), 0);
+            for (const QString& key : rateKeys) QVERIFY2(!partial.contains(key), qPrintable(key));
+        }
+
+        // T023 / R3, adjacent windows: the recent ring is read against the window being emitted.
+        // A full window ends holding a reading exactly 60000 ms old at the next emit (still "recent"
+        // by age, ADR-0101 s.4); a drops-only window after it must not report that reading as its own.
+        {
+            rollupLogs.clear();
+            qint64 now = 0;
+            StreamQualitySampler sampler(nullptr, [&]() { return now; });
+            sampler.start(QStringLiteral("adjacent-drops"));
+            now = 60000;
+            sampler.feed(sample(60));
+            QVERIFY(fire(sampler));
+            QCOMPARE(rollupLogs.size(), 1);
+            QCOMPARE(rollupLogs.last().value("n").toInt(), 1);
+            QCOMPARE(rollupLogs.last().value("recent_n").toInt(), 1); // its own reading stays
+
+            QSemaphore locked, release;
+            QThread* holder = QThread::create([&]() {
+                QMutexLocker lock(&sampler.m_mutex);
+                locked.release();
+                release.acquire();
+            });
+            holder->start();
+            locked.acquire();
+            for (int i = 0; i < 3; ++i) sampler.feed(sample(30));
+            release.release();
+            holder->wait(); delete holder;
+            now = 120000;
+            QVERIFY(fire(sampler));
+            QCOMPARE(rollupLogs.size(), 2);
+            const QJsonObject drops = rollupLogs.last();
+            QCOMPARE(drops.value("n").toInt(), 0);
+            QCOMPARE(drops.value("dropped_samples").toInt(), 3);
+            QCOMPARE(drops.value("recent_n").toInt(), 0);
+            QCOMPARE(recentKeys(drops), 0);
+            for (const QString& key : rateKeys) QVERIFY2(!drops.contains(key), qPrintable(key));
+            // The newest reading's age is still stated honestly; only the window's recent list is clean.
+            QCOMPARE(drops.value("last_sample_age_ms").toDouble(), 60000.0);
+            sampler.finish();
+        }
+        // The same at finish: a full window, then a partial drops-only window; nothing carried over.
+        {
+            rollupLogs.clear();
+            qint64 now = 0;
+            StreamQualitySampler sampler(nullptr, [&]() { return now; });
+            sampler.start(QStringLiteral("adjacent-partial"));
+            now = 60000;
+            sampler.feed(sample(60));
+            QVERIFY(fire(sampler));
+            QCOMPARE(rollupLogs.last().value("recent_n").toInt(), 1);
+            QSemaphore locked, release;
+            QThread* holder = QThread::create([&]() {
+                QMutexLocker lock(&sampler.m_mutex);
+                locked.release();
+                release.acquire();
+            });
+            holder->start();
+            locked.acquire();
+            for (int i = 0; i < 2; ++i) sampler.feed(sample(30));
+            release.release();
+            holder->wait(); delete holder;
+            now = 60500;
+            sampler.finish();
+            QCOMPARE(rollupLogs.size(), 2);
+            const QJsonObject partial = rollupLogs.last();
+            QVERIFY(partial.value("partial").toBool());
+            QCOMPARE(partial.value("n").toInt(), 0);
+            QCOMPARE(partial.value("dropped_samples").toInt(), 2);
+            QCOMPARE(partial.value("recent_n").toInt(), 0);
+            QCOMPARE(recentKeys(partial), 0);
             for (const QString& key : rateKeys) QVERIFY2(!partial.contains(key), qPrintable(key));
         }
 

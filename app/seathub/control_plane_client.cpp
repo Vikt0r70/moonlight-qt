@@ -11,6 +11,9 @@
 #include <QNetworkAccessManager>
 #include <QNetworkReply>
 #include <QNetworkRequest>
+#include <QNetworkProxy>
+#include <QPointer>
+#include <QTimer>
 #include <QRandomGenerator>
 #include <QRegularExpression>
 #include <QThread>
@@ -19,11 +22,60 @@
 
 Q_LOGGING_CATEGORY(seathubControlPlane, "seathub.control_plane")
 
+struct PairingRequestState {
+    std::atomic_bool cancelled{false};
+    QElapsedTimer elapsed;
+    QPointer<QObject> context;
+    QPointer<QNetworkReply> reply;
+    QNetworkAccessManager* network = nullptr;
+    ControlPlaneClient::Callback callback;
+    ControlPlaneClient::PairingCancellation cancelLookup;
+    std::function<void()> nextCandidate;
+    QList<QHostAddress> candidates;
+    bool done = false;
+    bool resolved = false;
+};
+
 namespace {
+
+// The total clock starts at the public call, before dispatch and DNS. Leave scheduling
+// headroom under the two-second unusable-path bound, not an inactivity-only timeout.
+const int kPairingBudgetMs = 1800;
+
+ControlPlaneResult pairingTransportFailure()
+{
+    ControlPlaneResult result;
+    result.error = QStringLiteral("We could not verify a usable connection from your network, "
+                                  "so we did not start your session. You were not charged.");
+    result.failure = QStringLiteral("session_refused.no_external_path");
+    return result;
+}
+
+void completePairing(const std::shared_ptr<PairingRequestState>& state, ControlPlaneResult result)
+{
+    if (state->done) return;
+    state->done = true;
+    if (state->cancelLookup) {
+        auto cancel = std::move(state->cancelLookup);
+        cancel();
+    }
+    state->nextCandidate = {};
+    if (state->reply) {
+        QObject::disconnect(state->reply, nullptr, state->context, nullptr);
+        if (!state->reply->isFinished()) state->reply->abort();
+        state->reply->deleteLater();
+    }
+    if (state->context) state->context->deleteLater();
+    auto callback = std::move(state->callback);
+    if (state->cancelled.load()) result = ControlPlaneResult::aborted();
+    if (callback) callback(result);
+}
 
 // V-REQ (ADR-0083 decision 1): the inactivity limit for every short control-plane request.
 // `openAccountStream()` deliberately does not set it (its own comment explains why).
 const int kShortRequestTimeoutMs = 8000;
+// SC24: the drop check's one health request gives up after 5 s (docs/spec/client.md, Stream record).
+const int kHealthRequestTimeoutMs = 5000;
 
 // A short, stable class name for a route, for the transport-failure log: never the URL, the
 // session id, an address or a token (V-REQ, ADR-0083 decision 11).
@@ -468,6 +520,11 @@ bool UsageInfo::parse(const QJsonObject& body, UsageInfo* out)
 
 SeatHubFailure ControlPlaneResult::toFailure() const
 {
+    if (statusCode == 0 && failure == QLatin1String("session_refused.no_external_path")) {
+        auto result = SeatHubFailure::local(error);
+        result.failure = failure;
+        return result;
+    }
     if (statusCode == 0) {
         // We never reached the control plane, so there is no control-plane sentence and no
         // control-plane reference. The reason is the deck's own offline sentence, in full
@@ -623,6 +680,7 @@ ControlPlaneResult ControlPlaneClient::classify(int httpStatus, const QByteArray
     result.reference = object.value(QStringLiteral("reference")).toString();
     result.failure = object.value(QStringLiteral("failure")).toString();
     result.kind = object.value(QStringLiteral("kind")).toString();
+    result.refusalReason = object.value(QStringLiteral("refusal_reason")).toString();
     if (result.error.isEmpty()) {
         result.error = SeatHubFailure::generic().error;
     }
@@ -896,7 +954,8 @@ void ControlPlaneClient::stopOwnedThread()
 
 // ---------------------------------------------------------------- transport
 
-void ControlPlaneClient::send(const QString& method, const QString& path, const QByteArray& body,
+ControlPlaneClient::PairingCancellation ControlPlaneClient::send(
+                             const QString& method, const QString& path, const QByteArray& body,
                              bool authenticated, Callback callback,
                              const QHash<QByteArray, QByteArray>& extraHeaders)
 {
@@ -922,6 +981,22 @@ void ControlPlaneClient::send(const QString& method, const QString& path, const 
         traceId = m_traceId;
     }
 
+    std::shared_ptr<PairingRequestState> pairing;
+    PairingCancellation cancel;
+    if (routeClassForPath(path) == QLatin1String("session-pairing")) {
+        pairing = std::make_shared<PairingRequestState>();
+        pairing->elapsed.start();
+        const QPointer<ControlPlaneClient> guard(this);
+        cancel = [guard, pairing]() {
+            pairing->cancelled.store(true);
+            if (guard) {
+                QMetaObject::invokeMethod(guard, [pairing]() {
+                    if (pairing->context) completePairing(pairing, ControlPlaneResult::aborted());
+                }, Qt::QueuedConnection);
+            }
+        };
+    }
+
     // Every public call funnels through here, and here is the one place that knows the
     // caller may be on a different thread than this object. A queued invocation makes the
     // access to `m_network` happen on the owning thread, which is what
@@ -930,23 +1005,25 @@ void ControlPlaneClient::send(const QString& method, const QString& path, const 
         QMetaObject::invokeMethod(
             this,
             [this, method, path, body, authenticated, accessToken, traceId, callback,
-             extraHeaders]() {
+             extraHeaders, pairing]() {
                 sendOnOwningThread(method, path, body, authenticated, accessToken, traceId,
-                                   callback, extraHeaders);
+                                   callback, extraHeaders, pairing);
             },
             Qt::QueuedConnection);
-        return;
+        return cancel;
     }
 
     sendOnOwningThread(method, path, body, authenticated, accessToken, traceId, callback,
-                       extraHeaders);
+                       extraHeaders, pairing);
+    return cancel;
 }
 
 void ControlPlaneClient::sendOnOwningThread(const QString& method, const QString& path,
                                             const QByteArray& body, bool authenticated,
                                             const QString& accessToken, const QString& traceId,
                                             Callback callback,
-                                            const QHash<QByteArray, QByteArray>& extraHeaders)
+                                            const QHash<QByteArray, QByteArray>& extraHeaders,
+                                            std::shared_ptr<PairingRequestState> pairing)
 {
     QUrl url(m_baseUrl + path);
     QNetworkRequest request(url);
@@ -970,11 +1047,17 @@ void ControlPlaneClient::sendOnOwningThread(const QString& method, const QString
         request.setRawHeader(it.key(), it.value());
     }
 
+    if (pairing) {
+        sendPairing(request, std::move(callback), std::move(pairing));
+        return;
+    }
+
     // V-REQ (ADR-0083 decision 1): every short REST call is bounded by an 8 s inactivity limit,
     // so a request on a connection that stopped answering fails instead of hanging. This is the
     // one place every short call funnels through; `openAccountStream()` builds its own request on
     // `m_streamNetwork` and deliberately leaves this unset.
-    request.setTransferTimeout(kShortRequestTimeoutMs);
+    request.setTransferTimeout(path == QLatin1String("/health") ? kHealthRequestTimeoutMs
+                                                                 : kShortRequestTimeoutMs);
 
     QNetworkReply* reply = nullptr;
     if (method == QLatin1String("GET")) {
@@ -998,6 +1081,136 @@ void ControlPlaneClient::sendOnOwningThread(const QString& method, const QString
             [this, reply, callback, routeClass, elapsed]() {
                 finishReply(reply, callback, routeClass, elapsed.elapsed());
             });
+}
+
+void ControlPlaneClient::sendPairing(QNetworkRequest request, Callback callback,
+                                    std::shared_ptr<PairingRequestState> state)
+{
+    state->callback = std::move(callback);
+    state->context = new QObject(this);
+    const int remaining = kPairingBudgetMs - int(state->elapsed.elapsed());
+    if (state->cancelled.load() || remaining <= 0) {
+        completePairing(state, pairingTransportFailure());
+        return;
+    }
+    auto* timer = new QTimer(state->context);
+    timer->setTimerType(Qt::PreciseTimer);
+    timer->setSingleShot(true);
+    connect(timer, &QTimer::timeout, state->context, [state]() {
+        completePairing(state, pairingTransportFailure());
+    });
+    timer->start(remaining);
+    connect(state->context, &QObject::destroyed, [state]() {
+        state->done = true;
+        state->callback = {};
+        state->nextCandidate = {};
+        if (state->cancelLookup) {
+            auto cancel = std::move(state->cancelLookup);
+            cancel();
+        }
+    });
+
+    const QUrl original = request.url();
+    request.setPeerVerifyName(original.host());
+    request.setRawHeader("Host", original.authority(QUrl::FullyEncoded | QUrl::RemoveUserInfo).toUtf8());
+    // HTTP/2 discards Host and builds :authority from the numeric URL. HTTP/1 preserves Host.
+    request.setAttribute(QNetworkRequest::Http2AllowedAttribute, false);
+    request.setAttribute(QNetworkRequest::Http2DirectAttribute, false);
+    request.setAttribute(QNetworkRequest::RedirectPolicyAttribute, QNetworkRequest::ManualRedirectPolicy);
+    request.setAttribute(QNetworkRequest::CacheLoadControlAttribute, QNetworkRequest::AlwaysNetwork);
+    request.setTransferTimeout(remaining);
+
+    // Injected managers remain hermetic. An explicit DNS seam enables numeric routing in
+    // deterministic fake tests, without unexpectedly resolving production names on the internet.
+    const bool hermetic = !m_ownsNetwork && !m_pairingResolver;
+    if (m_ownsNetwork) {
+        state->network = new QNetworkAccessManager(state->context);
+        state->network->setProxy(QNetworkProxy::NoProxy);
+    }
+    else state->network = m_network;
+
+    const std::weak_ptr<PairingRequestState> weak = state;
+    state->nextCandidate = [weak, request, hermetic]() mutable {
+        auto current = weak.lock();
+        if (!current || current->done || !current->context) return;
+        if (current->cancelled.load() || current->elapsed.elapsed() >= kPairingBudgetMs
+            || (!hermetic && current->candidates.isEmpty())) {
+            completePairing(current, pairingTransportFailure());
+            return;
+        }
+        QNetworkRequest candidate(request);
+        if (!hermetic) {
+            QUrl url = candidate.url();
+            url.setHost(current->candidates.takeFirst().toString());
+            candidate.setUrl(url);
+        }
+        auto* reply = current->network->get(candidate);
+        current->reply = reply;
+        if (!hermetic && !current->candidates.isEmpty()) {
+            // Give another resolved IPv4 a fair share if this edge stalls, still within the
+            // one outer DNS/connect/TLS/read budget. No IPv6 or fresh dual-stack retry.
+            auto* candidateTimer = new QTimer(reply);
+            candidateTimer->setSingleShot(true);
+            candidateTimer->setTimerType(Qt::PreciseTimer);
+            QObject::connect(candidateTimer, &QTimer::timeout, reply, &QNetworkReply::abort);
+            candidateTimer->start(qMax(1, int(kPairingBudgetMs - current->elapsed.elapsed())
+                                            / int(current->candidates.size() + 1)));
+        }
+        QObject::connect(reply, &QNetworkReply::finished, current->context,
+                         [current, reply, hermetic]() {
+            if (current->done || !current->context) return;
+            const int status = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+            const int error = int(reply->error());
+            const bool failed = error != int(QNetworkReply::NoError)
+                && (status == 0 || (error >= 1 && error <= 99));
+            if (status >= 300 && status < 400) {
+                completePairing(current, pairingTransportFailure());
+            }
+            else if (failed || status == 0) {
+                current->reply.clear();
+                reply->deleteLater();
+                if (!hermetic && !current->candidates.isEmpty()) {
+                    current->network->clearConnectionCache();
+                    current->nextCandidate();
+                }
+                else completePairing(current, pairingTransportFailure());
+            }
+            else {
+                completePairing(current, ControlPlaneClient::classify(status, reply->readAll()));
+            }
+        });
+    };
+    if (hermetic) {
+        state->nextCandidate();
+        return;
+    }
+    auto resolved = [state](const QHostInfo& info) {
+        if (state->done || state->resolved || !state->context) return;
+        state->resolved = true;
+        if (state->cancelled.load() || info.error() != QHostInfo::NoError) {
+            completePairing(state, pairingTransportFailure());
+            return;
+        }
+        for (const auto& address : info.addresses()) {
+            // Conversion alone would also accept mapped IPv6, which is not an IPv4 socket.
+            if (address.protocol() == QAbstractSocket::IPv4Protocol
+                && (address.toIPv4Address() & 0xf0000000U) != 0xf0000000U
+                && !state->candidates.contains(address)) state->candidates.append(address);
+        }
+        state->nextCandidate();
+    };
+    PairingCancellation cancelLookup;
+    if (m_pairingResolver) {
+        cancelLookup = m_pairingResolver(original.host(), state->context, std::move(resolved));
+    }
+    else {
+        const int id = QHostInfo::lookupHost(original.host(), state->context, std::move(resolved));
+        cancelLookup = [id]() { QHostInfo::abortHostLookup(id); };
+    }
+    if (state->done) {
+        if (cancelLookup) cancelLookup();
+    }
+    else state->cancelLookup = std::move(cancelLookup);
 }
 
 void ControlPlaneClient::finishReply(QNetworkReply* reply, Callback callback,
@@ -1153,12 +1366,13 @@ void ControlPlaneClient::fetchSession(const QString& sessionId, Callback callbac
          QByteArray(), true, callback);
 }
 
-void ControlPlaneClient::fetchSessionAuthorization(const QString& sessionId, Callback callback)
+ControlPlaneClient::PairingCancellation ControlPlaneClient::fetchSessionAuthorization(
+    const QString& sessionId, Callback callback)
 {
     // The session authorization: where to connect, what the CONNECT lease permits, and the
     // control-plane-issued pairing PIN (ADR-0034). Short-lived and scoped to this one
     // session; it never carries a Sunshine admin credential.
-    send(QStringLiteral("GET"), QStringLiteral("/api/sessions/") + encodedPathSegment(sessionId)
+    return send(QStringLiteral("GET"), QStringLiteral("/api/sessions/") + encodedPathSegment(sessionId)
              + QStringLiteral("/pairing"),
          QByteArray(), true, callback);
 }
@@ -1270,6 +1484,11 @@ void ControlPlaneClient::postEvidence(const QString& sessionId, const QByteArray
     send(QStringLiteral("POST"), QStringLiteral("/api/sessions/") + encodedPathSegment(sessionId)
              + QStringLiteral("/evidence"),
          body, true, callback);
+}
+
+void ControlPlaneClient::checkHealth(Callback callback)
+{
+    send(QStringLiteral("GET"), QStringLiteral("/health"), QByteArray(), false, callback);
 }
 
 void ControlPlaneClient::postStreamTime(const QString& sessionId, int segmentNo, qint64 deliveredMs,

@@ -97,6 +97,7 @@ QJsonObject lineToJson(const ShippedLine& line)
     // false) and never has to guess from a missing key.
     obj.insert(QStringLiteral("attrs"), line.attrs);
     obj.insert(QStringLiteral("diagnostic"), line.diagnostic);
+    obj.insert(QStringLiteral("account_id"), line.accountId);
     return obj;
 }
 
@@ -120,6 +121,9 @@ std::optional<ShippedLine> lineFromJson(const QJsonObject& obj)
     // key: both default to their empty/false values, which is exactly what an ordinary line is.
     line.attrs = obj.value(QStringLiteral("attrs")).toObject();
     line.diagnostic = obj.value(QStringLiteral("diagnostic")).toBool(false);
+    // A spool file from before T023 has no account: empty means "not account-scoped", and such a
+    // line ships as it always did.
+    line.accountId = obj.value(QStringLiteral("account_id")).toString();
     return line;
 }
 
@@ -467,6 +471,20 @@ public:
         std::atomic_store(&currentIds, next);
     }
 
+    void publishAccount(const QString& accountId, const std::function<void()>& underLock)
+    {
+        // The worker holds `accountMutex` from its account check until the SDK has taken the
+        // line, so waiting here means any line already past that check is emitted under the SDK
+        // user it was checked against, and the next line is checked against this account.
+        std::lock_guard<std::mutex> lock(accountMutex);
+        if (underLock) {
+            underLock();
+        }
+        std::atomic_store(&currentAccount, std::make_shared<const QString>(accountId));
+    }
+
+    qint64 droppedAccountTotal() const { return droppedAccountCount.load(); }
+
     void setSpoolDirectoryForTests(const QString& directory) { spoolDirectoryOverride = directory; }
 
     void holdWorkerForTests(bool hold)
@@ -507,6 +525,7 @@ private:
         // Capture-time redaction survives a terminal clear before the worker drains this line.
         line.body = scrubRig(text);
         line.loggedAt = currentEpochSeconds();
+        line.accountId = currentAccountId();
         const std::shared_ptr<const Ids> ids = std::atomic_load(&currentIds);
         if (ids) {
             line.sessionId = ids->sessionId;
@@ -570,6 +589,7 @@ public:
         line.loggedAt = currentEpochSeconds();
         line.attrs = attrs;
         line.diagnostic = true;
+        line.accountId = currentAccountId();
         const std::shared_ptr<const Ids> ids = std::atomic_load(&currentIds);
         if (ids) {
             line.sessionId = ids->sessionId;
@@ -647,9 +667,15 @@ private:
     {
         QList<ShippedLine> spooled = spool->takeAll();
         for (int i = 0; i < spooled.size(); ++i) {
+            // Per line, so a sign-out never waits behind the whole spool. The gate is re-checked
+            // under the lock: it may have flipped while this thread waited for it.
+            std::lock_guard<std::mutex> accountLock(accountMutex);
             if (handOffPaused.load() || !canShip.load() || !ReportingConsent::coveredUploadsAllowed()) {
                 requeue(spooled, i);
                 return;
+            }
+            if (belongsToAnotherAccount(spooled.at(i))) {
+                continue;
             }
             if (!handOffOne(spooled.at(i))) {
                 requeue(spooled, i);
@@ -663,14 +689,43 @@ private:
         ShippedLine line = rawLine;
         line.body = LogShipper::scrub(line.body);
 
+        // The account check and the whole SDK emission are one step with respect to
+        // `publishAccount()`, so the SDK user cannot change between the two (T070 / A2).
+        std::lock_guard<std::mutex> accountLock(accountMutex);
         if (handOffPaused.load() || !canShip.load() || !ReportingConsent::coveredUploadsAllowed()) {
             spool->append(line);
+            return;
+        }
+
+        if (belongsToAnotherAccount(line)) {
             return;
         }
 
         if (!handOffOne(line)) {
             spool->append(line);
         }
+    }
+
+    /// T023: the account signed in right now ("" when none). Called on any thread.
+    QString currentAccountId() const
+    {
+        const std::shared_ptr<const QString> account = std::atomic_load(&currentAccount);
+        return account ? *account : QString();
+    }
+
+    /// T023: true, and counted, for a line logged under one account that is due to ship while a
+    /// different one is signed in. Such a line is dropped, not re-spooled: it can never ship
+    /// correctly, and the SDK would stamp it with the wrong user. A line with no account (logged
+    /// before any sign-in, or spooled by an older build) ships as it always did, and the same
+    /// account signing back in still ships what it held. Checked only once the line is otherwise
+    /// free to ship, so a sign-out never drops a held line early.
+    bool belongsToAnotherAccount(const ShippedLine& line)
+    {
+        if (line.accountId.isEmpty() || line.accountId == currentAccountId()) {
+            return false;
+        }
+        droppedAccountCount.fetch_add(1);
+        return true;
     }
 
     /// Puts `spooled[from..]` back into the spool, in order - used whenever draining stops
@@ -770,6 +825,12 @@ private:
     std::atomic<quint64> processedSequence{ 0 };
 
     std::shared_ptr<const Ids> currentIds;
+    std::shared_ptr<const QString> currentAccount;
+    std::atomic<qint64> droppedAccountCount{ 0 };
+    /// Held by the worker from the account comparison through the end of the hand-off, and by
+    /// `publishAccount()` around the SDK user change. Lock order: this, then the SDK's own locks.
+    /// Never held across `pauseHandOff()` or `drainBeforeSignOut()`.
+    std::mutex accountMutex;
 
     std::mutex queueMutex;
     std::condition_variable queueCv;
@@ -842,6 +903,16 @@ void LogShipper::stop()
 void LogShipper::publishIds(const QString& sessionId, const QString& hostId, const QString& traceId)
 {
     m_impl->publishIds(sessionId, hostId, traceId);
+}
+
+void LogShipper::publishAccount(const QString& accountId, const std::function<void()>& underLock)
+{
+    m_impl->publishAccount(accountId, underLock);
+}
+
+qint64 LogShipper::droppedAccountCount() const
+{
+    return m_impl->droppedAccountTotal();
 }
 
 void LogShipper::enqueueDiagnostic(const QString& body, LogLevel level, const QJsonObject& attrs)

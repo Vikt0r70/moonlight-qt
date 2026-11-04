@@ -78,6 +78,8 @@ SOURCES += \
     ../app/seathub/update_retry_state.cpp \
     ../app/seathub/stream_stats.cpp \
     ../app/seathub/stream_quality_sampler.cpp \
+    ../app/seathub/stream_record.cpp \
+    ../app/seathub/drop_check.cpp \
     ../app/seathub/engine_termination.cpp \
     ../app/seathub/engine_status.cpp \
     ../app/seathub/quality_outbox.cpp \
@@ -124,6 +126,8 @@ HEADERS += \
     ../app/seathub/update_retry_state.h \
     ../app/seathub/stream_stats.h \
     ../app/seathub/stream_quality_sampler.h \
+    ../app/seathub/stream_record.h \
+    ../app/seathub/drop_check.h \
     ../app/seathub/engine_termination.h \
     ../app/seathub/engine_status.h \
     ../app/seathub/quality_outbox.h \

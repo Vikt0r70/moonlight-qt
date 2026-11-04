@@ -26,6 +26,11 @@
 #include <QNetworkAccessManager>
 #include <QNetworkReply>
 #include <QNetworkRequest>
+#include <QNetworkProxy>
+#include <QSslCertificate>
+#include <QSslConfiguration>
+#include <QSslKey>
+#include <QSslSocket>
 #include <QRegularExpression>
 #include <QTcpServer>
 #include <QTcpSocket>
@@ -40,6 +45,126 @@
 #include "seathub/web_origin.h"
 
 namespace {
+
+// Public test-only, self-signed CA/server identity, valid 2026-2046, only pairing.test.
+// Never installed in the OS trust store; each test restores Qt's original configuration.
+const QByteArray kPairingTestCertificate = R"PEM(-----BEGIN CERTIFICATE-----
+MIIDTzCCAjegAwIBAgIUIUqsMD3LK/HkSn/owxYrQb/5/OYwDQYJKoZIhvcNAQEL
+BQAwFzEVMBMGA1UEAwwMcGFpcmluZy50ZXN0MB4XDTI2MDEwMTAwMDAwMFoXDTQ2
+MDEwMTAwMDAwMFowFzEVMBMGA1UEAwwMcGFpcmluZy50ZXN0MIIBIjANBgkqhkiG
+9w0BAQEFAAOCAQ8AMIIBCgKCAQEAzJ9jJlbs1nqC3ScT0Cos95+BnJR2Zdp3zMO+
+lJIm4ad+aoRBA4YZH53ZWaKmWaZ6nJ2MT7NF4ZSxaJNuCYpYvpwV3u9ghy0i85IO
+0LnLI1CuMQ5VavBgmRdgANm5gUeJlglQGP3pMNgchlPXDdRF1gVeCcH6/FOpIwYv
+Uxx9W+nMKcOX6PNuEsZLmqwrogojoq5AqhN9rXkhVXE4mh96txHJKL2vdP6JsN37
+/u36+7kIaBCWZJLFLMigKD5BNVvVZ7d5UN91MzkPOqyFjeod96ROHNZsl+Zi4CF3
+IPWzqn4bMkz8gT8JXtnljUJ8Q56FcAJscW2OI0Z5SAK+cjn7fQIDAQABo4GSMIGP
+MB0GA1UdDgQWBBRB9wcOqLvMwoZvWGLFAuI4CG3W8jAfBgNVHSMEGDAWgBRB9wcO
+qLvMwoZvWGLFAuI4CG3W8jAXBgNVHREEEDAOggxwYWlyaW5nLnRlc3QwDwYDVR0T
+AQH/BAUwAwEB/zAOBgNVHQ8BAf8EBAMCAqQwEwYDVR0lBAwwCgYIKwYBBQUHAwEw
+DQYJKoZIhvcNAQELBQADggEBAJ+x7DEXA84OkU0zoJ8j2YopdpTe0miIa+2FsUtk
+LfyH85jEcNzvvwRfJZ8gsKEUQtYEd9H4LmMsHNUpRJNdK3U3+XZJhvF3+OXvSZsl
+hyHnsDpA0ncUbZKEbZUx2mN9DOdLVNWwslYBA3ZTvN+J2Br7CpzIzwUNJ8UTWVqu
+s40VqubK/g60OL9zJASd+8QVR3Lhvc6A66M8xHXMhzeFvptkpbvEjpr1sSKN6mb7
+vvZ53pL0HTSnL7fB4v8m5kJ/THWWRQfEz7BLC5uF5AZkvbDXKPicU9PXKOo7RdB7
+CtBhlQUg04bwtiv16kuhygKfSHEchy1kfJlMGoasDM2HNaU=
+-----END CERTIFICATE-----
+)PEM";
+const QByteArray kPairingTestKey = R"PEM(-----BEGIN PRIVATE KEY-----
+MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQDMn2MmVuzWeoLd
+JxPQKiz3n4GclHZl2nfMw76Ukibhp35qhEEDhhkfndlZoqZZpnqcnYxPs0XhlLFo
+k24Jili+nBXe72CHLSLzkg7QucsjUK4xDlVq8GCZF2AA2bmBR4mWCVAY/ekw2ByG
+U9cN1EXWBV4Jwfr8U6kjBi9THH1b6cwpw5fo824SxkuarCuiCiOirkCqE32teSFV
+cTiaH3q3Eckova90/omw3fv+7fr7uQhoEJZkksUsyKAoPkE1W9Vnt3lQ33UzOQ86
+rIWN6h33pE4c1myX5mLgIXcg9bOqfhsyTPyBPwle2eWNQnxDnoVwAmxxbY4jRnlI
+Ar5yOft9AgMBAAECggEAIO3DZG+XpHpJpfI8b4LiAqViE8MWfJSYM9UKTdlpNWYh
+Y13OIpWJZHuf9xtEHug6EgsOgeLtK3ykwhn7msBvQJlYsawfAhHi7oSCKtfDV3cL
+2Swf1dpCCVDoK6rd/e53tzPfdm4iATC+AmXqlTikVmk9tV9IlyOVc+PyaLMMf2ZK
+KzWFrcmjSX6F+CjeSysLPOsFyZxYWHGmWEomtNYNOY0wGQ3q0gD3hkkXOGyFwwqe
+Q7L+aBDhucKxfeDd4Mt0AwklJ+qkU6pLSwSFfdzuU4EHQvbcJpF3YdyQ/GgGJyqI
+2jFi6Z9SvcEP1DBOysO3B9bTqr7ntCcBWyrcblDjBwKBgQDwMhWbwFjNwr0AqoiY
+/vwzoRDhYxogNRIPUZ45+udbO1PZK0V8GTr1vWRXPN8H/L3Zp+CPrGdCmMs7MlKv
+m9TAV7DRymJAIjElvrEZcb25oyD7w5PvC2yNYaEXYRnm48YsGZrrHeYUUP1yDJgk
+JCeoIbmrjfhjXT3zUW5VvgkqGwKBgQDaFhoNmoxNleNE7QkwTeUcokx2uN/B97FX
+EwszLJ40GeXTx0pyvQVPTLObw63HLk4hNehYG1s/tqFIWkUkyj+jV3u1XzH9dfHi
+iNbj+aVzgKt/+6JRuYloFfHeRocJGnH6OGcuhzSvEmexn9p9uIIexR5MjmO9brE8
+WYmObsLKRwKBgC7Kovj/hI049ZbOoeOkML9iDibKJonFrOn9DWTgIvfb296/lj6x
+r5G1vnlcK1qj+twO3yk9/bO0jkrO59q78bsymgiUc4Vo48glmNyLEtm6FK/XDteP
+kysLrNUgHmqjTrTCnDJXVb35dRYlq/HGdU9EmqX39z5sKKhg4aykY6anAoGABe7q
+AIq+3HGCgGKOiHDmFdRYjjZTaByMB5luCZNiLnqx5QQcA2kfFtw4WrmFJdEdsQud
+aaA86EvYsXY7QVf7ST9dDz8qxgGKdiZQ6lzlYnISuGWpMd4BXgKS1QBINjgw96TH
+Md3d0hGHHq8Bq7/0Uk/8lgqdrg6v5btt4aEjzYsCgYEApJyBcUPocJNt+E+38Edk
+DP2IwQbjt5vCQq2tmXRIACa88ER/y+JwcozxeV81jRkNoNWO90sIHp2gk/5GCebJ
+mZMVe3cjTeHbzHcIb2BisHA3clUP9zERZYkX+fXf3W6XgEQY50VmD4HhZjh4Kp9Z
+j1kKEADiuXarET3ehErmeRU=
+-----END PRIVATE KEY-----
+)PEM";
+
+struct TestTlsTrust {
+    QSslConfiguration original = QSslConfiguration::defaultConfiguration();
+    explicit TestTlsTrust(bool trusted = true) {
+        auto config = original;
+        config.setCaCertificates(trusted ? QList<QSslCertificate>{QSslCertificate(kPairingTestCertificate)}
+                                         : QList<QSslCertificate>{});
+        config.setPeerVerifyMode(QSslSocket::VerifyPeer);
+        QSslConfiguration::setDefaultConfiguration(config);
+    }
+    ~TestTlsTrust() { QSslConfiguration::setDefaultConfiguration(original); }
+};
+
+class PairingTlsServer : public QTcpServer {
+public:
+    QList<QByteArray> hellos, requests, protocols;
+    int connections = 0;
+    bool stallTls = false;
+    QByteArray response = "HTTP/1.1 200 OK\r\nContent-Length: 15\r\nConnection: close\r\n\r\n{\"status\":true}";
+protected:
+    void incomingConnection(qintptr descriptor) override {
+        ++connections;
+        auto* socket = new QSslSocket(this);
+        socket->setSocketDescriptor(descriptor);
+        auto config = socket->sslConfiguration();
+        config.setLocalCertificate(QSslCertificate(kPairingTestCertificate));
+        config.setPrivateKey(QSslKey(kPairingTestKey, QSsl::Rsa));
+        config.setPeerVerifyMode(QSslSocket::VerifyNone); // Server does not require client certs.
+        config.setAllowedNextProtocols({QByteArrayLiteral("h2"), QByteArrayLiteral("http/1.1")});
+        socket->setSslConfiguration(config);
+        connect(socket, &QSslSocket::encrypted, this, [this, socket]() {
+            protocols.append(socket->sslConfiguration().nextNegotiatedProtocol());
+        });
+        connect(socket, &QSslSocket::readyRead, this, [this, socket]() {
+            if (!socket->isEncrypted()) {
+                if (socket->property("started").toBool()) return;
+                const QByteArray hello = socket->peek(65536);
+                if (hello.size() < 5) return;
+                const int size = (quint8(hello[3]) << 8) + quint8(hello[4]) + 5;
+                if (hello.size() < size) return;
+                hellos.append(hello.left(size));
+                socket->setProperty("started", true);
+                if (!stallTls) socket->startServerEncryption();
+                return;
+            }
+            QByteArray request = socket->property("request").toByteArray() + socket->readAll();
+            socket->setProperty("request", request);
+            if (!request.contains("\r\n\r\n") || socket->property("answered").toBool()) return;
+            socket->setProperty("answered", true);
+            requests.append(request);
+            if (!response.isEmpty()) {
+                socket->write(response);
+                socket->disconnectFromHost();
+            }
+        });
+    }
+};
+
+ControlPlaneClient::PairingResolver loopbackResolver(int delayMs = 0)
+{
+    return [delayMs](const QString&, QObject* context, std::function<void(const QHostInfo&)> callback) {
+        QHostInfo info;
+        info.setAddresses({QHostAddress(QStringLiteral("::1")), QHostAddress(QHostAddress::LocalHost)});
+        QTimer::singleShot(delayMs, context, [callback, info]() { callback(info); });
+        return []() {};
+    };
+}
 
 // A reply that produces one canned response as soon as the event loop turns. Emitting
 // `finished()` from the constructor would fire before the client connected to it.
@@ -160,6 +285,314 @@ QByteArray refusedBody(const QString& error, const QString& reference,
 class TstControlPlane : public QObject
 {
     Q_OBJECT
+
+private slots:
+    void pairingTriesAnotherResolvedIpv4WithoutDualStackFallback()
+    {
+        TestTlsTrust trust;
+        PairingTlsServer server;
+        QVERIFY(server.listen(QHostAddress::LocalHost));
+        ControlPlaneClient client;
+        client.setBaseUrl(QStringLiteral("https://pairing.test:%1").arg(server.serverPort()));
+        client.setPairingResolver([](const QString&, QObject* context, auto callback) {
+            QHostInfo info;
+            info.setAddresses({QHostAddress(QStringLiteral("127.0.0.2")),
+                               QHostAddress(QStringLiteral("::1")),
+                               QHostAddress(QHostAddress::LocalHost)});
+            QTimer::singleShot(0, context, [callback, info]() { callback(info); });
+            return []() {};
+        });
+        int completions = 0;
+        client.fetchSessionAuthorization(QStringLiteral("retry-ipv4"), [&](const auto& result) {
+            QVERIFY2(result.ok, qPrintable(result.error)); ++completions;
+        });
+        QTRY_COMPARE_WITH_TIMEOUT(completions, 1, 1900);
+        QCOMPARE(server.requests.size(), 1);
+    }
+
+    void pairingCancelDuringTlsAbortsWithoutSendingCredentials()
+    {
+        TestTlsTrust trust;
+        PairingTlsServer server;
+        server.stallTls = true;
+        QVERIFY(server.listen(QHostAddress::LocalHost));
+        ControlPlaneClient client;
+        client.setBaseUrl(QStringLiteral("https://pairing.test:%1").arg(server.serverPort()));
+        client.setAccessToken(QStringLiteral("cancelled-secret"));
+        client.setPairingResolver(loopbackResolver());
+        int completions = 0;
+        auto cancel = client.fetchSessionAuthorization(QStringLiteral("cancel-tls"), [&](const auto& result) {
+            QVERIFY(result.wasAborted); ++completions;
+        });
+        QTRY_COMPARE_WITH_TIMEOUT(server.hellos.size(), 1, 500);
+        cancel();
+        QTRY_COMPARE_WITH_TIMEOUT(completions, 1, 500);
+        QVERIFY(server.requests.isEmpty());
+        QTest::qWait(30);
+        QCOMPARE(completions, 1);
+    }
+
+    void pairingUsesRealIpv4TlsWithOriginalSniHostAndCapturedCredentials()
+    {
+        QVERIFY(QSslSocket::supportsSsl());
+        TestTlsTrust trust;
+        PairingTlsServer server;
+        QVERIFY(server.listen(QHostAddress::LocalHost));
+        QTcpServer proxyTrap;
+        QVERIFY(proxyTrap.listen(QHostAddress::LocalHost));
+        struct ProxyRestore {
+            QNetworkProxy old = QNetworkProxy::applicationProxy();
+            ~ProxyRestore() { QNetworkProxy::setApplicationProxy(old); }
+        } proxyRestore;
+        QNetworkProxy::setApplicationProxy(QNetworkProxy(QNetworkProxy::HttpProxy,
+                                                         QStringLiteral("127.0.0.1"), proxyTrap.serverPort()));
+        ControlPlaneClient client;
+        client.setBaseUrl(QStringLiteral("https://pairing.test:%1").arg(server.serverPort()));
+        int lookups = 0;
+        QString resolvedName;
+        const auto resolve = loopbackResolver(20);
+        client.setPairingResolver([&](const QString& name, QObject* context, auto callback) {
+            ++lookups;
+            resolvedName = name;
+            return resolve(name, context, callback);
+        });
+        client.setAccessToken(QStringLiteral("captured-secret"));
+        client.setTraceId(QStringLiteral("0123456789abcdef0123456789abcdef"));
+        int completions = 0;
+        ControlPlaneResult result;
+        client.fetchSessionAuthorization(QStringLiteral("a/b %"), [&](const auto& value) {
+            QCOMPARE(QThread::currentThread(), client.thread());
+            result = value; ++completions;
+        });
+        client.setAccessToken(QStringLiteral("replacement-secret"));
+        client.setTraceId(QStringLiteral("fedcba9876543210fedcba9876543210"));
+        QTRY_COMPARE_WITH_TIMEOUT(completions, 1, 1900);
+        QVERIFY2(result.ok, qPrintable(result.error));
+        QCOMPARE(server.connections, 1);
+        QCOMPARE(resolvedName, QStringLiteral("pairing.test"));
+        QCOMPARE(server.requests.size(), 1);
+        const QByteArray request = server.requests.first();
+        QVERIFY(request.startsWith("GET /api/sessions/a%2Fb%20%25/pairing HTTP/1.1\r\n"));
+        QVERIFY(request.contains("Host: pairing.test:" + QByteArray::number(server.serverPort()) + "\r\n"));
+        QVERIFY(request.contains("Authorization: Bearer captured-secret\r\n"));
+        QVERIFY(!request.contains("replacement-secret"));
+        QVERIFY(request.toLower().contains("traceparent: 00-0123456789abcdef0123456789abcdef-"));
+        QVERIFY(request.contains("User-Agent: SeatHub/" SEATHUB_VERSION "\r\n"));
+        QCOMPARE(server.hellos.size(), 1);
+        // Exact server_name extension: list length 15, DNS name length 12.
+        QVERIFY(server.hellos.first().contains(QByteArray::fromHex("00000011000f00000c") + "pairing.test"));
+        QVERIFY(!server.protocols.contains(QByteArrayLiteral("h2")));
+        QVERIFY(!proxyTrap.hasPendingConnections());
+        client.fetchSessionAuthorization(QStringLiteral("next"), [&](const auto& value) {
+            QVERIFY(value.ok); ++completions;
+        });
+        QTRY_COMPARE_WITH_TIMEOUT(completions, 2, 1900);
+        QCOMPARE(lookups, 2); // No indefinitely cached edge, connection or credentials between polls.
+        QCOMPARE(server.connections, 2);
+        QVERIFY(server.requests.last().contains("Bearer replacement-secret\r\n"));
+    }
+
+    void pairingTlsRejectsWrongIdentityAndUntrustedCertificates_data()
+    {
+        QTest::addColumn<bool>("trusted");
+        QTest::addColumn<QString>("hostname");
+        QTest::newRow("wrong-host") << true << QStringLiteral("wrong.test");
+        QTest::newRow("untrusted") << false << QStringLiteral("pairing.test");
+    }
+    void pairingTlsRejectsWrongIdentityAndUntrustedCertificates()
+    {
+        QFETCH(bool, trusted);
+        QFETCH(QString, hostname);
+        TestTlsTrust trust(trusted);
+        PairingTlsServer server;
+        QVERIFY(server.listen(QHostAddress::LocalHost));
+        ControlPlaneClient client;
+        client.setBaseUrl(QStringLiteral("https://%1:%2").arg(hostname).arg(server.serverPort()));
+        client.setPairingResolver(loopbackResolver());
+        int completions = 0;
+        client.fetchSessionAuthorization(QStringLiteral("s"), [&](const auto& result) {
+            ++completions;
+            QVERIFY(!result.ok);
+            QCOMPARE(result.statusCode, 0);
+            QCOMPARE(result.failure, QStringLiteral("session_refused.no_external_path"));
+            QVERIFY(result.reference.isEmpty());
+        });
+        QTRY_COMPARE_WITH_TIMEOUT(completions, 1, 1900);
+        QVERIFY(server.requests.isEmpty()); // Bearer never crosses a failed TLS identity check.
+        QTest::qWait(30);
+        QCOMPARE(completions, 1);
+    }
+
+    void pairingRejectsEvenSameHostTlsRedirectWithoutForwardingBearer()
+    {
+        TestTlsTrust trust;
+        PairingTlsServer first, second;
+        QVERIFY(first.listen(QHostAddress::LocalHost));
+        QVERIFY(second.listen(QHostAddress::LocalHost));
+        first.response = "HTTP/1.1 302 Found\r\nContent-Length: 0\r\nLocation: https://pairing.test:"
+            + QByteArray::number(second.serverPort()) + "/redirect\r\nConnection: close\r\n\r\n";
+        ControlPlaneClient client;
+        client.setBaseUrl(QStringLiteral("https://pairing.test:%1").arg(first.serverPort()));
+        client.setAccessToken(QStringLiteral("redirect-must-not-leak"));
+        int lookups = 0;
+        const auto resolve = loopbackResolver();
+        client.setPairingResolver([&](const QString& name, QObject* context, auto callback) {
+            ++lookups; return resolve(name, context, callback);
+        });
+        int completions = 0;
+        client.fetchSessionAuthorization(QStringLiteral("s"), [&](const auto& result) {
+            ++completions;
+            QVERIFY(!result.ok);
+            QCOMPARE(result.statusCode, 0);
+        });
+        QTRY_COMPARE_WITH_TIMEOUT(completions, 1, 1900);
+        QTest::qWait(50);
+        QCOMPARE(lookups, 1);
+        QCOMPARE(first.requests.size(), 1);
+        QCOMPARE(second.connections, 0);
+    }
+
+    void pairingBoundsDnsTlsAndReadTogether_data()
+    {
+        QTest::addColumn<bool>("stallTls");
+        QTest::newRow("tls") << true;
+        QTest::newRow("read") << false;
+    }
+    void pairingBoundsDnsTlsAndReadTogether()
+    {
+        QFETCH(bool, stallTls);
+        TestTlsTrust trust;
+        PairingTlsServer server;
+        server.stallTls = stallTls;
+        server.response.clear();
+        QVERIFY(server.listen(QHostAddress::LocalHost));
+        ControlPlaneClient client;
+        client.setBaseUrl(QStringLiteral("https://pairing.test:%1").arg(server.serverPort()));
+        client.setPairingResolver(loopbackResolver(800));
+        QElapsedTimer clock;
+        clock.start();
+        int completions = 0;
+        client.fetchSessionAuthorization(QStringLiteral("s"), [&](const auto& result) {
+            ++completions;
+            QVERIFY(!result.ok);
+            QCOMPARE(result.statusCode, 0);
+        });
+        QTRY_COMPARE_WITH_TIMEOUT(completions, 1, 1950);
+        QVERIFY(clock.elapsed() < 2000);
+        QVERIFY(clock.elapsed() >= 1700);
+        QCOMPARE(server.connections, 1);
+        QTest::qWait(50);
+        QCOMPARE(completions, 1);
+    }
+
+    void pairingDnsFiltersAllNonIpv4AndHandlesLookupErrors_data()
+    {
+        QTest::addColumn<QStringList>("addresses");
+        QTest::addColumn<bool>("dnsError");
+        QTest::newRow("aaaa-only") << QStringList{"::1"} << false;
+        QTest::newRow("mapped-ipv6") << QStringList{"::ffff:127.0.0.1"} << false;
+        QTest::newRow("pseudo-ipv4") << QStringList{"240.1.2.3"} << false;
+        QTest::newRow("empty") << QStringList{} << false;
+        QTest::newRow("lookup-error") << QStringList{"127.0.0.1"} << true;
+    }
+    void pairingDnsFiltersAllNonIpv4AndHandlesLookupErrors()
+    {
+        QFETCH(QStringList, addresses);
+        QFETCH(bool, dnsError);
+        FakeNetworkAccessManager network;
+        ControlPlaneClient client;
+        client.setNetworkAccessManager(&network);
+        client.setPairingResolver([&](const QString&, QObject* context, auto callback) {
+            QHostInfo info;
+            QList<QHostAddress> list;
+            for (const QString& address : addresses) list.append(QHostAddress(address));
+            info.setAddresses(list);
+            if (dnsError) info.setError(QHostInfo::HostNotFound);
+            QTimer::singleShot(0, context, [callback, info]() { callback(info); });
+            return []() {};
+        });
+        int completions = 0;
+        client.fetchSessionAuthorization(QStringLiteral("s"), [&](const auto& result) {
+            ++completions;
+            QCOMPARE(result.statusCode, 0);
+            QVERIFY(!result.ok);
+        });
+        QTRY_COMPARE_WITH_TIMEOUT(completions, 1, 500);
+        QVERIFY(network.paths.isEmpty());
+    }
+
+    void pairingDnsTimeoutCancelDestructionAndLateRepliesNeverSend()
+    {
+        FakeNetworkAccessManager network;
+        std::function<void(const QHostInfo&)> late;
+        int cancellations = 0, completions = 0;
+        auto resolver = [&](const QString&, QObject*, auto callback) {
+            late = callback;
+            return [&]() { ++cancellations; };
+        };
+        QHostInfo info;
+        info.setAddresses({QHostAddress(QHostAddress::LocalHost)});
+        {
+            ControlPlaneClient client;
+            client.setNetworkAccessManager(&network);
+            client.setPairingResolver(resolver);
+            QElapsedTimer clock;
+            clock.start();
+            client.fetchSessionAuthorization(QStringLiteral("timeout"), [&](const auto& result) {
+                QVERIFY(!result.ok); ++completions;
+            });
+            QTRY_COMPARE_WITH_TIMEOUT(completions, 1, 1950);
+            QVERIFY(clock.elapsed() < 2000);
+            QCOMPARE(cancellations, 1);
+            late(info);
+            QVERIFY(network.paths.isEmpty());
+            auto cancel = client.fetchSessionAuthorization(QStringLiteral("cancel"), [&](const auto& result) {
+                QVERIFY(result.wasAborted); ++completions;
+            });
+            cancel();
+            late(info); // Fence immediately, even before the queued abort is delivered.
+            QTRY_COMPARE_WITH_TIMEOUT(completions, 2, 500);
+            QVERIFY(network.paths.isEmpty());
+            client.fetchSessionAuthorization(QStringLiteral("destroy"), [&](const auto&) { ++completions; });
+        }
+        late(info);
+        QTest::qWait(50);
+        QCOMPARE(cancellations, 3);
+        QCOMPARE(completions, 2);
+        QVERIFY(network.paths.isEmpty());
+    }
+
+    void pairingPinsItsIdentityAndDoesNotFollowRedirectsOrUseHttp2()
+    {
+        ControlPlaneClient client;
+        FakeNetworkAccessManager fake;
+        fake.body = okBody();
+        client.setNetworkAccessManager(&fake);
+        client.setBaseUrl(QStringLiteral("https://api.rentapc.online:443"));
+        client.setAccessToken(QStringLiteral("captured-pairing-bearer"));
+        client.setTraceId(QStringLiteral("0123456789abcdef0123456789abcdef"));
+        int completions = 0;
+        client.fetchSessionAuthorization(QStringLiteral("a/b %"), [&](const ControlPlaneResult&) {
+            ++completions;
+        });
+        QTRY_COMPARE(completions, 1);
+        QCOMPARE(fake.lastMethod, QByteArrayLiteral("GET"));
+        QCOMPARE(fake.lastPath, QStringLiteral("/api/sessions/a%2Fb%20%25/pairing"));
+        QCOMPARE(fake.lastRequest.peerVerifyName(), QStringLiteral("api.rentapc.online"));
+        QCOMPARE(fake.lastRequest.rawHeader("Host"), QByteArrayLiteral("api.rentapc.online:443"));
+        QCOMPARE(fake.lastRequest.rawHeader("Authorization"),
+                 QByteArrayLiteral("Bearer captured-pairing-bearer"));
+        QVERIFY(!fake.lastRequest.attribute(QNetworkRequest::Http2AllowedAttribute, true).toBool());
+        QCOMPARE(fake.lastRequest.attribute(QNetworkRequest::RedirectPolicyAttribute).toInt(),
+                 int(QNetworkRequest::ManualRedirectPolicy));
+        QVERIFY(fake.lastRequest.rawHeader("traceparent").startsWith(
+            QByteArrayLiteral("00-0123456789abcdef0123456789abcdef-")));
+        client.fetchMe([&](const ControlPlaneResult&) { ++completions; });
+        QTRY_COMPARE(completions, 2);
+        QVERIFY(fake.lastRequest.attribute(QNetworkRequest::Http2AllowedAttribute, true).toBool());
+        QVERIFY(fake.lastRequest.peerVerifyName().isEmpty());
+        QVERIFY(fake.lastRequest.rawHeader("Host").isEmpty());
+    }
 
 private slots:
     // --- Pitfall 4 -------------------------------------------------------------------------

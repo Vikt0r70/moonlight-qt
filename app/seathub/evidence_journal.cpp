@@ -104,16 +104,61 @@ const QStringList& clockBucketSet()
 // Field rules
 // ---------------------------------------------------------------------------------------------
 
-enum class FieldType { Int, Bool, Enum, Token };
+// Number, Uuid, DateTime, Warnings and TailSeconds serve the stream record (T054, ADR-0117): a
+// reading with a fraction, the run id, a server-time instant, and the two closed arrays.
+// Host serves the `attempt` entry's `dial_host` (openapi `^[A-Za-z0-9.:_-]{1,255}$`, T012).
+enum class FieldType { Int, Bool, Enum, Token, Number, Uuid, DateTime, Warnings, TailSeconds, Host };
 
 struct FieldRule {
     QString name;
     FieldType type = FieldType::Int;
     qint64 lo = 0;
     qint64 hi = 0;
+    double dlo = 0;
+    double dhi = 0;
     QStringList values;
     bool optional = false;
 };
+
+FieldRule numberField(const char* name, double lo, double hi, bool optional = false)
+{
+    FieldRule rule;
+    rule.name = QLatin1String(name);
+    rule.type = FieldType::Number;
+    rule.dlo = lo;
+    rule.dhi = hi;
+    rule.optional = optional;
+    return rule;
+}
+FieldRule plainField(const char* name, FieldType type, bool optional = false)
+{
+    FieldRule rule;
+    rule.name = QLatin1String(name);
+    rule.type = type;
+    rule.optional = optional;
+    return rule;
+}
+
+// The closed StreamWarningCode table (openapi `StreamWarningCode`, T049); `other` is last.
+const QStringList& warningCodeSet()
+{
+    static const QStringList v{QStringLiteral("poor_connection"), QStringLiteral("connection_recovered"),
+                               QStringLiteral("decoder_reset"),   QStringLiteral("audio_unavailable"),
+                               QStringLiteral("stall"),           QStringLiteral("other")};
+    return v;
+}
+const QStringList& streamEndReasonSet()
+{
+    static const QStringList v{QStringLiteral("connection_terminated"), QStringLiteral("engine_failure"),
+                               QStringLiteral("stall_timeout"), QStringLiteral("decoder_failure"),
+                               QStringLiteral("other")};
+    return v;
+}
+const QStringList& overlayVisibleSet()
+{
+    static const QStringList v{QStringLiteral("true"), QStringLiteral("false"), QStringLiteral("unknown")};
+    return v;
+}
 
 FieldRule intField(const char* name, qint64 lo, qint64 hi, bool optional = false)
 {
@@ -141,12 +186,26 @@ FieldRule enumField(const char* name, const QStringList& values, bool optional =
     rule.optional = optional;
     return rule;
 }
-FieldRule tokenField(const char* name)
+FieldRule tokenField(const char* name, bool optional = false)
 {
     FieldRule rule;
     rule.name = QLatin1String(name);
     rule.type = FieldType::Token;
+    rule.optional = optional;
     return rule;
+}
+
+// The `attempt` entry's outcome set (openapi `EvidenceOutcome` for kind `attempt`).
+const QStringList& attemptOutcomeSet()
+{
+    static const QStringList v{QStringLiteral("refused"), QStringLiteral("dialing"),
+                               QStringLiteral("connected"), QStringLiteral("failed")};
+    return v;
+}
+const QStringList& attemptSideSet()
+{
+    static const QStringList v{QStringLiteral("client")};
+    return v;
 }
 
 const QHash<QString, QList<FieldRule>>& kindRules()
@@ -178,6 +237,56 @@ const QHash<QString, QList<FieldRule>>& kindRules()
                   intField("engine_code", std::numeric_limits<qint32>::min(),
                            std::numeric_limits<qint32>::max())});
         r.insert(QStringLiteral("clock_skew"), {enumField("bucket", clockBucketSet())});
+        // M002 T012 (openapi AttemptEntry): one start attempt, refused or dialled. Unknown values
+        // are omitted, never null; the client states side `client` on every entry it posts.
+        r.insert(QStringLiteral("attempt"),
+                 {enumField("side", attemptSideSet()), intField("attempt", 1, 2),
+                  enumField("outcome", attemptOutcomeSet()),
+                  plainField("session_id", FieldType::Uuid, true),
+                  intField("handed_https", 1, 65535, true), intField("handed_control", 1, 65535, true),
+                  intField("handed_rtsp", 1, 65535, true),
+                  plainField("dial_host", FieldType::Host, true), intField("dial_port", 1, 65535, true),
+                  tokenField("refusal_class", true), tokenField("engine_step", true),
+                  tokenField("engine_class", true), intField("duration_ms", 0, kMaxSafeInteger, true),
+                  plainField("server_time", FieldType::DateTime, true),
+                  intField("skew_ms", std::numeric_limits<qint32>::min(),
+                           std::numeric_limits<qint32>::max(), true)});
+        // The sixteen readings (the six T054 shipped and the ten min/max T088 adds) are present
+        // only when sample_count > 0 (a cross-field rule below) and are never null (ADR-0117,
+        // openapi.yaml StreamMinuteEntry). The ten are individually optional so an entry stating
+        // only the six older readings still validates and stores (contract 3.37.0 is additive);
+        // the cross-field rule keeps them together.
+        r.insert(QStringLiteral("stream_minute"),
+                 {plainField("run_id", FieldType::Uuid), intField("minute_seq", 0, kMaxSafeInteger),
+                  plainField("window_start_server_time", FieldType::DateTime),
+                  intField("sample_count", 0, kMaxSafeInteger), numberField("coverage_pct", 0, 100),
+                  intField("poor_connection_flags", 0, kMaxSafeInteger),
+                  enumField("overlay_visible", overlayVisibleSet()),
+                  plainField("warnings", FieldType::Warnings),
+                  intField("warnings_dropped", 0, kMaxSafeInteger),
+                  numberField("fps_avg", 0, 1000, true), numberField("network_loss_pct", 0, 100, true),
+                  numberField("jitter_drop_pct", 0, 100, true),
+                  intField("delay_ms_p50", 0, kMaxSafeInteger, true),
+                  intField("delay_ms_p95", 0, kMaxSafeInteger, true),
+                  intField("decode_ms_p50", 0, kMaxSafeInteger, true),
+                  numberField("fps_min", 0, 1000, true), numberField("fps_max", 0, 1000, true),
+                  numberField("network_loss_pct_min", 0, 100, true),
+                  numberField("network_loss_pct_max", 0, 100, true),
+                  numberField("jitter_drop_pct_min", 0, 100, true),
+                  numberField("jitter_drop_pct_max", 0, 100, true),
+                  intField("delay_ms_min", 0, kMaxSafeInteger, true),
+                  intField("delay_ms_max", 0, kMaxSafeInteger, true),
+                  intField("decode_ms_min", 0, kMaxSafeInteger, true),
+                  intField("decode_ms_max", 0, kMaxSafeInteger, true)});
+        r.insert(QStringLiteral("stream_tail"),
+                 {plainField("run_id", FieldType::Uuid), enumField("end_reason", streamEndReasonSet()),
+                  plainField("ended_at_server_time", FieldType::DateTime),
+                  plainField("seconds", FieldType::TailSeconds)});
+        r.insert(QStringLiteral("drop_check"),
+                 {plainField("run_id", FieldType::Uuid), boolField("server_reachable"),
+                  intField("server_ms", 0, kMaxSafeInteger), boolField("rig_port_open"),
+                  intField("rig_ms", 0, kMaxSafeInteger),
+                  plainField("checked_at_server_time", FieldType::DateTime)});
         return r;
     }();
     return rules;
@@ -248,14 +357,113 @@ bool isRfc3339Utc(const QString& s)
     return QDateTime::fromString(s, Qt::ISODateWithMs).isValid();
 }
 
+// ^[A-Za-z0-9.:_-]{1,255}$ - a plain host name or IP literal, never a path, user, query or space.
+bool isPlainHost(const QString& s)
+{
+    if (s.isEmpty() || s.size() > 255) {
+        return false;
+    }
+    for (const QChar qc : s) {
+        const ushort c = qc.unicode();
+        const bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
+            || c == '.' || c == ':' || c == '_' || c == '-';
+        if (!ok) {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool isAttemptStep(const QString& step)
 {
     return attemptStepTokens().contains(step);
 }
 
+bool isNumberIn(const QJsonValue& value, double lo, double hi)
+{
+    if (!value.isDouble()) {
+        return false;
+    }
+    const double d = value.toDouble();
+    return qIsFinite(d) && d >= lo && d <= hi;
+}
+
+// At most 16 `{code, offset_s}` objects with a closed code and a whole second 0-59, ordered by
+// offset_s then code text - the order the server checks (stream_record.py), so an entry that
+// would be refused there is never stored here.
+bool warningsOk(const QJsonValue& value)
+{
+    if (!value.isArray() || value.toArray().size() > 16) {
+        return false;
+    }
+    qint64 lastOffset = -1;
+    QString lastCode;
+    for (const QJsonValue& item : value.toArray()) {
+        if (!item.isObject()) {
+            return false;
+        }
+        const QJsonObject o = item.toObject();
+        if (o.size() != 2 || !o.value(QStringLiteral("code")).isString()
+            || !warningCodeSet().contains(o.value(QStringLiteral("code")).toString())
+            || !isIntegral(o.value(QStringLiteral("offset_s")), 0, 59)) {
+            return false;
+        }
+        const qint64 offset = static_cast<qint64>(o.value(QStringLiteral("offset_s")).toDouble());
+        const QString code = o.value(QStringLiteral("code")).toString();
+        if (offset < lastOffset || (offset == lastOffset && code < lastCode)) {
+            return false;
+        }
+        lastOffset = offset;
+        lastCode = code;
+    }
+    return true;
+}
+
+// At most 30 `{offset_s, fps, network_loss_pct, delay_ms}` objects whose offsets are EXACTLY the
+// distinct set 0 .. n-1: a duplicate, a gap or a missing 0 refuses the whole tail (T049's
+// tail_offsets_match), so a short Play never pads itself out to thirty.
+bool tailSecondsOk(const QJsonValue& value)
+{
+    if (!value.isArray() || value.toArray().size() > 30) {
+        return false;
+    }
+    const int n = value.toArray().size();
+    QSet<int> seen;
+    for (const QJsonValue& item : value.toArray()) {
+        if (!item.isObject()) {
+            return false;
+        }
+        const QJsonObject o = item.toObject();
+        if (o.size() != 4 || !isIntegral(o.value(QStringLiteral("offset_s")), 0, 29)
+            || !isNumberIn(o.value(QStringLiteral("fps")), 0, 1000)
+            || !isNumberIn(o.value(QStringLiteral("network_loss_pct")), 0, 100)
+            || !isIntegral(o.value(QStringLiteral("delay_ms")), 0, kMaxSafeInteger)) {
+            return false;
+        }
+        const int offset = static_cast<int>(o.value(QStringLiteral("offset_s")).toDouble());
+        if (offset >= n || seen.contains(offset)) {
+            return false;
+        }
+        seen.insert(offset);
+    }
+    return seen.size() == n;
+}
+
 bool fieldOk(const FieldRule& rule, const QJsonValue& value)
 {
     switch (rule.type) {
+    case FieldType::Number:
+        return isNumberIn(value, rule.dlo, rule.dhi);
+    case FieldType::Uuid:
+        return value.isString() && isCanonicalUuid(value.toString());
+    case FieldType::DateTime:
+        return value.isString() && isRfc3339Utc(value.toString());
+    case FieldType::Host:
+        return value.isString() && isPlainHost(value.toString());
+    case FieldType::Warnings:
+        return warningsOk(value);
+    case FieldType::TailSeconds:
+        return tailSecondsOk(value);
     case FieldType::Int:
         return isIntegral(value, rule.lo, rule.hi);
     case FieldType::Bool:
@@ -335,6 +543,31 @@ bool validateEntry(const QJsonObject& entry, bool envelope, bool strictVocab)
         const bool failed = entry.value(QStringLiteral("outcome")).toString()
             == QLatin1String("failed");
         if (failed != entry.contains(QStringLiteral("failed_mask"))) {
+            return false;
+        }
+    } else if (kind == QLatin1String("stream_minute")) {
+        // The sixteen readings exist exactly when the minute had samples; a null never passes the
+        // type checks above, so a zero-sample minute carries none of them.
+        const bool sampled = entry.value(QStringLiteral("sample_count")).toDouble() > 0;
+        for (const char* reading : {"fps_avg", "network_loss_pct", "jitter_drop_pct", "delay_ms_p50",
+                                    "delay_ms_p95", "decode_ms_p50"}) {
+            if (sampled != entry.contains(QLatin1String(reading))) {
+                return false;
+            }
+        }
+        // The ten min/max readings arrive together (T088): a partial set claims readings the minute
+        // cannot have, and a zero-sample minute may not carry them at all. Their absence stays legal
+        // so an entry stating only the six older readings still validates and stores.
+        int minMaxStated = 0;
+        for (const char* reading : {"fps_min", "fps_max", "network_loss_pct_min",
+                                    "network_loss_pct_max", "jitter_drop_pct_min",
+                                    "jitter_drop_pct_max", "delay_ms_min", "delay_ms_max",
+                                    "decode_ms_min", "decode_ms_max"}) {
+            if (entry.contains(QLatin1String(reading))) {
+                ++minMaxStated;
+            }
+        }
+        if (minMaxStated != 0 && (minMaxStated != 10 || !sampled)) {
             return false;
         }
     } else if (kind == QLatin1String("engine_failure") && strictVocab) {
@@ -569,6 +802,14 @@ bool EvidenceJournal::open(const QString& sessionId, const QString& accountId)
     m_open = false;
     m_sessionId = sessionId;
     m_accountId = accountId;
+    startRunLocked();
+    m_open = true;
+    enforceCapLocked();
+    return true;
+}
+
+void EvidenceJournal::startRunLocked()
+{
     m_runId = QUuid::createUuid().toString(QUuid::WithoutBraces);
     // File names sort by open time; the serial breaks a tie within one millisecond and the clock
     // never goes backwards for the names of one process.
@@ -581,9 +822,6 @@ bool EvidenceJournal::open(const QString& sessionId, const QString& accountId)
                           QString::number(serial).rightJustified(4, QLatin1Char('0')), m_runId,
                           kCapsuleSuffix);
     m_nextSeq = 0;
-    m_open = true;
-    enforceCapLocked();
-    return true;
 }
 
 void EvidenceJournal::close()
@@ -596,6 +834,37 @@ bool EvidenceJournal::isOpen() const
 {
     QMutexLocker locker(&m_mutex);
     return m_open;
+}
+
+QString EvidenceJournal::runId() const
+{
+    QMutexLocker locker(&m_mutex);
+    return m_runId;
+}
+
+int EvidenceJournal::entryCount() const
+{
+    QMutexLocker locker(&m_mutex);
+    return m_open ? m_nextSeq : 0;
+}
+
+int EvidenceJournal::entryCap() const
+{
+    QMutexLocker locker(&m_mutex);
+    return m_entryCap;
+}
+
+bool EvidenceJournal::rollRun()
+{
+    QMutexLocker locker(&m_mutex);
+    if (!m_open) {
+        return false;
+    }
+    // The finished capsule stays on disk as a closed one (still undelivered, still keyed by its
+    // own run id); the Play carries on in a fresh capsule of the same session.
+    startRunLocked();
+    enforceCapLocked();
+    return true;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -678,6 +947,44 @@ QJsonObject EvidenceJournal::engineFailure(const QString& step, const QString& e
     o.insert(QStringLiteral("step"), step);
     o.insert(QStringLiteral("engine_class"), engineClass);
     o.insert(QStringLiteral("engine_code"), engineCode);
+    return finishBuilt(o);
+}
+
+QJsonObject EvidenceJournal::attempt(const AttemptRecord& record)
+{
+    QJsonObject o;
+    o.insert(QStringLiteral("kind"), QStringLiteral("attempt"));
+    o.insert(QStringLiteral("side"), QStringLiteral("client"));
+    o.insert(QStringLiteral("attempt"), record.attempt);
+    o.insert(QStringLiteral("outcome"), record.outcome);
+    // Unknown values are left out (never null); the rules below refuse anything out of range.
+    const auto putText = [&o](const char* key, const QString& value) {
+        if (!value.isEmpty()) {
+            o.insert(QLatin1String(key), value);
+        }
+    };
+    const auto putPort = [&o](const char* key, int value) {
+        if (value != 0) {
+            o.insert(QLatin1String(key), value);
+        }
+    };
+    putText("session_id", record.sessionId);
+    putPort("handed_https", record.handedHttps);
+    putPort("handed_control", record.handedControl);
+    putPort("handed_rtsp", record.handedRtsp);
+    putText("dial_host", record.dialHost);
+    putPort("dial_port", record.dialPort);
+    putText("refusal_class", record.refusalClass);
+    putText("engine_step", record.engineStep);
+    putText("engine_class", record.engineClass);
+    o.insert(QStringLiteral("duration_ms"), record.durationMs);
+    if (record.serverTime.isValid()) {
+        o.insert(QStringLiteral("server_time"),
+                 record.serverTime.toUTC().toString(Qt::ISODateWithMs));
+    }
+    if (record.hasSkew) {
+        o.insert(QStringLiteral("skew_ms"), record.skewMs);
+    }
     return finishBuilt(o);
 }
 
@@ -841,56 +1148,76 @@ void EvidenceJournal::enforceCapLocked()
             return;
         }
 
-        // The open Play's capsule is never reduced or dropped by the cap.
-        bool progressed = false;
+        // The open Play's capsule is never reduced or dropped by the cap. Closed capsules fall in
+        // two groups: those holding no stream-record entries go first, and the stream-record
+        // ones last (ADR-0117: undelivered stream evidence is the last thing the cap may take).
+        struct Closed {
+            QString name;
+            Capsule capsule;
+        };
+        QList<Closed> plain;
+        QList<Closed> stream;
+        bool unreadableRemoved = false;
         for (const QString& name : names) {
             if (m_open && name == m_fileName) {
                 continue;
             }
-            Capsule capsule;
-            if (!readCapsule(name, &capsule)) {
+            Closed closed;
+            closed.name = name;
+            if (!readCapsule(name, &closed.capsule)) {
                 removeUnreadable(name);
-                progressed = true;
+                unreadableRemoved = true;
                 break;
             }
-            if (capsule.reduced) {
-                continue;
+            bool holdsStream = false;
+            for (const QJsonValue& value : closed.capsule.entries) {
+                const QString kind = value.toObject().value(QStringLiteral("kind")).toString();
+                if (kind.startsWith(QLatin1String("stream_")) || kind == QLatin1String("drop_check")) {
+                    holdsStream = true;
+                    break;
+                }
             }
-            capsule.entries = summarise(capsule.entries);
-            capsule.reduced = true;
-            if (!writeCapsule(name, capsule)) {
-                return; // the disk refuses; do not spin
-            }
-            Counters delta;
-            delta.reducedCapsules = 1;
-            addPendingCounters(delta);
-            logLine("reduced", QStringLiteral("none"), capsule.sessionId, capsule.entries.size());
-            progressed = true;
-            break;
+            (holdsStream ? stream : plain).append(closed);
         }
-        if (progressed) {
+        if (unreadableRemoved) {
             continue;
         }
 
-        // Every closed capsule is already a summary and the folder is still over the cap: drop
-        // the oldest summary. Its own counters are not lost; they move to the pending counts.
-        for (const QString& name : names) {
-            if (m_open && name == m_fileName) {
-                continue;
+        // Within a group: reduce the oldest full capsule to a summary; when every capsule of the
+        // group is already a summary, drop the oldest one (its own counters move to the pending
+        // counts, so they are not lost).
+        bool progressed = false;
+        for (QList<Closed>* group : {&plain, &stream}) {
+            for (Closed& closed : *group) {
+                if (closed.capsule.reduced) {
+                    continue;
+                }
+                closed.capsule.entries = summarise(closed.capsule.entries);
+                closed.capsule.reduced = true;
+                if (!writeCapsule(closed.name, closed.capsule)) {
+                    return; // the disk refuses; do not spin
+                }
+                Counters delta;
+                delta.reducedCapsules = 1;
+                addPendingCounters(delta);
+                logLine("reduced", QStringLiteral("none"), closed.capsule.sessionId,
+                        closed.capsule.entries.size());
+                progressed = true;
+                break;
             }
-            Capsule capsule;
-            Counters delta;
-            QString sessionId;
-            if (readCapsule(name, &capsule)) {
-                delta = capsule.counters;
-                sessionId = capsule.sessionId;
+            if (progressed) {
+                break;
             }
-            QFile::remove(capsulePath(name));
-            delta.droppedCapsules += 1;
-            addPendingCounters(delta);
-            logLine("dropped", QStringLiteral("none"), sessionId, 1);
-            progressed = true;
-            break;
+            if (!group->isEmpty()) {
+                Counters delta = group->first().capsule.counters;
+                const QString sessionId = group->first().capsule.sessionId;
+                QFile::remove(capsulePath(group->first().name));
+                delta.droppedCapsules += 1;
+                addPendingCounters(delta);
+                logLine("dropped", QStringLiteral("none"), sessionId, 1);
+                progressed = true;
+                break;
+            }
         }
         if (!progressed) {
             return;

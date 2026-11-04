@@ -90,6 +90,7 @@ call :suite tst_log_tee
 call :suite tst_overlay_injection
 call :suite tst_pairing
 call :suite tst_pairing_key
+call :suite tst_pairing_refusal
 call :suite tst_session_websocket
 call :suite tst_sse_client
 call :suite tst_settings_bridge
@@ -107,6 +108,7 @@ call :suite tst_osd_render
 call :suite tst_telemetry
 call :suite tst_single_instance
 call :suite tst_reporting_consent
+call :suite tst_stream_record
 
 if defined FAILED goto :failed
 

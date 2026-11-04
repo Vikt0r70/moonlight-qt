@@ -47,6 +47,10 @@
 #include <QMutex>
 #include <limits>
 #include <QMutexLocker>
+#include <QProcess>
+#include <QTcpServer>
+#include <QTcpSocket>
+#include <QGuiApplication>
 #include <QNetworkAccessManager>
 #include <QNetworkReply>
 #include <QNetworkRequest>
@@ -64,7 +68,11 @@
 #include <QWindow>
 
 #include <atomic>
+#include <chrono>
+#include <cstring>
 #include <functional>
+#include <future>
+#include <memory>
 #include <thread>
 
 #include "seathub/control_plane_client.h"
@@ -949,6 +957,156 @@ private:
 };
 
 } // namespace
+
+// --- T070 / A2: a diagnostic line held across an account change, read off the SDK's own payload ---
+//
+// The in-process tests above stop at the hand-off seam. This role goes through the REAL
+// `SeatHubTelemetry::logShipperHandOff()` into a REAL `sentry_init()`, so it needs its own process
+// (a second `sentry_init()` in the test process would leak into every other slot). The parent
+// listens on a loopback DSN and reads the `user.id` attribute the SDK stamped on the envelope.
+namespace account_race {
+
+const char* const kChildFlag = "--account-race-child";
+const char* const kHeldBody = "held.line";
+
+struct LogItem
+{
+    QString body;
+    QJsonObject attributes;
+};
+
+QList<LogItem> logItemsOf(const QByteArray& envelope)
+{
+    QList<LogItem> items;
+    int pos = envelope.indexOf('\n');
+    if (pos < 0) return items;
+    pos += 1;
+    while (pos < envelope.size()) {
+        const int headerEnd = envelope.indexOf('\n', pos);
+        if (headerEnd < 0) break;
+        QJsonParseError error;
+        const QJsonObject header = QJsonDocument::fromJson(envelope.mid(pos, headerEnd - pos), &error).object();
+        if (error.error != QJsonParseError::NoError) break;
+        const int length = header.value(QStringLiteral("length")).toInt();
+        pos = headerEnd + 1;
+        const QByteArray payload = envelope.mid(pos, length);
+        pos += length;
+        if (pos < envelope.size() && envelope.at(pos) == '\n') ++pos;
+        if (header.value(QStringLiteral("type")).toString() != QLatin1String("log")) continue;
+        const QJsonArray entries
+            = QJsonDocument::fromJson(payload).object().value(QStringLiteral("items")).toArray();
+        for (const QJsonValue& entry : entries) {
+            const QJsonObject log = entry.toObject();
+            items.append({ log.value(QStringLiteral("body")).toString(),
+                           log.value(QStringLiteral("attributes")).toObject() });
+        }
+    }
+    return items;
+}
+
+/// Answers every request `200 {}` once its whole body (per Content-Length) has arrived and keeps
+/// each body. This fork's pinned sentry-native build never gzips envelopes.
+void collectEnvelopes(QTcpServer* server, QList<QByteArray>* envelopes)
+{
+    QObject::connect(server, &QTcpServer::newConnection, server, [server, envelopes]() {
+        while (QTcpSocket* socket = server->nextPendingConnection()) {
+            auto buffer = std::make_shared<QByteArray>();
+            auto responded = std::make_shared<bool>(false);
+            QObject::connect(socket, &QTcpSocket::readyRead, socket, [socket, buffer, responded, envelopes]() {
+                *buffer += socket->readAll();
+                if (*responded) return;
+                const int headerEnd = buffer->indexOf("\r\n\r\n");
+                if (headerEnd < 0) return;
+                qint64 contentLength = 0;
+                for (const QByteArray& line : buffer->left(headerEnd).split('\n')) {
+                    const QByteArray trimmed = line.trimmed();
+                    if (trimmed.toLower().startsWith("content-length:")) {
+                        contentLength = trimmed.mid(trimmed.indexOf(':') + 1).trimmed().toLongLong();
+                        break;
+                    }
+                }
+                const int bodyStart = headerEnd + 4;
+                if (buffer->size() - bodyStart < contentLength) return;
+                envelopes->append(buffer->mid(bodyStart, static_cast<int>(contentLength)));
+                *responded = true;
+                socket->write("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                              "Content-Length: 2\r\nConnection: close\r\n\r\n{}");
+                socket->flush();
+                socket->disconnectFromHost();
+            });
+            QObject::connect(socket, &QTcpSocket::disconnected, socket, &QTcpSocket::deleteLater);
+        }
+    });
+}
+
+/// `tst_facade_wiring --account-race-child <switch|clear> <dsn> <db> <handler> <spool> <A> <B>`:
+/// signs in as A, holds A's diagnostic line inside the hand-off (just after the shipper's account
+/// check), then changes the account to B (`switch`) or signs out (`clear`) from another thread
+/// while the line is held, and releases it. An unfixed shipper lets the change land first, so the
+/// SDK stamps B (or nobody) on A's line.
+int runChild(int argc, char* argv[])
+{
+    if (argc < 9) return 2;
+    QCoreApplication app(argc, argv);
+    const QString scenario = QString::fromLocal8Bit(argv[2]);
+    const QString accountA = QString::fromLocal8Bit(argv[7]);
+    const QString accountB = QString::fromLocal8Bit(argv[8]);
+
+    reporting_consent_store::Record record;
+    record.recorded = true;
+    record.send = true;
+    record.noticeVersion = reporting_consent_store::kCurrentNoticeVersion;
+    ReportingConsent::setStateForTests(true, record);
+
+    SeatHubTelemetry::Options options;
+    options.dsn = QString::fromLocal8Bit(argv[3]);
+    options.databaseDir = QString::fromLocal8Bit(argv[4]);
+    options.handlerPath = QString::fromLocal8Bit(argv[5]);
+    options.environment = QStringLiteral("test");
+    options.release = QStringLiteral("tst_facade_wiring@0.0.0");
+
+    std::promise<void> entered;
+    std::promise<void> release;
+    const std::shared_future<void> released = release.get_future().share();
+    std::atomic<bool> first{ true };
+    const HandOff real = SeatHubTelemetry::logShipperHandOff();
+
+    LogShipper::instance().setSpoolDirectoryForTests(QString::fromLocal8Bit(argv[6]));
+    LogShipper::instance().start([&](const ShippedLine& line) {
+        if (line.body == QLatin1String(kHeldBody) && first.exchange(false)) {
+            entered.set_value();
+            released.wait_for(std::chrono::seconds(20));
+        }
+        return real(line);
+    });
+    if (!SeatHubTelemetry::startWith(options)) return 3;
+    SeatHubTelemetry::setSession(QStringLiteral("session-race-child"), QString());
+    SeatHubTelemetry::setUser(accountA);
+    // `applyHandout()` refuses a loopback DSN in this build (no SEATHUB_TEST_ALLOW_LOOPBACK_DSN),
+    // so the gate the handout would open is opened directly. The later `setUser()` / `clearUser()`
+    // recompute it, which is the real behaviour under test.
+    LogShipper::instance().setCanShip(true);
+
+    SeatHubTelemetry::emitDiagnostic(QString::fromLatin1(kHeldBody), LogLevel::Info, { { "k", "v" } });
+    if (entered.get_future().wait_for(std::chrono::seconds(10)) != std::future_status::ready) return 4;
+
+    std::thread change([&]() {
+        if (scenario == QLatin1String("switch")) SeatHubTelemetry::setUser(accountB);
+        else SeatHubTelemetry::clearUser();
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(500)); // the change has had its chance
+    release.set_value();
+    change.join();
+
+    LogShipper::instance().drainBeforeSignOut();
+    SeatHubTelemetry::flush(3000);
+    // `sentry_flush()` does not drain the logs batcher; its own interval is 5 s.
+    std::this_thread::sleep_for(std::chrono::seconds(6));
+    LogShipper::instance().stop();
+    return 0;
+}
+
+} // namespace account_race
 
 class TstFacadeWiring : public QObject
 {
@@ -4021,6 +4179,54 @@ private slots:
         verifyNoInternalNameIsShown(client);
     }
 
+    void aPairingTransportFailureRefusesImmediatelyWithoutBlamingOrDiallingTheRig()
+    {
+        SeatHubClient client;
+        reachHome(client, 90);
+        QVERIFY(!QTest::currentTestFailed());
+        const int handshakes = g_plainHandshakeRuns;
+        const int engineCreates = g_engineCreateCalls;
+        QSignalSpy failed(client.pairing(), &PairingController::pairingFailed);
+        QSignalSpy stepFailed(client.pairing(), &PairingController::stepFailed);
+        m_fake->answerPairing(0);
+        int deadline = 0;
+        auto* pairing = client.pairing();
+        QMetaObject::invokeMethod(pairing, [&]() { deadline = pairing->deadlineMs(); },
+                                  Qt::BlockingQueuedConnection);
+        QCOMPARE(deadline, 30000);
+        QElapsedTimer clock;
+        clock.start();
+        client.beginSession(QStringLiteral("s-stages"));
+        QTRY_VERIFY_WITH_TIMEOUT(client.connectFailed(), 1900);
+        QVERIFY(clock.elapsed() < 2000);
+        QCOMPARE(failed.size(), 1);
+        const auto failure = failed.first().first().value<SeatHubFailure>();
+        QCOMPARE(failure.kind, FailureKind::Local);
+        QCOMPARE(failure.statusCode, 0);
+        QCOMPARE(failure.failure, QStringLiteral("session_refused.no_external_path"));
+        QCOMPARE(client.stalledReasonText(), QStringLiteral("We could not verify a usable connection "
+                 "from your network, so we did not start your session. You were not charged."));
+        QVERIFY(client.reference().isEmpty());
+        QCOMPARE(stepFailed.size(), 0);
+        QCOMPARE(g_plainHandshakeRuns, handshakes);
+        QCOMPARE(g_engineCreateCalls, engineCreates);
+        const QString end = QStringLiteral("/api/sessions/s-stages/end");
+        QTRY_VERIFY_WITH_TIMEOUT(m_fake->requestPaths().contains(end), 1900);
+        const auto endBody = QJsonDocument::fromJson(m_fake->bodyFor(end)).object();
+        QCOMPARE(endBody.value(QStringLiteral("stage")).toString(), QStringLiteral("session_refused"));
+        QVERIFY(!endBody.contains(QStringLiteral("attempt_step")));
+        const QString liveness = QStringLiteral("/api/sessions/s-stages/liveness");
+        QTRY_VERIFY_WITH_TIMEOUT(m_fake->bodyFor(liveness).contains("session_refused"), 1900);
+        const auto liveBody = QJsonDocument::fromJson(m_fake->bodyFor(liveness)).object();
+        QCOMPARE(liveBody.value(QStringLiteral("engine_stage")).toString(), QStringLiteral("session_refused"));
+        QCOMPARE(liveBody.value(QStringLiteral("stage")).toString(), QStringLiteral("failed"));
+        const int polls = m_fake->requestPaths().count(QStringLiteral("/api/sessions/s-stages/pairing"));
+        QTest::qWait(1100);
+        QCOMPARE(m_fake->requestPaths().count(QStringLiteral("/api/sessions/s-stages/pairing")), polls);
+        QCOMPARE(polls, 1);
+        verifyNoInternalNameIsShown(client);
+    }
+
     void theClientsOwnPairingDeadlineIsAStallToo()
     {
         SeatHubClient client;
@@ -4045,11 +4251,10 @@ private slots:
                 [](const ShippedLine& line) { return line.body == QLatin1String("play.step"); }));
         };
 
-        // A run of 409s no longer stalls this deadline (fork `15962514`: "a 409 while the rig is
-        // prepared does not spend the pairing deadline" - it restarts D-08's clock on every "not
-        // yet" answer). A transport failure still does, so the authorization poll never resolving
-        // at all is what makes this deadline expire.
-        m_fake->answerPairing(0);
+        // Real READY/null-PIN waiting spends the deadline; 409/PREPARING reset it and an
+        // unusable API transport now refuses immediately instead of blaming a rig deadline.
+        m_fake->answerPairing(200, QByteArrayLiteral(
+            "{\"session_id\":\"s-stages\",\"state\":\"READY\",\"pairing_pin\":null}"));
 
         // The deadline is measured by the pairing controller, on its own thread: shorten it there, then
         // let a real pairing wait for a rig that never becomes ready.
@@ -4081,7 +4286,7 @@ private slots:
                  QStringLiteral("pair_authorize"));
         QCOMPARE(record->attrs.value(QStringLiteral("outcome")).toString(), QStringLiteral("failed"));
         QCOMPARE(record->attrs.value(QStringLiteral("failure_class")).toString(),
-                 QStringLiteral("unreachable_deadline"));
+                  QStringLiteral("deadline"));
         verifyNoInternalNameIsShown(client);
     }
 
@@ -9298,6 +9503,101 @@ private slots:
         QVERIFY(!outbox.hasQueuedReports());
     }
 
+    // T023 / R4: a diagnostic line held (spooled) while account A was signed in must not reach Sentry
+    // under account B after sign-out and sign-in. Real SeatHubTelemetry identity and real LogShipper;
+    // the hand-off is the same seam the tests around it read (sentry-native is not initialised in this
+    // suite), and it records which account the telemetry facade names at the moment of hand-off.
+    void aLineHeldAcrossSignOutIsNotShippedUnderTheNextAccount()
+    {
+        QTemporaryDir spool;
+        QMutex mutex;
+        QList<ShippedLine> records;
+        QStringList usersAtHandOff;
+        const qint64 droppedBefore = LogShipper::instance().droppedAccountCount();
+        reporting_consent_store::Record record;
+        record.recorded = true;
+        record.send = true;
+        record.noticeVersion = reporting_consent_store::kCurrentNoticeVersion;
+        ReportingConsent::setStateForTests(true, record);
+        LogShipper::instance().setSpoolDirectoryForTests(spool.path());
+        LogShipper::instance().start([&](const ShippedLine& line) {
+            QMutexLocker lock(&mutex);
+            records.append(line);
+            usersAtHandOff.append(SeatHubTelemetry::currentUserId());
+            return true;
+        });
+        StopShipperOnScopeExit guard;
+        const auto handedOver = [&](const QString& body) {
+            QMutexLocker lock(&mutex);
+            for (const ShippedLine& line : records) {
+                if (line.body == body) return true;
+            }
+            return false;
+        };
+
+        SeatHubTelemetry::setUser(accountAId());
+        LogShipper::instance().setCanShip(false); // this suite has logs disabled; the test owns it
+        SeatHubTelemetry::emitDiagnostic(QStringLiteral("held.line"), LogLevel::Info, {{"k", "v"}});
+        LogShipper::instance().drainBeforeSignOut(); // the line is now spooled under account A
+        QVERIFY(!handedOver(QStringLiteral("held.line")));
+
+        SeatHubTelemetry::clearUser();
+        SeatHubTelemetry::setUser(accountBId());
+        LogShipper::instance().setCanShip(true);
+        SeatHubTelemetry::emitDiagnostic(QStringLiteral("b.line"), LogLevel::Info, {{"k", "v"}});
+        QTRY_VERIFY_WITH_TIMEOUT(handedOver(QStringLiteral("b.line")), 10000);
+        LogShipper::instance().drainBeforeSignOut();
+
+        QVERIFY2(!handedOver(QStringLiteral("held.line")),
+                 "account A's held line must not be shipped while account B is signed in");
+        QMutexLocker lock(&mutex);
+        for (const QString& user : usersAtHandOff) QCOMPARE(user, accountBId());
+        for (const ShippedLine& line : records) QCOMPARE(line.accountId, accountBId());
+        QCOMPARE(LogShipper::instance().droppedAccountCount() - droppedBefore, qint64(1));
+    }
+
+    // The same account signing back in still ships what it held.
+    void aLineHeldAcrossSignOutShipsWhenTheSameAccountSignsBackIn()
+    {
+        QTemporaryDir spool;
+        QMutex mutex;
+        QList<ShippedLine> records;
+        const qint64 droppedBefore = LogShipper::instance().droppedAccountCount();
+        reporting_consent_store::Record record;
+        record.recorded = true;
+        record.send = true;
+        record.noticeVersion = reporting_consent_store::kCurrentNoticeVersion;
+        ReportingConsent::setStateForTests(true, record);
+        LogShipper::instance().setSpoolDirectoryForTests(spool.path());
+        LogShipper::instance().start([&](const ShippedLine& line) {
+            QMutexLocker lock(&mutex);
+            records.append(line);
+            return true;
+        });
+        StopShipperOnScopeExit guard;
+
+        SeatHubTelemetry::setUser(accountAId());
+        LogShipper::instance().setCanShip(false);
+        SeatHubTelemetry::emitDiagnostic(QStringLiteral("held.line"), LogLevel::Info, {{"k", "v"}});
+        LogShipper::instance().drainBeforeSignOut();
+
+        SeatHubTelemetry::clearUser();
+        SeatHubTelemetry::setUser(accountAId());
+        LogShipper::instance().setCanShip(true);
+        QTRY_VERIFY_WITH_TIMEOUT(
+            [&]() {
+                QMutexLocker lock(&mutex);
+                for (const ShippedLine& line : records) {
+                    if (line.body == QLatin1String("held.line")) return true;
+                }
+                return false;
+            }(),
+            10000);
+        QMutexLocker lock(&mutex);
+        QCOMPARE(records.first().accountId, accountAId());
+        QCOMPARE(LogShipper::instance().droppedAccountCount() - droppedBefore, qint64(0));
+    }
+
     // T095 / SC19: the quality rollup reaches the hand-off through the production chain only - the
     // facade's stats tap, the real sampler (real clock, 40 ms window), SeatHubTelemetry, the LogTee and
     // the process-wide LogShipper - with no prebuilt rollup injected. The hand-off here is the same
@@ -9920,8 +10220,79 @@ private slots:
         client.session()->attachSession(nullptr);
         delete engine;
     }
+
+    // T070 / A2 (P1 privacy): a diagnostic line the shipper has already checked against account A
+    // must reach the SDK under A even when the account changes (another sign-in, or a sign-out -
+    // the refused-restore path calls the same clearUser()) before the hand-off completes. The
+    // answer is read from the log item the real SDK sent, not from the hand-off seam.
+    void aHeldLineKeepsItsAccountOnTheSdkPayloadWhenTheAccountChanges_data()
+    {
+        QTest::addColumn<QString>("scenario");
+        QTest::newRow("sign-in as another account") << QStringLiteral("switch");
+        QTest::newRow("sign-out or refused restore") << QStringLiteral("clear");
+    }
+
+    void aHeldLineKeepsItsAccountOnTheSdkPayloadWhenTheAccountChanges()
+    {
+        QFETCH(QString, scenario);
+        QString sentryDir = qEnvironmentVariable("SEATHUB_SENTRY_DIR");
+        if (sentryDir.isEmpty()) {
+            sentryDir = QDir(QCoreApplication::applicationDirPath())
+                            .absoluteFilePath(QStringLiteral("../build/sentry-native-0.17.1/install"));
+        }
+        const QString handlerSource = sentryDir + QStringLiteral("/bin/crashpad_handler.exe");
+        QVERIFY2(QFileInfo::exists(handlerSource), qPrintable(handlerSource));
+        QTemporaryDir handlerDir;
+        QTemporaryDir databaseDir;
+        QTemporaryDir spoolDir;
+        QVERIFY(handlerDir.isValid() && databaseDir.isValid() && spoolDir.isValid());
+        const QString handler = handlerDir.filePath(QStringLiteral("crashpad_handler.exe"));
+        QVERIFY(QFile::copy(handlerSource, handler));
+
+        QTcpServer server;
+        QList<QByteArray> envelopes;
+        QVERIFY2(server.listen(QHostAddress::LocalHost, 0), "the fake Sentry listener must bind 127.0.0.1:0");
+        account_race::collectEnvelopes(&server, &envelopes);
+        const QString dsn = QStringLiteral("http://publickey@127.0.0.1:%1/1").arg(server.serverPort());
+
+        QProcess child;
+        child.setProcessChannelMode(QProcess::ForwardedChannels);
+        child.start(QCoreApplication::applicationFilePath(),
+                    { QString::fromLatin1(account_race::kChildFlag), scenario, dsn, databaseDir.path(),
+                      handler, spoolDir.path(), accountAId(), accountBId() });
+        QVERIFY(child.waitForStarted(10000));
+        QTRY_VERIFY_WITH_TIMEOUT(child.state() == QProcess::NotRunning, 90000);
+        QCOMPARE(child.exitStatus(), QProcess::NormalExit);
+        QCOMPARE(child.exitCode(), 0);
+        QTest::qWait(300);
+
+        bool found = false;
+        QString userId;
+        for (const QByteArray& envelope : envelopes) {
+            for (const account_race::LogItem& item : account_race::logItemsOf(envelope)) {
+                if (item.body != QLatin1String(account_race::kHeldBody)) continue;
+                found = true;
+                userId = item.attributes.value(QStringLiteral("user.id")).toObject()
+                             .value(QStringLiteral("value")).toString();
+            }
+        }
+        QVERIFY2(found, "the held line must reach the SDK payload");
+        QCOMPARE(userId, accountAId());
+    }
 };
 
-QTEST_MAIN(TstFacadeWiring)
+// Not QTEST_MAIN: the A2 test re-runs this binary as a child process (account_race::runChild)
+// before any Qt test application exists.
+int main(int argc, char* argv[])
+{
+    if (argc > 1 && std::strcmp(argv[1], account_race::kChildFlag) == 0) {
+        return account_race::runChild(argc, argv);
+    }
+    QGuiApplication app(argc, argv);
+    app.setAttribute(Qt::AA_Use96Dpi, true);
+    TstFacadeWiring tc;
+    QTEST_SET_MAIN_SOURCE_PATH
+    return QTest::qExec(&tc, argc, argv);
+}
 
 #include "tst_facade_wiring.moc"

@@ -49,7 +49,38 @@
 #include <QMutex>
 #include <QString>
 
+#include <QMetaType>
+
 #include "port_test_result.h"
+
+/// M002 T012 / openapi `AttemptEntry`: one start attempt as the client saw it, refused or dialled.
+/// The same record becomes the `attempt_record side=client` log line (`attemptRecordLine()` in
+/// `pairing_controller.h`) and the `attempt` evidence entry (`EvidenceJournal::attempt()`), so the
+/// two can never disagree. An int of 0 and an empty string or invalid instant mean "unknown": the
+/// line prints `-` for them and the entry omits the key (the contract never sends null). The one
+/// string that is an address is `dialHost`, the rig host the client was handed; it reaches the
+/// entry only when it is a plain host name or IP (`[A-Za-z0-9.:_-]{1,255}`), never a PIN, a
+/// certificate or free text.
+struct AttemptRecord
+{
+    QString sessionId;
+    int attempt = 1; // 1 or 2
+    int handedHttps = 0;
+    int handedControl = 0;
+    int handedRtsp = 0;
+    QString dialHost;
+    int dialPort = 0;
+    QString outcome; // refused | dialing | connected | failed
+    QString refusalClass;
+    QString engineStep;
+    QString engineClass;
+    qint64 durationMs = 0;
+    QDateTime at = QDateTime::currentDateTimeUtc();
+    QDateTime serverTime;
+    bool hasSkew = false;
+    qint64 skewMs = 0;
+};
+Q_DECLARE_METATYPE(AttemptRecord)
 
 class EvidenceJournal
 {
@@ -92,6 +123,16 @@ public:
     void close();
     bool isOpen() const;
 
+    /// ADR-0117 rollover support (the stream recorder is the only caller). `runId()` is the open
+    /// capsule's `run_id`; `entryCount()` how many entries it holds; `entryCap()` its limit.
+    /// `rollRun()` keeps the session and account but starts a new capsule under a new `run_id`
+    /// (seq from 0) and settles the folder cap; the closed capsule stays on disk for delivery.
+    /// False (nothing changed) while no capsule is open.
+    QString runId() const;
+    int entryCount() const;
+    int entryCap() const;
+    bool rollRun();
+
     /// Add one entry (a builder's result) to the open capsule, stamping `seq`, `at` and
     /// `elapsed_ms`. A no-op while closed. An empty or invalid entry, or one past the entry cap,
     /// stores nothing and counts `dropped_entries`.
@@ -120,6 +161,9 @@ public:
     /// `within_5s` when |local - server| <= 5 s, `client_ahead` / `client_behind` beyond it,
     /// `unknown` when either instant is invalid.
     static QJsonObject clockSkew(const QDateTime& serverUtc, const QDateTime& localUtc);
+    /// The `attempt` entry (side `client`) for one record. Empty when the outcome or a token is
+    /// outside its closed set. Unknown values are omitted, never null.
+    static QJsonObject attempt(const AttemptRecord& record);
 
     /// Capsules of `accountId` waiting for the server, oldest first. The open Play's capsule is
     /// included once it holds an entry (failure-class events send while the Play runs).
@@ -148,6 +192,7 @@ private:
     Counters readPendingCounters() const;
     void addPendingCounters(const Counters& delta) const;
     void enforceCapLocked();
+    void startRunLocked();
     void removeUnreadable(const QString& fileName) const;
 
     mutable QMutex m_mutex;

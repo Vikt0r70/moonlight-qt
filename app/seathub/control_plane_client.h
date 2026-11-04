@@ -52,6 +52,11 @@
 #include <QString>
 #include <atomic>
 #include <functional>
+#include <memory>
+#include <QHostInfo>
+#include <QNetworkRequest>
+
+struct PairingRequestState;
 
 #include "error_map.h"
 
@@ -76,6 +81,9 @@ struct ControlPlaneResult
     /// `Error.kind`, when the control plane named one - e.g. the `session.pairing_limit` refusal a
     /// reconnect episode's fourth PIN request gets (V10). Empty when absent.
     QString kind;
+    /// `Error.refusal_reason` of a 412 `session.no_verified_path` (M002 T011/T012): one of
+    /// `no_external_path`, `no_lease`, `host_unknown`, `port_unverified`. Empty when absent.
+    QString refusalReason;
     /// The parsed response object. Empty on failure.
     QJsonObject body;
 
@@ -565,7 +573,13 @@ public:
     void requestSession(const QString& clientCertSha256, const QString& idempotencyKey,
                         Callback callback);
     void fetchSession(const QString& sessionId, Callback callback);
-    void fetchSessionAuthorization(const QString& sessionId, Callback callback);
+    using PairingCancellation = std::function<void()>;
+    using PairingResolver = std::function<PairingCancellation(
+        const QString&, QObject*, std::function<void(const QHostInfo&)>)>;
+    /// Test seam for asynchronous DNS only; install before starting requests. Empty restores Qt.
+    void setPairingResolver(PairingResolver resolver) { m_pairingResolver = std::move(resolver); }
+    /// Cancelling fences DNS before a late send and aborts an in-flight request on its owner.
+    PairingCancellation fetchSessionAuthorization(const QString& sessionId, Callback callback);
 
     /// `GET /api/stream` (3.5.0, ADR-0062/ADR-0067): opens the account's push channel on
     /// `m_streamNetwork`, its own manager (never `m_network`, D-35/T-06.4-45 - a long-lived
@@ -629,6 +643,11 @@ public:
     /// here retries.
     void postEvidence(const QString& sessionId, const QByteArray& body, Callback callback);
 
+    /// SC24 / ADR-0117: ONE unauthenticated `GET /health`, bounded by a 5 s transfer timeout, no
+    /// retry. The drop check (`drop_check.h`) is its only caller; `callback` gets the control
+    /// plane's answer or a transport failure (statusCode 0), once.
+    void checkHealth(Callback callback);
+
     /// `POST /api/sessions/{session_id}/stream-time` (ADR-0074 W04, contract 3.11.0): one stream
     /// segment of the caller's own session per call, authenticated with the customer token and
     /// bound to `sessionId` by the server's ownership check (another customer's session answers
@@ -654,7 +673,7 @@ private:
     /// `extraHeaders` rides alongside the standard `Authorization`/`traceparent` headers - today
     /// only `requestSession()`'s `Idempotency-Key` (ADR-0062 decision 11) uses it. Defaulted so
     /// every other call site is unaffected.
-    void send(const QString& method, const QString& path, const QByteArray& body,
+    PairingCancellation send(const QString& method, const QString& path, const QByteArray& body,
               bool authenticated, Callback callback,
               const QHash<QByteArray, QByteArray>& extraHeaders = {});
     /// The rest of what `send()` used to do after its thread marshal, now taking the access token
@@ -663,12 +682,16 @@ private:
     void sendOnOwningThread(const QString& method, const QString& path, const QByteArray& body,
                             bool authenticated, const QString& accessToken, const QString& traceId,
                             Callback callback,
-                            const QHash<QByteArray, QByteArray>& extraHeaders = {});
+                            const QHash<QByteArray, QByteArray>& extraHeaders = {},
+                            std::shared_ptr<PairingRequestState> pairing = {});
+    void sendPairing(QNetworkRequest request, Callback callback,
+                     std::shared_ptr<PairingRequestState> state);
     void finishReply(QNetworkReply* reply, Callback callback, const QString& routeClass,
                      qint64 elapsedMs);
 
     QNetworkAccessManager* m_network = nullptr;
     bool m_ownsNetwork = false;
+    PairingResolver m_pairingResolver;
     /// `openAccountStream()`'s own manager, separate from `m_network` (see that method's own
     /// comment). Parented to `this` like `m_network`, so `moveToOwnThread()` carries both to the
     /// network thread together and `stopOwnedThread()`'s join destroys both.

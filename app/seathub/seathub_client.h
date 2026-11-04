@@ -43,8 +43,10 @@
 #include "liveness_timer.h"
 #include "engine_status.h"
 #include "end_outbox.h"
+#include "drop_check.h"
 #include "evidence_journal.h"
 #include "stream_quality_sampler.h"
+#include "stream_record.h"
 #include "log_tee.h"
 #include "moonlight_engine_session.h"
 #include "pairing_controller.h"
@@ -392,6 +394,11 @@ public:
     /// milliseconds instead of minutes. Set before the stream starts.
     void setSamplerWindowMsForTests(int windowMs);
 
+    /// Test seams for the stream record (T054): the length of one `stream_minute` window, and the
+    /// rig endpoint the drop check dials (production reads it from the pairing controller).
+    void setStreamRecordMinuteMsForTests(qint64 minuteMs);
+    void setRigEndpointForTests(const QString& host, int port);
+
     /// C-ENDING: is an End saved on disk for the signed-in account?
     bool hasSavedEnd() const;
 
@@ -694,6 +701,9 @@ private:
     void openEvidenceJournal(const QString& sessionId);
     void closeEvidenceJournal();
     void recordEvidence(const QJsonObject& entry);
+    /// M002 T012: stamp the server clock on a dialled attempt, write its `attempt_record` line and
+    /// record its `attempt` entry. A refused attempt arrives already stamped and logged.
+    void noteAttemptRecord(AttemptRecord record);
     /// Callable from the main thread or the network thread. At most one send per capsule at a time.
     void deliverEvidence();
     /// Network thread: a full 60 s window ended with no samples and no drops.
@@ -926,6 +936,11 @@ private:
     QString m_stageText;
     int m_connectStage = 0;
     bool m_connectFailed = false;
+    /// M002 T012: the pairing failure on screen is a refused start (HTTP 412
+    /// `session.no_verified_path`). The server will attribute its end to us and its late
+    /// `end_blame` would otherwise overwrite the refusal sentence with the rig's, so the terminal
+    /// session read leaves the text alone while this is set. Cleared with the stall (`clearStall()`).
+    bool m_sessionRefused = false;
     QString m_stalledStepText;
     QString m_stalledReasonText;
     bool m_stalledReasonPlain = false;
@@ -1185,9 +1200,41 @@ private:
     /// ADR-0105: the per-Play evidence capsule (mutex-guarded; written from the main thread and
     /// the network thread). `m_journalGeneration` counts opens and `m_journalOpen` says whether one
     /// is open now, so the network thread can tell a stall that belongs to another Play.
-    EvidenceJournal m_journal;
+    /// T070 / A6: one Play's capsule writer. The journal keeps a single open run, so a capsule can
+    /// only be finished by the instance that opened it; each Play therefore gets its own set. The
+    /// recorder writes into the journal beside it (declared first) and is mutex-guarded: the render
+    /// thread feeds samples, the network thread advances minutes and warnings, the main thread ends it.
+    struct EvidenceSet {
+        EvidenceJournal journal;
+        StreamRecorder recorder{&journal};
+    };
+    /// The set of the Play in progress (or the last one, once closed). Read with
+    /// `std::atomic_load()` through `evidence()`, replaced only by `startDropCheck()` and the
+    /// constructor. A bad-ended Play's set moves to its own drop-check completion and stays alive
+    /// until that completion has written and closed it.
+    std::shared_ptr<EvidenceSet> m_evidence;
+    std::shared_ptr<EvidenceSet> evidence() const { return std::atomic_load(&m_evidence); }
+    std::shared_ptr<EvidenceSet> makeEvidenceSet() const;
+    /// The active set while its bad-ended Play's check is still out (main thread only); compared by
+    /// address, never dereferenced.
+    EvidenceSet* m_pendingCheckSet = nullptr;
+    void retireEndedEvidenceSet();
+    QString m_evidenceDirectory;
+    qint64 m_streamMinuteMsForTests = 0;
+    /// Serialises the journal calls that read or rewrite capsules across sets (hand-out, answer, the
+    /// closing check's write): two sets share one folder, and each only locks itself.
+    std::mutex m_evidenceIoMutex;
     std::atomic<quint64> m_journalGeneration{0};
     std::atomic<bool> m_journalOpen{false};
+    /// T054 / ADR-0117: the one drop check after a bad end. Each ended Play owns its own, parented to
+    /// the client, and nothing cancels or replaces it: a later Play, or a second bad end, never
+    /// touches an earlier Play's completion.
+    void startDropCheck();
+    QList<DropCheck*> m_dropChecks;
+    LogTee::SinkHandle m_streamWarningSinkHandle = 0;
+    QString m_rigHostForTests;
+    int m_rigPortForTests = 0;
+    bool m_rigForcedForTests = false;
     /// Network-thread-readable copy of the signed-in account, guarded by `m_evidenceMutex`, along
     /// with how many sends are outstanding. No new batch is taken while any is in flight, because
     /// `EvidenceJournal::deliverable()` marks what it hands out and an answer removes up to that mark.

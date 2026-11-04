@@ -250,9 +250,13 @@ void StreamQualitySampler::emitWindow(bool partial)
     // stale newest observation means the window states "no recent rate" by absence (recent_n of 0,
     // no rate attributes), never by a synthetic zero. The fixed constant, not m_windowMs, is the
     // rule so a shortened test window does not change what "recent" means.
+    // T023: a window that accepted no sample of its own (drops only) cannot carry a reading; every
+    // entry still in the ring was fed in an earlier window. It states "no recent rate" by absence,
+    // the same as a stale newest observation. last_sample_age_ms below still reports the age.
+    const bool ownReadings = attrs.value(QStringLiteral("n")).toInt() > 0;
     QVector<SampleWithTime> recentCopy;
     for (const auto& s : allRecent) {
-        if (now - s.elapsedMs <= kWindowMs) recentCopy.append(s);
+        if (ownReadings && now - s.elapsedMs <= kWindowMs) recentCopy.append(s);
     }
     if (recentCopy.isEmpty() && !allRecent.isEmpty()) {
         for (const char* prefix : {"fps_", "incoming_fps_", "decoded_fps_"}) {
