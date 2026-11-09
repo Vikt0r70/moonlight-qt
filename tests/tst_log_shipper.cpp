@@ -21,6 +21,7 @@
 #include <QtTest>
 
 #include <QCoreApplication>
+#include <QCryptographicHash>
 #include <QDateTime>
 #include <QDir>
 #include <QElapsedTimer>
@@ -147,7 +148,7 @@ void appendRawSpoolLine(const QString& directory, const QString& body, double lo
 /// cannot be a live one either; no `.lock` companion is written, so the adoption's `tryLock()`
 /// takes a fresh lock exactly as it does for a real leftover whose owner died.
 void appendLeftoverSpoolLine(const QString& directory, qint64 deadPid, const QString& body,
-                             double loggedAt)
+                             double loggedAt, const QJsonObject& attrs = QJsonObject())
 {
     QDir().mkpath(directory);
     QJsonObject obj;
@@ -157,6 +158,11 @@ void appendLeftoverSpoolLine(const QString& directory, qint64 deadPid, const QSt
     obj.insert(QStringLiteral("session_id"), QString());
     obj.insert(QStringLiteral("host_id"), QString());
     obj.insert(QStringLiteral("trace_id"), QString());
+    // T020: an old build's spool may carry the diagnostic lane's own attributes, address included.
+    if (!attrs.isEmpty()) {
+        obj.insert(QStringLiteral("attrs"), attrs);
+        obj.insert(QStringLiteral("diagnostic"), true);
+    }
 
     QFile file(QDir(directory).filePath(QStringLiteral("spool-%1.jsonl").arg(deadPid)));
     file.open(QIODevice::Append | QIODevice::Text);
@@ -637,7 +643,7 @@ private slots:
 
     // --- scrub -----------------------------------------------------------------------------------
 
-    void scrubRemovesSecretsAndKeepsTheIpv4Address()
+    void scrubRemovesSecretsAndTheCustomerAddress()
     {
         const QString scrubbed = LogShipper::scrub(QStringLiteral(
             "GET /launch?&rikey=abc123&rikeyid=45-67 from 203.0.113.7 "
@@ -657,8 +663,201 @@ private slots:
         QVERIFY(!scrubbed.contains(QStringLiteral("cafef00d")));
         QVERIFY(!scrubbed.contains(QStringLiteral("f00dcafe")));
         QVERIFY(!scrubbed.contains(QStringLiteral("MIIBabc")));
-        QVERIFY2(scrubbed.contains(QStringLiteral("203.0.113.7")),
-                 "the customer's public IP must survive scrubbing");
+        // T020/SC7: a customer address is a diagnostic fact we no longer publish or retain off
+        // the rig. The old D-09 expectation ("the customer's public IP must survive scrubbing")
+        // is superseded by INTENT N1 (owner correction C3 narrows it to the rig's own file log
+        // only, which never goes through this function).
+        QVERIFY2(!scrubbed.contains(QStringLiteral("203.0.113.7")),
+                 "the customer's address must not survive scrubbing");
+        QVERIFY(scrubbed.contains(QStringLiteral("[address]")));
+    }
+
+    // --- T020/SC7: customer addresses in diagnostics and retained copies ---------------------------
+
+    /// The sanitized fixtures this file proves, emitted as a stable digest so the task's evidence
+    /// receipt can name a real artifact instead of a claim. When `SEATHUB_PRIVACY_DIGEST_FILE` is
+    /// set, the lines are appended there (`tests/verify-m003-privacy.cmd` collects them and refuses
+    /// a receipt whose digests do not match a live run); otherwise they go to the console.
+    static void printPrivacyDigest(const QString& id, const QString& sanitized)
+    {
+        const QByteArray digest
+            = QCryptographicHash::hash(sanitized.toUtf8(), QCryptographicHash::Sha256).toHex();
+        const QString line = QStringLiteral("PRIVACY_DIGEST %1 %2")
+                                 .arg(id, QString::fromLatin1(digest));
+        const QString path = qEnvironmentVariable("SEATHUB_PRIVACY_DIGEST_FILE");
+        if (!path.isEmpty()) {
+            QFile file(path);
+            if (file.open(QIODevice::Append | QIODevice::Text)) {
+                file.write(line.toUtf8());
+                file.write("\n");
+                file.close();
+                return;
+            }
+        }
+        qInfo().noquote() << line;
+    }
+
+    void customerAddressesAreScrubbedButAuthorityFactsSurvive()
+    {
+        const QString raw = QStringLiteral(
+            "dial target 203.0.113.7:47984 session session-abc123 host host-42 trace trace-7f "
+            "peer [2001:db8::5]:47989 version seathub@0.1.37 port 48010");
+        const QString scrubbed = LogShipper::scrub(raw);
+
+        QVERIFY2(!scrubbed.contains(QStringLiteral("203.0.113.7")), "customer IPv4 survived");
+        QVERIFY2(!scrubbed.contains(QStringLiteral("2001:db8::5")), "customer IPv6 survived");
+        // Everything that is not the customer's address is a fact we keep, byte for byte.
+        QVERIFY(scrubbed.contains(QStringLiteral(":47984")));
+        QVERIFY(scrubbed.contains(QStringLiteral(":47989")));
+        QVERIFY(scrubbed.contains(QStringLiteral("session-abc123")));
+        QVERIFY(scrubbed.contains(QStringLiteral("host-42")));
+        QVERIFY(scrubbed.contains(QStringLiteral("trace-7f")));
+        QVERIFY(scrubbed.contains(QStringLiteral("seathub@0.1.37")));
+        QVERIFY(scrubbed.contains(QStringLiteral("48010")));
+        QCOMPARE(scrubbed, QStringLiteral(
+            "dial target [address]:47984 session session-abc123 host host-42 trace trace-7f "
+            "peer [address]:47989 version seathub@0.1.37 port 48010"));
+
+        // Local endpoints are not the customer's address: loopback and the wildcard stay exact, so
+        // a URL, a DSN and a bind fact remain readable.
+        const QStringList kept = {
+            QStringLiteral("connecting to 127.0.0.1:48010"),
+            QStringLiteral("bound 0.0.0.0:47984"),
+            QStringLiteral("dsn http://publickey@127.0.0.1:9/1"),
+            QStringLiteral("listening on [::1]:47984"),
+            QStringLiteral("any [::]:47984")
+        };
+        for (const auto& fixture : kept) QCOMPARE(LogShipper::scrub(fixture), fixture);
+
+        // Non-address lookalikes must never be mistaken for one.
+        const QStringList lookalikes = {
+            QStringLiteral("12:30:45"),
+            QStringLiteral("aa:bb:cc:dd:ee:ff"),
+            QStringLiteral("0.1.37"),
+            QStringLiteral("attempt 3 of 5"),
+            QStringLiteral("received 1234 bytes in 203 ms"),
+            QStringLiteral("ssrc 1234567 payload 96")
+        };
+        for (const auto& fixture : lookalikes) QCOMPARE(LogShipper::scrub(fixture), fixture);
+
+        printPrivacyDigest(QStringLiteral("body-embedded-v4-v6"), scrubbed);
+    }
+
+    void escapedAndEmbeddedAddressFormsAreAllRemoved()
+    {
+        const QStringList fixtures = {
+            QStringLiteral("Executing request: https://user:pw@203.0.113.7:47984/serverinfo"),
+            QStringLiteral("Host 203.0.113.7 not found (Error 3)"),
+            QStringLiteral("GET /launch?host=203.0.113.7&port=47984"),
+            QStringLiteral("pattern 203\\.0\\.113\\.7"),
+            QStringLiteral("{\"address\":\"203.0.113.7\",\"port\":47984}"),
+            QStringLiteral("peer=[2001:db8::5]:47989"),
+            QStringLiteral("{\"address\":\"2001:db8::5\"}"),
+            QStringLiteral("relay 2001:db8:0:0:0:0:0:5:47989"),
+            QStringLiteral("mapped ::ffff:203.0.113.7")
+        };
+        for (const auto& raw : fixtures) {
+            const QString scrubbed = LogShipper::scrub(raw);
+            QVERIFY2(!scrubbed.contains(QStringLiteral("203.0.113.7")),
+                     qPrintable(QStringLiteral("IPv4 survived in: ") + raw));
+            QVERIFY2(!scrubbed.contains(QStringLiteral("2001:db8")),
+                     qPrintable(QStringLiteral("IPv6 survived in: ") + raw));
+            QVERIFY2(scrubbed.contains(QStringLiteral("[address]")),
+                     qPrintable(QStringLiteral("nothing was redacted in: ") + raw));
+            // Idempotent: a second pass (the SDK's own) changes nothing further.
+            QCOMPARE(LogShipper::scrub(scrubbed), scrubbed);
+        }
+        printPrivacyDigest(QStringLiteral("body-escaped-forms"),
+                           LogShipper::scrub(fixtures.join(QLatin1Char('\n'))));
+    }
+
+    void diagnosticAttributesAreScrubbedBeforeTheyAreRetainedOrSent()
+    {
+        QTemporaryDir spoolDir;
+        QVERIFY(spoolDir.isValid());
+        LogShipper::instance().setSpoolDirectoryForTests(spoolDir.path());
+        StubHandOff stub;
+        LogShipper::instance().start([&stub](const ShippedLine& line) { return stub(line); });
+        StopShipperOnScopeExit stopOnExit;
+
+        QJsonObject nested;
+        nested.insert(QStringLiteral("peer"), QStringLiteral("2001:db8::5"));
+        nested.insert(QStringLiteral("port"), 47989);
+        QJsonObject attrs;
+        attrs.insert(QStringLiteral("step"), QStringLiteral("pair_handshake"));
+        attrs.insert(QStringLiteral("address"), QStringLiteral("203.0.113.7"));
+        attrs.insert(QStringLiteral("endpoint"), QStringLiteral("203.0.113.7:47984"));
+        attrs.insert(QStringLiteral("attempt"), 2);
+        attrs.insert(QStringLiteral("nested"), nested);
+
+        // Part 1: shipped nowhere yet - the retained copy on disk must already be sanitized.
+        LogShipper::instance().setCanShip(false);
+        LogShipper::instance().enqueueDiagnostic(QStringLiteral("play.step from 203.0.113.7"),
+                                                LogLevel::Warning, attrs);
+        LogShipper::instance().drainBeforeSignOut();
+        QVERIFY(LogShipper::instance().backlogSpoolLines() >= 1);
+        {
+            QFile file(ownSpoolFilePath(spoolDir.path()));
+            QVERIFY(file.open(QIODevice::ReadOnly));
+            const QByteArray onDisk = file.readAll();
+            QVERIFY2(!onDisk.contains("203.0.113.7"), "the retained copy kept the address");
+            QVERIFY2(!onDisk.contains("2001:db8"), "the retained copy kept the IPv6 address");
+            QVERIFY(onDisk.contains("pair_handshake"));
+            QVERIFY(onDisk.contains("47984"));
+        }
+
+        // Part 2: the same retained line, drained and shipped - sanitized on the way out too.
+        LogShipper::instance().setCanShip(true);
+        LogShipper::instance().drainBeforeSignOut();
+        QTRY_COMPARE_WITH_TIMEOUT(stub.received().size(), 1, 5000);
+        const ShippedLine line = stub.received().constFirst();
+        QVERIFY(!line.body.contains(QStringLiteral("203.0.113.7")));
+        const QJsonObject shipped = line.attrs;
+        QCOMPARE(shipped.value(QStringLiteral("step")).toString(),
+                 QStringLiteral("pair_handshake"));
+        QCOMPARE(shipped.value(QStringLiteral("attempt")).toInt(), 2);
+        QVERIFY(!shipped.value(QStringLiteral("address")).toString()
+                     .contains(QStringLiteral("203.0.113.7")));
+        QVERIFY(shipped.value(QStringLiteral("endpoint")).toString().endsWith(QStringLiteral(":47984")));
+        QVERIFY(!shipped.value(QStringLiteral("nested")).toObject()
+                     .value(QStringLiteral("peer")).toString()
+                     .contains(QStringLiteral("2001:db8")));
+        QCOMPARE(shipped.value(QStringLiteral("nested")).toObject()
+                     .value(QStringLiteral("port")).toInt(), 47989);
+        printPrivacyDigest(QStringLiteral("attrs-sanitized"),
+                           QString::fromUtf8(QJsonDocument(shipped).toJson(QJsonDocument::Compact)));
+    }
+
+    void anAlreadyRetainedSpoolCopyIsSanitisedOnRewriteAndOnDrain()
+    {
+        QTemporaryDir spoolDir;
+        QVERIFY(spoolDir.isValid());
+        const qint64 deadPid = 4194306;
+
+        // An old build's spool: a customer address in the body AND in the retained attributes.
+        QJsonObject oldAttrs;
+        oldAttrs.insert(QStringLiteral("address"), QStringLiteral("203.0.113.7"));
+        oldAttrs.insert(QStringLiteral("step"), QStringLiteral("pair_handshake"));
+        appendLeftoverSpoolLine(spoolDir.path(), deadPid,
+                                QStringLiteral("old-release-line from 203.0.113.7:47984"),
+                                epochSecondsNow(), oldAttrs);
+
+        LogShipper::instance().setSpoolDirectoryForTests(spoolDir.path());
+        StubHandOff stub;
+        LogShipper::instance().start([&stub](const ShippedLine& line) { return stub(line); });
+        LogShipper::instance().setCanShip(true);
+        StopShipperOnScopeExit stopOnExit;
+
+        QTRY_COMPARE_WITH_TIMEOUT(stub.countMatching(QStringLiteral("old-release-line")), 1, 5000);
+        for (const ShippedLine& line : stub.received()) {
+            QVERIFY2(!line.body.contains(QStringLiteral("203.0.113.7")),
+                     "a re-sent retained copy still carried the address");
+            QVERIFY2(!line.attrs.value(QStringLiteral("address")).toString()
+                          .contains(QStringLiteral("203.0.113.7")),
+                     "a re-sent retained copy still carried the address in its attributes");
+        }
+        printPrivacyDigest(QStringLiteral("retained-copy-replay"),
+                           stub.received().constFirst().body);
     }
 
     void theCurrentRigAddressIsScrubbedAtBothPasses()
@@ -676,10 +875,18 @@ private slots:
             QVERIFY(first.contains(QStringLiteral("[rig]")));
             QCOMPARE(LogShipper::scrub(first), first);
         }
-        QCOMPARE(LogShipper::scrub(QStringLiteral("Customer 198.51.100.12")),
-                 QStringLiteral("Customer 198.51.100.12"));
+        // T020: a customer address is scrubbed whether or not it is the current rig's, so the
+        // address rule no longer depends on `setRedactions()`. A non-address remainder stays
+        // exact, and clearing the rig literal only stops the `[rig]` substitution.
+        const QString customer = QStringLiteral("Customer 198.51.100.12 at 47984");
+        QCOMPARE(LogShipper::scrub(customer),
+                 QStringLiteral("Customer [address] at 47984"));
         LogShipper::clearRedactions();
-        for (const auto& raw : fixtures) QCOMPARE(LogShipper::scrub(raw), raw);
+        for (const auto& raw : fixtures) {
+            const QString afterClear = LogShipper::scrub(raw);
+            QVERIFY(!afterClear.contains(rig));
+            QVERIFY(afterClear.contains(QStringLiteral("[address]")));
+        }
     }
 
     void concurrentReadersNeverSeeATornRedactionList()
@@ -689,8 +896,11 @@ private slots:
         for (int i = 0; i < 4; ++i) readers.emplace_back([&]() {
             for (int n = 0; n < 1000; ++n) {
                 const QString result = LogShipper::scrub(QStringLiteral("203.0.113.77 203.0.113.78"));
-                if (result != QLatin1String("[rig] [rig]")
-                    && result != QLatin1String("203.0.113.77 203.0.113.78")) failed.store(true);
+                // T020: an address is always scrubbed now, so the only acceptable results are the
+                // fully-redacted pair, or - while the rig literal is set - that same pair after
+                // the rig substitution ran first. A torn redaction list would show one of each.
+                if (result != QLatin1String("[address] [address]")
+                    && result != QLatin1String("[rig] [rig]")) failed.store(true);
             }
         });
         for (int n = 0; n < 1000; ++n) {

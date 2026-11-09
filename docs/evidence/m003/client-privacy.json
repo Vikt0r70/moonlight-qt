@@ -1,0 +1,160 @@
+{
+  "schema": "seathub.client-privacy/m003/v1",
+  "task": "T020",
+  "milestone": "M003",
+  "title": "Customer addresses removed from RentaPC diagnostics and retained off-rig spools",
+  "criterion": "INTENT SC7 / prohibition N1, owner correction C3",
+  "repo": "moonlight-qt (RentaPC customer client)",
+  "member_base": "fe6edc7654a2bd47961d841ebc0e2de84859bdc1",
+  "source_tag_checked": "seathub-v0.1.37",
+  "source_tag_note": "Newest published tag at the time of work (21 tags seathub-v0.1.16..seathub-v0.1.37, 0.1.28 absent). `git diff --stat seathub-v0.1.37 fe6edc76` is docs/release-versions.md only, so app/seathub and tests at the published tag are byte-identical to the member base.",
+  "landing_revision": null,
+  "landing_revision_note": "Not known at build time. The orchestrator records the immutable landing commit (and its hash) when the task lands; this receipt is then read by T027 at that revision. No SHA is invented here.",
+  "revision": {
+    "member_base": "fe6edc7654a2bd47961d841ebc0e2de84859bdc1",
+    "branch": "gsd-path-task/seven-hills-alpha-T020",
+    "landing_revision": null,
+    "landing_revision_owner": "orchestrator at landing"
+  },
+  "captured_utc": "2026-11-09T00:00:00Z",
+  "captured_utc_note": "Coarse build-time stamp; the authoritative time is the landing commit's own committer date, recorded by the orchestrator.",
+  "verify": {
+    "command": "cmd /d /c tests/verify-m003-privacy.cmd",
+    "cwd": "member sidecar root",
+    "suites": [
+      {
+        "name": "tst_log_shipper",
+        "command": "cmd /d /c tests/run-all-suites.cmd tst_log_shipper",
+        "exit": 0,
+        "raw_locator": "tests/tst_log_shipper-out.txt",
+        "totals": "Totals: 25 passed, 0 failed, 0 skipped, 0 blacklisted"
+      },
+      {
+        "name": "tst_log_tee",
+        "command": "cmd /d /c tests/run-all-suites.cmd tst_log_tee",
+        "exit": 0,
+        "raw_locator": "tests/tst_log_tee-out.txt",
+        "totals": "Totals: 7 passed, 0 failed, 0 skipped, 0 blacklisted"
+      },
+      {
+        "name": "tst_reporting_consent",
+        "command": "cmd /d /c tests/run-all-suites.cmd tst_reporting_consent",
+        "exit": 0,
+        "raw_locator": "tests/tst_reporting_consent-out.txt",
+        "totals": "Totals: 24 passed, 0 failed, 0 skipped, 0 blacklisted"
+      },
+      {
+        "name": "tst_telemetry",
+        "command": "cmd /d /c tests/run-all-suites.cmd tst_telemetry",
+        "exit": 0,
+        "raw_locator": "tests/tst_telemetry-out.txt",
+        "totals": "Totals: 36 passed, 0 failed, 0 skipped, 0 blacklisted"
+      }
+    ],
+    "registry_note": "All four suites were already registered by name in tests/run-all-suites.cmd; no new suite was added, so there is no zero-match pass. Named mode prints NAMED_SUITES_PASSED only after each suite's own `^Totals:.*, 0 failed` line is found."
+  },
+  "fixtures": [
+    {
+      "id": "body-embedded-v4-v6",
+      "kind": "off-rig-emitted",
+      "suite": "tst_log_shipper",
+      "test": "customerAddressesAreScrubbedButAuthorityFactsSurvive",
+      "input_shape": "One diagnostic body: a dial target with an IPv4 address and port, a bracketed IPv6 peer with port, a session id, a host id, a trace id, a release version and a standalone port number.",
+      "input_addresses": ["203.0.113.7:47984", "[2001:db8::5]:47989"],
+      "input_facts_that_must_survive": ["47984", "47989", "session-abc123", "host-42", "trace-7f", "seathub@0.1.37", "48010"],
+      "sanitized_sha256": "e5340ed547a3720580f6eb94216f3bfeeef2406114d0833b55ef5cbbfe63fdcb",
+      "assertions": "Neither address literal remains; every non-address fact is byte-identical, including both ports and both ids."
+    },
+    {
+      "id": "body-escaped-forms",
+      "kind": "off-rig-emitted",
+      "suite": "tst_log_shipper",
+      "test": "escapedAndEmbeddedAddressFormsAreAllRemoved",
+      "input_shape": "Nine embedded forms in one input set: a credentialled URL, a plain sentence, a pairing query string, a backslash-escaped regex form, a JSON body, a bracketed IPv6 peer, a JSON IPv6 value, a fully written-out IPv6 with a port, and an IPv4-mapped IPv6 literal.",
+      "input_addresses": [
+        "203.0.113.7 in a URL with user:password",
+        "203.0.113.7 in prose",
+        "203.0.113.7 in a query parameter",
+        "203\\.0\\.113\\.7 escaped",
+        "203.0.113.7 in JSON",
+        "2001:db8::5 bracketed",
+        "2001:db8::5 in JSON",
+        "2001:db8:0:0:0:0:0:5 fully written",
+        "::ffff:203.0.113.7 IPv4-mapped"
+      ],
+      "sanitized_sha256": "4159623c08d8cf43cc26239515ae348581c97ae06f8649f19aa2bbbd3caaf9ed",
+      "assertions": "No form survives; each sanitized line contains the redaction marker; a second pass (the SDK's own) changes nothing further."
+    },
+    {
+      "id": "attrs-sanitized",
+      "kind": "off-rig-emitted",
+      "suite": "tst_log_shipper",
+      "test": "diagnosticAttributesAreScrubbedBeforeTheyAreRetainedOrSent",
+      "input_shape": "One diagnostic line whose body carries an IPv4 address and whose attributes carry an address, an address-plus-port endpoint, a fixed-vocabulary step name, an integer attempt count, and a nested object holding an IPv6 peer plus an integer port.",
+      "input_addresses": ["203.0.113.7", "203.0.113.7:47984", "2001:db8::5 (nested)"],
+      "input_facts_that_must_survive": ["step=pair_handshake", "attempt=2", ":47984", "nested.port=47989"],
+      "sanitized_sha256": "adf33fad009afbe5fb6a69046497cf1bb1a11d6053302b13343aee4f2e88fb75",
+      "assertions": "The retained on-disk copy is sanitized before any send; the shipped line is sanitized again; keys, integers and the port survive."
+    },
+    {
+      "id": "retained-copy-replay",
+      "kind": "off-rig-retained-copy",
+      "suite": "tst_log_shipper",
+      "test": "anAlreadyRetainedSpoolCopyIsSanitisedOnRewriteAndOnDrain",
+      "input_shape": "A spool file written the way an older release wrote it - an address in the body and an address in the retained attributes - then adopted by a new process, drained and re-sent.",
+      "input_addresses": ["203.0.113.7:47984 (body)", "203.0.113.7 (attributes)"],
+      "sanitized_sha256": "1fdc306e8fa793ac4e4f11aaec84045ebdd5db813bac3df179045ae95afb5ecf",
+      "assertions": "The already-retained copy carries no address on the way out, in either the body or the attributes."
+    }
+  ],
+  "live_envelope_readback": {
+    "suite": "tst_telemetry",
+    "test": "noCustomerAddressEscapesTheRealEnvelope",
+    "scenario": "customer-address: a real child process with the real telemetry hand-off, sending to a loopback envelope collector, with no rig literal set at all (the ordinary case of dialling someone else's rig).",
+    "assertions": "No collected envelope contains the customer IPv4 or IPv6 in any form; the `play.step` log item reaches the envelope; its `address` and `peer` attributes carry no address; `endpoint` keeps `:47984`; `port` keeps 47989; every file left in the child's own spool directory is clean.",
+    "note": "This is the sanitized readback required by SC7: what would have left the machine is checked on the wire, not inferred from a unit assertion."
+  },
+  "authority_preserved": {
+    "statement": "Network authority, pairing and dial inputs are not scrubbed by this task.",
+    "where": [
+      "LogShipper::scrub() only rewrites text that is being emitted off the rig or retained for that purpose; it is not on any pairing, dial or control-plane path.",
+      "The rig-literal pass (setRedactions()/publishPairingTarget()) still runs first and still wins for the machine's own address.",
+      "No pairing, dial, control-plane or engine call site was edited by this task."
+    ],
+    "suites": ["tst_d28_boundary (engine boundary, 16 passed)", "tst_facade_wiring (319 passed, includes pairing and account-race cases)"]
+  },
+  "c3_scope": {
+    "owner_ruling": "C3, 2026-11-07: keep the customer address in the rig's own local file log.",
+    "in_scope": "Diagnostic output sent off the rig (the Sentry payload) and copies held off the rig (the support spool waiting to be sent).",
+    "out_of_scope": "The rig's own local file log. This task does not edit that log, does not route it through LogShipper::scrub(), and does not supersede ADR-0071. Any export or upload of that log is still covered by the same rule, and would be a copy held off the rig.",
+    "sources": ["docs/spec/agents.md:351-352", "docs/decisions/ADR-0071-rig-toolchain-1-88-sentry-0-49-3-and-rig-metrics.md item 10"]
+  },
+  "account_and_consent": {
+    "unchanged": true,
+    "statement": "Account binding, consent and revocation, lock ownership, and send/drop/retry/age/size semantics are unchanged. The scrub runs on the existing worker path, before the spool write and before the SDK call, and does not alter any gate decision.",
+    "regression_suites": ["tst_log_shipper (25 passed, includes queue/spool/age/byte-cap/account cases)", "tst_reporting_consent (24 passed)", "tst_log_tee (7 passed)"]
+  },
+  "limits": {
+    "rig_local_file_log": "Out of scope by C3; it keeps the address by owner ruling and is not exercised here.",
+    "raw_minidumps": "Crash dumps are outside the diagnostic payload path and are not covered by this receipt. The client deletes legacy SeatHub-*.dmp files and never uploads them (telemetry.cpp removeLegacyDumps()); nothing in this task changes that, and no claim is made about the contents of any dump a platform tooling might retain.",
+    "third_party": "Sentry-native's own internals, transport, and any server-side storage are third-party. This receipt proves what our code hands to sentry_log() and what our own spool retains; it makes no claim about third-party retention beyond that boundary.",
+    "no_universal_scrub": "This is a targeted redaction of address literals in our own emitted and retained diagnostics. It is not a universal byte-scrub, not a deletion promise, and not a claim about data already delivered before this change.",
+    "integrated_check": "T027 checks actual emissions and copies at the integrated revision; this receipt is the input it reads, and the landing revision is filled in by the orchestrator.",
+    "loopback_and_wildcard": "Loopback and wildcard literals (127.0.0.0/8, 0.0.0.0, ::, ::1) are deliberately left byte-identical: they are this machine's own endpoint facts and never identify a customer."
+  },
+  "implementation": {
+    "files": [
+      "app/seathub/log_shipper.cpp",
+      "app/seathub/log_shipper.h"
+    ],
+    "entry_points": {
+      "LogShipper::scrub": "body text: rig literal, existing secret patterns, then address literals",
+      "LogShipper::scrubAttributes": "diagnostic attributes, recursive, keys and non-string scalars untouched",
+      "LogSpool::append": "both body and attributes sanitised for every line that lands in the off-rig spool",
+      "readSpoolFile": "an older release's spool line is sanitised at read, so a retained copy is cleaned before it is re-sent",
+      "Impl::processLine": "second pass on the way to the SDK"
+    },
+    "no_engine_change": "No engine code, updater, unknown-metric (M005) code, dependency or new suite was added."
+  },
+  "t027_handoff": "T027 reads this file at the landed revision: `fixtures[].sanitized_sha256` plus `verify.suites[].raw_locator`. `landing_revision` is null here because landing is the orchestrator's act; T027 must confirm it is no longer null before treating the receipt as immutable."
+}

@@ -456,6 +456,20 @@ int runDiagChild(int argc, char* argv[])
         qInfo() << "Connecting to 203.0.113.77:47989";
         LogShipper::clearRedactions();
     }
+    else if (scenario == QLatin1String("customer-address")) {
+        // T020/SC7: the customer's own address, with no rig literal set at all - the ordinary
+        // case, where the client dials someone else's rig. Body forms and attribute forms both
+        // reach the real Sentry envelope, which is the copy that leaves the machine.
+        qInfo() << "Executing request: https://203.0.113.7:47984/serverinfo";
+        qInfo() << "peer [2001:db8::5]:47989 session session-cust-1";
+        QJsonObject attributes = stepAttributes;
+        attributes.insert(QStringLiteral("address"), QStringLiteral("203.0.113.7"));
+        attributes.insert(QStringLiteral("endpoint"), QStringLiteral("203.0.113.7:47984"));
+        attributes.insert(QStringLiteral("peer"), QStringLiteral("2001:db8::5"));
+        attributes.insert(QStringLiteral("port"), 47989);
+        SeatHubTelemetry::emitDiagnostic(QStringLiteral("play.step from 203.0.113.7"),
+                                         LogLevel::Warning, attributes);
+    }
     else if (scenario == QLatin1String("play-step")) {
         // ADR-0072 item 2: the local diagnostic a real failure would carry, PIN and all. It is
         // built HERE and handed to nothing - the emission below receives only vocabulary tokens
@@ -2190,6 +2204,64 @@ private slots:
         }
         for (const auto& log : scan.logs) if (log.body.contains(QStringLiteral("[rig]"))) ++rigLines;
         QCOMPARE(rigLines, 3);
+    }
+
+    void noCustomerAddressEscapesTheRealEnvelope()
+    {
+        // T020/SC7/N1: the ordinary case - a customer dialling someone else's rig - with the
+        // real telemetry hand-off, a real envelope collected on the wire. Neither the body nor a
+        // diagnostic attribute may carry the address; the port, session and step facts stay.
+        QTemporaryDir db, spool, state;
+        QTcpServer server;
+        QList<QByteArray> envelopes;
+        wireEnvelopeCollector(&server, &envelopes);
+        QVERIFY(server.listen(QHostAddress::LocalHost, 0));
+        QProcess child;
+        child.setProgram(m_appPath);
+        child.setArguments({"--diag-child", "customer-address",
+            QStringLiteral("http://publickey@127.0.0.1:%1/1").arg(server.serverPort()),
+            db.path(), m_handlerPath, spool.path(), state.path()});
+        child.start();
+        QVERIFY(child.waitForStarted(5000));
+        QTRY_VERIFY_WITH_TIMEOUT(child.state() != QProcess::Running, 20000);
+        QCOMPARE(child.exitCode(), 0);
+        QVERIFY(!envelopes.isEmpty());
+
+        for (const auto& envelope : envelopes) {
+            QVERIFY2(!envelope.contains("203.0.113.7"), "a customer IPv4 reached the envelope");
+            QVERIFY2(!envelope.contains("2001:db8"), "a customer IPv6 reached the envelope");
+        }
+
+        const auto scan = scanEnvelopes(envelopes);
+        const ParsedLogItem* step = nullptr;
+        for (const auto& log : scan.logs) {
+            if (log.body.startsWith(QStringLiteral("play.step"))) step = &log;
+        }
+        QVERIFY2(step != nullptr, "the diagnostic log never reached the envelope");
+        // The Sentry log item carries each attribute in the SDK's own `{type, value}` wrapper.
+        const auto attrText = [](const QJsonObject& attributes, const QString& key) {
+            const QJsonValue wrapped = attributes.value(key);
+            if (wrapped.isObject()) return wrapped.toObject().value(QStringLiteral("value"));
+            return wrapped;
+        };
+        QVERIFY(!attrText(step->attributes, QStringLiteral("step")).toString().isEmpty());
+        QVERIFY(!attrText(step->attributes, QStringLiteral("address")).toString()
+                     .contains(QStringLiteral("203.0.113.7")));
+        QVERIFY(!attrText(step->attributes, QStringLiteral("peer")).toString()
+                     .contains(QStringLiteral("2001:db8")));
+        QVERIFY(attrText(step->attributes, QStringLiteral("endpoint")).toString()
+                    .endsWith(QStringLiteral(":47984")));
+        QCOMPARE(attrText(step->attributes, QStringLiteral("port")).toInt(), 47989);
+        // The retained-off-rig copy that carried this line is the spool the child held: prove the
+        // child's own last spool write is clean too (drainBeforeSignOut rewrites it before exit).
+        QDir spoolDir(spool.path());
+        for (const QString& name : spoolDir.entryList(QDir::Files)) {
+            QFile file(spoolDir.filePath(name));
+            if (!file.open(QIODevice::ReadOnly)) continue;
+            const QByteArray retained = file.readAll();
+            QVERIFY2(!retained.contains("203.0.113.7"), "a retained spool copy kept the address");
+            QVERIFY2(!retained.contains("2001:db8"), "a retained spool copy kept the IPv6 address");
+        }
     }
 
     void hostileFixtureEmissionsReachTheRealEnvelopeCollector()

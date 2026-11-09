@@ -6,11 +6,13 @@
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
+#include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QJsonValue>
 #include <QLoggingCategory>
 #include <QRegularExpression>
+#include <QRegularExpressionMatch>
 #include <QSaveFile>
 #include <QStandardPaths>
 #include <QStringList>
@@ -22,6 +24,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -65,6 +68,218 @@ QString scrubRig(const QString& text)
     if (snapshot) for (const auto& literal : *snapshot) {
         if (!literal.isEmpty()) result.replace(literal, QStringLiteral("[rig]"));
     }
+    return result;
+}
+
+// ---------------------------------------------------------------------------------------------------
+// T020/SC7/N1 (owner correction C3, `docs/spec/agents.md`:351, ADR-0071): a customer's IP address is
+// not published or retained off the rig. Everything below runs ONLY on the two paths that leave the
+// machine - the Sentry payload (`LogShipper::scrub()` in `processLine()`/`drainSpool()`) and the
+// off-rig support spool (`LogSpool::append`) - never on the rig's own local file log, which keeps
+// the address by that same ruling.
+//
+// Deliberately NOT scrubbed:
+//   - this machine's own endpoints (loopback, the wildcard): a URL, a DSN and a bind fact stay
+//     readable, and none of them identifies the customer;
+//   - ports, versions, ids: `203.0.113.7:47984` keeps `:47984`, and `0.1.37` is not address-shaped
+//     at all (three dotted parts, not four).
+//
+// Implemented by hand rather than with QHostAddress: this translation unit is compiled into test
+// suites that link Qt Core only (`tests/tst_log_shipper.pro`, `tests/tst_log_tee.pro`), and
+// QHostAddress lives in Qt Network.
+// ---------------------------------------------------------------------------------------------------
+
+bool isHexGroup(const QString& group, int maxLength)
+{
+    if (group.isEmpty() || group.size() > maxLength) {
+        return false;
+    }
+    for (const QChar c : group) {
+        const QChar lower = c.toLower();
+        if (!((lower >= QLatin1Char('0') && lower <= QLatin1Char('9'))
+              || (lower >= QLatin1Char('a') && lower <= QLatin1Char('f')))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+QStringList splitGroups(const QString& text)
+{
+    return text.isEmpty() ? QStringList() : text.split(QLatin1Char(':'));
+}
+
+bool isIpv4Literal(const QString& text)
+{
+    const QStringList parts = text.split(QLatin1Char('.'));
+    if (parts.size() != 4) {
+        return false;
+    }
+    for (const QString& part : parts) {
+        if (part.isEmpty() || part.size() > 3) {
+            return false;
+        }
+        for (const QChar c : part) {
+            if (c < QLatin1Char('0') || c > QLatin1Char('9')) {
+                return false;
+            }
+        }
+        if (part.toInt() > 255) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool isIpv6Literal(const QString& text)
+{
+    if (!text.contains(QLatin1Char(':'))) {
+        return false;
+    }
+
+    QString work = text;
+    int groups = 0;
+    const int lastColon = work.lastIndexOf(QLatin1Char(':'));
+    const QString tail = work.mid(lastColon + 1);
+    if (tail.contains(QLatin1Char('.'))) {
+        // RFC4291 embedded IPv4 tail ("::ffff:203.0.113.7") - two groups' worth of address.
+        if (!isIpv4Literal(tail)) {
+            return false;
+        }
+        groups += 2;
+        work = work.left(lastColon);
+    }
+
+    const int compression = work.indexOf(QStringLiteral("::"));
+    if (compression >= 0) {
+        // At most one "::", and it must stand for at least one all-zero group.
+        if (work.indexOf(QStringLiteral("::"), compression + 1) >= 0) {
+            return false;
+        }
+        for (const QString& group : splitGroups(work.left(compression))) {
+            if (!isHexGroup(group, 4)) {
+                return false;
+            }
+            ++groups;
+        }
+        for (const QString& group : splitGroups(work.mid(compression + 2))) {
+            if (!isHexGroup(group, 4)) {
+                return false;
+            }
+            ++groups;
+        }
+        return groups < 8;
+    }
+
+    for (const QString& group : splitGroups(work)) {
+        if (!isHexGroup(group, 4)) {
+            return false;
+        }
+        ++groups;
+    }
+    // Without a "::" compression every one of the eight groups must be written out - which is also
+    // what stops a clock (`12:30:45`) and a MAC-ish six-group run from ever reading as an address.
+    return groups == 8;
+}
+
+/// True for an address literal that identifies the customer (and so must go), false for one that
+/// identifies only this machine's own endpoint or is not an address at all.
+bool isCustomerAddress(const QString& candidate)
+{
+    if (isIpv4Literal(candidate)) {
+        const int firstOctet = candidate.section(QLatin1Char('.'), 0, 0).toInt();
+        // The loopback block and the wildcard are local facts, and no customer is ever dialled at
+        // either.
+        return firstOctet != 127 && firstOctet != 0;
+    }
+    if (!isIpv6Literal(candidate)) {
+        return false;
+    }
+
+    const QString lowered = candidate.toLower();
+    const QString mappedPrefix = QStringLiteral("::ffff:");
+    if (lowered.startsWith(mappedPrefix)) {
+        // An IPv4-mapped IPv6 literal is the same customer address written differently.
+        return isCustomerAddress(lowered.mid(mappedPrefix.size()));
+    }
+    return lowered != QStringLiteral("::") && lowered != QStringLiteral("::1");
+}
+
+/// Replaces every match the callback maps to a replacement, leaving the rest of the text exact.
+QString replaceMatches(const QString& text, const QRegularExpression& pattern,
+                       const std::function<QString(const QRegularExpressionMatch&)>& decide)
+{
+    QString out;
+    out.reserve(text.size());
+    int last = 0;
+    auto matches = pattern.globalMatch(text);
+    while (matches.hasNext()) {
+        const QRegularExpressionMatch match = matches.next();
+        out += text.mid(last, match.capturedStart() - last);
+        out += decide(match);
+        last = match.capturedEnd();
+    }
+    out += text.mid(last);
+    return out;
+}
+
+/// A bare IPv6 literal with a port appended and no brackets (`2001:db8::5:47989`) is not itself a
+/// valid address once the port is on it, so the port is kept and the address part replaced.
+QString scrubIpv6Candidate(const QString& candidate)
+{
+    if (isCustomerAddress(candidate)) {
+        return QStringLiteral("[address]");
+    }
+    static const QRegularExpression portTail(QStringLiteral("^(.*):(\\d{1,5})$"));
+    const QRegularExpressionMatch match = portTail.match(candidate);
+    if (match.hasMatch() && isCustomerAddress(match.captured(1))) {
+        return QStringLiteral("[address]:") + match.captured(2);
+    }
+    return candidate;
+}
+
+QString scrubAddresses(const QString& text)
+{
+    QString result = text;
+
+    // 1. A bracketed IPv6 literal, port or no port: the whole bracket pair goes, the port stays.
+    static const QRegularExpression bracketed(QStringLiteral("\\[([0-9A-Fa-f:.]+)\\]"));
+    result = replaceMatches(result, bracketed, [](const QRegularExpressionMatch& match) {
+        return isCustomerAddress(match.captured(1)) ? QStringLiteral("[address]")
+                                                    : match.captured(0);
+    });
+
+    // 2. An IPv4-mapped IPv6 literal as one unit, before the dotted quad inside it is considered.
+    static const QRegularExpression mapped(
+        QStringLiteral("::ffff:\\d{1,3}(?:\\.\\d{1,3}){3}"));
+    result = replaceMatches(result, mapped, [](const QRegularExpressionMatch& match) {
+        return isCustomerAddress(match.captured(0)) ? QStringLiteral("[address]")
+                                                    : match.captured(0);
+    });
+
+    // 3. A dotted quad, including the backslash-escaped form a regex-shaped log line carries
+    //    (`203\.0\.113\.7`). Three parts (a version, `0.1.37`) never match.
+    static const QRegularExpression ipv4(
+        QStringLiteral("\\d{1,3}(?:\\\\?\\.\\d{1,3}){3}"));
+    result = replaceMatches(result, ipv4, [](const QRegularExpressionMatch& match) {
+        QString plain = match.captured(0);
+        plain.remove(QLatin1Char('\\'));
+        if (!isIpv4Literal(plain)) {
+            return match.captured(0);
+        }
+        return isCustomerAddress(plain) ? QStringLiteral("[address]") : match.captured(0);
+    });
+
+    // 4. Any remaining bare IPv6 run - written out in full, compressed, or carrying a port.
+    static const QRegularExpression ipv6Run(QStringLiteral("[0-9A-Fa-f:.]+"));
+    result = replaceMatches(result, ipv6Run, [](const QRegularExpressionMatch& match) {
+        const QString candidate = match.captured(0);
+        if (candidate.count(QLatin1Char(':')) < 2) {
+            return candidate;
+        }
+        return scrubIpv6Candidate(candidate);
+    });
+
     return result;
 }
 
@@ -145,7 +360,15 @@ QList<ShippedLine> readSpoolFile(const QString& path)
             continue;
         }
         if (const std::optional<ShippedLine> line = lineFromJson(doc.object())) {
-            lines.append(*line);
+            // T020/SC7: a spool file written by an OLDER release still carries the customer's
+            // address. This spool is a copy held off the rig (a support copy waiting to be sent),
+            // so it is sanitised here - at read, re-encoded on the next append, and scrubbed again
+            // on the way out by `processLine()`. Every older copy is therefore cleaned before it is
+            // ever re-sent, and a copy nobody ever re-sends is cleaned the first time it is read.
+            ShippedLine sanitised = *line;
+            sanitised.body = LogShipper::scrub(sanitised.body);
+            sanitised.attrs = LogShipper::scrubAttributes(sanitised.attrs);
+            lines.append(sanitised);
         }
     }
     return lines;
@@ -182,7 +405,15 @@ LogSpool::~LogSpool() = default;
 void LogSpool::append(const ShippedLine& newLine)
 {
     QList<ShippedLine> lines = readSpoolFile(m_path);
-    lines.append(newLine);
+    // T020/SC7: the spool is a copy that outlives this machine's own file log and is written for
+    // the express purpose of being sent off the rig, so BOTH the body and the diagnostic
+    // attributes are sanitised here, once, for every line that lands in it - whether it arrived
+    // from a live capture or from the shutdown flush. `readSpoolFile()` applies the same treatment
+    // to lines an older release already wrote.
+    ShippedLine line = newLine;
+    line.body = LogShipper::scrub(line.body);
+    line.attrs = LogShipper::scrubAttributes(line.attrs);
+    lines.append(line);
 
     QList<QByteArray> encoded;
     encoded.reserve(lines.size());
@@ -688,6 +919,7 @@ private:
     {
         ShippedLine line = rawLine;
         line.body = LogShipper::scrub(line.body);
+        line.attrs = LogShipper::scrubAttributes(line.attrs);
 
         // The account check and the whole SDK emission are one step with respect to
         // `publishAccount()`, so the SDK user cannot change between the two (T070 / A2).
@@ -1029,5 +1261,39 @@ QString LogShipper::scrub(const QString& text)
         QStringLiteral("-----BEGIN [A-Z ]+-----[\\s\\S]*?-----END [A-Z ]+-----"));
     result.replace(pem, QStringLiteral("-----BEGIN CERTIFICATE----- REDACTED -----END CERTIFICATE-----"));
 
+    // T020/SC7/N1: the customer's own addresses, last, so a pairing secret or a URL token cannot
+    // hide an address behind an already-replaced run. Idempotent: `[address]` is not address-shaped.
+    result = scrubAddresses(result);
+
     return result;
+}
+
+QJsonObject LogShipper::scrubAttributes(const QJsonObject& attrs)
+{
+    QJsonObject out;
+    for (auto it = attrs.begin(); it != attrs.end(); ++it) {
+        const QJsonValue value = it.value();
+        if (value.isString()) {
+            out.insert(it.key(), scrub(value.toString()));
+        }
+        else if (value.isObject()) {
+            // A nested value is still text on its way off the machine - recurse rather than drop it
+            // (a dropped key would silently change the diagnostic's meaning).
+            out.insert(it.key(), scrubAttributes(value.toObject()));
+        }
+        else if (value.isArray()) {
+            QJsonArray array;
+            for (const QJsonValue& element : value.toArray()) {
+                array.append(element.isString() ? QJsonValue(scrub(element.toString()))
+                                                : element);
+            }
+            out.insert(it.key(), array);
+        }
+        else {
+            // Numbers and bools carry no text of their own: a port, an attempt count and a step
+            // number survive exactly as the caller wrote them.
+            out.insert(it.key(), value);
+        }
+    }
+    return out;
 }

@@ -214,10 +214,24 @@ public:
     /// `clientcert=`, `clientchallenge=`, `serverchallengeresp=`, `clientpairingsecret=` -
     /// `app/backend/nvpairingmanager.cpp`'s own request bodies, which `nvhttp.cpp` logs verbatim
     /// with `qInfo() << "Executing request:" << url.toString();`), a 4-digit Sunshine PIN written
-    /// next to the word "pin", and a PEM certificate block. The customer's public IP is left
-    /// alone (D-09). Takes an immutable rig-literal snapshot under a short lock; replacement and
-    /// the existing pure rules run outside the lock, including the SDK's second pass.
+    /// next to the word "pin", a PEM certificate block, and (T020/SC7/C3) every customer IPv4 and
+    /// IPv6 literal - `203.0.113.7:47984` becomes `[address]:47984`, so the port fact survives.
+    ///
+    /// The rig's own local file log is out of scope and is never routed through here (C3,
+    /// `docs/spec/agents.md`:351, ADR-0071): this runs only on copies that leave the machine (the
+    /// Sentry payload) or are retained for that purpose (the off-rig support spool). A literal
+    /// that is a local endpoint fact - `127.0.0.0/8`, `0.0.0.0`, `::`, `::1` - is not the
+    /// customer's address and is left byte-identical. A version with fewer than four dotted parts
+    /// (`0.1.37`) and a port number are never address-shaped and always survive. Takes an
+    /// immutable rig-literal snapshot under a short lock; replacement and the existing pure rules
+    /// run outside the lock, including the SDK's second pass.
     static QString scrub(const QString& text);
+
+    /// T020/SC7: `scrub()` over every string in a diagnostic line's own attributes (recursively,
+    /// so a nested value cannot smuggle an address past the body-only pass). Keys are fixed
+    /// vocabulary, never scrubbed. Called before a line is written to the spool and again on the
+    /// way to the SDK, so an old retained copy is sanitised at read/rewrite/re-send.
+    static QJsonObject scrubAttributes(const QJsonObject& attrs);
     static void setRedactions(const QStringList& literals);
     static void clearRedactions();
 
