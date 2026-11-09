@@ -2,6 +2,15 @@
 rem ===============================================================================================
 rem T020 / M003 verified check: no customer address survives RentaPC diagnostics or a retained copy.
 rem
+rem How to invoke it (T038): the harness runs Verifies through Git Bash, and MSYS rewrites the
+rem `/d /c` switches of `cmd /d /c ...` into drive paths, so cmd.exe started interactive and exited 0
+rem with nothing run (that is how T020's recorded evidence came out void). The working form is:
+rem
+rem   MSYS_NO_PATHCONV=1 cmd.exe /d /s /c 'tests\verify-m003-privacy.cmd'
+rem
+rem This script also writes its whole output to tests\privacy-verify-m003-out.txt and prints it, so the
+rem raw locator keeps the four DIGEST_OK lines even when the caller pipes stdout through `grep -F`.
+rem
 rem What this proves, and what it does not:
 rem   - the four suites below exercise the public seams only (LogShipper::scrub, the diagnostic
 rem     lane, LogSpool, the real Sentry envelope collector) and print one digest per sanitized
@@ -19,6 +28,20 @@ rem script checks for them and fails with the exact missing path.
 rem ===============================================================================================
 setlocal enabledelayedexpansion
 
+set "RAW=%~dp0privacy-verify-m003-out.txt"
+
+call :main > "%RAW%" 2>&1
+set "RC=!ERRORLEVEL!"
+type "%RAW%"
+endlocal & exit /b %RC%
+
+rem -----------------------------------------------------------------------------------------------
+rem Everything below is the pass rule itself, unchanged from T020: four suites, exactly four live
+rem digests, each one already written into the receipt, marker printed only when all of that holds.
+rem -----------------------------------------------------------------------------------------------
+:main
+setlocal enabledelayedexpansion
+
 set "FORK=%~dp0.."
 set "QT=C:\Qt\6.11.2\msvc2022_64"
 set "SENTRY=%FORK%\build\sentry-native-0.17.1\install"
@@ -29,19 +52,19 @@ set "DIGESTS=%~dp0privacy-digests-out.txt"
 echo VERIFY_T020 no customer address off the rig
 
 call :need_file "%QT%\bin\qmake.exe" "Qt 6.11.2 (the toolchain scripts/build-seathub.ps1 pins)"
-if errorlevel 1 goto :prereq_failed
+if errorlevel 1 exit /b 1
 call :need_file "%QT%\bin\Qt6Core.dll" "Qt 6.11.2 (the toolchain scripts/build-seathub.ps1 pins)"
-if errorlevel 1 goto :prereq_failed
+if errorlevel 1 exit /b 1
 call :need_file "%SDL%\SDL2.lib" "the prebuilt SDL2 the test .pro files link (libs submodule at its pinned commit)"
-if errorlevel 1 goto :prereq_failed
+if errorlevel 1 exit /b 1
 call :need_file "%SENTRY%\lib\sentry.lib" "sentry-native 0.17.1 (scripts/build-seathub.ps1, pinned by SHA-256)"
-if errorlevel 1 goto :prereq_failed
+if errorlevel 1 exit /b 1
 call :need_file "%FORK%\scripts\jom.exe" "the pinned jom.exe in scripts\"
-if errorlevel 1 goto :prereq_failed
+if errorlevel 1 exit /b 1
 call :need_file "%EVIDENCE%" "the T020 evidence receipt"
-if errorlevel 1 goto :prereq_failed
+if errorlevel 1 exit /b 1
 call :need_vcvars
-if errorlevel 1 goto :prereq_failed
+if errorlevel 1 exit /b 1
 
 del /q "%DIGESTS%" 2>nul
 set "SEATHUB_PRIVACY_DIGEST_FILE=%DIGESTS%"
@@ -63,7 +86,6 @@ for /f "usebackq tokens=1,2,3" %%A in ("%DIGESTS%") do (
 if not "!COUNT!"=="4" goto :digest_count
 
 echo VERIFY_T020 PASS - four fixture digests match docs\evidence\m003\client-privacy.json
-endlocal
 exit /b 0
 
 :need_file
@@ -80,32 +102,22 @@ if exist "%ProgramFiles%\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Bui
 echo PREREQ_MISSING a VS 2022 x64 C++ toolset (VC\Auxiliary\Build\vcvars64.bat) - see scripts\build-seathub.ps1
 exit /b 1
 
-:prereq_failed
-echo VERIFY_T020 FAIL - a required prerequisite is absent; nothing was run and nothing is claimed
-endlocal
-exit /b 1
-
 :suites_failed
 echo VERIFY_T020 FAIL - a named suite failed (see tests\<suite>-out.txt)
-endlocal
 exit /b 1
 
 :no_digests
 echo VERIFY_T020 FAIL - tst_log_shipper produced no privacy digest file, so no fixture was proven
-endlocal
 exit /b 1
 
 :bad_digest_line
 echo VERIFY_T020 FAIL - unexpected line in %DIGESTS%
-endlocal
 exit /b 1
 
 :receipt_mismatch
 echo VERIFY_T020 FAIL - %EVIDENCE% does not record a digest a live run just produced
-endlocal
 exit /b 1
 
 :digest_count
 echo VERIFY_T020 FAIL - expected 4 fixture digests, found !COUNT!
-endlocal
 exit /b 1

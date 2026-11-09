@@ -8,44 +8,64 @@
   "member_base": "fe6edc7654a2bd47961d841ebc0e2de84859bdc1",
   "source_tag_checked": "seathub-v0.1.37",
   "source_tag_note": "Newest published tag at the time of work (21 tags seathub-v0.1.16..seathub-v0.1.37, 0.1.28 absent). `git diff --stat seathub-v0.1.37 fe6edc76` is docs/release-versions.md only, so app/seathub and tests at the published tag are byte-identical to the member base.",
-  "landing_revision": null,
-  "landing_revision_note": "Not known at build time. The orchestrator records the immutable landing commit (and its hash) when the task lands; this receipt is then read by T027 at that revision. No SHA is invented here.",
+  "landing_revision": "3e2137174ab7ed530b2e2902542f06c11dc42c6b",
+  "landing_revision_note": "T020's immutable member landing commit (parent fe6edc7654a2bd47961d841ebc0e2de84859bdc1 on branch gsd-path-task/seven-hills-alpha-T020). Filled by T038 from the recorded landing, read with `git log`/`git rev-parse` in the member clone, never typed from memory. T027 reads the receipt at this revision.",
   "revision": {
     "member_base": "fe6edc7654a2bd47961d841ebc0e2de84859bdc1",
     "branch": "gsd-path-task/seven-hills-alpha-T020",
-    "landing_revision": null,
-    "landing_revision_owner": "orchestrator at landing"
+    "landing_revision": "3e2137174ab7ed530b2e2902542f06c11dc42c6b",
+    "landing_revision_owner": "T020 landing, recorded by T038"
   },
-  "captured_utc": "2026-11-09T00:00:00Z",
-  "captured_utc_note": "Coarse build-time stamp; the authoritative time is the landing commit's own committer date, recorded by the orchestrator.",
+  "captured_utc": "2026-11-09T10:22:52Z",
+  "captured_utc_note": "Time of the T038 re-run that produced the suites' output and the raw locator. The authoritative landing time is T020's own commit date.",
   "verify": {
-    "command": "cmd /d /c tests/verify-m003-privacy.cmd",
-    "cwd": "member sidecar root",
+    "command": "test -f tests/verify-m003-privacy.cmd && set -o pipefail && MSYS_NO_PATHCONV=1 cmd.exe /d /s /c 'tests\\verify-m003-privacy.cmd' | grep -F 'VERIFY_T020 PASS' && MSYS_NO_PATHCONV=1 python -B -c 'import json,sys; r=json.load(open(\"docs/evidence/m003/client-privacy.json\",encoding=\"utf-8\")).get(\"landing_revision\"); ok=r==\"3e2137174ab7ed530b2e2902542f06c11dc42c6b\"; print((\"LANDING_REVISION_OK \" if ok else \"LANDING_REVISION_BAD \")+str(r)); sys.exit(0 if ok else 1)'",
+    "cwd": "member worktree root, run through Git Bash",
+    "runs": [
+      {
+        "by": "T020",
+        "utc": "2026-11-09T00:00:00Z",
+        "command": "cmd /d /c tests/verify-m003-privacy.cmd",
+        "exit": 0,
+        "void": true,
+        "void_reason": "The harness runs Verifies through Git Bash with no MSYS_NO_PATHCONV, so MSYS rewrote `/d /c` into drive paths, cmd.exe started interactive and exited 0 without running the script. Its recorded stdout is only the cmd banner; no suite, digest or marker line was produced. This run proves nothing."
+      },
+      {
+        "by": "T038",
+        "utc": "2026-11-09T10:22:52Z",
+        "command": "MSYS_NO_PATHCONV=1 cmd.exe /d /s /c 'tests\\verify-m003-privacy.cmd' | grep -F 'VERIFY_T020 PASS'",
+        "exit": 0,
+        "void": false,
+        "raw_locator": "tests/privacy-verify-m003-out.txt",
+        "recorded_stdout_marker": "VERIFY_T020 PASS",
+        "note": "The script tees its full output to the raw locator and then prints it, so the four DIGEST_OK lines survive the caller's `grep -F`. The recorded stdout carries the marker line, which is what makes an empty recorded stdout impossible to mistake for a pass."
+      }
+    ],
     "suites": [
       {
         "name": "tst_log_shipper",
-        "command": "cmd /d /c tests/run-all-suites.cmd tst_log_shipper",
+        "command": "call \"%~dp0run-all-suites.cmd\" tst_log_shipper  (invoked by tests/verify-m003-privacy.cmd)",
         "exit": 0,
         "raw_locator": "tests/tst_log_shipper-out.txt",
         "totals": "Totals: 25 passed, 0 failed, 0 skipped, 0 blacklisted"
       },
       {
         "name": "tst_log_tee",
-        "command": "cmd /d /c tests/run-all-suites.cmd tst_log_tee",
+        "command": "call \"%~dp0run-all-suites.cmd\" tst_log_tee  (invoked by tests/verify-m003-privacy.cmd)",
         "exit": 0,
         "raw_locator": "tests/tst_log_tee-out.txt",
         "totals": "Totals: 7 passed, 0 failed, 0 skipped, 0 blacklisted"
       },
       {
         "name": "tst_reporting_consent",
-        "command": "cmd /d /c tests/run-all-suites.cmd tst_reporting_consent",
+        "command": "call \"%~dp0run-all-suites.cmd\" tst_reporting_consent  (invoked by tests/verify-m003-privacy.cmd)",
         "exit": 0,
         "raw_locator": "tests/tst_reporting_consent-out.txt",
         "totals": "Totals: 24 passed, 0 failed, 0 skipped, 0 blacklisted"
       },
       {
         "name": "tst_telemetry",
-        "command": "cmd /d /c tests/run-all-suites.cmd tst_telemetry",
+        "command": "call \"%~dp0run-all-suites.cmd\" tst_telemetry  (invoked by tests/verify-m003-privacy.cmd)",
         "exit": 0,
         "raw_locator": "tests/tst_telemetry-out.txt",
         "totals": "Totals: 36 passed, 0 failed, 0 skipped, 0 blacklisted"
@@ -139,7 +159,7 @@
     "raw_minidumps": "Crash dumps are outside the diagnostic payload path and are not covered by this receipt. The client deletes legacy SeatHub-*.dmp files and never uploads them (telemetry.cpp removeLegacyDumps()); nothing in this task changes that, and no claim is made about the contents of any dump a platform tooling might retain.",
     "third_party": "Sentry-native's own internals, transport, and any server-side storage are third-party. This receipt proves what our code hands to sentry_log() and what our own spool retains; it makes no claim about third-party retention beyond that boundary.",
     "no_universal_scrub": "This is a targeted redaction of address literals in our own emitted and retained diagnostics. It is not a universal byte-scrub, not a deletion promise, and not a claim about data already delivered before this change.",
-    "integrated_check": "T027 checks actual emissions and copies at the integrated revision; this receipt is the input it reads, and the landing revision is filled in by the orchestrator.",
+    "integrated_check": "T027 checks actual emissions and copies at the integrated revision; this receipt is the input it reads, at landing revision 3e2137174ab7ed530b2e2902542f06c11dc42c6b.",
     "loopback_and_wildcard": "Loopback and wildcard literals (127.0.0.0/8, 0.0.0.0, ::, ::1) are deliberately left byte-identical: they are this machine's own endpoint facts and never identify a customer."
   },
   "implementation": {
@@ -156,5 +176,5 @@
     },
     "no_engine_change": "No engine code, updater, unknown-metric (M005) code, dependency or new suite was added."
   },
-  "t027_handoff": "T027 reads this file at the landed revision: `fixtures[].sanitized_sha256` plus `verify.suites[].raw_locator`. `landing_revision` is null here because landing is the orchestrator's act; T027 must confirm it is no longer null before treating the receipt as immutable."
+  "t027_handoff": "T027 reads this file at the landed revision: `fixtures[].sanitized_sha256` plus `verify.suites[].raw_locator`. `landing_revision` is T020's immutable member landing 3e2137174ab7ed530b2e2902542f06c11dc42c6b, filled by T038; T027 must confirm it still matches the revision it is reading before treating the receipt as immutable."
 }
