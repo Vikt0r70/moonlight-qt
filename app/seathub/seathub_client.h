@@ -189,6 +189,10 @@ class SeatHubClient : public QObject
     /// gives it, or empty. Styled text: the minute count in it is wrapped in the mono family,
     /// because every number with a unit is mono (copy.md §5). The bare enum never reaches QML.
     Q_PROPERTY(QString endReasonText READ endReasonText NOTIFY endReasonTextChanged)
+    // v2.0 03-06 (REQ-CUST01, ADR-0147): the Arabic line of the same end reason (the screens show it
+    // under the English one, non-mirrored, ADR-0043) and whether `Contact support` is offered.
+    Q_PROPERTY(QString endReasonTextArabic READ endReasonTextArabic NOTIFY outcomeExtrasChanged)
+    Q_PROPERTY(bool contactSupportVisible READ contactSupportVisible NOTIFY outcomeExtrasChanged)
 
     /// The signed-in identity: the first of phone, email, username and display name the account
     /// has. Never a credential.
@@ -334,6 +338,10 @@ public:
     bool balanceStale() const { return m_balanceStale; }
     QString homeStatus() const { return m_homeStatus; }
     QString endReasonText() const { return m_endReasonText; }
+    QString endReasonTextArabic() const { return m_endReasonTextArabic; }
+    bool contactSupportVisible() const { return m_contactSupportVisible; }
+    /// `Contact support` opens the website home page through the same opener as every other link.
+    Q_INVOKABLE void openSupport();
     QVariantList countries() const { return m_countries; }
     QString defaultCountryCode() const { return m_defaultCountryCode; }
     bool animationEffects() const { return m_animationEffects; }
@@ -541,6 +549,7 @@ signals:
     void sessionWarningChanged();
     void homeStatusChanged();
     void endReasonTextChanged();
+    void outcomeExtrasChanged();
     void engineEndMessageChanged();
     void balanceChanged();
     void signedInChanged();
@@ -716,7 +725,8 @@ private:
     /// ADR-0066 decision 9 / V42: the jittered delay for `baseMs` (up to 20%).
     int jitteredReconnectDelay(int baseMs) const;
     double reconnectJitter() const;
-    void setEndReasonText(const QString& text);
+    void setEndReasonText(const QString& text, const QString& endReason = QString());
+    void setOutcomeExtras(const QString& endReason);
     void setEngineEndMessage(const QString& text);
     void raiseFailure(const SeatHubFailure& failure);
     void clearFailure();
@@ -946,6 +956,8 @@ private:
     bool m_stalledReasonPlain = false;
     QString m_homeStatus;
     QString m_endReasonText;
+    QString m_endReasonTextArabic;
+    bool m_contactSupportVisible = false;
     QString m_engineEndMessage;
     QVariantMap m_failure;
     QString m_identity;

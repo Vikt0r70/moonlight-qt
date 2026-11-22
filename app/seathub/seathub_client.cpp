@@ -179,6 +179,43 @@ const char* kEndTeardownTimeout =
 const char* kEndOperatorForced = "Support ended this session. You were charged for %1.";
 // C-SAMEPLAY (`copy.md` §Session end reasons): the customer's own Play ended the held session.
 const char* kEndReplacedByPlay = "Ended by your new Play. You were charged for %1.";
+// v2.0 03-06 (REQ-CUST01, ADR-0147; copy.md rows 651-656): the wait outcomes. The sentences are
+// proven byte-equal to docs/spec/fixtures/outcomes/startup-outcomes.json by tst_facade_wiring.
+const char* kEndRigResetFailed =
+    "Your PC had a problem, and no other free PC is available right now. You were not charged. "
+    "Contact support.";
+const char* kEndStartupUnavailable =
+    "We can't start a PC right now. Please try again later. You were not charged.";
+const char* kEndOperatorRemovedWait = "Our team cancelled your request for a PC. You were not charged.";
+
+// The Arabic line of the same rows, shown under the English one on the same screen (ADR-0043:
+// one non-mirrored layout carries both). Each sentence is split across source lines for width
+// only; the literal text is copy.md's cell exactly, and the test compares the two byte-for-byte.
+QString arabicEndReasonSentence(const QString& endReason)
+{
+    if (endReason == QLatin1String("RIG_RESET_FAILED")) {
+        return QStringLiteral(
+            "حدثت مشكلة في جهاز "
+            "الكمبيوتر، ولا يوجد "
+            "جهاز آخر متاح حاليًا. "
+            "لم يتم خصم أي مبلغ منك. "
+            "يرجى التواصل مع الدعم.");
+    }
+    if (endReason == QLatin1String("STARTUP_UNAVAILABLE")) {
+        return QStringLiteral(
+            "لا يمكننا تشغيل جهاز "
+            "كمبيوتر حاليًا. "
+            "يرجى المحاولة لاحقًا. "
+            "لم يتم خصم أي مبلغ منك.");
+    }
+    if (endReason == QLatin1String("OPERATOR_REMOVED_WAIT")) {
+        return QStringLiteral(
+            "ألغى فريقنا طلبك "
+            "للحصول على جهاز. "
+            "لم يتم خصم أي مبلغ منك.");
+    }
+    return QString();
+}
 
 // Every number with a unit is mono (copy.md §5), and the end-reason sentences are rendered as
 // `Text.StyledText`, so the minute count is wrapped in the mono family. The family name is the
@@ -224,6 +261,9 @@ QString endReasonSentence(const QString& endReason, int minutesBilled, bool styl
         { "TEARDOWN_TIMEOUT", kEndTeardownTimeout },
         { "OPERATOR_FORCED", kEndOperatorForced },
         { "REPLACED_BY_PLAY", kEndReplacedByPlay },
+        { "RIG_RESET_FAILED", kEndRigResetFailed },
+        { "STARTUP_UNAVAILABLE", kEndStartupUnavailable },
+        { "OPERATOR_REMOVED_WAIT", kEndOperatorRemovedWait },
     };
 
     for (const ReasonLine& line : kLines) {
@@ -1932,6 +1972,7 @@ void SeatHubClient::clearStall()
     m_stalledStepText.clear();
     m_stalledReasonText.clear();
     m_stalledReasonPlain = false;
+    setOutcomeExtras(QString());
     emit connectFailedChanged();
 }
 
@@ -1980,6 +2021,7 @@ void SeatHubClient::raiseConnectFailure(const SeatHubFailure& failure, const QSt
     m_stalledStepText = QStringLiteral("Stopped at: %1").arg(stageLine(qMax(m_connectStage, kStageRig)));
     m_stalledReasonText = reasonText;
     m_stalledReasonPlain = failure.verbatim;
+    setOutcomeExtras(endReason);
     m_connectFailed = true;
     qCInfo(seathubClient) << "connecting stopped at stage" << m_connectStage;
 
@@ -2010,13 +2052,39 @@ void SeatHubClient::setHomeStatus(const QString& status)
     emit homeStatusChanged();
 }
 
-void SeatHubClient::setEndReasonText(const QString& text)
+void SeatHubClient::setEndReasonText(const QString& text, const QString& endReason)
 {
+    // The Arabic line and the support button belong to the reason that produced `text`; a clear
+    // (no reason) clears them too.
+    setOutcomeExtras(text.isEmpty() ? QString() : endReason);
     if (m_endReasonText == text) {
         return;
     }
     m_endReasonText = text;
     emit endReasonTextChanged();
+}
+
+void SeatHubClient::setOutcomeExtras(const QString& endReason)
+{
+    const QString arabic = arabicEndReasonSentence(endReason);
+    // Only a PC that failed with no other PC to give is the customer's cue to write to support.
+    const bool contact = endReason == QLatin1String("RIG_RESET_FAILED");
+    if (m_endReasonTextArabic == arabic && m_contactSupportVisible == contact) {
+        return;
+    }
+    m_endReasonTextArabic = arabic;
+    m_contactSupportVisible = contact;
+    emit outcomeExtrasChanged();
+}
+
+void SeatHubClient::openSupport()
+{
+    // DD-6: the support channel is NEEDS-USER (owner has not chosen WhatsApp, email or a form), so
+    // `Contact support` opens the website home, where the customer can reach the team, and nothing
+    // the server sent. Change this one line when the owner names the channel.
+    if (m_urlOpener) {
+        m_urlOpener(SeatHubWeb::homeUrl());
+    }
 }
 
 void SeatHubClient::setEngineEndMessage(const QString& text)
@@ -2392,6 +2460,12 @@ void SeatHubClient::applyPlayFailure(const ControlPlaneResult& result)
         m_failure = result.toFailure().toVariantMap();
         emit failureChanged();
         setHomeStatus(QString::fromLatin1(kHomeRefused));
+        // v2.0 03-06 (REQ-CUST01): the shared outage refusal reads in Arabic too, under the
+        // server's own English sentence. Only that failure; every other refusal keeps one line,
+        // and a refused Play never offers `Contact support` (no session was created, no rig failed).
+        setOutcomeExtras(result.failure == QLatin1String("STARTUP_UNAVAILABLE")
+                             ? QStringLiteral("STARTUP_UNAVAILABLE")
+                             : QString());
         return;
     }
 
@@ -3832,7 +3906,7 @@ void SeatHubClient::handleSessionState(const SessionInfo& session)
         // The session's own outcome, in the deck's words, ready for the home screen the customer
         // lands on once teardown finishes (audit E10). The minute count is the server's own
         // `minutes_billed`, never arithmetic done here.
-        setEndReasonText(endSentence(session.endReason, session.minutesBilled));
+        setEndReasonText(endSentence(session.endReason, session.minutesBilled), session.endReason);
     }
 }
 
@@ -4722,7 +4796,8 @@ void SeatHubClient::handleTeardownCompleted(const SessionInfo& finalSession,
     // server gave no reason for leaves the line empty: showing nothing is honest, inventing a sentence
     // is not.
     if (!finalSession.endReason.isEmpty()) {
-        setEndReasonText(endSentence(finalSession.endReason, finalSession.minutesBilled));
+        setEndReasonText(endSentence(finalSession.endReason, finalSession.minutesBilled),
+                         finalSession.endReason);
     }
 
     // 06.1's ADR item 4 / J-22: the connecting view already showed the client's own best guess the

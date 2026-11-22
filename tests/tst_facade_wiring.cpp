@@ -10279,6 +10279,168 @@ private slots:
         QVERIFY2(found, "the held line must reach the SDK payload");
         QCOMPARE(userId, accountAId());
     }
+
+    // --- v2.0 03-06 (REQ-CUST01): the startup outcomes, from the shared spec fixture ----------------
+    //
+    // `tests/fixtures/outcomes/startup-outcomes.json` is a byte copy of Seven Hills
+    // `docs/spec/fixtures/outcomes/startup-outcomes.json`, which the server suite proves against its
+    // real producers. A missing file fails here; it never skips.
+
+    static QJsonObject startupOutcome(const QString& key)
+    {
+        const QString path = QFINDTESTDATA("fixtures/outcomes/startup-outcomes.json");
+        QFile file(path);
+        if (path.isEmpty() || !file.open(QIODevice::ReadOnly)) {
+            return QJsonObject();
+        }
+        const QJsonArray all = QJsonDocument::fromJson(file.readAll()).object()
+                                   .value(QStringLiteral("outcomes")).toArray();
+        for (const QJsonValue& value : all) {
+            if (value.toObject().value(QStringLiteral("key")).toString() == key) {
+                return value.toObject();
+            }
+        }
+        return QJsonObject();
+    }
+
+    static SessionInfo endedWaitFrom(const QJsonObject& outcome)
+    {
+        const QJsonObject body = outcome.value(QStringLiteral("body")).toObject();
+        SessionInfo info;
+        info.id = QStringLiteral("s-stages");
+        info.state = body.value(QStringLiteral("state")).toString();
+        info.endReason = body.value(QStringLiteral("end_reason")).toString();
+        return info;
+    }
+
+    void theStartupOutcomeFixtureIsPresentAndComplete()
+    {
+        for (const char* key : {"RIG_RESET_FAILED", "STARTUP_UNAVAILABLE", "OPERATOR_REMOVED_WAIT",
+                                "STARTUP_UNAVAILABLE_PLAY", "NO_HOST_AVAILABLE_PLAY", "WAITING"}) {
+            QVERIFY2(!startupOutcome(QString::fromLatin1(key)).isEmpty(), key);
+        }
+    }
+
+    void aWaitThatEndedShowsItsApprovedSentenceInBothLanguagesWithTheRightActions_data()
+    {
+        QTest::addColumn<QString>("key");
+        QTest::newRow("PC problem, no other PC free") << "RIG_RESET_FAILED";
+        QTest::newRow("cannot start a PC") << "STARTUP_UNAVAILABLE";
+        QTest::newRow("removed by an operator") << "OPERATOR_REMOVED_WAIT";
+    }
+
+    void aWaitThatEndedShowsItsApprovedSentenceInBothLanguagesWithTheRightActions()
+    {
+        QFETCH(QString, key);
+        const QJsonObject outcome = startupOutcome(key);
+        QVERIFY2(!outcome.isEmpty(), "fixture entry missing");
+        const QJsonObject copy = outcome.value(QStringLiteral("copy")).toObject();
+
+        SeatHubClient client;
+        beginStagedSession(client);
+        QVERIFY(!QTest::currentTestFailed());
+        report(client, endedWaitFrom(outcome));
+
+        QVERIFY(client.connectFailed());
+        QCOMPARE(client.stalledReasonText(), copy.value(QStringLiteral("en_long")).toString());
+        QCOMPARE(client.endReasonTextArabic(), copy.value(QStringLiteral("ar_long")).toString());
+        QCOMPARE(client.contactSupportVisible(),
+                 outcome.value(QStringLiteral("contact_support")).toBool());
+        // The same reason reaches the Home line, in both languages.
+        QCOMPARE(client.endReasonText(), copy.value(QStringLiteral("en_long")).toString());
+    }
+
+    void aPlayRefusedForStartupShowsTheApprovedSentenceInBothLanguagesWithoutContactSupport()
+    {
+        const QJsonObject outcome = startupOutcome(QStringLiteral("STARTUP_UNAVAILABLE_PLAY"));
+        QVERIFY2(!outcome.isEmpty(), "fixture entry missing");
+        const QJsonObject copy = outcome.value(QStringLiteral("copy")).toObject();
+        const QJsonObject body = outcome.value(QStringLiteral("body")).toObject();
+
+        SeatHubClient client;
+        reachHome(client, 90);
+        QVERIFY(!QTest::currentTestFailed());
+        // The production server sends row 653's EN sentence as the 409 `error` (customer.py:700-702);
+        // the fixture's body carries a shorter sentence (recorded as a GSD-ISSUE), so the wire text
+        // used here is the long one. The facade shows the server's text verbatim.
+        m_fake->answerPlay(409, playRefusalBody(copy.value(QStringLiteral("en_long")).toString(),
+                                                body.value(QStringLiteral("reference")).toString(),
+                                                body.value(QStringLiteral("failure")).toString()));
+        client.start();
+        QTRY_COMPARE_WITH_TIMEOUT(client.homeStatus(), QStringLiteral("refused"), 15000);
+        QCOMPARE(client.failure().value(QStringLiteral("error")).toString(),
+                 copy.value(QStringLiteral("en_long")).toString());
+        QCOMPARE(client.endReasonTextArabic(), copy.value(QStringLiteral("ar_long")).toString());
+        QVERIFY(!client.contactSupportVisible());
+    }
+
+    void aPlayRefusedForNoFreePcStaysTheBusyHomeStateWithNoFailedStartSentence()
+    {
+        const QJsonObject outcome = startupOutcome(QStringLiteral("NO_HOST_AVAILABLE_PLAY"));
+        QVERIFY2(!outcome.isEmpty(), "fixture entry missing");
+        const QJsonObject body = outcome.value(QStringLiteral("body")).toObject();
+
+        SeatHubClient client;
+        reachHome(client, 90);
+        QVERIFY(!QTest::currentTestFailed());
+        m_fake->answerPlay(409, playRefusalBody(body.value(QStringLiteral("error")).toString(),
+                                                body.value(QStringLiteral("reference")).toString(),
+                                                body.value(QStringLiteral("failure")).toString()));
+        client.start();
+        QTRY_COMPARE_WITH_TIMEOUT(client.homeStatus(), QStringLiteral("busy"), 15000);
+        QVERIFY(client.failure().isEmpty());
+        QVERIFY(client.endReasonTextArabic().isEmpty());
+        QVERIFY(client.endReasonText().isEmpty());
+        QVERIFY(!client.contactSupportVisible());
+    }
+
+    void aHostlessWaitShowsTheGettingReadyStageAndNoQueueInformation()
+    {
+        const QJsonObject outcome = startupOutcome(QStringLiteral("WAITING"));
+        QVERIFY2(!outcome.isEmpty(), "fixture entry missing");
+
+        SeatHubClient client;
+        beginStagedSession(client);
+        QVERIFY(!QTest::currentTestFailed());
+        report(client, endedWaitFrom(outcome));
+
+        QCOMPARE(client.connectStage(), 1);
+        QVERIFY(!client.connectFailed());
+        QVERIFY(client.stalledReasonText().isEmpty());
+        QVERIFY(client.endReasonTextArabic().isEmpty());
+        QVERIFY(!client.contactSupportVisible());
+        const QRegularExpression queueWords(
+            QStringLiteral("position|in line|queue|ETA|\\d"), QRegularExpression::CaseInsensitiveOption);
+        QVERIFY2(!queueWords.match(client.stageText()).hasMatch(), qPrintable(client.stageText()));
+    }
+
+    void contactSupportOpensTheWebsiteHomeOnceAndNothingTheServerSent()
+    {
+        SeatHubClient client;
+        QList<QUrl> opened;
+        client.setUrlOpener([&opened](const QUrl& url) {
+            opened.append(url);
+            return true;
+        });
+        client.openSupport();
+        QCOMPARE(opened.size(), 1);
+        QCOMPARE(opened.first(), SeatHubWeb::homeUrl());
+    }
+
+    void theArabicRunAndContactSupportAreForgottenWhenTheNextSessionBegins()
+    {
+        SeatHubClient client;
+        beginStagedSession(client);
+        QVERIFY(!QTest::currentTestFailed());
+        report(client, endedWaitFrom(startupOutcome(QStringLiteral("RIG_RESET_FAILED"))));
+        QVERIFY(client.contactSupportVisible());
+        QVERIFY(!client.endReasonTextArabic().isEmpty());
+
+        client.beginSession(QStringLiteral("s-stages"));
+        QVERIFY(client.endReasonTextArabic().isEmpty());
+        QVERIFY(!client.contactSupportVisible());
+        QVERIFY(client.endReasonText().isEmpty());
+    }
 };
 
 // Not QTEST_MAIN: the A2 test re-runs this binary as a child process (account_race::runChild)
