@@ -10360,10 +10360,9 @@ private slots:
         SeatHubClient client;
         reachHome(client, 90);
         QVERIFY(!QTest::currentTestFailed());
-        // The production server sends row 653's EN sentence as the 409 `error` (customer.py:700-702);
-        // the fixture's body carries a shorter sentence (recorded as a GSD-ISSUE), so the wire text
-        // used here is the long one. The facade shows the server's text verbatim.
-        m_fake->answerPlay(409, playRefusalBody(copy.value(QStringLiteral("en_long")).toString(),
+        // The 409 `error` is the production server's sentence (customer.py:700-702) and the fixture's
+        // body carries it verbatim; the facade shows the server's text as sent.
+        m_fake->answerPlay(409, playRefusalBody(body.value(QStringLiteral("error")).toString(),
                                                 body.value(QStringLiteral("reference")).toString(),
                                                 body.value(QStringLiteral("failure")).toString()));
         client.start();

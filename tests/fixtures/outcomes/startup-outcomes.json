@@ -6,7 +6,6 @@
       "body": {
         "id": "11111111-1111-4111-8111-111111111111",
         "state": "FAILED",
-        "host_id": null,
         "quality_profile": null,
         "minutes_billed": 0,
         "reconnect_count": 0,
@@ -19,8 +18,8 @@
         "authorized_through": null,
         "save_deadline_at": null,
         "grace_deadline_at": null,
-        "end_blame": "rig",
-        "end_reference": "SH-4F7KQ2"
+        "end_blame": null,
+        "end_reference": null
       },
       "copy": {
         "en_long": "Your PC had a problem, and no other free PC is available right now. You were not charged. Contact support.",
@@ -35,7 +34,6 @@
       "body": {
         "id": "11111111-1111-4111-8111-111111111111",
         "state": "FAILED",
-        "host_id": null,
         "quality_profile": null,
         "minutes_billed": 0,
         "reconnect_count": 0,
@@ -64,7 +62,6 @@
       "body": {
         "id": "11111111-1111-4111-8111-111111111111",
         "state": "CANCELLED",
-        "host_id": null,
         "quality_profile": null,
         "minutes_billed": 0,
         "reconnect_count": 0,
@@ -93,7 +90,7 @@
       "body": {
         "status_code": 409,
         "status": false,
-        "error": "We can't start a PC right now.",
+        "error": "We can't start a PC right now. Please try again later. You were not charged.",
         "reference": "SH-4F7KQ2",
         "failure": "STARTUP_UNAVAILABLE"
       },
@@ -110,7 +107,7 @@
       "body": {
         "status_code": 409,
         "status": false,
-        "error": "No free PC is available right now.",
+        "error": "No machine is free right now. Try again shortly.",
         "reference": "SH-4F7KQ2",
         "failure": "NO_HOST_AVAILABLE"
       },
@@ -127,7 +124,6 @@
       "body": {
         "id": "11111111-1111-4111-8111-111111111111",
         "state": "PREPARING",
-        "host_id": null,
         "quality_profile": null,
         "minutes_billed": 0,
         "reconnect_count": 0,
