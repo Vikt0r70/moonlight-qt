@@ -38,6 +38,10 @@ Item {
     readonly property bool stalledReasonPlain: root.client && root.client.stalledReasonPlain === true
     readonly property string reference: root.client && root.client.reference
                                         ? String(root.client.reference) : ""
+    // v2.0 03-06: the Arabic line of the same outcome, and whether this failure offers support.
+    readonly property string arabicOutcome: root.client && root.client.endReasonTextArabic
+                                            ? String(root.client.endReasonTextArabic) : ""
+    readonly property bool contactSupport: root.client && root.client.contactSupportVisible === true
 
     Column {
         id: column
@@ -104,6 +108,24 @@ Item {
                 lineHeight: 1.4
             }
 
+            // v2.0 03-06 (REQ-CUST01, ADR-0147/ADR-0043): the Arabic line of the same outcome, in
+            // the tokens' Arabic family, under the English one and on the same left edge. One layout
+            // carries both languages: no mirroring, no toggle. Empty means no element and no gap.
+            Text {
+                objectName: "endReasonArabic"
+                width: parent.width
+                visible: text.length > 0
+                text: root.arabicOutcome
+                textFormat: Text.PlainText
+                wrapMode: Text.Wrap
+                horizontalAlignment: Text.AlignLeft
+                LayoutMirroring.enabled: false
+                color: Tokens.foregroundDefault
+                font.family: Tokens.fontArabicDefault
+                font.pixelSize: Metrics.fontBody
+                lineHeight: 1.4
+            }
+
             Row {
                 objectName: "stalledReferenceRow"
                 spacing: Metrics.s2
@@ -163,6 +185,20 @@ Item {
             text: qsTr("Cancel")
 
             onClicked: root.client.interrupt()
+        }
+
+        // v2.0 03-06 (REQ-CUST01, DD-6): only the combined PC-problem outcome (copy.md row 652) offers
+        // this, beside the two ways on. It opens the website home through the facade's own
+        // openSupport() - the compiled URL, never anything the server sent (T-03-16).
+        SeatHubButton {
+            id: contactSupportButton
+            objectName: "contactSupportButton"
+            width: parent.width
+            variant: "ghost"
+            visible: root.failed && root.contactSupport
+            text: qsTr("Contact support")
+
+            onClicked: root.client.openSupport()
         }
     }
 }

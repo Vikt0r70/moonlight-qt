@@ -56,6 +56,8 @@ namespace {
 
 const char* kSansFamily = "Inter";
 const char* kMonoFamily = "Geist Mono";
+// v2.0 03-06: Tokens.fontArabicDefault, the family the Arabic run must use (no new token).
+const char* kArabicFamily = "IBM Plex Sans Arabic";
 
 QString guiDir()
 {
@@ -352,6 +354,9 @@ class FakeShellClient : public QObject
     Q_PROPERTY(QString stalledStepText READ stalledStepText NOTIFY connectFailedChanged)
     Q_PROPERTY(QString stalledReasonText READ stalledReasonText NOTIFY connectFailedChanged)
     Q_PROPERTY(bool stalledReasonPlain READ stalledReasonPlain NOTIFY connectFailedChanged)
+    // v2.0 03-06 (REQ-CUST01, ADR-0147): the Arabic run of the same outcome, and Contact support.
+    Q_PROPERTY(QString endReasonTextArabic READ endReasonTextArabic NOTIFY outcomeExtrasChanged)
+    Q_PROPERTY(bool contactSupportVisible READ contactSupportVisible NOTIFY outcomeExtrasChanged)
     Q_PROPERTY(QString engineEndMessage READ engineEndMessage NOTIFY engineEndMessageChanged)
     Q_PROPERTY(int liveRetrySeconds READ liveRetrySeconds NOTIFY retrySecondsChanged)
     Q_PROPERTY(QVariantMap account READ account NOTIFY accountChanged)
@@ -468,6 +473,21 @@ public:
     }
     Q_INVOKABLE void interrupt() { ++m_interrupts; }
     int interrupts() const { return m_interrupts; }
+
+    // v2.0 03-06: the Arabic line and the support control, set the way the facade sets them.
+    QString endReasonTextArabic() const { return m_endReasonTextArabic; }
+    bool contactSupportVisible() const { return m_contactSupport; }
+    void setOutcomeExtras(const QString& arabic, bool contactSupport)
+    {
+        m_endReasonTextArabic = arabic;
+        m_contactSupport = contactSupport;
+        emit outcomeExtrasChanged();
+    }
+    Q_INVOKABLE void openSupport() { ++m_supportOpens; }
+    int supportOpens() const { return m_supportOpens; }
+signals:
+    void outcomeExtrasChanged();
+public:
 
     // Home offline countdown and `Try now`.
     int liveRetrySeconds() const { return m_liveRetrySeconds; }
@@ -648,6 +668,10 @@ private:
     int m_acknowledgements = 0;
     QString m_homeStatus = QStringLiteral("ready");
     QString m_endReasonText;
+    // v2.0 03-06: the Arabic run and the support control.
+    QString m_endReasonTextArabic;
+    bool m_contactSupport = false;
+    int m_supportOpens = 0;
     QString m_identity = QStringLiteral("+962 7 0001 0002");
     QString m_reference;
     QVariantMap m_failure;
@@ -818,6 +842,12 @@ private slots:
     void homeShowsMoonlightsEndMessageVerbatim();
     void homeHidesTheEngineEndMessageLineWhenEmpty();
     void connectFailureShowsMoonlightsTextVerbatim();
+    // v2.0 03-06 (REQ-CUST01): the bilingual outcome and Contact support.
+    void aFailedWaitShowsTheArabicLineUnmirroredWithContactSupport();
+    void anOutageWaitOffersTryAgainAndNoContactSupport();
+    void homeShowsBothLinesOfAStartupOutcome();
+    void anEmptyArabicLineLeavesNoGap();
+    void waitingShowsNoQueuePositionOrCount();
     void theClientRaisesNoNotificationOfAnyKind();
     void homeNoLongerCarriesTheBalanceElement();
     void appHeaderCarriesTheWordmarkTheBalanceAndTheMenuInThatOrder();
@@ -4539,6 +4569,172 @@ void TstUiScreens::connectFailureShowsMoonlightsTextVerbatim()
     QObject* reason = itemNamed(screen.data(), QStringLiteral("stalledReason"));
     QCOMPARE(reason->property("text").toString(), text);
     QCOMPARE(reason->property("textFormat").toInt(), 0); // Text.PlainText: the <b> renders literally
+}
+
+// v2.0 03-06 (REQ-CUST01, ADR-0147, ADR-0043): copy.md row 652 - the combined PC-problem outcome -
+// in English with the approved Arabic beneath it and `Contact support` beside the two ways on.
+void TstUiScreens::aFailedWaitShowsTheArabicLineUnmirroredWithContactSupport()
+{
+    QQuickStyle::setStyle(QStringLiteral("Basic"));
+    QQmlEngine engine;
+    registerTokenSingletons(&engine);
+    FakeShellClient client;
+
+    QString error;
+    QScopedPointer<QObject> screen(connectingScreen(&engine, &client, &error));
+    QVERIFY2(screen, qPrintable(error));
+
+    const QString english = QStringLiteral(
+        "Your PC had a problem, and no other free PC is available right now. You were not charged. "
+        "Contact support.");
+    const QString arabic = QStringLiteral(
+        "حدثت مشكلة في جهاز الكمبيوتر، ولا يوجد جهاز آخر متاح حاليًا. لم يتم خصم أي مبلغ منك. يرجى التواصل مع الدعم.");
+    client.setConnectStage(1);
+    client.setStalled(QStringLiteral("Stopped at: Preparing the rig"), english, QString());
+    client.setOutcomeExtras(arabic, true);
+
+    QObject* englishLine = itemNamed(screen.data(), QStringLiteral("stalledReason"));
+    QObject* arabicLine = itemNamed(screen.data(), QStringLiteral("endReasonArabic"));
+    QVERIFY(englishLine && arabicLine);
+    QCOMPARE(englishLine->property("text").toString(), english);
+    QCOMPARE(arabicLine->property("text").toString(), arabic);
+    QVERIFY(effectivelyVisible(arabicLine));
+
+    // The Arabic run uses the token's family, and sits on the same left edge as the English line:
+    // one LTR layout carries both, never a mirrored copy (ADR-0043).
+    QCOMPARE(arabicLine->property("font").value<QFont>().family(),
+             QString::fromLatin1(kArabicFamily));
+    QQuickItem* englishItem = qobject_cast<QQuickItem*>(englishLine);
+    QQuickItem* arabicItem = qobject_cast<QQuickItem*>(arabicLine);
+    QQuickItem* screenItem = qobject_cast<QQuickItem*>(screen.data());
+    QVERIFY(englishItem && arabicItem && screenItem);
+    QCOMPARE(arabicItem->mapToItem(screenItem, QPointF(0, 0)).x(),
+             englishItem->mapToItem(screenItem, QPointF(0, 0)).x());
+
+    // Contact support is offered beside Try again and Back to home, and it reaches the facade's own
+    // openSupport() - the compiled website home, never a URL the server sent (T-03-16).
+    QObject* support = buttonNamed(screen.data(), QStringLiteral("contactSupportButton"));
+    QVERIFY(support);
+    QVERIFY(effectivelyVisible(support));
+    QCOMPARE(support->property("text").toString(), QStringLiteral("Contact support"));
+    QVERIFY(effectivelyVisible(buttonNamed(screen.data(), QStringLiteral("tryAgainButton"))));
+    QVERIFY(effectivelyVisible(buttonNamed(screen.data(), QStringLiteral("backButton"))));
+    QMetaObject::invokeMethod(support, "clicked");
+    QCOMPARE(client.supportOpens(), 1);
+}
+
+// copy.md row 653: the shared outage. Both languages, the two ways on, and no Contact support.
+void TstUiScreens::anOutageWaitOffersTryAgainAndNoContactSupport()
+{
+    QQuickStyle::setStyle(QStringLiteral("Basic"));
+    QQmlEngine engine;
+    registerTokenSingletons(&engine);
+    FakeShellClient client;
+
+    QString error;
+    QScopedPointer<QObject> screen(connectingScreen(&engine, &client, &error));
+    QVERIFY2(screen, qPrintable(error));
+
+    const QString arabic = QStringLiteral(
+        "لا يمكننا تشغيل جهاز كمبيوتر حاليًا. يرجى المحاولة لاحقًا. لم يتم خصم أي مبلغ منك.");
+    client.setConnectStage(1);
+    client.setStalled(QStringLiteral("Stopped at: Preparing the rig"),
+                      QStringLiteral("We can't start a PC right now. Please try again later. "
+                                     "You were not charged."),
+                      QString());
+    client.setOutcomeExtras(arabic, false);
+
+    QObject* arabicLine = itemNamed(screen.data(), QStringLiteral("endReasonArabic"));
+    QVERIFY(arabicLine);
+    QCOMPARE(arabicLine->property("text").toString(), arabic);
+    QVERIFY(!effectivelyVisible(buttonNamed(screen.data(), QStringLiteral("contactSupportButton"))));
+    QVERIFY(effectivelyVisible(buttonNamed(screen.data(), QStringLiteral("tryAgainButton"))));
+    QVERIFY(effectivelyVisible(buttonNamed(screen.data(), QStringLiteral("backButton"))));
+}
+
+// Home carries the same two lines for a session that ended with one of these reasons.
+void TstUiScreens::homeShowsBothLinesOfAStartupOutcome()
+{
+    QQuickStyle::setStyle(QStringLiteral("Basic"));
+    QQmlEngine engine;
+    registerTokenSingletons(&engine);
+
+    FakeShellClient client;
+    QString error;
+    QScopedPointer<QObject> screen(instantiate(&engine, QStringLiteral("HomeScreen.qml"), &error));
+    QVERIFY2(screen, qPrintable(error));
+    QVERIFY(screen->setProperty("client", QVariant::fromValue(static_cast<QObject*>(&client))));
+
+    const QString english = QStringLiteral(
+        "Your PC had a problem, and no other free PC is available right now. You were not charged. "
+        "Contact support.");
+    const QString arabic = QStringLiteral(
+        "حدثت مشكلة في جهاز الكمبيوتر، ولا يوجد جهاز آخر متاح حاليًا. لم يتم خصم أي مبلغ منك. يرجى التواصل مع الدعم.");
+    client.setEndReasonText(english);
+    client.setOutcomeExtras(arabic, true);
+
+    QVERIFY2(findVisibleTextItem(screen.data(), english), "Home must render the English line");
+    QObject* arabicLine = screen->findChild<QObject*>(QStringLiteral("endReasonLineArabic"));
+    QVERIFY(arabicLine);
+    QVERIFY(effectivelyVisible(arabicLine));
+    QCOMPARE(arabicLine->property("text").toString(), arabic);
+    QCOMPARE(arabicLine->property("font").value<QFont>().family(), QString::fromLatin1(kArabicFamily));
+
+    QObject* support = buttonNamed(screen.data(), QStringLiteral("contactSupportButton"));
+    QVERIFY(support);
+    QVERIFY(effectivelyVisible(support));
+    QMetaObject::invokeMethod(support, "clicked");
+    QCOMPARE(client.supportOpens(), 1);
+}
+
+// No Arabic text means no Arabic element: an empty Text would still take its gap in the column.
+void TstUiScreens::anEmptyArabicLineLeavesNoGap()
+{
+    QQuickStyle::setStyle(QStringLiteral("Basic"));
+    QQmlEngine engine;
+    registerTokenSingletons(&engine);
+    FakeShellClient client;
+
+    QString error;
+    QScopedPointer<QObject> screen(connectingScreen(&engine, &client, &error));
+    QVERIFY2(screen, qPrintable(error));
+    client.setConnectStage(1);
+    client.setStalled(QStringLiteral("Stopped at: Preparing the rig"),
+                      QStringLiteral("The stream didn't start. You were not charged."), QString());
+    client.setOutcomeExtras(QString(), false);
+
+    QVERIFY(!effectivelyVisible(itemNamed(screen.data(), QStringLiteral("endReasonArabic"))));
+    QVERIFY(!effectivelyVisible(buttonNamed(screen.data(), QStringLiteral("contactSupportButton"))));
+}
+
+// While waiting: the getting-ready stage and nothing that stands for a place in a line or a count.
+void TstUiScreens::waitingShowsNoQueuePositionOrCount()
+{
+    QQuickStyle::setStyle(QStringLiteral("Basic"));
+    QQmlEngine engine;
+    registerTokenSingletons(&engine);
+    FakeShellClient client;
+
+    QString error;
+    QScopedPointer<QObject> screen(connectingScreen(&engine, &client, &error));
+    QVERIFY2(screen, qPrintable(error));
+    client.setConnectStage(1);
+    client.setOutcomeExtras(QString(), false);
+
+    QVERIFY(effectivelyVisible(buttonNamed(screen.data(), QStringLiteral("cancelButton"))));
+    QVERIFY(!effectivelyVisible(buttonNamed(screen.data(), QStringLiteral("tryAgainButton"))));
+
+    QStringList everything;
+    collectTexts(qobject_cast<QQuickItem*>(screen.data()), &everything);
+    const QString joined = everything.join(QLatin1Char('\n'));
+    for (const QString& word : {QStringLiteral("position"), QStringLiteral("in line"),
+                                QStringLiteral("ETA"), QStringLiteral("queue"),
+                                QStringLiteral("ahead of")}) {
+        QVERIFY2(!joined.contains(word, Qt::CaseInsensitive),
+                 qPrintable(QStringLiteral("the wait says '%1'").arg(word)));
+    }
+    QVERIFY2(!joined.contains(QRegularExpression(QStringLiteral("[0-9]"))),
+             qPrintable(QStringLiteral("the wait draws a count: %1").arg(joined)));
 }
 
 void TstUiScreens::connectingShowsCancelWhileItGoesAndTheNamedStallWhenItStops()

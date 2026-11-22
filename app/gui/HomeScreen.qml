@@ -70,6 +70,11 @@ Item {
                                           ? String(client.failure.error) : ""
     readonly property string refusalReference: (client && client.reference)
                                                ? String(client.reference) : ""
+    // v2.0 03-06 (REQ-CUST01, ADR-0147/ADR-0043): the Arabic line of the last session's outcome, and
+    // whether that outcome offers support. Same one layout, no mirroring.
+    readonly property string arabicOutcome: (client && client.endReasonTextArabic)
+                                            ? String(client.endReasonTextArabic) : ""
+    readonly property bool contactSupport: client && client.contactSupportVisible === true
 
     Column {
         anchors.centerIn: parent
@@ -104,6 +109,35 @@ Item {
             color: Tokens.foregroundMutedDefault
             font.family: Tokens.fontSansDefault
             font.pixelSize: Metrics.fontBody
+        }
+
+        // v2.0 03-06 (REQ-CUST01, ADR-0147/ADR-0043): the Arabic line of the same outcome, in the
+        // tokens' Arabic family, under the English one and on the same left edge. Empty means no
+        // element and no gap.
+        Text {
+            objectName: "endReasonLineArabic"
+            width: parent.width
+            visible: text.length > 0
+            text: root.arabicOutcome
+            textFormat: Text.PlainText
+            wrapMode: Text.Wrap
+            horizontalAlignment: Text.AlignLeft
+            LayoutMirroring.enabled: false
+            color: Tokens.foregroundMutedDefault
+            font.family: Tokens.fontArabicDefault
+            font.pixelSize: Metrics.fontBody
+        }
+
+        // v2.0 03-06 (DD-6): offered only by the combined PC-problem outcome. It opens the website
+        // home through the facade's own openSupport() - the compiled URL (T-03-16).
+        SeatHubButton {
+            objectName: "contactSupportButton"
+            width: parent.width
+            variant: "ghost"
+            visible: root.contactSupport
+            text: qsTr("Contact support")
+
+            onClicked: root.client.openSupport()
         }
 
         // The state line: named loading, the no-rig sentence, or the offline sentence.
