@@ -47,6 +47,7 @@
 #include <QJsonObject>
 #include <QProcess>
 #include <QProcessEnvironment>
+#include <QSettings>
 #include <QStandardPaths>
 #include <QStringList>
 #include <QSet>
@@ -334,6 +335,20 @@ int runDiagChild(int argc, char* argv[])
     const QString spoolDir = argc > 6 ? QString::fromLocal8Bit(argv[6]) : QString();
     const QString runStateDir = argc > 7 ? QString::fromLocal8Bit(argv[7]) : QString();
 
+    if (scenario.startsWith(QLatin1String("sdk-offline-"))) {
+        // AppDataLocation has no production override. Give this test child a
+        // path-valued application suffix that resolves into its own temp profile,
+        // and verify the result before any cache write; never touch the shared sandbox.
+        const QString profile = runStateDir + QStringLiteral("/profile");
+        const QString base = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
+        QCoreApplication::setApplicationName(QCoreApplication::applicationName()
+            + QLatin1Char('/') + QDir(base).relativeFilePath(profile));
+        if (QDir::cleanPath(TokenStore::defaultDirectory()) != QDir::cleanPath(profile)) return 3;
+        QSettings::setDefaultFormat(QSettings::IniFormat);
+        QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, profile);
+        QSettings::setPath(QSettings::IniFormat, QSettings::SystemScope, profile);
+    }
+
     SeatHubTelemetry::Options options;
     options.databaseDir = dbDir;
     options.handlerPath = handler;
@@ -546,7 +561,8 @@ int runDiagChild(int argc, char* argv[])
         emitStreamDiagnostics();
         SeatHubTelemetry::noteLaunch();
     }
-    else if (scenario == QLatin1String("offline-queue")) {
+    else if (scenario == QLatin1String("offline-queue")
+             || scenario == QLatin1String("sdk-offline-queue")) {
         QElapsedTimer emission;
         emission.start();
         emitStep(QStringLiteral("pair_handshake"), QStringLiteral("failed"),
@@ -554,7 +570,8 @@ int runDiagChild(int argc, char* argv[])
         emitStreamDiagnostics();
         fprintf(stdout, "EMISSION_MS=%lld\n", static_cast<long long>(emission.elapsed()));
     }
-    else if (scenario == QLatin1String("offline-drain")) {
+    else if (scenario == QLatin1String("offline-drain")
+             || scenario == QLatin1String("sdk-offline-drain")) {
         // Startup adopts the previous process's spool before this scenario reaches the exit drain.
         SeatHubTelemetry::noteLaunch();
     }
@@ -691,6 +708,7 @@ struct ParsedLogItem
     QString body;
     QString level;
     QJsonObject attributes;
+    QJsonValue timestamp;
 };
 
 ParsedLogItem parseFirstLogItem(const QByteArray& envelopeBody)
@@ -837,6 +855,7 @@ QList<ParsedLogItem> parseLogItems(const QByteArray& envelopeBody)
             parsed.body = log.value(QStringLiteral("body")).toString();
             parsed.level = log.value(QStringLiteral("level")).toString();
             parsed.attributes = log.value(QStringLiteral("attributes")).toObject();
+            parsed.timestamp = log.value(QStringLiteral("timestamp"));
             items.append(parsed);
         }
     }
@@ -2522,6 +2541,86 @@ private slots:
                                         .arg(QString::fromLatin1(hostile))));
             }
         }
+    }
+
+    void signedInOfflineSdkDiagnosticsSurviveAndDrainAfterRestart()
+    {
+        QTemporaryDir db, spool, runState;
+        QVERIFY(db.isValid() && spool.isValid() && runState.isValid());
+        QTcpServer collector;
+        QVERIFY(collector.listen(QHostAddress::LocalHost, 0));
+        const quint16 port = collector.serverPort();
+        collector.close(); // real failed WinHTTP transport, no mock SDK hand-off
+        const QString dsn = QStringLiteral("http://publickey@127.0.0.1:%1/1").arg(port);
+        const auto arguments = [&](const QString& scenario) {
+            return QStringList{QStringLiteral("--diag-child"), scenario, dsn,
+                               db.path(), m_handlerPath, spool.path(), runState.path()};
+        };
+        QProcess offline;
+        offline.setProgram(m_appPath);
+        offline.setArguments(arguments(QStringLiteral("sdk-offline-queue")));
+        offline.start();
+        QVERIFY(offline.waitForStarted(5000));
+        QTRY_COMPARE_WITH_TIMEOUT(offline.state(), QProcess::NotRunning, 15000);
+        QCOMPARE(offline.exitStatus(), QProcess::NormalExit);
+        QVERIFY2(offline.exitCode() == 0, offline.readAllStandardError().constData());
+        QVERIFY(offline.readAllStandardOutput().contains("EMISSION_MS="));
+        QVERIFY(QFile::exists(runState.path() + QStringLiteral("/profile/telemetry.json")));
+
+        QList<QByteArray> persisted;
+        QDir cache(db.path() + QStringLiteral("/cache"));
+        const QStringList originals = cache.entryList({QStringLiteral("*.envelope")}, QDir::Files);
+        QVERIFY2(!originals.isEmpty(), "signed-in network failure must persist actual SDK envelopes");
+        for (const QString& fileName : originals) {
+            QFile file(cache.filePath(fileName));
+            QVERIFY(file.open(QIODevice::ReadOnly));
+            persisted.append(file.readAll());
+        }
+        const EnvelopeScan before = scanEnvelopes(persisted);
+        QByteArray cacheEvidence;
+        for (const QByteArray& envelope : persisted) cacheEvidence += envelope.left(1200) + '\n';
+        const QStringList bodies{QStringLiteral("play.step"), QStringLiteral("stream.rollup"),
+                                 QStringLiteral("play.summary")};
+        for (const QString& body : bodies) {
+            const ParsedLogItem original = findLog(before, body);
+            QVERIFY2(original.found, qPrintable(body + QStringLiteral(" must be in SDK disk cache: ")
+                                               + QString::fromUtf8(cacheEvidence)));
+            QCOMPARE(original.attributes.value("user.id").toObject().value("value").toString(),
+                     QStringLiteral("acct-diag-child"));
+            QVERIFY(original.attributes.value("seathub.logged_at").toObject().value("value").toDouble() > 0);
+            QVERIFY(original.timestamp.toDouble() > 0);
+        }
+        // These originals have left LogShipper: replay must not be rescued by the
+        // signed-out JSONL path that the older offline test exercises.
+        for (const QString& fileName : QDir(spool.path()).entryList({QStringLiteral("*.jsonl")}, QDir::Files)) {
+            QFile file(QDir(spool.path()).filePath(fileName));
+            QVERIFY(file.open(QIODevice::ReadOnly));
+            const QByteArray lines = file.readAll();
+            for (const QString& body : bodies) QVERIFY(!lines.contains(body.toUtf8()));
+        }
+
+        QList<QByteArray> delivered;
+        wireEnvelopeCollector(&collector, &delivered);
+        QVERIFY(collector.listen(QHostAddress::LocalHost, port)); // SAME DSN after restart
+        QProcess online;
+        online.setProgram(m_appPath);
+        online.setArguments(arguments(QStringLiteral("sdk-offline-drain")));
+        online.start();
+        QVERIFY(online.waitForStarted(5000));
+        QTRY_COMPARE_WITH_TIMEOUT(online.state(), QProcess::NotRunning, 15000);
+        QCOMPARE(online.exitStatus(), QProcess::NormalExit);
+        QCOMPARE(online.exitCode(), 0);
+        for (const QString& body : bodies) QTRY_VERIFY_WITH_TIMEOUT(hasLog(delivered, body), 15000);
+        const EnvelopeScan after = scanEnvelopes(delivered);
+        for (const QString& body : bodies) {
+            const ParsedLogItem original = findLog(before, body);
+            const ParsedLogItem replayed = findLog(after, body);
+            QCOMPARE(replayed.body, original.body);
+            QCOMPARE(replayed.level, original.level);
+            QCOMPARE(replayed.attributes, original.attributes); // includes original logged_at and identity
+            QCOMPARE(replayed.timestamp, original.timestamp);
+        }
+        for (const QString& fileName : originals) QVERIFY(!QFile::exists(cache.filePath(fileName)));
     }
 
     void offlineDiagnosticsAreDeliveredByTheNextProcess()
