@@ -164,6 +164,7 @@ PairingTarget targetForFakeHandshake()
     target.sessionId = QStringLiteral("aaaabbbb-cccc-dddd-eeee-ffff00001111");
     target.hostAddress = QStringLiteral("203.0.113.7");
     target.httpsPort = 47984;
+    target.controlPort = 47989;
     target.pairingPin = QStringLiteral("4217");
     return target;
 }
