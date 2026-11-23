@@ -278,8 +278,17 @@ function Invoke-ReleaseCandidate {
         # requests it so no test is skipped, and the sheet lands in build\ with the rest of the
         # output.
         $env:SEATHUB_PICTURE_SHEET_DIR = Join-Path $buildRoot 'picture-sheet'
-        $suiteOutput = @(& cmd.exe /d /c "`"$runner`"" 2>&1)
-        $suiteExit = $LASTEXITCODE
+        # The suite runner's toolchain probe leaves harmless warnings on stderr (vcvars64.bat looks
+        # for its own vswhere). Redirecting stderr while $ErrorActionPreference is 'Stop' would turn
+        # the first of those into a terminating error, so it is relaxed for this call only; the
+        # runner's own exit code and its Totals lines still decide the result.
+        $previousPreference = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try {
+            $suiteOutput = @(& cmd.exe /d /c "`"$runner`"" 2>&1 | ForEach-Object { "$_" })
+            $suiteExit = $LASTEXITCODE
+        }
+        finally { $ErrorActionPreference = $previousPreference }
         $suiteLog = Join-Path $buildRoot 'customer-candidate-suites.log'
         Set-Content -LiteralPath $suiteLog -Value $suiteOutput -Encoding UTF8
         $suiteOutput | ForEach-Object { Write-Host $_ }
