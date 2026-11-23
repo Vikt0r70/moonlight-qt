@@ -29,6 +29,12 @@
 #
 # Git's bash is named explicitly. A bare `bash` on this PC is WSL's C:\WINDOWS\system32\bash.exe,
 # which has no git on its PATH and would report the diff steps as failures for the wrong reason.
+#
+# build-seathub.ps1 and pack-seathub.ps1 are called as child processes under pwsh, the interpreter
+# their own usage lines name. Windows PowerShell 5.1 cannot run build-seathub.ps1 at all: the banner
+# cl.exe writes to stderr becomes a terminating NativeCommandError at build-seathub.ps1:98 because
+# both scripts set $ErrorActionPreference = 'Stop'. This script itself stays runnable under either
+# interpreter.
 
 [CmdletBinding()]
 param(
@@ -41,6 +47,25 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
 $GitBash = 'C:\Program Files\Git\bin\bash.exe'
+
+# The interpreter for the two existing scripts (see the header). pwsh is what they are written for;
+# powershell.exe is the fallback only so a missing pwsh fails inside the called script, not here.
+function Get-ChildInterpreter {
+    $pwsh = Get-Command pwsh -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($pwsh) { return $pwsh.Source }
+    return 'powershell.exe'
+}
+
+# Runs one of the existing release scripts as its own process, so its own error preference, and the
+# stderr the toolchain writes, cannot stop this script mid-way.
+function Invoke-ChildScript([string]$ScriptPath, [string]$QtDir, [string]$VcVars) {
+    $interpreter = Get-ChildInterpreter
+    $childArgs = @('-NoProfile', '-File', $ScriptPath, '-QtDir', $QtDir)
+    if ($VcVars) { $childArgs += @('-VcVars', $VcVars) }
+    & $interpreter @childArgs
+    $code = $LASTEXITCODE
+    if ($code -ne 0) { throw "$(Split-Path -Leaf $ScriptPath) failed with exit code $code" }
+}
 
 function Step([string]$text) { Write-Host "`n=== $text ===" -ForegroundColor Cyan }
 
@@ -241,9 +266,7 @@ function Invoke-ReleaseCandidate {
 
         Step 'Build (full compile, no reuse)'
         $buildScript = Join-Path $PSScriptRoot 'build-seathub.ps1'
-        $buildArgs = @{ QtDir = $QtDir }
-        if ($VcVars) { $buildArgs['VcVars'] = $VcVars }
-        & $buildScript @buildArgs
+        Invoke-ChildScript -ScriptPath $buildScript -QtDir $QtDir -VcVars $VcVars
 
         Step 'Full suite run'
         $runner = Join-Path $repoRoot 'tests\run-all-suites.cmd'
@@ -319,9 +342,7 @@ function Invoke-ReleaseCandidate {
 
         Step 'Pack'
         $packScript = Join-Path $PSScriptRoot 'pack-seathub.ps1'
-        $packArgs = @{ QtDir = $QtDir }
-        if ($VcVars) { $packArgs['VcVars'] = $VcVars }
-        & $packScript @packArgs
+        Invoke-ChildScript -ScriptPath $packScript -QtDir $QtDir -VcVars $VcVars
 
         $releaseDir = Join-Path $buildRoot 'velopack-x64-release'
         $setup = Join-Path $releaseDir 'RentaPC-Setup.exe'
