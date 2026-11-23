@@ -588,15 +588,29 @@ int runDiagChild(int argc, char* argv[])
     }
 
     LogShipper::instance().drainBeforeSignOut();
+    // The SDK-offline scenarios need one real, FAILED WinHTTP request to finish before this process
+    // exits. The send to a closed loopback port takes ~2.1 s (four measured runs: 2163, 2187, 2205 ms
+    // until db/cache appeared) before `WinHttpSendRequest` reports the failure, because the client
+    // opens with WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY
+    // (build/sentry-native-0.17.1/src/src/transports/sentry_http_transport_winhttp.c:128) and that
+    // proxy resolution costs about that long here; its own resolve/connect timeouts are 15 s (:148).
+    // At the old 2000 ms budget `flush()` expired every time, and the cache write - the
+    // `sentry__retry_enqueue()` that lands `db/cache/<ts>-00-<uuid>.envelope`
+    // (src/sentry_retry.c:345-367) - only happened because the child lingered a few tens of ms past
+    // the flush. This child never calls `sentry_close()` (the product never does, telemetry.cpp:936),
+    // so an envelope still in flight when it exits is lost, and a second envelope is sent only after
+    // the first returns. 15000 covers the transport's own timeouts; the parent requires FLUSH_OK=1.
+    const bool offlineSdk = scenario == QLatin1String("sdk-offline-queue")
+        || scenario == QLatin1String("sdk-offline-drain");
+    const uint64_t flushBudgetMs = offlineSdk ? 15000 : 2000;
     const qint64 flushStartedAt = QDateTime::currentMSecsSinceEpoch();
-    const bool flushed = SeatHubTelemetry::flush(2000);
+    const bool flushed = SeatHubTelemetry::flush(flushBudgetMs);
     const qint64 flushElapsed = QDateTime::currentMSecsSinceEpoch() - flushStartedAt;
-    if (scenario == QLatin1String("flush")) {
-        // The parent reads this: the call must return inside its 2000 ms budget.
-        fprintf(stdout, "FLUSH_MS=%lld FLUSH_OK=%d\n", static_cast<long long>(flushElapsed),
-                flushed ? 1 : 0);
-        fflush(stdout);
-    }
+    // The parent reads this for every scenario: `flush` must return inside its 2000 ms budget, and
+    // the offline scenarios must return true before the cache is read.
+    fprintf(stdout, "FLUSH_MS=%lld FLUSH_OK=%d\n", static_cast<long long>(flushElapsed),
+            flushed ? 1 : 0);
+    fflush(stdout);
     LogShipper::instance().stop();
     // A marker after the one call that can block on another thread, so a parent that reports a
     // child "still running" can tell where it stopped rather than guessing.
@@ -606,6 +620,30 @@ int runDiagChild(int argc, char* argv[])
 }
 
 // --- the fake Sentry endpoint --------------------------------------------------------------
+
+/// The loopback port the offline tests point a DSN at: nothing accepts a connection on it now, and
+/// nothing can appear on it while the child runs. The candidates sit below the Windows dynamic port
+/// range (49152-65535 by default), so no other process's `listen(0)` is handed one in between.
+/// `listen(0)` + `close()`, the shape the older offline test uses, returns its port to that dynamic
+/// range: a process that claims it in the gap turns the expected network failure into an HTTP
+/// answer, which caches nothing (`cache_keep` is unset), or into a silent listener that stalls the
+/// send past the flush budget. Only "nothing accepts the connect" is checked, never the error code:
+/// this Qt/Windows build answers a refused loopback connect with `SocketTimeoutError`, so the code
+/// proves nothing about the peer.
+bool findUnusedLoopbackPort(quint16* port)
+{
+    for (quint16 candidate = 4711; candidate <= 4781; ++candidate) {
+        QTcpSocket probe;
+        probe.connectToHost(QHostAddress::LocalHost, candidate);
+        const bool connected = probe.waitForConnected(500);
+        probe.abort();
+        if (!connected) {
+            *port = candidate;
+            return true;
+        }
+    }
+    return false;
+}
 
 /// Wires `server` to answer every request with `200 {}` and record the request line's path in
 /// `receivedPaths`. Only the request line is parsed - crashpad's real POST bodies are chunked and
@@ -2548,9 +2586,11 @@ private slots:
         QTemporaryDir db, spool, runState;
         QVERIFY(db.isValid() && spool.isValid() && runState.isValid());
         QTcpServer collector;
-        QVERIFY(collector.listen(QHostAddress::LocalHost, 0));
-        const quint16 port = collector.serverPort();
-        collector.close(); // real failed WinHTTP transport, no mock SDK hand-off
+        // Real failed WinHTTP transport, no mock SDK hand-off - and a port that is guaranteed to
+        // refuse the child's connect when it flushes (see findUnusedLoopbackPort).
+        quint16 port = 0;
+        QVERIFY2(findUnusedLoopbackPort(&port),
+                 "every candidate loopback DSN port accepts a connection");
         const QString dsn = QStringLiteral("http://publickey@127.0.0.1:%1/1").arg(port);
         const auto arguments = [&](const QString& scenario) {
             return QStringList{QStringLiteral("--diag-child"), scenario, dsn,
@@ -2561,15 +2601,28 @@ private slots:
         offline.setArguments(arguments(QStringLiteral("sdk-offline-queue")));
         offline.start();
         QVERIFY(offline.waitForStarted(5000));
-        QTRY_COMPARE_WITH_TIMEOUT(offline.state(), QProcess::NotRunning, 15000);
+        QTRY_COMPARE_WITH_TIMEOUT(offline.state(), QProcess::NotRunning, 30000);
         QCOMPARE(offline.exitStatus(), QProcess::NormalExit);
         QVERIFY2(offline.exitCode() == 0, offline.readAllStandardError().constData());
-        QVERIFY(offline.readAllStandardOutput().contains("EMISSION_MS="));
+        const QByteArray offlineReport = offline.readAllStandardOutput();
+        QVERIFY(offlineReport.contains("EMISSION_MS="));
+        // The child's own flush result, not a hopeful wait: only FLUSH_OK=1 says its failed send
+        // classified (and wrote the cache) before the process exited. The child never calls
+        // `sentry_close()`, so anything still in flight when it exits is gone.
+        const QRegularExpressionMatch flushMatch =
+            QRegularExpression(QStringLiteral("FLUSH_OK=(\\d+)")).match(QString::fromUtf8(offlineReport));
+        QVERIFY2(flushMatch.hasMatch(),
+                 qPrintable(QStringLiteral("no flush result in: %1").arg(QString::fromUtf8(offlineReport))));
+        QCOMPARE(flushMatch.captured(1), QStringLiteral("1"));
         QVERIFY(QFile::exists(runState.path() + QStringLiteral("/profile/telemetry.json")));
 
         QList<QByteArray> persisted;
         QDir cache(db.path() + QStringLiteral("/cache"));
-        const QStringList originals = cache.entryList({QStringLiteral("*.envelope")}, QDir::Files);
+        QStringList originals;
+        // FLUSH_OK=1 already guarantees the write completed before the child exited; the bounded
+        // retry only covers filesystem visibility of a file written moments earlier.
+        QTRY_VERIFY_WITH_TIMEOUT(
+            !(originals = cache.entryList({QStringLiteral("*.envelope")}, QDir::Files)).isEmpty(), 2000);
         QVERIFY2(!originals.isEmpty(), "signed-in network failure must persist actual SDK envelopes");
         for (const QString& fileName : originals) {
             QFile file(cache.filePath(fileName));
@@ -2607,9 +2660,15 @@ private slots:
         online.setArguments(arguments(QStringLiteral("sdk-offline-drain")));
         online.start();
         QVERIFY(online.waitForStarted(5000));
-        QTRY_COMPARE_WITH_TIMEOUT(online.state(), QProcess::NotRunning, 15000);
+        QTRY_COMPARE_WITH_TIMEOUT(online.state(), QProcess::NotRunning, 30000);
         QCOMPARE(online.exitStatus(), QProcess::NormalExit);
         QCOMPARE(online.exitCode(), 0);
+        // Same guarantee on the way back: the drain's own flush completed before it exited, so an
+        // undelivered original below is a real drain failure, not a process that quit too early.
+        const QByteArray onlineReport = online.readAllStandardOutput();
+        QVERIFY2(onlineReport.contains("FLUSH_OK=1"),
+                 qPrintable(QStringLiteral("drain flush did not complete: %1")
+                                .arg(QString::fromUtf8(onlineReport))));
         for (const QString& body : bodies) QTRY_VERIFY_WITH_TIMEOUT(hasLog(delivered, body), 15000);
         const EnvelopeScan after = scanEnvelopes(delivered);
         for (const QString& body : bodies) {
