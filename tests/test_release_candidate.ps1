@@ -79,6 +79,38 @@ Check 'a suite whose only PASS lines are the fixture hooks is reported' ($hooksO
 Check 'the hooks-only report says no real PASS line ran' (
     ($hooksOnlyProblems -join ' ') -match 'initTestCase')
 
+# The manifest is the one artefact 04-06 reads (plan 04-05 T1's key list). A dry run has not packed,
+# so setup_sha256 must be JSON null rather than an empty string: a later step that tests it for a
+# hash has to see "not computed yet", not "computed as nothing".
+$manifestPath = Join-Path ([IO.Path]::GetTempPath()) ('candidate-manifest-' + [guid]::NewGuid().ToString('n') + '.json')
+try {
+    Write-CandidateManifest -ManifestPath $manifestPath -AppVersion '0.1.38' -SetupVersion $null -DryRun $true `
+        -SetupSha256 $null -ClientCommit ('a' * 40) -ClientTree ('b' * 40) -FileVersion '0.1.38.0' `
+        -SuiteCount 30 | Out-Null
+    $dryManifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+    $dryKeys = @($dryManifest.PSObject.Properties.Name)
+    Check 'the dry-run manifest carries the plan''s keys' (
+        @(@('versions', 'dry_run', 'setup_sha256', 'published', 'signed', 'client', 'file_version',
+            'suite_count', 'boundary') | Where-Object { $dryKeys -notcontains $_ }).Count -eq 0)
+    Check 'a dry-run manifest leaves setup_sha256 null' ($null -eq $dryManifest.setup_sha256)
+    Check 'a dry-run manifest is flagged and not published' (
+        $dryManifest.dry_run -eq $true -and $dryManifest.published -eq $false -and $dryManifest.signed -eq $false)
+    Check 'the manifest records the app version and both client revisions' (
+        $dryManifest.versions.app -eq '0.1.38' -and $dryManifest.client.commit -eq ('a' * 40) -and $dryManifest.client.tree -eq ('b' * 40))
+
+    Write-CandidateManifest -ManifestPath $manifestPath -AppVersion '0.1.38' -SetupVersion '0.1.38' -DryRun $false `
+        -SetupSha256 ('c' * 64) -ClientCommit ('a' * 40) -ClientTree ('b' * 40) -FileVersion '0.1.38.0' `
+        -SuiteCount 30 | Out-Null
+    $packedManifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+    Check 'a packed manifest carries the setup hash it measured' (
+        $packedManifest.setup_sha256 -eq ('c' * 64) -and $packedManifest.dry_run -eq $false)
+    Check 'a packed manifest still records a passing boundary' (
+        $packedManifest.boundary.passed -eq $true -and $packedManifest.boundary.steps -eq 3)
+}
+finally {
+    Remove-Item -LiteralPath $manifestPath -ErrorAction SilentlyContinue
+}
+
 if ($failures -gt 0) {
     Write-Host "TEST_RELEASE_CANDIDATE_FAILED ($failures check(s))"
     exit 1

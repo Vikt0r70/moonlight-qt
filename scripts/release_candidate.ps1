@@ -217,7 +217,9 @@ function Write-CandidateManifest(
             setup = $SetupVersion
         }
         dry_run     = $DryRun
-        setup_sha256 = $SetupSha256
+        # Plan 04-05 T1: null while this is a dry run, because nothing has been packed and no hash
+        # exists yet. An empty string would let a later reader treat "not computed" as a value.
+        setup_sha256 = if ($SetupSha256) { $SetupSha256 } else { $null }
         published   = $false
         signed      = $false
         client      = [ordered]@{
