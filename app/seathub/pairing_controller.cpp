@@ -317,13 +317,17 @@ void PairingController::handleAuthorization(quint64 attempt, const ControlPlaneR
             return;
         }
 
-        if (result.statusCode == 0) {
-            // FIX-01: a poll that never reached the control plane (no status at all) is a lost
-            // poll, not a refused start. Ask again on the normal interval and leave the running
-            // clock alone: an outage must stay bounded by the same 30 s the wait always had, so
-            // neither `m_clock` nor the deadline timer restarts here. Nothing was reached, which
-            // is what the deadline reports as `unreachable_deadline`.
-            m_transportFailureSeen = true;
+        if (result.statusCode == 0 || (result.statusCode >= 500 && result.statusCode <= 599)) {
+            // FIX-01: a poll that never reached the control plane (no status at all) or one the
+            // server could not answer at all (5xx) is a lost poll, not a refused start. Ask again
+            // on the normal interval and leave the running clock alone: an outage must stay
+            // bounded by the same 30 s the wait always had, so neither `m_clock` nor the deadline
+            // timer restarts here. A status of 0 means nothing was reached, which is what the
+            // deadline reports as `unreachable_deadline`; a 5xx means the server was reached, so
+            // the wait is still an ordinary deadline if it never clears.
+            if (result.statusCode == 0) {
+                m_transportFailureSeen = true;
+            }
             scheduleNextPoll();
             return;
         }

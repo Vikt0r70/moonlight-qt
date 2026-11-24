@@ -755,6 +755,75 @@ private slots:
         }
     }
 
+    void aServerErrorMidWaitIsRetriedNotAFailure()
+    {
+        // FIX-01: a 5xx is the server failing to answer, not the customer's rig. It is retried on
+        // the normal interval, so one bad poll cannot end a boot wait that is otherwise fine.
+        PairingController controller;
+        auto* fake = new PathNetworkAccessManager;
+        auto* seam = new RecordingSeam;
+        wire(controller, fake);
+        controller.setSeam(seam);
+        controller.setPollIntervalMs(1);
+
+        fake->authorizations.append(
+            qMakePair(200, authorizationBody(QString(), QStringLiteral("PREPARING"))));
+        fake->authorizations.append(qMakePair(503, QByteArray()));
+        fake->authorizations.append(
+            qMakePair(200, authorizationBody(QString::fromLatin1(kPin), QStringLiteral("READY"))));
+
+        QSignalSpy failed(&controller, &PairingController::pairingFailed);
+        QSignalSpy completed(&controller, &PairingController::pairingCompleted);
+        QSignalSpy records(&controller, &PairingController::attemptRecorded);
+
+        controller.start(QString::fromLatin1(kSessionId));
+
+        QTRY_COMPARE(completed.count(), 1);
+        QCOMPARE(failed.count(), 0);
+        QCOMPARE(seam->calls, 1);
+        QCOMPARE(fake->pairingPolls, 3);
+        for (const auto& record : records) {
+            QVERIFY2(record.first().value<AttemptRecord>().outcome != QLatin1String("refused"),
+                     "a 5xx poll must never be recorded as a refusal");
+        }
+    }
+
+    void aContinuousOutageEndsAtTheClockAsUnreachable()
+    {
+        // FIX-01 does not make an outage endless: with every poll lost, the wait ends when its
+        // running clock expires, and the class says the control plane was unreachable - never a
+        // refusal, so nothing is blamed on the rig or on the customer's network.
+        PairingController controller;
+        auto* fake = new FakeNetworkAccessManager;
+        auto* seam = new RecordingSeam;
+        wire(controller, fake);
+        controller.setSeam(seam);
+        controller.setPollIntervalMs(1);
+        // The production clock is 30 s; shortened here the way the deadline tests already do.
+        QCOMPARE(controller.deadlineMs(), 30000);
+        controller.setDeadlineMs(100);
+
+        fake->statuses = { 0 };
+        fake->bodies = { QByteArray() };
+
+        QSignalSpy failed(&controller, &PairingController::pairingFailed);
+        QSignalSpy steps(&controller, &PairingController::stepFailed);
+        QSignalSpy records(&controller, &PairingController::attemptRecorded);
+
+        controller.start(QString::fromLatin1(kSessionId));
+
+        QTRY_COMPARE_WITH_TIMEOUT(failed.count(), 1, 2000);
+        const SeatHubFailure failure = failed.first().first().value<SeatHubFailure>();
+        QCOMPARE(failure.kind, FailureKind::Local);
+        QCOMPARE(failure.error, QStringLiteral("The rig didn't finish connecting. Try again."));
+        QCOMPARE(controller.state(), QStringLiteral("failed"));
+        QCOMPARE(steps.count(), 1);
+        QCOMPARE(steps.first().at(0).toString(), QStringLiteral("pair_authorize"));
+        QCOMPARE(steps.first().at(1).toString(), QStringLiteral("unreachable_deadline"));
+        QCOMPARE(records.count(), 0);
+        QCOMPARE(seam->calls, 0);
+    }
+
     void aReadyAnswerWithAPinPairs()
     {
         // A 200 answer with `state: "READY"` and a PIN starts pairing as today.
