@@ -414,7 +414,10 @@ private slots:
             ++completions;
             QVERIFY(!result.ok);
             QCOMPARE(result.statusCode, 0);
-            QCOMPARE(result.failure, QStringLiteral("session_refused.no_external_path"));
+            // FIX-01: a pairing poll that never completed carries no sentence and no failure
+            // class of its own - it is a lost poll the controller retries, not a refusal.
+            QVERIFY2(result.error.isEmpty(), "a lost pairing poll must carry no local sentence");
+            QVERIFY2(result.failure.isEmpty(), "a lost pairing poll must carry no failure class");
             QVERIFY(result.reference.isEmpty());
         });
         QTRY_COMPARE_WITH_TIMEOUT(completions, 1, 1900);

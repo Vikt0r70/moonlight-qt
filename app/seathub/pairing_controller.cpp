@@ -317,17 +317,26 @@ void PairingController::handleAuthorization(quint64 attempt, const ControlPlaneR
             return;
         }
 
-        if (result.statusCode == 0
-            || (result.statusCode == kHttpPreconditionFailed
-                && result.kind == QLatin1String(kRefusalKind))) {
+        if (result.statusCode == 0) {
+            // FIX-01: a poll that never reached the control plane (no status at all) is a lost
+            // poll, not a refused start. Ask again on the normal interval and leave the running
+            // clock alone: an outage must stay bounded by the same 30 s the wait always had, so
+            // neither `m_clock` nor the deadline timer restarts here. Nothing was reached, which
+            // is what the deadline reports as `unreachable_deadline`.
+            m_transportFailureSeen = true;
+            scheduleNextPoll();
+            return;
+        }
+
+        if (result.statusCode == kHttpPreconditionFailed
+            && result.kind == QLatin1String(kRefusalKind)) {
             // A refused start. Fail here, before any PairingTarget exists, so no port is dialled
-            // and the customer sees the sentence at once instead of after a 30 s deadline. A
+            // and the customer sees the sentence at once instead of after the 30 s deadline. A
             // reason outside the closed set keeps the server's own sentence and the class
             // `unknown`: still a refusal, never a retry and never a "pairing" end.
             QString sentence = result.error;
             QString reason = QStringLiteral("unknown");
-            const QString refusalReason = result.statusCode == 0
-                ? QStringLiteral("no_external_path") : result.refusalReason;
+            const QString refusalReason = result.refusalReason;
             for (const RefusalSentence& known : kRefusalSentences) {
                 if (refusalReason == QLatin1String(known.reason)) {
                     sentence = QString::fromLatin1(known.sentence);
@@ -344,15 +353,8 @@ void PairingController::handleAuthorization(quint64 attempt, const ControlPlaneR
             stampAttemptClock(&record, m_helloServerUtc, m_helloLocalUtc);
             logAttemptRecord(record);
             emit attemptRecorded(record);
-            if (result.statusCode == 0) {
-                auto failure = SeatHubFailure::local(sentence);
-                failure.failure = QLatin1String(kRefusalFailurePrefix) + reason;
-                fail(failure);
-            }
-            else {
-                fail(SeatHubFailure::api(kHttpPreconditionFailed, sentence, result.reference,
-                                         QLatin1String(kRefusalFailurePrefix) + reason));
-            }
+            fail(SeatHubFailure::api(kHttpPreconditionFailed, sentence, result.reference,
+                                     QLatin1String(kRefusalFailurePrefix) + reason));
             return;
         }
 

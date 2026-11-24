@@ -4179,7 +4179,7 @@ private slots:
         verifyNoInternalNameIsShown(client);
     }
 
-    void aPairingTransportFailureRefusesImmediatelyWithoutBlamingOrDiallingTheRig()
+    void aLostPairingPollThroughTheFacadeKeepsTheWait()
     {
         SeatHubClient client;
         reachHome(client, 90);
@@ -4194,36 +4194,33 @@ private slots:
         QMetaObject::invokeMethod(pairing, [&]() { deadline = pairing->deadlineMs(); },
                                   Qt::BlockingQueuedConnection);
         QCOMPARE(deadline, 30000);
-        QElapsedTimer clock;
-        clock.start();
         client.beginSession(QStringLiteral("s-stages"));
-        QTRY_VERIFY_WITH_TIMEOUT(client.connectFailed(), 1900);
-        QVERIFY(clock.elapsed() < 2000);
-        QCOMPARE(failed.size(), 1);
-        const auto failure = failed.first().first().value<SeatHubFailure>();
-        QCOMPARE(failure.kind, FailureKind::Local);
-        QCOMPARE(failure.statusCode, 0);
-        QCOMPARE(failure.failure, QStringLiteral("session_refused.no_external_path"));
-        QCOMPARE(client.stalledReasonText(), QStringLiteral("We could not verify a usable connection "
-                 "from your network, so we did not start your session. You were not charged."));
-        QVERIFY(client.reference().isEmpty());
+
+        // FIX-01: the first poll is lost. Through the real facade wiring the boot wait survives
+        // it - nothing is blamed on the rig, no failure is raised, and no session_refused end is
+        // sent on the strength of one dropped request.
+        const QString poll = QStringLiteral("/api/sessions/s-stages/pairing");
+        const QString end = QStringLiteral("/api/sessions/s-stages/end");
+        QTRY_VERIFY_WITH_TIMEOUT(m_fake->requestPaths().count(poll) >= 1, 1900);
+        QTest::qWait(250); // the controller's own turn to act on the lost answer
+        QCOMPARE(failed.size(), 0);
         QCOMPARE(stepFailed.size(), 0);
+        QVERIFY(!client.connectFailed());
+        QVERIFY2(!m_fake->bodyFor(end).contains("session_refused"),
+                 "a lost poll must never end the session as a refusal");
+
+        // The next poll is asked for on the normal interval, and a READY answer keeps the wait
+        // alive as it always did. No PIN: this test sets up no engine seam, so a PIN would reach
+        // for one that is not there (the technique `theClientsOwnPairingDeadlineIsAStallToo` uses).
+        m_fake->answerPairing(200, QByteArrayLiteral(
+            "{\"session_id\":\"s-stages\",\"state\":\"READY\",\"pairing_pin\":null}"));
+        QTRY_VERIFY_WITH_TIMEOUT(m_fake->requestPaths().count(poll) >= 2, 3000);
+        QCOMPARE(failed.size(), 0);
+        QCOMPARE(stepFailed.size(), 0);
+        QVERIFY(!client.connectFailed());
+        QVERIFY(!m_fake->bodyFor(end).contains("session_refused"));
         QCOMPARE(g_plainHandshakeRuns, handshakes);
         QCOMPARE(g_engineCreateCalls, engineCreates);
-        const QString end = QStringLiteral("/api/sessions/s-stages/end");
-        QTRY_VERIFY_WITH_TIMEOUT(m_fake->requestPaths().contains(end), 1900);
-        const auto endBody = QJsonDocument::fromJson(m_fake->bodyFor(end)).object();
-        QCOMPARE(endBody.value(QStringLiteral("stage")).toString(), QStringLiteral("session_refused"));
-        QVERIFY(!endBody.contains(QStringLiteral("attempt_step")));
-        const QString liveness = QStringLiteral("/api/sessions/s-stages/liveness");
-        QTRY_VERIFY_WITH_TIMEOUT(m_fake->bodyFor(liveness).contains("session_refused"), 1900);
-        const auto liveBody = QJsonDocument::fromJson(m_fake->bodyFor(liveness)).object();
-        QCOMPARE(liveBody.value(QStringLiteral("engine_stage")).toString(), QStringLiteral("session_refused"));
-        QCOMPARE(liveBody.value(QStringLiteral("stage")).toString(), QStringLiteral("failed"));
-        const int polls = m_fake->requestPaths().count(QStringLiteral("/api/sessions/s-stages/pairing"));
-        QTest::qWait(1100);
-        QCOMPARE(m_fake->requestPaths().count(QStringLiteral("/api/sessions/s-stages/pairing")), polls);
-        QCOMPARE(polls, 1);
         verifyNoInternalNameIsShown(client);
     }
 

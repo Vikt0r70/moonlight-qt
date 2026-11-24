@@ -44,11 +44,12 @@ const int kPairingBudgetMs = 1800;
 
 ControlPlaneResult pairingTransportFailure()
 {
-    ControlPlaneResult result;
-    result.error = QStringLiteral("We could not verify a usable connection from your network, "
-                                  "so we did not start your session. You were not charged.");
-    result.failure = QStringLiteral("session_refused.no_external_path");
-    return result;
+    // FIX-01: a pairing poll that never reached the control plane is a lost poll, not a refusal.
+    // It carries no sentence and no failure class of its own: the pairing controller treats it as
+    // transient and asks again on the normal interval, and a wait that never recovers is ended by
+    // its running 30 s clock as an unreachable deadline. `toFailure()` still maps a status-0 result
+    // to the deck's own offline sentence for every other caller.
+    return ControlPlaneResult();
 }
 
 void completePairing(const std::shared_ptr<PairingRequestState>& state, ControlPlaneResult result)
@@ -520,11 +521,6 @@ bool UsageInfo::parse(const QJsonObject& body, UsageInfo* out)
 
 SeatHubFailure ControlPlaneResult::toFailure() const
 {
-    if (statusCode == 0 && failure == QLatin1String("session_refused.no_external_path")) {
-        auto result = SeatHubFailure::local(error);
-        result.failure = failure;
-        return result;
-    }
     if (statusCode == 0) {
         // We never reached the control plane, so there is no control-plane sentence and no
         // control-plane reference. The reason is the deck's own offline sentence, in full

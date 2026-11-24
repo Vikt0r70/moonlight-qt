@@ -335,14 +335,18 @@ private slots:
         QVERIFY(!isSessionRefusal(SeatHubFailure::generic()));
     }
 
-    void aLocalTransportFailureIsATerminalRefusalNotARigDeadline()
+    void aLocalTransportFailureIsRetriedNotARefusal()
     {
+        // FIX-01: a poll that never reached the control plane is a lost poll, not a refused
+        // start. It schedules the next poll, writes no refusal record, grants nothing and blames
+        // no rig; the running 30 s clock is what ends the wait if the outage never clears.
         PairingController controller;
         auto* fake = new FakeNetworkAccessManager;
         fake->setParent(&controller);
         RecordingSeam seam;
         wire(controller, fake);
         controller.setSeam(&seam);
+        controller.setPollIntervalMs(1);
         fake->statuses = { 0 };
         fake->bodies = { QByteArray() };
         QCOMPARE(controller.deadlineMs(), 30000);
@@ -350,28 +354,15 @@ private slots:
         QSignalSpy granted(&controller, &PairingController::authorizationGranted);
         QSignalSpy steps(&controller, &PairingController::stepFailed);
         QSignalSpy records(&controller, &PairingController::attemptRecorded);
-        QElapsedTimer clock;
-        clock.start();
         controller.start(QString::fromLatin1(kSessionId));
-        QTRY_COMPARE_WITH_TIMEOUT(failed.count(), 1, 1900);
-        QVERIFY(clock.elapsed() < 2000);
-        const auto failure = failed.first().first().value<SeatHubFailure>();
-        QCOMPARE(failure.kind, FailureKind::Local);
-        QCOMPARE(failure.statusCode, 0);
-        QVERIFY(failure.reference.isEmpty());
-        QCOMPARE(failure.error, expectedSentence(QStringLiteral("no_external_path")));
-        QCOMPARE(failure.failure, QStringLiteral("session_refused.no_external_path"));
-        QCOMPARE(pairingFailureStage(failure), QStringLiteral("session_refused"));
-        QCOMPARE(seam.calls, 0);
-        QCOMPARE(granted.count(), 0);
+        // Two poll ticks go by - each is the pairing read plus the session read that rides it -
+        // and both are lost.
+        QTRY_VERIFY_WITH_TIMEOUT(fake->calls >= 4, 2000);
+        QCOMPARE(failed.count(), 0);
+        QCOMPARE(records.count(), 0);
         QCOMPARE(steps.count(), 0);
-        QCOMPARE(records.count(), 1);
-        QCOMPARE(records.first().first().value<AttemptRecord>().refusalClass,
-                 QStringLiteral("no_external_path"));
-        QCOMPARE(fake->calls, 2);
-        QTest::qWait(1100);
-        QCOMPARE(failed.count(), 1);
-        QCOMPARE(fake->calls, 2);
+        QCOMPARE(granted.count(), 0);
+        QCOMPARE(seam.calls, 0);
     }
 
     void aConflictStillWaitsAndNeverShowsTheRefusalSentence()

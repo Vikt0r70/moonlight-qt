@@ -712,6 +712,49 @@ private slots:
         QCOMPARE(seam->calls, 1);
     }
 
+    // -----------------------------------------------------------------------------------------
+    // FIX-01: a lost or failed poll mid-wait is transient, never the end of the boot wait.
+    // -----------------------------------------------------------------------------------------
+
+    void aLostPollMidWaitDoesNotEndTheWait()
+    {
+        // A poll that never reached the control plane (status 0) is a lost poll, not a refusal:
+        // the wait keeps its running clock, the next poll is asked for, and a later READY answer
+        // still pairs. A first customer on a slow boot must not lose the session to one dropped
+        // request.
+        PairingController controller;
+        auto* fake = new PathNetworkAccessManager;
+        auto* seam = new RecordingSeam;
+        wire(controller, fake);
+        controller.setSeam(seam);
+        controller.setPollIntervalMs(1);
+
+        fake->authorizations.append(
+            qMakePair(200, authorizationBody(QString(), QStringLiteral("PREPARING"))));
+        fake->authorizations.append(qMakePair(0, QByteArray()));
+        fake->authorizations.append(
+            qMakePair(200, authorizationBody(QString::fromLatin1(kPin), QStringLiteral("READY"))));
+
+        QSignalSpy failed(&controller, &PairingController::pairingFailed);
+        QSignalSpy completed(&controller, &PairingController::pairingCompleted);
+        QSignalSpy granted(&controller, &PairingController::authorizationGranted);
+        QSignalSpy records(&controller, &PairingController::attemptRecorded);
+
+        controller.start(QString::fromLatin1(kSessionId));
+
+        QTRY_COMPARE(completed.count(), 1);
+        QCOMPARE(failed.count(), 0);
+        QCOMPARE(granted.count(), 1);
+        QCOMPARE(seam->calls, 1);
+        QCOMPARE(seam->lastTarget.pairingPin, QString::fromLatin1(kPin));
+        // Three polls: the waiting answer, the lost one, and the READY answer that paired.
+        QCOMPARE(fake->pairingPolls, 3);
+        for (const auto& record : records) {
+            QVERIFY2(record.first().value<AttemptRecord>().outcome != QLatin1String("refused"),
+                     "a lost poll must never be recorded as a refusal");
+        }
+    }
+
     void aReadyAnswerWithAPinPairs()
     {
         // A 200 answer with `state: "READY"` and a PIN starts pairing as today.
