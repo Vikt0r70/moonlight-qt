@@ -147,7 +147,10 @@ jobs:
           chmod +x gitleaks
 
       - name: actionlint (every workflow)
-        run: ./actionlint
+        # ShellCheck is disabled here: it is not installed on this runner image, and when it is,
+        # actionlint adopts it and fails on pre-existing style findings in old workflow scripts.
+        # The workspace repository runs ShellCheck as its own explicit step.
+        run: ./actionlint -shellcheck=
 
       - name: zizmor (workflow security, medium and above)
         run: ./zizmor --persona=auditor --min-severity medium .github/workflows
