@@ -1,0 +1,13 @@
+# gitleaks baseline for this repository, reviewed by hand on 2026-11-27 before the fork's first
+# full-history secret scan. None of the three findings is a live credential; the list is a baseline
+# for history that cannot be rewritten, not a blanket allowlist for new commits. A new finding is
+# fixed or rotated, never added here without a row in this header.
+#
+# e881e38d... tests/tst_control_plane.cpp: a fixed RSA key pair used only by the pairing control-plane
+#   unit test. Test fixture, never shipped, never loaded by production code.
+# 381f43bd... .github/workflows/seathub-build-win.yml:190: the aqtinstall pin is a git URL with a
+#   40-hex commit; gitleaks reads the hash as a Sentry token. Not a secret.
+# de465682... scripts/build-seathub.ps1:124: sentry-native version and SHA-256 constants. Not a secret.
+e881e38d964b7c49f22a0ceda59667d4310f1493:tests/tst_control_plane.cpp:private-key:72
+381f43bd5cc5d3335a17f788aebfc4b1463cafe2:.github/workflows/seathub-build-win.yml:sentry-access-token:190
+de465682fa374d8ea81e95674ded4a195ad951d4:scripts/build-seathub.ps1:sentry-access-token:124

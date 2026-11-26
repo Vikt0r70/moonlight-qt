@@ -1,0 +1,15 @@
+# Pre-commit hooks for the RentaPC fork.
+#
+# The one hook is gitleaks, a secret scanner that reads the staged diff with its default ruleset
+# (private keys, provider tokens, .env-style assignments). It is the fallback the workspace picked
+# for private repositories on GitHub Pro, where push protection is not available: the hook refuses
+# a commit that contains a synthetic secret before it ever leaves the machine.
+#
+# Install once per clone: `pre-commit install`. Run over everything: `pre-commit run --all-files`.
+# The hook is skippable by design (`git commit --no-verify` or `SKIP=gitleaks git commit`), and CI
+# scans the pushed history after the fact, so a skip is caught rather than trusted.
+repos:
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.30.1
+    hooks:
+      - id: gitleaks
