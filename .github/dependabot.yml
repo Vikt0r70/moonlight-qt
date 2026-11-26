@@ -1,0 +1,17 @@
+version: 2
+
+# Version updates for the actions this repository's workflows run. The only ecosystem managed
+# here is github-actions; dependency version bumps for the client itself are a deliberate change,
+# not a bot's weekly pull request. Cooldown and the staggered time keep it clear of the weekly
+# CodeQL run (Wednesday 05:41 UTC) and of the workspace repository's own Dependabot run.
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: thursday
+      time: '05:17'
+      timezone: UTC
+    cooldown:
+      default-days: 3
+    open-pull-requests-limit: 5

@@ -15,15 +15,22 @@ on:
   pull_request:
     branches: [main]
   push:
-    branches: [main]
+    branches: [main, seathub/v3.0-phase1]
+
+permissions:
+  contents: read
 
 jobs:
   diff-gate:
     name: Engine-untouched diff gate (D-28, ADR-0046, ADR-0104)
     runs-on: windows-latest
+    permissions:
+      contents: read
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
+          persist-credentials: false
           fetch-depth: 0
 
       - name: Fetch upstream tag baseline
@@ -113,15 +120,54 @@ jobs:
             exit 1
           fi
 
+  checks:
+    name: Static checks (workflows, secret scan)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Install the pinned checkers
+        run: |
+          set -euo pipefail
+          curl -sSfL -o actionlint.tar.gz https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz
+          echo "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  actionlint.tar.gz" | sha256sum -c -
+          tar -xzf actionlint.tar.gz actionlint
+          curl -sSfL -o zizmor.tar.gz https://github.com/zizmorcore/zizmor/releases/download/v1.33.1/zizmor-x86_64-unknown-linux-gnu.tar.gz
+          echo "3e6a301c7a820a2501915f5a9de8c0486da82bdec7965f068477538a98743d43  zizmor.tar.gz" | sha256sum -c -
+          tar -xzf zizmor.tar.gz zizmor
+          curl -sSfL -o gitleaks.tar.gz https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz
+          echo "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  gitleaks.tar.gz" | sha256sum -c -
+          tar -xzf gitleaks.tar.gz gitleaks
+          chmod +x gitleaks
+
+      - name: actionlint (every workflow)
+        run: ./actionlint
+
+      - name: zizmor (workflow security, medium and above)
+        run: ./zizmor --persona=auditor --min-severity medium .github/workflows
+
+      - name: gitleaks (every commit, redacted)
+        run: ./gitleaks git . --redact --no-banner
+
   seathub-windows-build:
     name: SeatHub Windows/Qt build
     runs-on: windows-latest
-    needs: diff-gate
+    permissions:
+      contents: read
+    timeout-minutes: 360
+    needs: [diff-gate, checks]
     steps:
       # Full history: tst_d28_boundary measures against the pinned upstream commit object itself
       # and fails closed by name when that object is absent (a shallow clone), so this must stay 0.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
+          persist-credentials: false
           submodules: recursive
           fetch-depth: 0
 
@@ -170,7 +216,7 @@ jobs:
       # vpk version. The Velopack C library (velopack_libc 1.2.161) is fetched and SHA-256 checked by
       # scripts/build-seathub.ps1 itself.
       - name: Install the .NET SDK 8.0.425 (for vpk)
-        uses: actions/setup-dotnet@v4
+        uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4.3.1
         with:
           dotnet-version: '8.0.425'
 
@@ -188,7 +234,7 @@ jobs:
       # cmake configure line (or the pinned sentry-native version living inside it) invalidates the
       # cache instead of reusing a stale build.
       - name: Cache sentry-native 0.17.1 (crashpad)
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: build/sentry-native-0.17.1/install
           key: sentry-native-0.17.1-${{ hashFiles('scripts/build-seathub.ps1') }}-msvc
@@ -271,7 +317,7 @@ jobs:
       - name: Upload SeatHub's symbols to Sentry
         shell: pwsh
         env:
-          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}  # zizmor: ignore[secrets-outside-env] -- the fork build keeps symbol upload until plan 01-09 Task 3 deletes this secret; giving the build job an environment would make every work-branch push wait on production rules
           SENTRY_ORG: space-desk
           SENTRY_PROJECT: seathub
           SENTRY_URL: https://de.sentry.io
@@ -397,7 +443,7 @@ jobs:
           Write-Output "Publish with POST /api/admin/releases (D-40); see docs/runbooks/client-release.md in the monorepo."
 
       # The three release assets (ADR-0086): Setup.exe, the full package and releases.win.json.
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: SeatHub-Velopack
           path: |
@@ -426,6 +472,8 @@ jobs:
     needs: seathub-windows-build
     runs-on: ubuntu-latest
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    timeout-minutes: 30
+    environment: production
     # `contents: write` is only for the GitHub Release at the end (owner decision A-22).
     permissions:
       contents: write
@@ -434,9 +482,11 @@ jobs:
       cancel-in-progress: false
     steps:
       # ADR-0077: the newest published release is the floor; the publish body carries none.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: SeatHub-Velopack
           path: dist
