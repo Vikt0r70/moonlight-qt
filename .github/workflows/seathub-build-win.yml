@@ -328,11 +328,8 @@ jobs:
           $ErrorActionPreference = 'Stop'
 
           if (-not $env:SENTRY_AUTH_TOKEN) {
-            if ($env:GITHUB_EVENT_NAME -eq 'pull_request') {
-              Write-Host "::warning::Sentry symbol upload skipped: SENTRY_AUTH_TOKEN is not set; skipping the symbol upload on this pull request."
-              exit 0
-            }
-            throw "SENTRY_AUTH_TOKEN is empty on a push to main -- the owner's secret (A-44) is missing or was revoked (D-12)"
+            Write-Host "::warning::Sentry symbol upload skipped: SENTRY_AUTH_TOKEN is not set in this repository any more. Publishing and symbol uploads live in the workspace repository's release-client workflow (plan 01-09, 2026-11-27)."
+            exit 0
           }
 
           $sentryCliSha256 = '2257cf6805a616f5c3ee291a549ebbba021190048b646adc006beb4e8cdef7fd'
@@ -474,7 +471,10 @@ jobs:
     name: Publish client to the release feed
     needs: seathub-windows-build
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    # DISABLED 2026-11-27 (plan 01-09): the workspace repository (Vikt0r70/seven-hills-alpha)
+    # builds and publishes RentaPC from this fork's pinned commit. This job is kept, body intact,
+    # for one release cycle as the rollback path; it must never publish from a branch push again.
+    if: false
     timeout-minutes: 30
     environment: production
     # `contents: write` is only for the GitHub Release at the end (owner decision A-22).
