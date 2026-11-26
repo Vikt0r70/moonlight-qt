@@ -474,7 +474,10 @@ jobs:
     # DISABLED 2026-11-27 (plan 01-09): the workspace repository (Vikt0r70/seven-hills-alpha)
     # builds and publishes RentaPC from this fork's pinned commit. This job is kept, body intact,
     # for one release cycle as the rollback path; it must never publish from a branch push again.
-    if: false
+    # The condition must stay non-constant: actionlint rejects `if: false` [if-cond], and a
+    # rejected static-checks gate would stop every push before build and test (REL-01). The
+    # repository variable RENTAPC_FORK_PUBLISH is unset on this fork, so the job stays skipped.
+    if: vars.RENTAPC_FORK_PUBLISH == 'true'
     timeout-minutes: 30
     environment: production
     # `contents: write` is only for the GitHub Release at the end (owner decision A-22).
